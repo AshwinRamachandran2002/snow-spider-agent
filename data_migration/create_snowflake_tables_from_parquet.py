@@ -1,10 +1,11 @@
-import snowflake.connector
-import json
 import argparse
+import json
 import os
 import threading
-from google.cloud import storage
 from concurrent.futures import ThreadPoolExecutor
+
+import snowflake.connector
+from google.cloud import storage
 
 
 # Apply transformations to the name
@@ -121,7 +122,6 @@ def process_dataset(data, args, completed_tables, lock):
             cur.execute(f"USE SCHEMA {transform_name(dataset_name)}")
 
             # GCS path to Parquet file (relative to the stage)
-            parquet_file_path = f"{table_name}-*.parquet"
             example_parquet_file_path = f"{table_name}-000000000000.parquet"
 
             # Create the stage for loading data from GCS using the storage integration

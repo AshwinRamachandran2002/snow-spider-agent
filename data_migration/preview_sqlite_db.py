@@ -1,6 +1,6 @@
+import argparse
 import os
 import sqlite3
-import argparse
 
 
 def get_table_schemas(db_path):

@@ -1,7 +1,8 @@
+import argparse
+
 from google.cloud import bigquery
 from google.cloud import storage
 from tqdm.auto import tqdm
-import argparse
 
 
 def main():
