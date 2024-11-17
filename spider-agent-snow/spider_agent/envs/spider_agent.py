@@ -1,18 +1,10 @@
-import copy
 import logging
 import os
 import pathlib
-import shutil
-import signal
-import subprocess
-import tempfile
 import time
 from typing import Any
 from typing import Callable
 from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Tuple
 from typing import Union
 
 import docker
@@ -34,7 +26,11 @@ from spider_agent.agent.action import SNOWFLAKE_EXEC_SQL
 from spider_agent.agent.action import Terminate
 from spider_agent.controllers.python import PythonController
 from spider_agent.controllers.setup import SetupController
-from spider_agent.envs.utils import *
+from spider_agent.envs.utils import calculate_sha256
+from spider_agent.envs.utils import create_folder_if_not_exists
+from spider_agent.envs.utils import delete_files_in_folder
+from spider_agent.envs.utils import is_file_valid
+from spider_agent.envs.utils import timeout
 
 logger = logging.getLogger("spider_agent.env")
 
@@ -133,7 +129,7 @@ class Spider_Agent_Env(gym.Env):
             print(f"Container {container_name} stopped and removed.")
         except docker.errors.NotFound:
             pass
-        except docker.errors.APIError as e:
+        except docker.errors.APIError:
             pass
 
         create_folder_if_not_exists(self.mnt_dir)
@@ -173,7 +169,7 @@ class Spider_Agent_Env(gym.Env):
             self.container: Container = client.containers.run(
                 image=image, volumes=volumes, **extra_params
             )
-        except ImageNotFound as e:
+        except ImageNotFound:
             dockerfile_path = os.path.join(DEFAULT_IMAGE_DIR, self.image_name)
             if os.path.exists(dockerfile_path):
                 logger.info(
@@ -308,7 +304,7 @@ class Spider_Agent_Env(gym.Env):
             action.file_path, action.code, action.output
         )
         if obs is None or obs == "":
-            obs = f"SQL command executed successfully. No output."
+            obs = "SQL command executed successfully. No output."
 
         return obs
 
@@ -342,6 +338,6 @@ class Spider_Agent_Env(gym.Env):
             action.file_path, action.code, action.output
         )
         if obs is None or obs == "":
-            obs = f"SQL command executed successfully. No output."
+            obs = "SQL command executed successfully. No output."
 
         return obs

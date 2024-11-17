@@ -4,10 +4,7 @@ from abc import ABC
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
-from typing import Dict
-from typing import List
 from typing import Optional
-from typing import Union
 
 
 def remove_quote(text: str) -> str:
@@ -126,9 +123,6 @@ print("Hello, world!")
             code = matches[-1][2].strip()
             return cls(code=code, filepath=remove_quote(filepath))
         return None
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(filepath='{self.filepath}':\n'''\n{self.code}\n''')"
 
 
 @dataclass

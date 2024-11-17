@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import shutil
@@ -6,10 +5,7 @@ import uuid
 from typing import Any
 from typing import Dict
 from typing import List
-from typing import Optional
-from typing import Union
 
-import docker
 import requests
 from spider_agent import configs
 

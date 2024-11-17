@@ -1,7 +1,6 @@
 # import debugpy; debugpy.connect(('127.0.0.1', 5688))
 import argparse
 import json
-import logging
 import math
 import os
 import os.path as osp
@@ -9,10 +8,7 @@ import re
 import shutil
 import sqlite3
 import sys
-from typing import List
-from typing import Union
 
-import duckdb
 import pandas as pd
 import snowflake.connector
 from google.cloud import bigquery
@@ -73,7 +69,7 @@ def compare_multi_pandas_table(
         multi_condition_cols == []
         or multi_condition_cols == [[]]
         or multi_condition_cols == [None]
-        or multi_condition_cols == None
+        or multi_condition_cols is not None
     ):
         multi_condition_cols = [[] for _ in range(len(multi_gold))]
     elif len(multi_gold) > 1 and not all(
@@ -246,7 +242,7 @@ def get_sqlite_result(
     return True, None
 
 
-def evaluate_spider2sql(args):
+def evaluate_spider2sql(args):  # noqa: C901
     mode = args.mode
     gold_sql_dir = os.path.join(args.gold_dir, "sql")
     gold_result_dir = os.path.join(args.gold_dir, "exec_result")
@@ -283,7 +279,7 @@ def evaluate_spider2sql(args):
                 exe_flag, dbms_error_info = get_bigquery_sql_result(
                     pred_sql_query, True, "temp", f"{id}_pred.csv"
                 )
-                if exe_flag == False:
+                if not exe_flag:
                     score = 0
                     error_info = dbms_error_info
                 else:
@@ -303,7 +299,7 @@ def evaluate_spider2sql(args):
                         exe_flag, dbms_error_info = get_bigquery_sql_result(
                             gold_sql_query, True, "temp", f"{id}_gold.csv"
                         )
-                        if exe_flag == False:
+                        if not exe_flag:
                             score = 0
                             error_info = dbms_error_info
                         else:
@@ -358,7 +354,7 @@ def evaluate_spider2sql(args):
                     "temp",
                     f"{id}_pred.csv",
                 )
-                if exe_flag == False:
+                if not exe_flag:
                     score = 0
                     error_info = dbms_error_info
                 else:
@@ -404,7 +400,7 @@ def evaluate_spider2sql(args):
                 exe_flag, dbms_error_info = get_snowflake_sql_result(
                     pred_sql_query, True, "temp", f"{id}_pred.csv"
                 )
-                if exe_flag == False:
+                if not exe_flag:
                     score = 0
                     error_info = dbms_error_info
                 else:
@@ -424,7 +420,7 @@ def evaluate_spider2sql(args):
                         exe_flag, dbms_error_info = get_snowflake_sql_result(
                             gold_sql_query, True, "temp", f"{id}_gold.csv"
                         )
-                        if exe_flag == False:
+                        if not exe_flag:
                             score = 0
                             error_info = dbms_error_info
                         else:

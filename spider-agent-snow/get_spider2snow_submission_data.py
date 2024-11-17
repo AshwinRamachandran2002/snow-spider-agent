@@ -93,10 +93,11 @@ def postprocess(args):
                     os.path.join(submission_dir, instance_id),
                     files_to_copy=answer_or_path,
                 )
-            except:
+            except Exception as e:
                 import pdb
 
                 pdb.set_trace()
+                print(f"Error when copying the folder: {e}")
         elif not os.path.exists(os.path.join(result_folder_root_path, answer_or_path)):
             results_metadata.append(
                 {

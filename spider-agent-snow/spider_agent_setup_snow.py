@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import shutil
-import zipfile
 
 JSONL_PATH = "../../spider2-snow/spider2-snow.jsonl"
 DATABASE_PATH = "../../spider2-snow/resource/databases/"
@@ -77,7 +76,7 @@ def add_snowflake_agent_setting():
         if not os.path.exists(example_path):
             os.makedirs(example_path)
         external_knowledge = example["external_knowledge"]
-        if external_knowledge != None:
+        if external_knowledge is not None:
             shutil.copy(os.path.join(DOCUMENT_PATH, external_knowledge), example_path)
 
 

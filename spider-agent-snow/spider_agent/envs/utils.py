@@ -4,7 +4,6 @@ import os
 import shutil
 import signal
 import xml.etree.ElementTree as ET
-from typing import Dict
 
 import pandas as pd
 import yaml

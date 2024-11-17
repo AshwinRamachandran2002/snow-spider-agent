@@ -4,12 +4,10 @@ import glob
 import json
 import logging
 import os
-import random
 import sys
 
 from spider_agent.agent.agents import PromptAgent
 from spider_agent.envs.spider_agent import Spider_Agent_Env
-from tqdm import tqdm
 
 
 #  Logger Configs {{{ #
@@ -98,8 +96,7 @@ def config() -> argparse.Namespace:
     return args
 
 
-def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:
-    scores = []
+def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:  # noqa: C901
 
     # log args
     logger.info("Args: %s", args)
@@ -200,8 +197,8 @@ def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:
                 result = json.load(f)
                 if (
                     result["finished"]
-                    and (not "FAIL" in result["result"])
-                    and (not "error" in result["result"].lower())
+                    and ("FAIL" not in result["result"])
+                    and ("error" not in result["result"].lower())
                 ):
                     logger.info("Skipping %s", instance_id)
                     continue

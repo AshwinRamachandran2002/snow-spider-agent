@@ -1,5 +1,3 @@
-import base64
-import json
 import logging
 import os
 import time
@@ -10,7 +8,7 @@ from openai import AzureOpenAI
 logger = logging.getLogger("api-llms")
 
 
-def call_llm(payload):
+def call_llm(payload):  # noqa: C901
     model = payload["model"]
     stop = ["Observation:", "\n\n\n\n", "\n \n \n"]
     if model.startswith("gpt"):
@@ -58,8 +56,6 @@ def call_llm(payload):
         logger.info("Generating content with GPT model: %s", model)
 
         messages = payload["messages"]
-        top_p = payload["top_p"]
-        temperature = payload["temperature"]
 
         o1_messages = []
 

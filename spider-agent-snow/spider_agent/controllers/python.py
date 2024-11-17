@@ -1,16 +1,10 @@
 import ast
-import json
 import logging
 import os
 import platform
-import random
-import tempfile
-from typing import Any
-from typing import Dict
 from typing import Optional
 
 import docker
-import requests
 from spider_agent.agent.sql_template import BQ_EXEC_SQL_QUERY_TEMPLATE
 from spider_agent.agent.sql_template import BQ_GET_TABLE_INFO_TEMPLATE
 from spider_agent.agent.sql_template import BQ_GET_TABLES_TEMPLATE

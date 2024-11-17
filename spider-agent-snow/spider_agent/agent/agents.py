@@ -1,36 +1,15 @@
-import base64
-import json
 import logging
-import os
 import re
-import time
-import uuid
-from http import HTTPStatus
-from io import BytesIO
-from typing import Any
 from typing import Dict
 from typing import List
-from typing import Optional
-from typing import Tuple
-from typing import TypedDict
 
-from openai import AzureOpenAI
 from spider_agent.agent.action import Action
 from spider_agent.agent.action import Bash
-from spider_agent.agent.action import BIGQUERY_EXEC_SQL
-from spider_agent.agent.action import BQ_GET_TABLE_INFO
-from spider_agent.agent.action import BQ_GET_TABLES
-from spider_agent.agent.action import BQ_SAMPLE_ROWS
 from spider_agent.agent.action import CreateFile
 from spider_agent.agent.action import EditFile
-from spider_agent.agent.action import LOCAL_DB_SQL
 from spider_agent.agent.action import SNOWFLAKE_EXEC_SQL
 from spider_agent.agent.action import Terminate
 from spider_agent.agent.models import call_llm
-from spider_agent.agent.prompts import BIGQUERY_SYSTEM
-from spider_agent.agent.prompts import DBT_SYSTEM
-from spider_agent.agent.prompts import LOCAL_SYSTEM
-from spider_agent.agent.prompts import REFERENCE_PLAN_SYSTEM
 from spider_agent.agent.prompts import SNOWFLAKE_SYSTEM
 from spider_agent.envs.spider_agent import Spider_Agent_Env
 
@@ -236,7 +215,7 @@ class PromptAgent:
                 output_action = action
                 break
         if output_action is None:
-            action_string = action_string.replace("\_", "_").replace("'''", "```")
+            action_string = action_string.replace("\\_", "_").replace("'''", "```")
             for action_cls in self._AVAILABLE_ACTION_CLASSES:
                 action = action_cls.parse_action_from_text(action_string)
                 if action is not None:

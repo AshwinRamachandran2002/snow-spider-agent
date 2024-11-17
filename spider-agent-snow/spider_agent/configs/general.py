@@ -1,11 +1,8 @@
 # coding=utf8
 import os
 import shutil
-from typing import Any
 from typing import Dict
 from typing import List
-from typing import Optional
-from typing import Union
 
 
 def download_and_execute_setup(controller, url: str, path: str = "/home/user/init.sh"):
@@ -21,7 +18,7 @@ def download_and_execute_setup(controller, url: str, path: str = "/home/user/ini
     controller._execute_setup(command=f"chmod a+x {path}")
     controller._execute_setup(command=f"bash {path}")
     controller._execute_setup(command=f"rm -f {path}")
-    controller._execute_setup(command=f"rm -rf  __MACOSX")
+    controller._execute_setup(command="rm -rf  __MACOSX")
     return
 
 
@@ -38,9 +35,9 @@ def download_and_unzip_setup(controller, url: str, path: str = "/home/user/gold.
     controller._execute_setup(command=f"chmod a+x {path}")
     controller._execute_setup(command=f"unzip {path}")
     controller._execute_setup(command=f"rm -rf {path}")
-    controller._execute_setup(command=f"rm -rf  __MACOSX")
+    controller._execute_setup(command="rm -rf  __MACOSX")
     # make all the files in this path executable for all users
-    controller._execute_setup(command=f"chmod -R a+rwx .")
+    controller._execute_setup(command="chmod -R a+rwx .")
     return
 
 
@@ -65,7 +62,7 @@ def copy_execute_setup(controller, url: str, path: str = "/home/user/init.sh"):
     controller._execute_setup(command=f"chmod a+x {path}")
     controller._execute_setup(command=f"bash {path}")
     controller._execute_setup(command=f"rm -f {path}")
-    controller._execute_setup(command=f"rm -rf  __MACOSX")
+    controller._execute_setup(command="rm -rf  __MACOSX")
     return
 
 
