@@ -43,9 +43,7 @@ def copy_folder(src, dest, files_to_copy=None):
 
 def postprocess(args):
 
-    output_dir = os.path.join(
-        os.path.join(args.all_results_path, args.experiment_suffix)
-    )
+    output_dir = os.path.join(os.path.join(args.all_results_path, args.experiment_id))
 
     submission_dir = args.results_folder_name
     if not os.path.exists(submission_dir):
@@ -134,7 +132,7 @@ if __name__ == "__main__":
         "--all_results_path", type=str, default="output", help="Result directory"
     )
     parser.add_argument(
-        "--experiment_suffix", type=str, default="gpt-4o-test1", help="Result directory"
+        "--experiment_id", type=str, default="gpt-4o-test1", help="Result directory"
     )
     parser.add_argument(
         "--results_folder_name",

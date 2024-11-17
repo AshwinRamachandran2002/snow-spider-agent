@@ -41,14 +41,14 @@ For Azure OpenAI, do this (remember to add `azure/` before the deployment name):
 ```
 export AZURE_API_KEY=<azure-api-key>
 export AZURE_ENDPOINT=<azure-endpoint>
-python run.py --model azure/<deployment-name> -s <experiment-name>
+python run.py --agent default-agent --model azure/<deployment-name> -s <experiment-name>
 ```
 
 ## Evaluation
 
 ```
-python get_spider2snow_submission_data.py --experiment_suffix gpt-4o-test1 --results_folder_name ../spider2-snow-bench/evaluation_suite/experiments/gpt-4o-test1
+python get_spider2snow_submission_data.py --experiment_id default-agent-gpt4o-241117 --results_folder_name ../spider2-snow-bench/evaluation_suite/experiments/default-agent-gpt4o-241117
 
-cd ../../spider2-snow/evaluation_suite
-python evaluate.py --mode exec_result --result_dir ./experiments/gpt-4o-test1
+cd ../spider2-snow-bench/evaluation_suite
+python evaluate.py --mode exec_result --result_dir ./experiments/default-agent-gpt4o-241117
 ```

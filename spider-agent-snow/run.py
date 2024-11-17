@@ -100,14 +100,13 @@ def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:  # noqa:
 
     # log args
     logger.info("Args: %s", args)
+    experiment_id = f"{args.agent}-{args.model.split('/')[-1]}"
 
-    if args.suffix == "":
+    if args.suffix != "":
         logger.warning(
             "No suffix is provided, the experiment id will be the model name."
         )
-        experiment_id = args.model.split("/")[-1]
-    else:
-        experiment_id = args.model.split("/")[-1] + "-" + args.suffix
+        experiment_id += f"-{args.suffix}"
 
     if args.plan:
         experiment_id = f"{experiment_id}-plan"
