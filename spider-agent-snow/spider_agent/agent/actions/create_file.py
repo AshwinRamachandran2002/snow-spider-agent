@@ -1,8 +1,10 @@
+import re
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Optional
 
 from .action import Action
+from .utils import remove_quote
 
 
 @dataclass
@@ -38,3 +40,16 @@ Example: CreateFile(filepath="hello_world.py"):
 print("Hello, world!")
 ```
 """
+
+    @classmethod
+    def parse_action_from_text(cls, text: str) -> Optional[Action]:
+        matches = re.findall(
+            r"CreateFile\(filepath=(.*?)\).*?```[ \t]*(\w+)?[ \t]*\r?\n(.*)[\r\n \t]*```",
+            text,
+            flags=re.DOTALL,
+        )
+        if matches:
+            filepath = matches[-1][0].strip()
+            code = matches[-1][2].strip()
+            return cls(code=code, filepath=remove_quote(filepath))
+        return None
