@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 
-from spider_agent.agent.agents import PromptAgent
+from spider_agent.agent.agent_registry import AGENT_NAME_CLASS_MAP
 from spider_agent.envs.spider_agent import Spider_Agent_Env
 
 
@@ -54,7 +54,7 @@ def config() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run end-to-end evaluation on the benchmark"
     )
-
+    parser.add_argument("--agent", type=str, default="default-agent")
     parser.add_argument("--max_steps", type=int, default=20)
 
     parser.add_argument("--max_memory_length", type=int, default=30)
@@ -120,7 +120,7 @@ def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:  # noqa:
         },
     }
 
-    agent = PromptAgent(
+    agent = AGENT_NAME_CLASS_MAP[args.agent](
         model=args.model,
         max_tokens=args.max_tokens,
         top_p=args.top_p,
