@@ -6,7 +6,7 @@ import logging
 import os
 import sys
 
-from spider_agent.agent.agent_registry import AGENT_NAME_CLASS_MAP
+from spider_agent.agent.agents import AGENT_NAME_CLASS_MAP
 from spider_agent.envs.spider_agent import Spider_Agent_Env
 
 
