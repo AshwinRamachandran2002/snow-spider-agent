@@ -26,7 +26,7 @@ pip install -r requirements.txt
 
 4. **Spider 2.0-Snow Setup**
 ```
-cd ./spider2-snow-bench
+cd ./spider-agent-snow
 python spider_agent_setup_snow.py
 ```
 

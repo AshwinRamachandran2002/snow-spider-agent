@@ -3,9 +3,9 @@ import json
 import os
 import shutil
 
-JSONL_PATH = "../../spider2-snow/spider2-snow.jsonl"
-DATABASE_PATH = "../../spider2-snow/resource/databases/"
-DOCUMENT_PATH = "../../spider2-snow/resource/documents"
+JSONL_PATH = "../spider2-snow-bench/spider2-snow.jsonl"
+DATABASE_PATH = "../spider2-snow-bench/resource/databases/"
+DOCUMENT_PATH = "../spider2-snow-bench/resource/documents"
 
 
 def clear_folder(folder_path):
