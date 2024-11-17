@@ -1,10 +1,10 @@
 import argparse
-import datetime
 import glob
 import json
 import logging
 import os
 import sys
+from datetime import datetime
 
 from spider_agent.agent.agents import AGENT_NAME_CLASS_MAP
 from spider_agent.envs.spider_agent import Spider_Agent_Env
@@ -14,7 +14,7 @@ from spider_agent.envs.spider_agent import Spider_Agent_Env
 logger = logging.getLogger("spider_agent")
 logger.setLevel(logging.DEBUG)
 
-datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
+datetime_str: str = datetime.now().strftime("%Y%m%d@%H%M%S")
 
 file_handler = logging.FileHandler(
     os.path.join("logs", "normal-{:}.log".format(datetime_str)), encoding="utf-8"
@@ -63,7 +63,9 @@ def config() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=20)
 
     parser.add_argument("--max_memory_length", type=int, default=30)
-    parser.add_argument("--suffix", "-s", type=str, default="gpt-4-try1")
+    parser.add_argument(
+        "--suffix", "-s", type=str, default=datetime.now().strftime("%y%m%d")
+    )
 
     parser.add_argument("--model", type=str, default="gpt-4o")
     parser.add_argument("--temperature", type=float, default=0.5)
