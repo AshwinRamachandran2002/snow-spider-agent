@@ -26,4 +26,6 @@ Observation: the observation space of this action type.
 
     @classmethod
     def parse_action_from_text(cls, text: str) -> Optional[Any]:
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"This method should be implemented by subclass: {cls}"
+        )

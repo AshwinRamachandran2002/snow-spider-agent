@@ -34,14 +34,14 @@ python spider_agent_setup_snow.py
 ```
 cd ./spider-agent-snow
 export OPENAI_API_KEY=<your-openai-key>
-python run.py --model gpt-4o -s <experiment-name>
+python run.py --agent default-agent --model gpt4o -s 241117
 ```
 
 For Azure OpenAI, do this (remember to add `azure/` before the deployment name):
 ```
 export AZURE_API_KEY=<azure-api-key>
 export AZURE_ENDPOINT=<azure-endpoint>
-python run.py --agent default-agent --model azure/<deployment-name> -s <experiment-name>
+python run.py --agent default-agent --model azure/gpt4o -s 241117
 ```
 
 ## Evaluation
