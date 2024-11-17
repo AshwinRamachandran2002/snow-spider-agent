@@ -54,7 +54,12 @@ def config() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run end-to-end evaluation on the benchmark"
     )
-    parser.add_argument("--agent", type=str, default="default-agent")
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default="default-agent",
+        choices=AGENT_NAME_CLASS_MAP.keys(),
+    )
     parser.add_argument("--max_steps", type=int, default=20)
 
     parser.add_argument("--max_memory_length", type=int, default=30)
