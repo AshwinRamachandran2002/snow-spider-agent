@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 from dataclasses import field
 from typing import Optional
 
 from .action import Action
 
 
+@dataclass
 class CreateFile(Action):
 
     action_type: str = field(

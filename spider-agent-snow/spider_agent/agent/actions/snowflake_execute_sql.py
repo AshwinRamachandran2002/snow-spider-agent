@@ -1,10 +1,12 @@
 import re
+from dataclasses import dataclass
 from dataclasses import field
 from typing import Optional
 
 from .action import Action
 
 
+@dataclass
 class SnowflakeExecuteSQL(Action):
     action_type: str = field(
         default="execute_snowflake_SQL",

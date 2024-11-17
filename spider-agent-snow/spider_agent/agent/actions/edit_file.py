@@ -1,4 +1,5 @@
 import re
+from dataclasses import dataclass
 from dataclasses import field
 from typing import Optional
 
@@ -6,6 +7,7 @@ from .action import Action
 from .utils import remove_quote
 
 
+@dataclass
 class EditFile(Action):
     action_type: str = field(
         default="edit_file",

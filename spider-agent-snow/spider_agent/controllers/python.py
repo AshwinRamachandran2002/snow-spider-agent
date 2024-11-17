@@ -5,10 +5,6 @@ import platform
 from typing import Optional
 
 import docker
-from spider_agent.agent.sql_template import BQ_EXEC_SQL_QUERY_TEMPLATE
-from spider_agent.agent.sql_template import BQ_GET_TABLE_INFO_TEMPLATE
-from spider_agent.agent.sql_template import BQ_GET_TABLES_TEMPLATE
-from spider_agent.agent.sql_template import BQ_SAMPLE_ROWS_TEMPLATE
 from spider_agent.agent.sql_template import LOCAL_SQL_TEMPLATE
 from spider_agent.agent.sql_template import SF_EXEC_SQL_QUERY_TEMPLATE
 
@@ -142,21 +138,6 @@ class PythonController:
             observation = observation.split("\n", 1)[1]
         return observation
 
-    def execute_bq_exec_sql_query(self, action):
-        sql_query, is_save = action.sql_query, action.is_save
-        save_path = getattr(action, "save_path", "")
-
-        script_content = BQ_EXEC_SQL_QUERY_TEMPLATE.format(
-            sql_query=sql_query, is_save=is_save, save_path=save_path
-        )
-
-        temp_file_path = "temp_sql_script.py"
-        observation = self.execute_python_file(temp_file_path, script_content)
-        self.execute_command(f"rm {temp_file_path}")
-        if observation.startswith(f'File "{temp_file_path}"'):
-            observation = observation.split("\n", 1)[1]
-        return observation
-
     def execute_sf_exec_sql_query(self, action):
         sql_query, is_save = action.sql_query, action.is_save
         save_path = getattr(action, "save_path", "")
@@ -167,64 +148,6 @@ class PythonController:
 
         temp_file_path = "temp_sql_script.py"
         # import pdb; pdb.set_trace()
-        observation = self.execute_python_file(temp_file_path, script_content)
-        self.execute_command(f"rm {temp_file_path}")
-        if observation.startswith(f'File "{temp_file_path}"'):
-            observation = observation.split("\n", 1)[1]
-        return observation
-
-    def execute_bq_get_tables(self, action):
-        database_name, dataset_name, save_path = (
-            action.database_name,
-            action.dataset_name,
-            action.save_path,
-        )
-        script_content = BQ_GET_TABLES_TEMPLATE.format(
-            database_name=database_name, dataset_name=dataset_name, save_path=save_path
-        )
-        temp_file_path = "temp_sql_script.py"
-        observation = self.execute_python_file(temp_file_path, script_content)
-        self.execute_command(f"rm {temp_file_path}")
-        if observation.startswith(f'File "{temp_file_path}"'):
-            observation = observation.split("\n", 1)[1]
-        return observation
-
-    def execute_bq_get_table_info(self, action):
-        database_name, dataset_name, table, save_path = (
-            action.database_name,
-            action.dataset_name,
-            action.table,
-            action.save_path,
-        )
-        script_content = BQ_GET_TABLE_INFO_TEMPLATE.format(
-            database_name=database_name,
-            dataset_name=dataset_name,
-            table=table,
-            save_path=save_path,
-        )
-        temp_file_path = "temp_sql_script.py"
-        observation = self.execute_python_file(temp_file_path, script_content)
-        self.execute_command(f"rm {temp_file_path}")
-        if observation.startswith(f'File "{temp_file_path}"'):
-            observation = observation.split("\n", 1)[1]
-        return observation
-
-    def execute_bq_sample_rows(self, action):
-        database_name, dataset_name, table, row_number, save_path = (
-            action.database_name,
-            action.dataset_name,
-            action.table,
-            action.row_number,
-            action.save_path,
-        )
-        script_content = BQ_SAMPLE_ROWS_TEMPLATE.format(
-            database_name=database_name,
-            dataset_name=dataset_name,
-            table=table,
-            row_number=row_number,
-            save_path=save_path,
-        )
-        temp_file_path = "temp_sql_script.py"
         observation = self.execute_python_file(temp_file_path, script_content)
         self.execute_command(f"rm {temp_file_path}")
         if observation.startswith(f'File "{temp_file_path}"'):
