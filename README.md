@@ -3,7 +3,7 @@ Agent for Spider 2.0 text-to-SQL.
 
 ## 🚀 Quickstart
 
-1. **Snowflake Account**: ~~Follow this [guideline](https://github.com/xlang-ai/Spider2/blob/main/assets/Snowflake_Guideline.md) to get your own Snowflake username and password in our snowflake database. You must update `bigquery_credential.json` and `snowflake_credential.json`.~~ If you're a Snowflake employee, intern or collaborator, please contact `@canwen.xu` for account setup.
+1. **Snowflake Account**: ~~Follow this [guideline](https://github.com/xlang-ai/Spider2/blob/main/assets/Snowflake_Guideline.md) to get your own Snowflake username and password in our snowflake database. You must update `bigquery_credential.json` and `snowflake_credential.json`.~~ If you're a Snowflake employee, intern or collaborator, please use [this form](https://forms.gle/nDo6ovuQhavkpYit5) to submit an account request.
 
 2. Create `snowflake_credential.json`. You can find the template in `spider-agent-snow/snowflake_credential.json.example`.
 
