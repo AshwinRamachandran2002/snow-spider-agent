@@ -5,7 +5,6 @@ import time
 from typing import Any
 from typing import Callable
 from typing import Dict
-from typing import Union
 
 import docker
 import gymnasium as gym
@@ -13,17 +12,12 @@ from docker.client import DockerClient
 from docker.errors import ImageNotFound
 from docker.models.containers import Container
 from spider_agent import configs
-from spider_agent.agent.action import Action
-from spider_agent.agent.action import Bash
-from spider_agent.agent.action import BIGQUERY_EXEC_SQL
-from spider_agent.agent.action import BQ_GET_TABLE_INFO
-from spider_agent.agent.action import BQ_GET_TABLES
-from spider_agent.agent.action import BQ_SAMPLE_ROWS
-from spider_agent.agent.action import CreateFile
-from spider_agent.agent.action import EditFile
-from spider_agent.agent.action import LOCAL_DB_SQL
-from spider_agent.agent.action import SNOWFLAKE_EXEC_SQL
-from spider_agent.agent.action import Terminate
+from spider_agent.agent.actions import Action
+from spider_agent.agent.actions import Bash
+from spider_agent.agent.actions import CreateFile
+from spider_agent.agent.actions import EditFile
+from spider_agent.agent.actions import SnowflakeExecuteSQL
+from spider_agent.agent.actions import Terminate
 from spider_agent.controllers.python import PythonController
 from spider_agent.controllers.setup import SetupController
 from spider_agent.envs.utils import calculate_sha256
@@ -251,18 +245,8 @@ class Spider_Agent_Env(gym.Env):
                 done = False
                 if isinstance(action, Bash):
                     observation = self.execute_code_action(action)
-                elif isinstance(action, BQ_GET_TABLES):
-                    observation = self.controller.execute_bq_get_tables(action)
-                elif isinstance(action, BQ_GET_TABLE_INFO):
-                    observation = self.controller.execute_bq_get_table_info(action)
-                elif isinstance(action, BQ_SAMPLE_ROWS):
-                    observation = self.controller.execute_bq_sample_rows(action)
-                elif isinstance(action, BIGQUERY_EXEC_SQL):
-                    observation = self.controller.execute_bq_exec_sql_query(action)
-                elif isinstance(action, SNOWFLAKE_EXEC_SQL):
+                elif isinstance(action, SnowflakeExecuteSQL):
                     observation = self.controller.execute_sf_exec_sql_query(action)
-                elif isinstance(action, LOCAL_DB_SQL):
-                    observation = self.execute_sql_action(action)
                 elif isinstance(action, CreateFile):
                     observation = self.create_file_action(action)
                 elif isinstance(action, EditFile):
@@ -298,16 +282,6 @@ class Spider_Agent_Env(gym.Env):
 
         return obs
 
-    def execute_sql_action(self, action: LOCAL_DB_SQL):
-        """Execute action in sql"""
-        obs = self.controller.execute_sql_code(
-            action.file_path, action.code, action.output
-        )
-        if obs is None or obs == "":
-            obs = "SQL command executed successfully. No output."
-
-        return obs
-
     def create_file_action(self, action: CreateFile):
         obs = self.controller.create_file(action.filepath, action.code)
         if obs is None or obs == "":
@@ -330,9 +304,7 @@ class Spider_Agent_Env(gym.Env):
                 obs = f"Falied to validate file {action.filepath}, error: {error}"
         return obs
 
-    def execute_tmp_action(
-        self, action: Union[BQ_GET_TABLES, BQ_GET_TABLE_INFO, BQ_SAMPLE_ROWS]
-    ):
+    def execute_tmp_action(self, action: Action):
         """Execute action in sql"""
         obs = self.controller.execute_sql_code(
             action.file_path, action.code, action.output

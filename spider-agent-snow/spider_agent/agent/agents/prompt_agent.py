@@ -3,12 +3,12 @@ import re
 from typing import Dict
 from typing import List
 
-from spider_agent.agent.action import Action
-from spider_agent.agent.action import Bash
-from spider_agent.agent.action import CreateFile
-from spider_agent.agent.action import EditFile
-from spider_agent.agent.action import SNOWFLAKE_EXEC_SQL
-from spider_agent.agent.action import Terminate
+from spider_agent.agent.actions import Action
+from spider_agent.agent.actions import Bash
+from spider_agent.agent.actions import CreateFile
+from spider_agent.agent.actions import EditFile
+from spider_agent.agent.actions import SnowflakeExecuteSQL
+from spider_agent.agent.actions import Terminate
 from spider_agent.agent.models import call_llm
 from spider_agent.agent.prompts import SNOWFLAKE_SYSTEM
 from spider_agent.envs.spider_agent import Spider_Agent_Env
@@ -62,7 +62,7 @@ class PromptAgent:
         self._AVAILABLE_ACTION_CLASSES = [
             Bash,
             Terminate,
-            SNOWFLAKE_EXEC_SQL,
+            SnowflakeExecuteSQL,
             CreateFile,
             EditFile,
         ]
@@ -286,44 +286,3 @@ class PromptAgent:
             "trajectory": trajectory,
         }
         return trajectory_log
-
-
-if __name__ == "__main__":
-    agent = PromptAgent()
-    response = """
-BIGQUERY_EXEC_SQL(sql_query=\"\"\"
-WITH purchase_users AS (
-  SELECT DISTINCT user_pseudo_id
-  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
-  WHERE event_name = 'purchase' AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
-),
-pageviews AS (
-  SELECT user_pseudo_id, COUNT(*) AS pageviews
-  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
-  WHERE event_name = 'page_view' AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
-  GROUP BY user_pseudo_id
-),
-pageviews_by_user AS (
-  SELECT
-    p.user_pseudo_id,
-    p.pageviews,
-    CASE WHEN pu.user_pseudo_id IS NOT NULL THEN 'purchaser' ELSE 'non-purchaser' END AS user_type
-  FROM pageviews p
-  LEFT JOIN purchase_users pu ON p.user_pseudo_id = pu.user_pseudo_id
-)
-SELECT user_type, AVG(pageviews) AS avg_pageviews
-FROM pageviews_by_user
-GROUP BY user_type
-\"\"\", is_save=True, save_path="avg_pageviews_dec_2020.csv")
-"""
-
-    response = """
-BIGQUERY_EXEC_SQL(sql_query=\"\"\"
-SELECT DISTINCT user_pseudo_id
-FROM bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*
-WHERE event_name = 'purchase' AND _TABLE_SUFFIX BETWEEN '20201201' AND '20201231'
-\"\"\", is_save=False)
-"""
-
-    action = agent.parse_action(response)
-    print(action)

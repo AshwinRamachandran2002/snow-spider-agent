@@ -54,7 +54,7 @@ Do not output an empty string!
 
 2. The database schema folder is located in the /workspace directory. This folder contains one or more schema directories for the databases. Each directory includes a DDL.csv file with the database's DDL, along with JSON files that contain the column names, column types, column descriptions, and sample rows for individual tables. Start by reviewing the DDL.csv file in each directory, then selectively examine the JSON files as needed. Read them carefully.
 
-3. Use SNOWFLAKE_EXEC_SQL to run your SQL queries and interact with the database. Do not use this action to query INFORMATION_SCHEMA or SHOW DATABASES/TABLES; the schema information is all stored in the /workspace/database_name folder. Refer to this folder whenever you have doubts about the schema.
+3. Use SnowflakeExecuteSQL to run your SQL queries and interact with the database. Do not use this action to query INFORMATION_SCHEMA or SHOW DATABASES/TABLES; the schema information is all stored in the /workspace/database_name folder. Refer to this folder whenever you have doubts about the schema.
 
 4. Be prepared to write multiple SQL queries to find the correct answer. Once it makes sense, consider it resolved.
 

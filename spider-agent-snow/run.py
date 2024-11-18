@@ -1,12 +1,12 @@
 import argparse
-import datetime
 import glob
 import json
 import logging
 import os
 import sys
+from datetime import datetime
 
-from spider_agent.agent.agents import PromptAgent
+from spider_agent.agent.agents import AGENT_NAME_CLASS_MAP
 from spider_agent.envs.spider_agent import Spider_Agent_Env
 
 
@@ -14,7 +14,7 @@ from spider_agent.envs.spider_agent import Spider_Agent_Env
 logger = logging.getLogger("spider_agent")
 logger.setLevel(logging.DEBUG)
 
-datetime_str: str = datetime.datetime.now().strftime("%Y%m%d@%H%M%S")
+datetime_str: str = datetime.now().strftime("%Y%m%d@%H%M%S")
 
 file_handler = logging.FileHandler(
     os.path.join("logs", "normal-{:}.log".format(datetime_str)), encoding="utf-8"
@@ -54,11 +54,18 @@ def config() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run end-to-end evaluation on the benchmark"
     )
-
+    parser.add_argument(
+        "--agent",
+        type=str,
+        default="default-agent",
+        choices=AGENT_NAME_CLASS_MAP.keys(),
+    )
     parser.add_argument("--max_steps", type=int, default=20)
 
     parser.add_argument("--max_memory_length", type=int, default=30)
-    parser.add_argument("--suffix", "-s", type=str, default="gpt-4-try1")
+    parser.add_argument(
+        "--suffix", "-s", type=str, default=datetime.now().strftime("%y%m%d")
+    )
 
     parser.add_argument("--model", type=str, default="gpt-4o")
     parser.add_argument("--temperature", type=float, default=0.5)
@@ -100,14 +107,13 @@ def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:  # noqa:
 
     # log args
     logger.info("Args: %s", args)
+    experiment_id = f"{args.agent}-{args.model.split('/')[-1]}"
 
-    if args.suffix == "":
+    if args.suffix != "":
         logger.warning(
             "No suffix is provided, the experiment id will be the model name."
         )
-        experiment_id = args.model.split("/")[-1]
-    else:
-        experiment_id = args.model.split("/")[-1] + "-" + args.suffix
+        experiment_id += f"-{args.suffix}"
 
     if args.plan:
         experiment_id = f"{experiment_id}-plan"
@@ -120,7 +126,7 @@ def test(args: argparse.Namespace, test_all_meta: dict = None) -> None:  # noqa:
         },
     }
 
-    agent = PromptAgent(
+    agent = AGENT_NAME_CLASS_MAP[args.agent](
         model=args.model,
         max_tokens=args.max_tokens,
         top_p=args.top_p,
