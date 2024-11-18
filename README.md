@@ -66,6 +66,6 @@ You can follow these steps to develop your own agents:
 
 | Name          | Correct/Total | Score | Description                                                                                                                                                                       |
 |---------------|---------------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Spider-Agent  | 40/260        | 15.4  | Reproduced number of [the official repo](https://github.com/snowflakedb/snow-spider-agent) by @canwen.xu                                                                          |
-| Spider-Agent  | 36/260        | 13.8  | Reproduced number of [the official repo](https://github.com/snowflakedb/snow-spider-agent) by @hao.zhang's lab                                                                    |
-| default-agent | TBA           | TBA   | [Default agent](/spider-agent-snow/spider_agent/agent/agents/__init__.py) in this repo (added `tree` in initial prompt to save a few steps; minor action name change)             |
+| Spider-Agent (gpt4o-240513)  | 40/260        | 15.4  | Reproduced number of [the official repo](https://github.com/snowflakedb/snow-spider-agent) by @canwen.xu                                                                          |
+| Spider-Agent (gpt4o-240806)  | 36/260        | 13.8  | Reproduced number of [the official repo](https://github.com/snowflakedb/snow-spider-agent) by @hao.zhang's lab                                                                    |
+| default-agent (gpt4o-240806) | 35/260        | 13.5  | [Default agent](/spider-agent-snow/spider_agent/agent/agents/__init__.py) in this repo (added `tree` in initial prompt to save a few steps; minor action name change)             |
