@@ -1,6 +1,8 @@
 import logging
 import os
 import pathlib
+import signal
+import sys
 import time
 from typing import Any
 from typing import Callable
@@ -95,6 +97,9 @@ class Spider_Agent_Env(gym.Env):
         time.sleep(2)
         logger.info("Environment setup complete.")
 
+        signal.signal(signal.SIGINT, self._cleanup)
+        signal.signal(signal.SIGTERM, self._cleanup)
+
     def _set_task_info(self, task_config: Dict[str, Any]):
         self.task_id: str = task_config["instance_id"]
         self.cache_dir: str = os.path.join(self.cache_dir_base, self.task_id)
@@ -110,6 +115,13 @@ class Spider_Agent_Env(gym.Env):
         self.container.stop()
         self.container.remove()
         logger.info(f"Container {self.container_name} stopped and removed.")
+
+    def _cleanup(self, signum, frame):
+        container_name = self.container_name
+        if self.container:
+            self.container.remove(force=True)
+            print(f"Container {container_name} stopped and removed.")
+        sys.exit(0)
 
     def _construct_container(self):
 
