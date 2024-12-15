@@ -317,6 +317,7 @@ def main(args):
             response = chat_session.get_model_response(e, "sql")
             if response == "Exceeded":
                 print(response)
+                os.remove(save_path)
                 break
             logger.info(chat_session.messages[-1]['content'])
             if len(response) > 0:
