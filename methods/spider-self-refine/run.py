@@ -54,7 +54,8 @@ class GPTChat:
                 model=self.model,
                 messages=self.messages
             )
-        except:
+        except Exception as e:
+            print(e)
             return "Exceeded"
         choices = response.choices
         if choices:
@@ -72,7 +73,8 @@ class GPTChat:
                 model=self.model,
                 messages=self.messages
             )
-        except:
+        except Exception as e:
+            print(e)
             return "Exceeded"
         choices = response.choices
         if choices:
@@ -298,6 +300,7 @@ def main(args):
         e += f"You may combine 2 column into 1 column to follow the column name in answer format like: {response_csv}.\n"
         error_rec = []
         while itercount < args.max_iter:
+            logger.info(f"itercount: {itercount}")
             logger.info(e)
             if e == 0:
                 e = f"Please check the answer again and give the final SQL query. It doesn't mean you are wrong, just check again. The answer format may be like {response_csv}. Don't output extra rows. Your snswer: \n"
