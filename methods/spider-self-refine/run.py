@@ -333,8 +333,8 @@ def main(args):
                 if len(set(error_rec[-3:])) == 1:
                     break
         logger.info(f"Total iteration counts: {itercount}")
-        if itercount == args.max_iter and args.save_all_results:
-            print("Exceede Max Iter")
+        if itercount == args.max_iter and not args.save_all_results:
+            print("Max Iter, remove file")
             os.remove(save_path)
 
 
