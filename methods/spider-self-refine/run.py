@@ -1,7 +1,5 @@
 import os
 import json
-import pandas as pd
-import snowflake.connector
 from openai import OpenAI
 from tqdm import tqdm
 import logging
@@ -11,46 +9,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 import Levenshtein
-
-def extract_all_blocks(main_content, code_format):
-    sql_blocks = []
-    start = 0
-    
-    while True:
-
-        sql_query_start = main_content.find(f"```{code_format}", start)
-        if sql_query_start == -1:
-            break
-        
-
-        sql_query_end = main_content.find("```", sql_query_start + len(f"```{code_format}"))
-        if sql_query_end == -1:
-            break 
-
-        sql_block = main_content[sql_query_start + len(f"```{code_format}"):sql_query_end].strip()
-        sql_blocks.append(sql_block)
-
-        start = sql_query_end + len("```")
-    
-    return sql_blocks
-
-def get_str_sim(str1, str2):
-    return Levenshtein.ratio(str1, str2)
-
-def hard_cut(str_e, length):
-    if len(str_e) > length:
-        str_e = "Too long, hard cut:\n" + str_e[:length]+"\n"
-    return str_e
-
-def get_values_from_table(csv_data_str):
-    return '\n'.join(csv_data_str.split('\n')[1:])
-
-def search_file(directory, target_file):
-    result = []
-    for root, dirs, files in os.walk(directory):
-        if target_file in files:
-            result.append(os.path.join(root, target_file))
-    return result
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info
+from agent import execute_sql, self_check, self_correct
 
 class GPTChat:
     def __init__(self, azure=False, model="gpt-4o") -> None:
@@ -148,37 +108,6 @@ class modelChat():
         self.messages = []
 
 
-def excute_sql(sql_query, save_path=None):
-    # Load Snowflake credentials
-    snowflake_credential = json.load(open("./snowflake_credential.json"))
-    # Define the SQL query
-    # Execute the SQL query
-    with snowflake.connector.connect(**snowflake_credential) as conn:
-        with conn.cursor() as cursor:
-            try:
-                cursor.execute(sql_query)
-                # Fetch the results
-                results = cursor.fetchall()
-                columns = [desc[0] for desc in cursor.description]
-                df = pd.DataFrame(results, columns=columns)
-
-                # Check if the result is empty
-                if df.empty:
-                    print("No data found for the specified query.")
-                    return "No data found for the specified query.\n"
-                else:
-                    # Save or print the results based on the is_save flag
-                    if save_path:
-                        df.to_csv(f"{save_path}", index=False)
-                        print(f"Results saved to {save_path}")
-                        return 0
-                    else:
-                        # print(df)
-                        return df.to_csv()
-            except Exception as e:
-                print("Error occurred: ", str(e))
-                return e
-
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
@@ -265,7 +194,7 @@ def main(args):
 
         # format
         format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values. When dealing with superlative cases, ensure the result is limited to just one row. For coordinate-related cases, use the ST_POINT() function. For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Do not output any SQL queries. Do not miss any column in the answer format, one column for one attribute and one row for one record in the task."
-        format_prompt += "e.g. Retrieve all male and female customers from a customers table who have placed orders in the last 30 days, along with their order count. Format: ```csv\nsex,customer_id,customer_name,total_orders\nmale,id: int,name: string,orders: int\nfemale,id: int,name: string,orders: int```\nCondition: customer_name(have placed orders in the last 30 days)\n"
+        format_prompt += "e.g. Retrieve all male and female customers from a customers table who have placed orders in the last 30 days, along with their order count. Format: ```csv\nsex,customer_id,customer_name,total_orders\nmale,id: int,name: string,orders: int\nfemale,id: int,name: string,orders: int```\nFor each column, specify its range or condition: customer_id/customer_name(have placed orders in the last 30 days), total_orders(male/female have placed orders in the last 30 days)\n"
         format_prompt += "For distance task, no need to convert from meters to miles unless requested.\n"
         format_prompt += "You may combine 2 columns into one if needed. (e.g. concatenate first name and last name as full name)\n" # local056
         response_csv = chat_session4o.get_model_response_txt(table_info + "Task: " + task + format_prompt)
@@ -291,24 +220,29 @@ def main(args):
 
             pre_info += f"Possible values for important columns:\n"
             sql_count = 0
-            for i in range(len(response_pre)):
-                e = excute_sql(response_pre[i])
-                if isinstance(e, str):
-                    # if len(e) > 1e4:
-                    #     e = "Too long, hard cut:"+e[:10000]+"\n"
-                    e = hard_cut(e, 10000)
-                    pre_info += "Query:\n" + response_pre[i] + "\nAnswer:\n" + e
-                    # if e != "No data found for the specified query.\n":
+            results_pre_dic, chat_session = execute_sql(response_pre, chat_session, max_len=10000)
+            for key, value in results_pre_dic.items():
+                pre_info += "Query:\n" + key + "\nAnswer:\n" + value
+                if isinstance(value, str):
                     sql_count += 1
-                elif "0A000" in e.msg:
-                        queries = [query.strip() for query in response_pre[i].strip().split(';') if query.strip()]
-                        for q in queries:
-                            e = excute_sql(q)
-                            if isinstance(e, str):
-                                e = hard_cut(e, 10000)
-                                pre_info += "Query:\n" + q + "Answer:\n" + e
-                                # if e != "No data found for the specified query.\n":
-                                sql_count += 1
+            # for i in range(len(response_pre)):
+            #     e = execute_sql(response_pre[i])
+            #     if isinstance(e, str):
+            #         # if len(e) > 1e4:
+            #         #     e = "Too long, hard cut:"+e[:10000]+"\n"
+            #         e = hard_cut(e, 10000)
+            #         pre_info += "Query:\n" + response_pre[i] + "\nAnswer:\n" + e
+            #         # if e != "No data found for the specified query.\n":
+            #         sql_count += 1
+            #     elif "0A000" in e.msg:
+            #             queries = [query.strip() for query in response_pre[i].strip().split(';') if query.strip()]
+            #             for q in queries:
+            #                 e = execute_sql(q)
+            #                 if isinstance(e, str):
+            #                     e = hard_cut(e, 10000)
+            #                     pre_info += "Query:\n" + q + "Answer:\n" + e
+            #                     # if e != "No data found for the specified query.\n":
+            #                     sql_count += 1
             if sql_count < len(response_pre) // 2:
                 print("Inadequate preparation, retry preparation.")
                 LIMIT -= 3
@@ -339,17 +273,40 @@ def main(args):
         e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
         e += "Don't ouput extra rows. (e.g. use JOIN rather LEFT JOIN to avoid extra rows)\n" # local131
 
+        if args.use_CoT:
+            step = 1
+            prompt_step = e
+            prompt_step_info = "Let's approach the task step by step. For each step, write a SQL query (subquery of the answer) format like ```sql``` and review the results. If the results are reasonable, proceed to the next step until the task is complete."
+            prompt_step_info += "Don't output the whole results at once! Break it down into steps, using one SELECT query per step. Consider using WITH to link the previous steps together.\n"
+            prompt_step_info += "e.g. Step 1: WITH name1 AS (SELECT \"column\" FROM PROJECT.DATABASE.TABLE WHERE ...) SELECT * FROM name; For other steps: Step k: WITH name1 AS (...), name2 AS (...) ... namek AS (...) SELECT * FROM namek;"
+            prompt_step = e + prompt_step_info + f"Step {step}:\n"
+            past_steps = ""
+            while step < 10:               
+                response_step = chat_session.get_model_response(prompt_step, "sql")
+                table_step, chat_session = execute_sql(response_step, chat_session)
+                sql, table, chat_session = self_correct(sql, table_step, chat_session, max_len=1000)
+                sql, table, chat_session = self_check(sql, table, chat_session)
+                past_steps += f"Step {step}: SQL: {sql}\n"
+                prompt_step = prompt_step_info + "Completed steps:\n" + past_steps
+                step += 1
+                prompt_step += f"Step {step}:\n"
+                if self_check(sql, table, chat_session, response_csv) == "A":
+                    break
+            e = 0
+
         # self-refine
         error_rec = []
         while itercount < args.max_iter:
             logger.info(f"itercount: {itercount}")
             logger.info(e)
             if e == 0:
-                e = f"Please check the answer again and give the final SQL query. It doesn't mean you are wrong, just check again. The answer format should be like: {response_csv}, check the number of rows and columns. Your snswer: \n"
+                e = f"Please check the answer again and give the final SQL query. It doesn't mean you are wrong, just check again. The answer format should be like: {response_csv}, check the number of rows and columns. Current snswer: \n"
                 with open(complete_save_path) as f:
                     csv_data = f.readlines()
                     csv_data_str = ''.join(csv_data)
                 e += csv_data_str if len(csv_data_str) < 1e4 else hard_cut(csv_data_str, 10000)
+                # if response.startswith("WITH"):
+                #     e += get_cte_info(response)
                 if get_values_from_table(csv_data_str) not in results_values:
                     results_values.append(get_values_from_table(csv_data_str))
                     results_tables.append(csv_data_str)
@@ -361,17 +318,18 @@ def main(args):
             if hasattr(e, 'msg'):
                 e = f"Input sql:\n{response}\nThe error information is:\n" + e.msg + "\nPlease correct it and output only 1 complete sql query."
             response = chat_session.get_model_response(e, "sql")
+            logger.info(chat_session.messages[-1]['content'])
             if response == "Exceeded":
                 print(response)
                 if os.path.exists(complete_save_path):
                     os.remove(complete_save_path)
                 break
-            logger.info(chat_session.messages[-1]['content'])
-            if len(response) > 0:
+            
+            elif len(response) > 0:
                 response_len = [len(i) for i in response]
                 response_index = response_len.index(max(response_len))
                 response = response[response_index]
-                e = excute_sql(response, complete_save_path)
+                e = execute_sql_snow(response, complete_save_path)
             itercount += 1
             error_rec.append(e)
             # if len(error_rec) > 3:
