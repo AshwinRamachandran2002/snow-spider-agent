@@ -155,29 +155,29 @@ def excute_sql(sql_query, save_path=None):
     # Execute the SQL query
     with snowflake.connector.connect(**snowflake_credential) as conn:
         with conn.cursor() as cursor:
-            cursor.execute(sql_query)
-    try:
-        # Fetch the results
-        results = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        df = pd.DataFrame(results, columns=columns)
+            try:
+                cursor.execute(sql_query)
+                # Fetch the results
+                results = cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
+                df = pd.DataFrame(results, columns=columns)
 
-        # Check if the result is empty
-        if df.empty:
-            print("No data found for the specified query.")
-            return "No data found for the specified query.\n"
-        else:
-            # Save or print the results based on the is_save flag
-            if save_path:
-                df.to_csv(f"{save_path}", index=False)
-                print(f"Results saved to {save_path}")
-                return 0
-            else:
-                # print(df)
-                return df.to_csv()
-    except Exception as e:
-        print("Error occurred: ", e)
-        return e
+                # Check if the result is empty
+                if df.empty:
+                    print("No data found for the specified query.")
+                    return "No data found for the specified query.\n"
+                else:
+                    # Save or print the results based on the is_save flag
+                    if save_path:
+                        df.to_csv(f"{save_path}", index=False)
+                        print(f"Results saved to {save_path}")
+                        return 0
+                    else:
+                        # print(df)
+                        return df.to_csv()
+            except Exception as e:
+                print("Error occurred: ", str(e))
+                return e
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
