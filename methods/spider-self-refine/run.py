@@ -193,7 +193,9 @@ def main(args):
                     table_info += f.read()
         table_struct = table_info[table_info.find("In conclusion, the table inforation is ({project name: {database name: {table name}}}):"):]
         # format
-        format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values. When dealing with superlative cases, ensure the result is limited to just one row. For coordinate-related cases, use the ST_POINT() function. For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Do not output any SQL queries.\n"
+        format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values.\n"
+        format_prompt += "When dealing with superlative cases, ensure the result is limited to just one row. e.g.: Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` Only one row.\n" # ga010
+        format_prompt += "For coordinate-related cases, use the ST_POINT() function. For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. \n"
         format_prompt += "Ensure that no columns are omitted in the response format by assigning each attribute to its own column and representing each record in a separate row. e.g. When answering rate1 and rate2, format should be ```csv\nrate1,rate2\nxx.xx,xx.xx``` rather than ```csv\nMetric,rate\nrate1,xx.xx\nrate2,xx.xx```\n" # bq112
         format_prompt += "e.g. Retrieve all male and female customers from a customers table who have placed orders in the last 30 days, along with their order count. Format: ```csv\nsex,customer_id,customer_name,total_orders\nmale,id: int,name: string,orders: int\nfemale,id: int,name: string,orders: int```\nFor each column, specify its range or condition: customer_id/customer_name(have placed orders in the last 30 days), total_orders(male/female have placed orders in the last 30 days)\n"
         format_prompt += "For distance task, no need to convert from meters to miles unless requested.\n"
@@ -201,6 +203,8 @@ def main(args):
         format_prompt += "If there are some records specified in the task, you should follow and capitalize them. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3```\n" # local008
         format_prompt += "For month cases, form format in both month_num and month: ```csv\nMonth_num,Month\n01,Jan\n02,Feb```.\n" # local028
         # format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. : 60 minutes trip durations 3 quantiles: Format: ```csv\ntime_range,distance\n01m to 20m,dis1\n21m to 40m,dis2\n41m to 60m,dis3``` The object for quantile is duration (time).\n"
+        format_prompt += "Don't ignore the core of a task. e.g. Calculate the chi-square value of A, B, C. You should not only focus on record of ABC but also chi-square value. Format: ```csv\nchi-value,A,B,C\nv1:float,v2,v3,v4\n" # bq159
+        format_prompt += "Do not output any SQL queries.\n"
         response_csv = chat_session4o.get_model_response_txt(table_info + "Task: " + task + format_prompt)
 
         # preparation
@@ -209,7 +213,7 @@ def main(args):
         pre_info = ''
         while LIMIT > 0:
 
-            ans_pre = prompt + f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f;;. DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
+            ans_pre = prompt + f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 5 simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f;;. DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
             # ans_pre += "e.g. Retrieve all products whose product_name contains the word \"Professor’s book\". Simple non-nested sql queries: SELECT \"product_id\", \"product_name\" FROM products WHERE product_name LIKE '%Professor%' OR '%Book%'; (For string matching cases, firstly look if the substring exists)"
             ans_pre += "For string-matching scenarios, ensure all characters are converted to standard symbols (e.g., replace ’ with '). And also use fuzzy query: WHERE str LIKE \"%target_str%\", don't directly match strings and avoid using REGEXP.\n" # bq085, local099
             ans_pre += "When using TO_DATE() function, filter NULL: WHERE TRY_TO_DATE(filing_date, 'YYYYMMDD') IS NOT NULL;.\n"
@@ -274,8 +278,9 @@ def main(args):
         e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
         e += "Don't ouput extra rows. (e.g. use JOIN rather LEFT JOIN to avoid extra rows)\n" # local131, bq150
         e += f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition. e.g. SELECT * FROM TABLE1 UNION ALL TABLE2 WHERE ...; Don't write sql as SELECT * FROM (TABLE1 WHERE ...) UNION ALL (TABLE2 WHERE ...); Don't use `-- Omit ...` `-- Continue ...` to omit any table. Table names: {table_struct}\n"
-        e += "Avoid using REGEXP\n"
+        e += "For string-matching scenarios, don't use fuzzy query if the string is decided and avoid using REGEXP.\n"
         e += "Don't be disturbed by examples in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
+        e += "When handling TO_TIMESTAMP_NTZ conversions, use query like: SELECT CASE WHEN \"date\" >= 1e15 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000000) WHEN \"date\" >= 1e12 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000) ELSE TO_TIMESTAMP_NTZ(\"date\") END AS parsed_timestamp FROM my_table;\n"
         # if args.use_CoT:
         #     step = 1
         #     prompt_step = e
@@ -360,9 +365,26 @@ def main(args):
             #         break
         logger.info(f"Total iteration counts: {itercount}")
         if itercount == args.max_iter and not args.save_all_results:
-            print("Max Iter, remove file")
-            if os.path.exists(complete_save_path):
-                os.remove(complete_save_path)
+
+            if args.model_vote:
+                if results_tables:
+                    if os.path.exists(complete_save_path):
+                        with open(complete_save_path) as f:
+                            csv_data = f.readlines()
+                            csv_data_str = ''.join(csv_data)
+                        results_tables.append(csv_data_str)
+                    selected_ans = chat_session.get_model_response(f"Here are some candidate answers. The task is: {task}. Please choose one as the correct answer. Provide the output in ```csv``` format: {results_tables}.", "csv")
+                    if selected_ans:
+                        try:
+                            with open(complete_save_path, "w") as file:
+                                file.writelines(selected_ans[0])
+                        except Exception as e:
+                            print(e)
+                break
+            else:
+                if os.path.exists(complete_save_path):
+                    os.remove(complete_save_path)
+                print("Max Iter, remove file")
 
 
 if __name__ == '__main__':
@@ -379,5 +401,6 @@ if __name__ == '__main__':
     parser.add_argument('--max_iter', type=int, default=8)
     parser.add_argument('--save_all_results', action="store_true")
     parser.add_argument('--use_CoT', action="store_true")
+    parser.add_argument('--model_vote', action="store_true")
     args = parser.parse_args()
     main(args)
