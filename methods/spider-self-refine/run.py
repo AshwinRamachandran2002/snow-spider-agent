@@ -380,7 +380,6 @@ def main(args):
                                 file.writelines(selected_ans[0])
                         except Exception as e:
                             print(e)
-                break
             else:
                 if os.path.exists(complete_save_path):
                     os.remove(complete_save_path)
