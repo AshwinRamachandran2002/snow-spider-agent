@@ -150,7 +150,7 @@ def compress_ddl(args):
         
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
-                prompts += "In conclusion, the table inforation is ({project name: {database name: {table name}}}): \n" + str(table_dict) + "\n"
+                prompts += "In conclusion, the table information is ({project name: {database name: {table name}}}): \n" + str(table_dict) + "\n"
                 f.writelines(prompts)
 
 if __name__ == '__main__':

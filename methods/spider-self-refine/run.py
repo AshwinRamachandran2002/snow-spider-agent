@@ -191,12 +191,16 @@ def main(args):
             for path in txt_path:
                 with open(path) as f:
                     table_info += f.read()
-
+        table_struct = table_info[table_info.find("In conclusion, the table inforation is ({project name: {database name: {table name}}}):"):]
         # format
-        format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values. When dealing with superlative cases, ensure the result is limited to just one row. For coordinate-related cases, use the ST_POINT() function. For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Do not output any SQL queries. Do not miss any column in the answer format, one column for one attribute and one row for one record in the task."
+        format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values. When dealing with superlative cases, ensure the result is limited to just one row. For coordinate-related cases, use the ST_POINT() function. For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Do not output any SQL queries.\n"
+        format_prompt += "Ensure that no columns are omitted in the response format by assigning each attribute to its own column and representing each record in a separate row. e.g. When answering rate1 and rate2, format should be ```csv\nrate1,rate2\nxx.xx,xx.xx``` rather than ```csv\nMetric,rate\nrate1,xx.xx\nrate2,xx.xx```\n" # bq112
         format_prompt += "e.g. Retrieve all male and female customers from a customers table who have placed orders in the last 30 days, along with their order count. Format: ```csv\nsex,customer_id,customer_name,total_orders\nmale,id: int,name: string,orders: int\nfemale,id: int,name: string,orders: int```\nFor each column, specify its range or condition: customer_id/customer_name(have placed orders in the last 30 days), total_orders(male/female have placed orders in the last 30 days)\n"
         format_prompt += "For distance task, no need to convert from meters to miles unless requested.\n"
         format_prompt += "You may combine 2 columns into one if needed. (e.g. concatenate first name and last name as full name)\n" # local056
+        format_prompt += "If there are some records specified in the task, you should follow and capitalize them. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3```\n" # local008
+        format_prompt += "For month cases, form format in both month_num and month: ```csv\nMonth_num,Month\n01,Jan\n02,Feb```.\n" # local028
+        # format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. : 60 minutes trip durations 3 quantiles: Format: ```csv\ntime_range,distance\n01m to 20m,dis1\n21m to 40m,dis2\n41m to 60m,dis3``` The object for quantile is duration (time).\n"
         response_csv = chat_session4o.get_model_response_txt(table_info + "Task: " + task + format_prompt)
 
         # preparation
@@ -207,8 +211,10 @@ def main(args):
 
             ans_pre = prompt + f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f;;. DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
             # ans_pre += "e.g. Retrieve all products whose product_name contains the word \"Professor’s book\". Simple non-nested sql queries: SELECT \"product_id\", \"product_name\" FROM products WHERE product_name LIKE '%Professor%' OR '%Book%'; (For string matching cases, firstly look if the substring exists)"
-            ans_pre += "For string-matching scenarios, ensure all characters are converted to standard symbols (e.g., replace ’ with ').\n"
+            ans_pre += "For string-matching scenarios, ensure all characters are converted to standard symbols (e.g., replace ’ with '). And also use fuzzy query: WHERE str LIKE \"%target_str%\", don't directly match strings and avoid using REGEXP.\n" # bq085, local099
             ans_pre += "When using TO_DATE() function, filter NULL: WHERE TRY_TO_DATE(filing_date, 'YYYYMMDD') IS NOT NULL;.\n"
+            ans_pre += "For time-related queries, given the variety of formats such as UNIX timestamp, ISO 8601, and DATETIME, avoid using time functions unless you are certain of the specific format being used.\n"
+            ans_pre += f"You can only use table in {table_struct}"
             logger.info(ans_pre)
             response_pre = chat_session.get_model_response(ans_pre, "sql")
             logger.info(chat_session.messages[-1]['content'])
@@ -220,29 +226,25 @@ def main(args):
 
             pre_info += f"Possible values for important columns:\n"
             sql_count = 0
-            results_pre_dic, chat_session = execute_sql(response_pre, chat_session, max_len=10000)
-            for key, value in results_pre_dic.items():
-                pre_info += "Query:\n" + key + "\nAnswer:\n" + value
-                if isinstance(value, str):
-                    sql_count += 1
-            # for i in range(len(response_pre)):
-            #     e = execute_sql(response_pre[i])
-            #     if isinstance(e, str):
-            #         # if len(e) > 1e4:
-            #         #     e = "Too long, hard cut:"+e[:10000]+"\n"
-            #         e = hard_cut(e, 10000)
-            #         pre_info += "Query:\n" + response_pre[i] + "\nAnswer:\n" + e
-            #         # if e != "No data found for the specified query.\n":
+            # results_pre_dic, chat_session = execute_sql_snow(response_pre, chat_session, max_len=10000)
+            # for key, value in results_pre_dic.items():
+            #     pre_info += "Query:\n" + key + "\nAnswer:\n" + value
+            #     if isinstance(value, str):
             #         sql_count += 1
-            #     elif "0A000" in e.msg:
-            #             queries = [query.strip() for query in response_pre[i].strip().split(';') if query.strip()]
-            #             for q in queries:
-            #                 e = execute_sql(q)
-            #                 if isinstance(e, str):
-            #                     e = hard_cut(e, 10000)
-            #                     pre_info += "Query:\n" + q + "Answer:\n" + e
-            #                     # if e != "No data found for the specified query.\n":
-            #                     sql_count += 1
+            for i in range(len(response_pre)):
+                e = execute_sql_snow(response_pre[i])
+                if isinstance(e, str):
+                    e = hard_cut(e, 10000)
+                    pre_info += "Query:\n" + response_pre[i] + "\nAnswer:\n" + e
+                    sql_count += 1
+                elif "0A000" in e.msg:
+                        queries = [query.strip() for query in response_pre[i].strip().split(';') if query.strip()]
+                        for q in queries:
+                            e = execute_sql_snow(q)
+                            if isinstance(e, str):
+                                e = hard_cut(e, 10000)
+                                pre_info += "Query:\n" + q + "Answer:\n" + e
+                                sql_count += 1
             if sql_count < len(response_pre) // 2:
                 print("Inadequate preparation, retry preparation.")
                 LIMIT -= 3
@@ -257,7 +259,7 @@ def main(args):
         print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
         if LIMIT <= 0:
             print("Inadequate preparation, skip")
-            continue
+            # continue
         
 
         # answer
@@ -268,31 +270,32 @@ def main(args):
         complete_save_path = search_directory + "/" + save_path
         e += "Task: " + task + "\n"+'\nPlease answer in snowflake dialect in ```sql``` format.\nUsage example: SELECT S."Column_Name" FROM {Project Name}.{Database Name}.{Table_name} (ensure all column names are enclosed in double quotations)\n'
         e += f"Follow the answer format like: {response_csv}.\n"
-        e += "When performing a UNION operation on tables, please ensure that all tables are explicitly listed. Do not omit any.\n"
         e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested.\n"
         e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
-        e += "Don't ouput extra rows. (e.g. use JOIN rather LEFT JOIN to avoid extra rows)\n" # local131
-
-        if args.use_CoT:
-            step = 1
-            prompt_step = e
-            prompt_step_info = "Let's approach the task step by step. For each step, write a SQL query (subquery of the answer) format like ```sql``` and review the results. If the results are reasonable, proceed to the next step until the task is complete."
-            prompt_step_info += "Don't output the whole results at once! Break it down into steps, using one SELECT query per step. Consider using WITH to link the previous steps together.\n"
-            prompt_step_info += "e.g. Step 1: WITH name1 AS (SELECT \"column\" FROM PROJECT.DATABASE.TABLE WHERE ...) SELECT * FROM name; For other steps: Step k: WITH name1 AS (...), name2 AS (...) ... namek AS (...) SELECT * FROM namek;"
-            prompt_step = e + prompt_step_info + f"Step {step}:\n"
-            past_steps = ""
-            while step < 10:               
-                response_step = chat_session.get_model_response(prompt_step, "sql")
-                table_step, chat_session = execute_sql(response_step, chat_session)
-                sql, table, chat_session = self_correct(sql, table_step, chat_session, max_len=1000)
-                sql, table, chat_session = self_check(sql, table, chat_session)
-                past_steps += f"Step {step}: SQL: {sql}\n"
-                prompt_step = prompt_step_info + "Completed steps:\n" + past_steps
-                step += 1
-                prompt_step += f"Step {step}:\n"
-                if self_check(sql, table, chat_session, response_csv) == "A":
-                    break
-            e = 0
+        e += "Don't ouput extra rows. (e.g. use JOIN rather LEFT JOIN to avoid extra rows)\n" # local131, bq150
+        e += f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition. e.g. SELECT * FROM TABLE1 UNION ALL TABLE2 WHERE ...; Don't write sql as SELECT * FROM (TABLE1 WHERE ...) UNION ALL (TABLE2 WHERE ...); Don't use `-- Omit ...` `-- Continue ...` to omit any table. Table names: {table_struct}\n"
+        e += "Avoid using REGEXP\n"
+        e += "Don't be disturbed by examples in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
+        # if args.use_CoT:
+        #     step = 1
+        #     prompt_step = e
+        #     prompt_step_info = "Let's approach the task step by step. For each step, write a SQL query (subquery of the answer) format like ```sql``` and review the results. If the results are reasonable, proceed to the next step until the task is complete."
+        #     prompt_step_info += "Don't output the whole results at once! Break it down into steps, using one SELECT query per step. Consider using WITH to link the previous steps together.\n"
+        #     prompt_step_info += "e.g. Step 1: WITH name1 AS (SELECT \"column\" FROM PROJECT.DATABASE.TABLE WHERE ...) SELECT * FROM name; For other steps: Step k: WITH name1 AS (...), name2 AS (...) ... namek AS (...) SELECT * FROM namek;"
+        #     prompt_step = e + prompt_step_info + f"Step {step}:\n"
+        #     past_steps = ""
+        #     while step < 10:               
+        #         response_step = chat_session.get_model_response(prompt_step, "sql")
+        #         table_step, chat_session = execute_sql(response_step, chat_session)
+        #         sql, table, chat_session = self_correct(sql, table_step, chat_session, max_len=1000)
+        #         sql, table, chat_session = self_check(sql, table, chat_session)
+        #         past_steps += f"Step {step}: SQL: {sql}\n"
+        #         prompt_step = prompt_step_info + "Completed steps:\n" + past_steps
+        #         step += 1
+        #         prompt_step += f"Step {step}:\n"
+        #         if self_check(sql, table, chat_session, response_csv) == "A":
+        #             break
+        #     e = 0
 
         # self-refine
         error_rec = []
@@ -300,11 +303,14 @@ def main(args):
             logger.info(f"itercount: {itercount}")
             logger.info(e)
             if e == 0:
-                e = f"Please check the answer again and give the final SQL query. It doesn't mean you are wrong, just check again. The answer format should be like: {response_csv}, check the number of rows and columns. Current snswer: \n"
+                e = f"Please check the answer again and give the final SQL query. It doesn't mean you are wrong, just check again.\n" 
+                e += f"The answer format should be like: {response_csv}, check the number of rows and columns.\n"
+                e += "Current snswer: \n"
                 with open(complete_save_path) as f:
                     csv_data = f.readlines()
                     csv_data_str = ''.join(csv_data)
                 e += csv_data_str if len(csv_data_str) < 1e4 else hard_cut(csv_data_str, 10000)
+                e += f"Current sql:\n{response}"
                 # if response.startswith("WITH"):
                 #     e += get_cte_info(response)
                 if get_values_from_table(csv_data_str) not in results_values:
@@ -317,7 +323,11 @@ def main(args):
                     save_path = save_path[:-4] + str(itercount) + save_path[-4:]
             if hasattr(e, 'msg'):
                 e = f"Input sql:\n{response}\nThe error information is:\n" + e.msg + "\nPlease correct it and output only 1 complete sql query."
+            if e == "No data found for the specified query.\n":
+                e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
+                e += f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition. e.g. SELECT * FROM TABLE1 UNION ALL TABLE2 WHERE ...; Don't write sql as SELECT * FROM (TABLE1 WHERE ...) UNION ALL (TABLE2 WHERE ...); Don't use `-- Omit ...` `-- Continue ...` to omit any table. Table names: {table_struct}\n"
             response = chat_session.get_model_response(e, "sql")
+            logger.info(e)
             logger.info(chat_session.messages[-1]['content'])
             if response == "Exceeded":
                 print(response)
