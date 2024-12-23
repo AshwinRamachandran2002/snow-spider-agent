@@ -194,16 +194,21 @@ def main(args):
         table_struct = table_info[table_info.find("In conclusion, the table inforation is ({project name: {database name: {table name}}}):"):]
         # format
         format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values.\n"
-        format_prompt += "When dealing with superlative cases, ensure the result is limited to just one row. e.g.: Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` Only one row.\n" # ga010
-        format_prompt += "For coordinate-related cases, use the ST_POINT() function. For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. \n"
+        format_prompt += "When dealing with superlative cases, ensure the result is limited to just one row. e.g.: Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` And emphasize only one row.\n" # ga010
+        format_prompt += "For coordinate-related cases, use the ST_POINT() function. e.g. Including its travel coordinates, the cumulative travel distance at each point. Format: ```csv\ngeom,cumulative_distance\nPOINT(longitude latitude),distance```\n"
+        format_prompt += "For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. \n"
         format_prompt += "Ensure that no columns are omitted in the response format by assigning each attribute to its own column and representing each record in a separate row. e.g. When answering rate1 and rate2, format should be ```csv\nrate1,rate2\nxx.xx,xx.xx``` rather than ```csv\nMetric,rate\nrate1,xx.xx\nrate2,xx.xx```\n" # bq112
-        format_prompt += "e.g. Retrieve all male and female customers from a customers table who have placed orders in the last 30 days, along with their order count. Format: ```csv\nsex,customer_id,customer_name,total_orders\nmale,id: int,name: string,orders: int\nfemale,id: int,name: string,orders: int```\nFor each column, specify its range or condition: customer_id/customer_name(have placed orders in the last 30 days), total_orders(male/female have placed orders in the last 30 days)\n"
+        format_prompt += "e.g. Retrieve all male and female customers from a customers table who have placed orders in the last 30 days, along with their order count. Format: ```csv\nsex,customer_id,customer_name,total_orders\nmale,id: int,name: string,orders: int\nfemale,id: int,name: string,orders: int```\n"
+        # format_prompt += "For each column, specify its range or condition: e.g. Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples. Provide the total number of samples, the number of mutation types. Format: ```csv\ntotal_number_of_samples,number_of_mutation_types\nnumber1:int,number2:int``` total_number_of_samples: TCGA-BRCA samples using sequencing and mutation data, number_of_mutation_types: TCGA-BRCA samples using mutation data\n"
+        format_prompt += "For the Magnificent 7 tech companies, their ticker names are: META, GOOGL (not GOOG), AMZN, MSFT, AAPL, TSLA, NVDA\n"
         format_prompt += "For distance task, no need to convert from meters to miles unless requested.\n"
-        format_prompt += "You may combine 2 columns into one if needed. (e.g. concatenate first name and last name as full name)\n" # local056
+        format_prompt += "You may combine 2 columns into one if needed. (e.g. concatenate first name and last name as full name) For other cases string should be separate, return both 2 strings. e.g. Ask team name: ```csv\nmarket,name\nstr1,str2```\n When asked for income, don't concatenate income with '$', just output number." # local056
         format_prompt += "If there are some records specified in the task, you should follow and capitalize them. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3```\n" # local008
         format_prompt += "For month cases, form format in both month_num and month: ```csv\nMonth_num,Month\n01,Jan\n02,Feb```.\n" # local028
         # format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. : 60 minutes trip durations 3 quantiles: Format: ```csv\ntime_range,distance\n01m to 20m,dis1\n21m to 40m,dis2\n41m to 60m,dis3``` The object for quantile is duration (time).\n"
         format_prompt += "Don't ignore the core of a task. e.g. Calculate the chi-square value of A, B, C. You should not only focus on record of ABC but also chi-square value. Format: ```csv\nchi-value,A,B,C\nv1:float,v2,v3,v4\n" # bq159
+        format_prompt += "If you meet with ambiguous name in the task that may match 2 columns, feel free to add 2 columns of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code```\n"
+        # format_prompt += "For blockchain timestamp cases, Format: ```csv\nblock_timestamp\n2021-05-12 01:40:17.000000 UTC```\n"
         format_prompt += "Do not output any SQL queries.\n"
         response_csv = chat_session4o.get_model_response_txt(table_info + "Task: " + task + format_prompt)
 
@@ -251,6 +256,7 @@ def main(args):
                                 sql_count += 1
             if sql_count < len(response_pre) // 2:
                 print("Inadequate preparation, retry preparation.")
+                pre_info = ''
                 LIMIT -= 3
                 continue
 
@@ -272,15 +278,16 @@ def main(args):
         results_values = []
         results_tables = []
         complete_save_path = search_directory + "/" + save_path
-        e += "Task: " + task + "\n"+'\nPlease answer in snowflake dialect in ```sql``` format.\nUsage example: SELECT S."Column_Name" FROM {Project Name}.{Database Name}.{Table_name} (ensure all column names are enclosed in double quotations)\n'
+        e += "Task: " + task + "\n"+'\nPlease answer only one complete sql in snowflake dialect in ```sql``` format.\nUsage example: SELECT S."Column_Name" FROM {Project Name}.{Database Name}.{Table_name} (ensure all column names are enclosed in double quotations)\n'
         e += f"Follow the answer format like: {response_csv}.\n"
+        e += "Here are some useful tips for answering:\n"
         e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested.\n"
         e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
-        e += "Don't ouput extra rows. (e.g. use JOIN rather LEFT JOIN to avoid extra rows)\n" # local131, bq150
-        e += f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition. e.g. SELECT * FROM TABLE1 UNION ALL TABLE2 WHERE ...; Don't write sql as SELECT * FROM (TABLE1 WHERE ...) UNION ALL (TABLE2 WHERE ...); Don't use `-- Omit ...` `-- Continue ...` to omit any table. Table names: {table_struct}\n"
-        e += "For string-matching scenarios, don't use fuzzy query if the string is decided and avoid using REGEXP.\n"
-        e += "Don't be disturbed by examples in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
+        e += f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition. e.g. SELECT * FROM TABLE1 UNION ALL TABLE2 WHERE ...; Don't write sql as SELECT * FROM (TABLE1 WHERE ...) UNION ALL (TABLE2 WHERE ...); Don't use `-- Omit ...` or `-- Continue ...` or `-- ...` or `-- Include all other` to omit any table. Table names: {table_struct}\n"
+        e += "For string-matching scenarios, don't use fuzzy query if the string is decided and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" sql: WHERE \"title\" LIKE '%book%' In this case, use LIKE\n"
+        e += "Don't be disturbed by extra description in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
         e += "When handling TO_TIMESTAMP_NTZ conversions, use query like: SELECT CASE WHEN \"date\" >= 1e15 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000000) WHEN \"date\" >= 1e12 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000) ELSE TO_TIMESTAMP_NTZ(\"date\") END AS parsed_timestamp FROM my_table;\n"
+        e += "Be careful of information in nested json columns. e.g. When it comes to active users, it refers to event_params.value.int_value > 0 rather than directly count users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec' AND flattened_params.value:value:int_value > 0\n"
         # if args.use_CoT:
         #     step = 1
         #     prompt_step = e
@@ -308,8 +315,12 @@ def main(args):
             logger.info(f"itercount: {itercount}")
             logger.info(e)
             if e == 0:
-                e = f"Please check the answer again and give the final SQL query. It doesn't mean you are wrong, just check again.\n" 
-                e += f"The answer format should be like: {response_csv}, check the number of rows and columns.\n"
+                e = f"Please check the answer again and give the final SQL query. The answer shouldn't be '0', '\"\"', null, etc. If you think the answer is right, just output the current sql.\n" 
+                if "LEFT JOIN" in response:
+                    e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table. (e.g. 1 Get total number of samples in both expression and mutation data on condition same id: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\")); In this case we just need their intersection to count number, so we shouldn't use LEFT JOIN." # local131, bq150, local099
+                    e += "e.g. 2 List each musical style with the number of times it appears as preference. You should write query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
+        
+                e += f"The answer format should be like: {response_csv} Don't output extra rows or nested rows!\n"
                 e += "Current snswer: \n"
                 with open(complete_save_path) as f:
                     csv_data = f.readlines()
@@ -319,8 +330,9 @@ def main(args):
                 # if response.startswith("WITH"):
                 #     e += get_cte_info(response)
                 if get_values_from_table(csv_data_str) not in results_values:
-                    results_values.append(get_values_from_table(csv_data_str))
-                    results_tables.append(csv_data_str)
+                    if get_values_from_table(csv_data_str).strip("\n") != "0" and get_values_from_table(csv_data_str).strip("\n"):
+                        results_values.append(get_values_from_table(csv_data_str))
+                        results_tables.append(csv_data_str)
                 else:
                     break
                 logger.info(f"results: \n{csv_data_str}\n")
