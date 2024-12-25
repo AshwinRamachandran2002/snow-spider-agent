@@ -11,6 +11,10 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 import Levenshtein
 from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info
 from agent import execute_sql, self_check, self_correct
+import numpy as np
+import pandas as pd
+from io import StringIO
+
 
 class Prompts:
     def __init__(self):
@@ -18,7 +22,26 @@ class Prompts:
     def get_prompt_list_all_tables(self, table_struct):
         return f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT \"col1\", \"col2\" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sql as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use `-- Omit ...` or `-- Continue ...` or `-- ...` or `-- Include all other` to omit any table. Table names: {table_struct}\n"
     def get_prompt_quantile_duration(self):
-        return "For 50 min durations divided into 10 quantiles, it's about time not distance, so calculate distance every 5 minutes.\n"
+        return "For 50 min durations divided into 10 quantiles, it's about time not distance, so calculate distance every 5 minutes. When calculating average number of sth, no need to filter null values, as they'll be treated as 0.\n"
+    # def get_prompt_quantile_trip(self):
+    #     return "For trips partition, it's about distance not time, so calculate minutes in equal divided trips.\n"
+    def get_prompt_package(self):
+        return "It's acceptable that there are repeatitive names and versions in NPM package.\n"
+    def get_prompt_generator(self):
+        return "Be careful of using GENERATOR. Don't use seq4(), use ROW_NUMBER().\n"
+    def get_prompt_NPM_package(self):
+        return "For NPM packages, the result can contain repeatitive names and versiona.\n"
+    def get_prompt_ST_INTERSECTS_FUNC(self):
+        return "Usage of ST_INTERSECTS: ST_INTERSECTS(geometry1, ST_GEOGFROMWKB(geometry2)) This function checks if the two geometries intersect. The first argument, geometry1, is compared with the second argument, geometry2, which is converted from its WKB (Well-Known Binary) representation to a geography type using ST_GEOGFROMWKB. If the two geometries share any portion of space, the function returns TRUE; otherwise, it returns FALSE. Usage of ST_CONTAINS: ST_CONTAINS(r1.geometry, r2.geometry) This function checks if the geometry r1.geometry completely contains the geometry r2.geometry. It returns TRUE if all points of r2.geometry are within r1.geometry and FALSE otherwise. This is useful for spatial containment queries, such as verifying whether one region is entirely within another. ARRAY_INTERSECTION(nodes1, nodes2): This function computes the intersection of the two arrays, returning a new array containing only the elements that are present in both nodes1 and nodes2. ARRAY_SIZE(...): This function then determines the size (or number of elements) in the resulting array from the intersection.\n"
+    def get_prompt_trip_duration(self):
+        return "Calculation of trip duration in date range (A, B): pickup_datetime in (A, B) and dropoff_datetime in (A, B), not only pickup_datetime.\n"
+    def get_prompt_full_outer_join(self):
+        return "Avoid using FULL OUTER JOIN\n"
+    def get_prompt_fuzzy_query(self):
+        return "For string-matching scenarios, don't use fuzzy query if the string is decided and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" sql: WHERE \"title\" LIKE '%book%' In this case, use LIKE.\n"
+    def get_prompt_decimal_places(self):
+        return "Keep all decimals to four decimal places.\n"
+
 
 class GPTChat:
     def __init__(self, azure=False, model="gpt-4o") -> None:
@@ -204,9 +227,10 @@ def main(args):
         # format
         format_prompt = "\nThis is a sql task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential type and conditions, rather than real values.\n"
         format_prompt += "For bool type, just write bool, don't fill with true or false. e.g. Please display the drug id, drug type and withdrawal status. Format: ```csv\ndrug_id,drug_type,hasBeenWithdrawn\npremarin_id,known_drug_type,bool\nhumira_id,known_drug_type,bool```\n"
-        format_prompt += "Keep all decimals to two decimal places.\n"
+        format_prompt += prompt_all.get_prompt_decimal_places()
         format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases, ensure the result is limited to just one row. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` And emphasize only one row.\n"
         format_prompt += "e.g. Calculate the chi-square value of A, B, C. You should only focus on chi-square value. Format: ```csv\nchi-value\nv1:float\n e.g. Number of active and closed stations in 2012, 2013. Format: ```csv\nyear,number_active,number_closed\n2012,num:int,num:int\n2013,num:int,num:int```\n" # bq159\n" # ga010
+        format_prompt += "e.g. Calculate the difference between A and B. You should only focus on difference value.\n"
         format_prompt += "e.g. Calculate proportion of A and B. You should only focus on proportion. Format: ```csv\nproportion\nnum:float```\n"
         format_prompt += "For coordinate-related cases, use the ST_POINT() function. e.g. Including its travel coordinates, the cumulative travel distance at each point. Format: ```csv\ngeom,cumulative_distance\nPOINT(longitude latitude),distance```\n"
         format_prompt += "For percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Otherwise, for portion, proportion, answer a float number < 1.\n"
@@ -217,13 +241,15 @@ def main(args):
         # format_prompt += "For each column, specify its range or condition: e.g. Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples. Provide the total number of samples, the number of mutation types. Format: ```csv\ntotal_number_of_samples,number_of_mutation_types\nnumber1:int,number2:int``` total_number_of_samples: TCGA-BRCA samples using sequencing and mutation data, number_of_mutation_types: TCGA-BRCA samples using mutation data\n"
         format_prompt += "For the Magnificent 7 tech companies, their ticker names are: META, GOOGL (not GOOG), AMZN, MSFT, AAPL, TSLA, NVDA\n"
         format_prompt += "For distance task, no need to convert from meters to miles unless requested.\n"
-        format_prompt += "You may combine 2 columns into one if needed. (e.g. concatenate first name and last name as full name) For other cases string should be separate, return both 2 strings. e.g. Ask team name: ```csv\nmarket,name\nstr1,str2```\n When asked for income, don't concatenate income with '$', just output number." # local056
+        format_prompt += "You may combine 2 columns into one for name cases. (e.g. concatenate first name and last name as full name)\n"
+        format_prompt += "For other cases string should be separate, return both 2 strings. e.g. Ask team name: ```csv\nmarket,name\nstr1,str2```\n When asked for income, don't concatenate income with '$', just output number." # local056
         format_prompt += "If there are some records specified in the task, you should follow and capitalize them. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3```\n" # local008
         format_prompt += "For month cases, form format in both month_num and month: ```csv\nMonth_num,Month\n01,Jan\n02,Feb```.\n" # local028
         format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. : 60 minutes trip durations 10 quantiles: Format: ```csv\ntime_range,distance\n00m to 10m,dis1\n10m to 20m,dis2\n...\n50m to 60m,dis3``` Start from 0.\n"
         format_prompt += "If you meet with ambiguous name in the task that may match 2 columns, feel free to add 2 columns of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code```\n"
         format_prompt += "You can also add column related to the task. e.g. The month with highest number. Format: ```csv\nmonth,month_num,number\nstr,int,int```\n"
-        format_prompt += "Please output only one format. \n"
+        format_prompt += "Please output only one format. If there could be 2 tables as the complete answers, return the later one as format. e.g. Identify the top five states by daily increases. Then, examine the state that ranks fourth overall and identify its top five counties. Format: ```csv\ntop_five_counties,count\ncounty1,count1\ncounty2,count2\ncounty3,count3\ncounty4,count4\ncounty5,count5```In this case, return results of the later one table.\n"
+        format_prompt += "If there is any math relationship between columns, you should note it. e.g. Get number added to the cart,without being purchased in cart and count of actual purchases. Format: ```csv\nnumber added to the cart,without being purchased in cart and count of actual purchases,num1,num2,num3``` Note: num1=num2+num3\n"
         # format_prompt += "For blockchain timestamp cases, Format: ```csv\nblock_timestamp\n2021-05-12 01:40:17.000000 UTC```\n"
         format_prompt += "Do not output any SQL queries.\n"
         response_csv = chat_session4o.get_model_response_txt(table_info + "Task: " + task + format_prompt)
@@ -239,16 +265,21 @@ def main(args):
         LIMIT = 10
         prompt = table_info + "\n" + "Task: " + task + "\n"
         pre_info = ''
+        ans_pre = prompt
         while LIMIT > 0:
 
-            ans_pre = prompt + f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 5 simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f;;. DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
+            ans_pre += f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 5 simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
             # ans_pre += "e.g. Retrieve all products whose product_name contains the word \"Professor’s book\". Simple non-nested sql queries: SELECT \"product_id\", \"product_name\" FROM products WHERE product_name LIKE '%Professor%' OR '%Book%'; (For string matching cases, firstly look if the substring exists)"
             # ensure all characters are converted to standard symbols (e.g., replace ’ with Escape Character \', replace ” with Escape Character \"'). And also u
             ans_pre += "For string-matching scenarios, convert non-standard symbols to '%'. e.g. ('he’s' to he%s) Use fuzzy query: WHERE str LIKE \"%target_str%\", don't directly match strings and avoid using REGEXP.\n" # bq085, local099
-            ans_pre += "When using TO_DATE() function, filter NULL: WHERE TRY_TO_DATE(filing_date, 'YYYYMMDD') IS NOT NULL;.\n"
-            ans_pre += "For time-related queries, given the variety of formats such as UNIX timestamp, ISO 8601, and DATETIME, avoid using time functions unless you are certain of the specific format being used.\n"
             ans_pre += "When faced with string matching for a topic, first retrive every columns related to the topic. e.g. A single Python 2 specific question on Stack Overflow. SQL: SELECT * FROM table WHERE (\"title\" iLIKE '%Python%2%' OR \"body\" iLIKE '%Python%2%' OR \"tags\" iLIKE '%python-2.%') Note for match string phase, e.g. meat lovers, you should use % to replace spapce. e.g. ILKIE %meat%lovers%.\n" 
+            
+            ans_pre += "When using TO_DATE() function, filter NULL: WHERE TRY_TO_DATE(filing_date, 'YYYYMMDD') IS NOT NULL;\n"
+            ans_pre += "For time-related queries, given the variety of formats such as UNIX timestamp, ISO 8601, and DATETIME, avoid using time functions unless you are certain of the specific format being used.\n"
+            
             ans_pre += "When generating sqls, be aware of quotation matching: 'Vegetarian\"; You sometimes match \' with \" which may cause error.\n"
+            ans_pre += "For nested columns like event_params, when you don't know the structure of it, just watch the whole column: SELECT f.value FROM table, LATERAL FLATTEN(input => t.\"event_params\") f;\n"
+            # ans_pre += "If you can get information you want in one table, then there's no need to join another.\n"
             ans_pre += f"You can only use table in {table_struct}"
             logger.info(ans_pre)
             response_pre = chat_session.get_model_response(ans_pre, "sql")
@@ -289,7 +320,7 @@ def main(args):
             if len(pre_info) < 1e5:
                 break
             print("Too long, retry preparation.")
-            # pre_info = ''
+            pre_info = ''
             LIMIT -= 3
             chat_session.init_messages()
         print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
@@ -310,15 +341,18 @@ def main(args):
         e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
         e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
         e += prompt_all.get_prompt_list_all_tables(table_struct)
-        e += "For string-matching scenarios, don't use fuzzy query if the string is decided and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" sql: WHERE \"title\" LIKE '%book%' In this case, use LIKE. However, if the task is to match string regardless of upper and lowercase, use ILIKE.\n"
+        e += prompt_all.get_prompt_fuzzy_query()
+        e += "Be careful one country may have different names in different columns in a database.\n"
+        #  However, if the task is to match string regardless of upper and lowercase, use ILIKE.
         e += "Don't be disturbed by extra description in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
         e += "When handling TO_TIMESTAMP_NTZ conversions, use query like: SELECT CASE WHEN \"date\" >= 1e15 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000000) WHEN \"date\" >= 1e12 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000) ELSE TO_TIMESTAMP_NTZ(\"date\") END AS parsed_timestamp FROM my_table;\n"
         e += "Be careful of information in nested json columns. e.g.1. When it comes to active users, it refers to has engagement_time_msec parameter rather than directly count users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec'\n"
         e += "e.g.2 When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
         e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
         e += "when counting for rows of a column, ensure they are distinct: SELECT COUNT(DISTINCT col_name) FROM table;\n"
-        e += "When calculating average number of sth, no need to filter null values, as they'll be treated as 0.\n"
-        e += "Keep all decimals to two decimal places.\n"
+        # e += "When the condition is superlative, use ROW_NUMBER() to rank first and get rn=1.\n"
+        e += prompt_all.get_prompt_decimal_places()
+        # e += "For complex tasks, use CTEs to think step by step.\n"
         if "duration" in task and "quantile" in task:
             e += prompt_all.get_prompt_quantile_duration()
         # if args.use_CoT:
@@ -348,24 +382,8 @@ def main(args):
             logger.info(f"itercount: {itercount}")
             logger.info(e)
             if e == 0:
-                e = f"Please check the answer again and give the final SQL query. The target column of the answer shouldn't be '0', '\"\"', null, etc. If you think the answer is right, just output the current sql.\n" 
-                e += "Keep all decimals to two decimal places.\n"
-                if "LEFT JOIN" in response:
-                    e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table. (e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\")); In this case we just need their intersection to count number, so we shouldn't use LEFT JOIN." # local131, bq150, local099
-                    e += "e.g. 2 List each musical style with the number of times it appears as preference. You should write query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
-                if "Google Analytics" in table_info:
-                    e += "Be careful of information in nested json columns. e.g.1. When it comes to active users in a date range, it refers to has engagement_time_msec parameter rather than directly count users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec' rather than directly count number in or not in the date range.\n"
-                    e += "e.g.2 When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
-                if "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response:
-                    e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
-                if "ORDER BY" in response and "DESC" in response:
-                    e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
-                if '"day_of_week" IN (' in response:
-                    e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
-                if any(keyword in response for keyword in ["-- Include all other", "-- Omit", "-- Continue", "-- Union all", "-- ..."]):
-                    e += prompt_all.get_prompt_list_all_tables(table_struct)
-                if "duration" in task and "quantile" in task:
-                    e += prompt_all.get_prompt_quantile_duration()
+                e = f"Please check the answer again by reviewing task, Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current sql.\n" 
+                e += prompt_all.get_prompt_decimal_places()
                 e += f"The answer format should be like: {response_csv} The answer should match the number of rows, the column name of the format and the filled values in the format. Don't output extra rows or nested rows!\n"
                 e += "Current snswer: \n"
                 with open(complete_save_path) as f:
@@ -380,10 +398,15 @@ def main(args):
                 # if response.startswith("WITH"):
                 #     e += get_cte_info(response)
                 if get_values_from_table(csv_data_str) not in results_values:
-                    if get_values_from_table(csv_data_str).strip("\n") != "0" and get_values_from_table(csv_data_str).strip("\n") != "":
+                    csv_buffer = StringIO(csv_data_str)
+                    df_csv = pd.read_csv(csv_buffer)
+                    df_csv = df_csv.fillna(0)
+                    if not ((df_csv == 0) | (df_csv == "")).all().any():
                         # if len(format_csv.split('\n')) == len(csv_data_str.split('\n')):
                             results_values.append(get_values_from_table(csv_data_str))
                             results_tables.append(csv_data_str)
+                    else:
+                        e += "Some columns are empty results. Please correct it.\n"
                 else:
                     break
                 logger.info(f"results: \n{csv_data_str}\n")
@@ -393,8 +416,35 @@ def main(args):
                 e = f"Input sql:\n{response}\nThe error information is:\n" + e.msg + "\nPlease correct it and output only 1 complete sql query."
             if e == "No data found for the specified query.\n":
                 e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
-                if "-- Include all other" in response or "-- Omit" in response or "-- Continue" in response or "-- Union all" in response:
+            if itercount > 0:
+                if "LEFT JOIN" in response.upper():
+                    e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table. (e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\")); In this case we just need their intersection to count number, so we shouldn't use LEFT JOIN." # local131, bq150, local099
+                    e += "e.g. 2 List each musical style with the number of times it appears as preference. You should write query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
+                if "Google Analytics" in table_info:
+                    e += "Be careful of information in nested json columns. e.g.1. When it comes to active users in a date range, it refers to has engagement_time_msec parameter rather than directly count users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec' rather than directly count number in or not in the date range.\n"
+                    e += "e.g.2 When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
+                if "ST_GEOGPOINT" in response.upper() or "ST_MAKEGEOGRAPHYPOINT" in response.upper() or "2 * 6371000 * ASIN" in response.upper():
+                    e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
+                if "ORDER BY" in response.upper() and "DESC" in response.upper():
+                    e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
+                if '"day_of_week" IN (' in response:
+                    e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
+                if any(keyword in response for keyword in ["-- Include all other", "-- Omit", "-- Continue", "-- Union all", "-- ..."]):
                     e += prompt_all.get_prompt_list_all_tables(table_struct)
+                if "duration" in task and "quantile" in task:
+                    e += prompt_all.get_prompt_quantile_duration()
+                if "GENERATOR" in response.upper():
+                    e += prompt_all.get_prompt_generator()
+                if any(keyword in response for keyword in ["ST_INTERSECTS", "ARRAY_INTERSECT", "ARRAY_OVERLAPS", "ST_OVERLAPS"]):
+                    e += prompt_all.get_prompt_ST_INTERSECTS_FUNC()
+                if "trip duration" in task:
+                    e += prompt_all.get_prompt_trip_duration()
+                if "FULL OUTER JOIN" in response.upper():
+                    e += prompt_all.get_prompt_full_outer_join()
+                if "ILIKE" in response.upper():
+                    e += prompt_all.get_prompt_fuzzy_query()
+                # if "NPM" in task and "packages" in task:
+                #     e += prompt_all.get_prompt_NPM_package()
             response = chat_session.get_model_response(e, "sql")
             logger.info(e)
             logger.info(chat_session.messages[-1]['content'])
@@ -461,7 +511,7 @@ if __name__ == '__main__':
     parser.add_argument('--understanding_model', type=str, default="gpt-4o")
     parser.add_argument('--overwrite_results', action="store_true")
     parser.add_argument('--azure', action="store_true")
-    parser.add_argument('--max_iter', type=int, default=8)
+    parser.add_argument('--max_iter', type=int, default=10)
     parser.add_argument('--save_all_results', action="store_true")
     parser.add_argument('--use_CoT', action="store_true")
     parser.add_argument('--model_vote', action="store_true")

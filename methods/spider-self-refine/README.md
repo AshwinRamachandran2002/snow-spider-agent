@@ -18,7 +18,7 @@ python reconstruct_data.py --example_folder examples
 export OPENAI_API_KEY=YOUR_API_KEY
 export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
-python run.py --test_path examples --model o1-preview ----understanding_model o1-preview --output_path output/o1-preview-test-all-log --azure --model_vote
+python run.py --test_path examples --model o1-preview ----understanding_model o1-preview --output_path output/o1-preview-test-all-log --azure
 ```
 
 ## Evaluation
