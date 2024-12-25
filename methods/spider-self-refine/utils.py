@@ -28,7 +28,7 @@ def extract_all_blocks(main_content, code_format):
 def hard_cut(str_e, length=0):
     if length:
         if len(str_e) > length:
-            str_e = "Too long, hard cut:\n" + str_e[:length]+"\n"
+            str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
     return str_e
 
 def get_values_from_table(csv_data_str):
@@ -132,3 +132,8 @@ def get_cte_info(ctes):
     for query in split_cte(ctes):
         cte_info += "Query:\n" + query + "Results:\n" + hard_cut(execute_sql_snow(query), 1000)
     return cte_info
+
+def get_longest(sql_list):
+    sql_list_len = [len(i) for i in sql_list]
+    sql_list_len_index = sql_list_len.index(max(sql_list_len))
+    return sql_list[sql_list_len_index]

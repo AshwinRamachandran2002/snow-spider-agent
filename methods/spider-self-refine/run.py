@@ -10,7 +10,7 @@ from openai import AzureOpenAI
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 import Levenshtein
 from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info
-from agent import execute_sql, self_check, self_correct
+from agent import execute_sql, self_correct
 import numpy as np
 import pandas as pd
 from io import StringIO
@@ -20,7 +20,7 @@ class Prompts:
     def __init__(self):
         pass
     def get_prompt_list_all_tables(self, table_struct):
-        return f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT \"col1\", \"col2\" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sql as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use `-- Omit ...` or `-- Continue ...` or `-- ...` or `-- Include all other` to omit any table. Table names: {table_struct}\n"
+        return f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT \"col1\", \"col2\" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sql as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use `-- Omit ...` or `-- Continue ...` or `-- ...` or `-- Include all` or `-- List all` to omit any table. Table names: {table_struct}\n"
     def get_prompt_quantile_duration(self):
         return "For 50 min durations divided into 10 quantiles, it's about time not distance, so calculate distance every 5 minutes. When calculating average number of sth, no need to filter null values, as they'll be treated as 0.\n"
     # def get_prompt_quantile_trip(self):
@@ -266,11 +266,13 @@ def main(args):
         prompt = table_info + "\n" + "Task: " + task + "\n"
         pre_info = ''
         ans_pre = prompt
+        ans_pre = ''
         while LIMIT > 0:
 
-            ans_pre += f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 5 simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
+            ans_pre += f"Consider which tables and columns are relevant to the task? Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 simple and short sql queries ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
             # ans_pre += "e.g. Retrieve all products whose product_name contains the word \"Professor’s book\". Simple non-nested sql queries: SELECT \"product_id\", \"product_name\" FROM products WHERE product_name LIKE '%Professor%' OR '%Book%'; (For string matching cases, firstly look if the substring exists)"
             # ensure all characters are converted to standard symbols (e.g., replace ’ with Escape Character \', replace ” with Escape Character \"'). And also u
+            ans_pre += f"Don't use CTEs and don't query about INFORMATION_SCHEMA.\n"
             ans_pre += "For string-matching scenarios, convert non-standard symbols to '%'. e.g. ('he’s' to he%s) Use fuzzy query: WHERE str LIKE \"%target_str%\", don't directly match strings and avoid using REGEXP.\n" # bq085, local099
             ans_pre += "When faced with string matching for a topic, first retrive every columns related to the topic. e.g. A single Python 2 specific question on Stack Overflow. SQL: SELECT * FROM table WHERE (\"title\" iLIKE '%Python%2%' OR \"body\" iLIKE '%Python%2%' OR \"tags\" iLIKE '%python-2.%') Note for match string phase, e.g. meat lovers, you should use % to replace spapce. e.g. ILKIE %meat%lovers%.\n" 
             
@@ -281,49 +283,68 @@ def main(args):
             ans_pre += "For nested columns like event_params, when you don't know the structure of it, just watch the whole column: SELECT f.value FROM table, LATERAL FLATTEN(input => t.\"event_params\") f;\n"
             # ans_pre += "If you can get information you want in one table, then there's no need to join another.\n"
             ans_pre += f"You can only use table in {table_struct}"
-            logger.info(ans_pre)
-            response_pre = chat_session.get_model_response(ans_pre, "sql")
-            logger.info(chat_session.messages[-1]['content'])
-            if response_pre == "Exceeded":
-                LIMIT -= 9
-                # print(f"{response_pre}, adjust LIMIT: {LIMIT}")
-                print(f"{response_pre}, retry")
-                continue
+            # logger.info(ans_pre)
+            
 
-            pre_info += f"Possible values for important columns:\n"
-            sql_count = 0
-            # results_pre_dic, chat_session = execute_sql_snow(response_pre, chat_session, max_len=10000)
-            # for key, value in results_pre_dic.items():
-            #     pre_info += "Query:\n" + key + "\nAnswer:\n" + value
-            #     if isinstance(value, str):
-            #         sql_count += 1
-            for i in range(len(response_pre)):
-                e = execute_sql_snow(response_pre[i])
-                if isinstance(e, str):
-                    e = hard_cut(e, 10000)
-                    pre_info += "Query:\n" + response_pre[i] + "\nAnswer:\n" + e
-                    sql_count += 1
-                elif "0A000" in e.msg:
-                        queries = [query.strip() for query in response_pre[i].strip().split(';') if query.strip()]
-                        for q in queries:
-                            e = execute_sql_snow(q)
-                            if isinstance(e, str):
-                                e = hard_cut(e, 10000)
-                                pre_info += "Query:\n" + q + "Answer:\n" + e
-                                sql_count += 1
-            if sql_count < len(response_pre) // 2:
-                print("Inadequate preparation, retry preparation.")
-                pre_info = ''
+
+
+            response_pre = chat_session4o.get_model_response(ans_pre, "sql")
+            if len(response_pre) == 1:
+                response_pre = [query.strip() for query in response_pre.strip().split(';') if query.strip()]
+            if len(response_pre) < 10:
+                ans_pre = ''
                 LIMIT -= 3
+                print("Few sqls, retry preparation.")
                 continue
+            results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, max_len=5000)
+            sql_count = 0
+            for key, value in results_pre_dic.items():
+                pre_info += "Query:\n" + key + "\nAnswer:\n" + value
+                if isinstance(value, str):
+                    sql_count += 1
+
+
+
+
+            # response_pre = chat_session.get_model_response(ans_pre, "sql")
+            # logger.info(chat_session.messages[-1]['content'])
+            # if response_pre == "Exceeded":
+            #     LIMIT -= 9
+            #     # print(f"{response_pre}, adjust LIMIT: {LIMIT}")
+            #     print(f"{response_pre}, retry")
+            #     continue
+
+            # pre_info += f"Possible values for important columns:\n"
+            # sql_count = 0
+
+            # for i in range(len(response_pre)):
+            #     e = execute_sql_snow(response_pre[i])
+            #     if isinstance(e, str):
+            #         e = hard_cut(e, 10000)
+            #         pre_info += "Query:\n" + response_pre[i] + "\nAnswer:\n" + e
+            #         sql_count += 1
+            #     elif "0A000" in e.msg:
+            #             queries = [query.strip() for query in response_pre[i].strip().split(';') if query.strip()]
+            #             for q in queries:
+            #                 e = execute_sql_snow(q)
+            #                 if isinstance(e, str):
+            #                     e = hard_cut(e, 10000)
+            #                     pre_info += "Query:\n" + q + "Answer:\n" + e
+            #                     sql_count += 1
+            # if sql_count < len(response_pre) // 2:
+            #     print("Inadequate preparation, retry preparation.")
+            #     pre_info = ''
+            #     LIMIT -= 3
+            #     continue
 
             if len(pre_info) < 1e5:
                 break
             print("Too long, retry preparation.")
             pre_info = ''
             LIMIT -= 3
-            chat_session.init_messages()
+            chat_session4o.init_messages()
         print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
+        print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
         if LIMIT <= 0:
             print("Inadequate preparation, skip")
             # continue
@@ -331,7 +352,7 @@ def main(args):
 
         # answer
         itercount = 0
-        e = pre_info
+        e = table_info + pre_info
         results_values = []
         results_tables = []
         complete_save_path = search_directory + "/" + save_path
@@ -417,31 +438,31 @@ def main(args):
             if e == "No data found for the specified query.\n":
                 e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
             if itercount > 0:
-                if "LEFT JOIN" in response.upper():
+                if "LEFT JOIN" in response:
                     e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table. (e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\")); In this case we just need their intersection to count number, so we shouldn't use LEFT JOIN." # local131, bq150, local099
                     e += "e.g. 2 List each musical style with the number of times it appears as preference. You should write query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
                 if "Google Analytics" in table_info:
                     e += "Be careful of information in nested json columns. e.g.1. When it comes to active users in a date range, it refers to has engagement_time_msec parameter rather than directly count users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec' rather than directly count number in or not in the date range.\n"
                     e += "e.g.2 When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
-                if "ST_GEOGPOINT" in response.upper() or "ST_MAKEGEOGRAPHYPOINT" in response.upper() or "2 * 6371000 * ASIN" in response.upper():
+                if "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response:
                     e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
-                if "ORDER BY" in response.upper() and "DESC" in response.upper():
+                if "ORDER BY" in response and "DESC" in response:
                     e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
                 if '"day_of_week" IN (' in response:
                     e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
-                if any(keyword in response for keyword in ["-- Include all other", "-- Omit", "-- Continue", "-- Union all", "-- ..."]):
+                if any(keyword in response for keyword in ["-- Include all", "-- Omit", "-- Continue", "-- Union all", "-- ...", "-- List all", "Include all other tables"]):
                     e += prompt_all.get_prompt_list_all_tables(table_struct)
                 if "duration" in task and "quantile" in task:
                     e += prompt_all.get_prompt_quantile_duration()
-                if "GENERATOR" in response.upper():
+                if "GENERATOR" in response:
                     e += prompt_all.get_prompt_generator()
                 if any(keyword in response for keyword in ["ST_INTERSECTS", "ARRAY_INTERSECT", "ARRAY_OVERLAPS", "ST_OVERLAPS"]):
                     e += prompt_all.get_prompt_ST_INTERSECTS_FUNC()
                 if "trip duration" in task:
                     e += prompt_all.get_prompt_trip_duration()
-                if "FULL OUTER JOIN" in response.upper():
+                if "FULL OUTER JOIN" in response:
                     e += prompt_all.get_prompt_full_outer_join()
-                if "ILIKE" in response.upper():
+                if "ILIKE" in response:
                     e += prompt_all.get_prompt_fuzzy_query()
                 # if "NPM" in task and "packages" in task:
                 #     e += prompt_all.get_prompt_NPM_package()
