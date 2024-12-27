@@ -3,14 +3,16 @@ from utils import execute_sql_snow, hard_cut, get_longest
 input: sqls
 output: results for each sql
 '''
-def execute_sql(sqls, chat_session, api="snow", max_len=0, save_path=None, get_max=False):
+def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=None, get_max=False):
     result_dic = {}
     for sql in sqls:
         if api == "snow":
-            results = execute_sql_snow(sql, save_path)
+            results = execute_sql_snow(sql, save_path, max_len=max_len)
             if isinstance(results, str) and results != "No data found for the specified query.\n":
-                results = hard_cut(results, max_len)
+                # results = hard_cut(results, max_len)
                 result_dic[sql] = results
+                chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
+                logger.info(chat_session.messages[-1]['content'])
             # multiple queries
             # elif hasattr(results, 'msg') and "0A000" in results.msg:
             #     queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
@@ -26,32 +28,39 @@ def execute_sql(sqls, chat_session, api="snow", max_len=0, save_path=None, get_m
                         break
                     if results == "No data found for the specified query.\n":
                         simplify = True
-                    corrected_sql, chat_session = self_correct(sql, results, chat_session, max_len=max_len, simplify=simplify)
+                    corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify)
                     if not corrected_sql:
-                        results = "No data found for the specified query.\n"
+                        results = "Empty. No data found for the specified query.\n"
                         break
                     corrected_sql = get_longest(corrected_sql)
-                    results = execute_sql_snow(corrected_sql)
+                    results = execute_sql_snow(corrected_sql, max_len=max_len)
                     max_iter -= 1
                     simplify = False
                 if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
-                    print("Corrected.")
+                    print("Corrected.\n")
                 else:
-                    print("Max iter, failed to correct.")
+                    print("Max iter, failed to correct.\n")
                     results = results.msg if hasattr(results, 'msg') else results
-                result_dic[corrected_sql] = hard_cut(results, max_len)
+                if not corrected_sql:
+                    print(f"Results: {results}")
+                    print("No corrected_sql, skip")
+                    continue
+                result_dic[corrected_sql] = results
+                chat_session.messages.append({"role": "user", "content": f"SQL:\n{corrected_sql}\nResults:\n{results}"})
+                logger.info(chat_session.messages[-1]['content'])
         else:
             raise NotImplementedError("Support Snowflake API only.")
     if get_max:
         return max(result_dic.keys(), key=len)
     return result_dic, chat_session
                 
-def self_correct(sql, error, chat_session, max_len=0, simplify=False):
+def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False):
     # while hasattr(error, 'msg'):
-    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it and output one sql query in ```sql``` format."
+    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
     if simplify:
-        prompt += "Since output is empty, please write a simpler sql query.\n"
+        prompt += "Since output is empty, please simplify some conditions of the past sql.\n"
     response = chat_session.get_model_response(prompt, "sql")
+    logger.info(chat_session.messages[-1]['content'])
     return response, chat_session
 
 # def self_check(sql, table, chat_session, format_restrict=None):

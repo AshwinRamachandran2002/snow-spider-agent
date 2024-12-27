@@ -3,7 +3,7 @@ import pandas as pd
 import re
 from tqdm import tqdm
 import argparse
-
+import shutil
 pd.set_option('display.max_colwidth', None)
 
 def remove_digits(s):
@@ -29,6 +29,31 @@ def process_ddl(ddl_file):
             representatives[remove_digits(table_names[i])] = [table_names[i]]
     return ddl_file, representatives
 
+def make_folder(args):
+    example_folder = args.example_folder
+    for entry in os.listdir(example_folder):
+        entry1_path = os.path.join(example_folder, entry)
+        if os.path.isdir(entry1_path):
+            for project_name in os.listdir(entry1_path):
+                project_name_path = os.path.join(entry1_path, project_name)
+                if os.path.isdir(project_name_path):
+                    for db_name in os.listdir(project_name_path):
+                        db_name_path = os.path.join(project_name_path, db_name)
+                        if db_name == "json":
+                            os.remove(os.path.join(project_name_path, "json"))
+                        elif db_name.endswith(".json"):
+                            assert '.' in db_name.strip(".json")
+                            folder_name = db_name.split(".")[0]
+                            file_name = '.'.join(db_name.split(".")[1:])
+                            folder_path = os.path.join(project_name_path, folder_name)
+                            if not os.path.exists(folder_path):
+                                os.mkdir(folder_path)
+                            shutil.copy(db_name_path, os.path.join(folder_path, file_name))
+                            os.remove(db_name_path)
+                    if "DDL.csv" in os.listdir(project_name_path):
+                        ddl_path = os.path.join(project_name_path, "DDL.csv")
+                        shutil.copy(ddl_path, os.path.join(folder_path, "DDL.csv"))
+                        os.remove(ddl_path)
 
 def compress_all(args):
     example_folder = args.example_folder
@@ -150,7 +175,7 @@ def compress_ddl(args):
         
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
-                prompts += "In conclusion, the table information is ({project name: {database name: {table name}}}): \n" + str(table_dict) + "\n"
+                prompts += "The table structure information is ({project name: {database name: {table name}}}): \n" + str(table_dict) + "\n"
                 f.writelines(prompts)
 
 if __name__ == '__main__':
@@ -161,4 +186,5 @@ if __name__ == '__main__':
     parser.add_argument('--example_folder', type=str, default="output/test")
     args = parser.parse_args()
     # compress_all(args)
+    make_folder(args)
     compress_ddl(args)

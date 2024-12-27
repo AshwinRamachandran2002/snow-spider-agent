@@ -27,7 +27,7 @@ def extract_all_blocks(main_content, code_format):
 
 def hard_cut(str_e, length=0):
     if length:
-        if len(str_e) > length:
+        if len(str_e) > length and not str_e.startswith("Too long, hard cut"):
             str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
     return str_e
 
@@ -41,37 +41,46 @@ def search_file(directory, target_file):
             result.append(os.path.join(root, target_file))
     return result
 
-def execute_sql_snow(sql_query, save_path=None):
+def execute_sql_snow(sql_query, save_path=None, max_len=10000):
     # Load Snowflake credentials
     snowflake_credential = json.load(open("./snowflake_credential.json"))
     # Define the SQL query
     # Execute the SQL query
-    with snowflake.connector.connect(**snowflake_credential) as conn:
-        with conn.cursor() as cursor:
+    try:
+        with snowflake.connector.connect(**snowflake_credential) as conn:
             try:
-                cursor.execute(sql_query)
-                # Fetch the results
-                results = cursor.fetchall()
-                columns = [desc[0] for desc in cursor.description]
-                df = pd.DataFrame(results, columns=columns)
+                with conn.cursor() as cursor:
+                    try:
+                        cursor.execute(sql_query)
+                        # Fetch the results
+                        results = cursor.fetchall()
+                        results = results[:max_len] if len(results) > max_len else results
+                        columns = [desc[0] for desc in cursor.description]
+                        df = pd.DataFrame(results, columns=columns)
 
-                # Check if the result is empty
-                if df.empty:
-                    print("No data found for the specified query.")
-                    return "No data found for the specified query.\n"
-                else:
-                    # Save or print the results based on the is_save flag
-                    if save_path:
-                        df.to_csv(f"{save_path}", index=False)
-                        print(f"Results saved to {save_path}")
-                        return 0
-                    else:
-                        # print(df)
-                        return df.to_csv()
+                        # Check if the result is empty
+                        if df.empty:
+                            print("No data found for the specified query.")
+                            return "No data found for the specified query.\n"
+                        else:
+                            # Save or print the results based on the is_save flag
+                            if save_path:
+                                df.to_csv(f"{save_path}", index=False)
+                                print(f"Results saved to {save_path}")
+                                return 0
+                            else:
+                                # print(df)
+                                return hard_cut(df.to_csv(), max_len)
+                    except Exception as e:
+                        print("Error occurred: ", str(e))
+                        return e
             except Exception as e:
                 print("Error occurred: ", str(e))
-                return e
-            
+                return e       
+    except Exception as e:
+        print("Error occurred: ", str(e))
+        return e  
+    
 def split_cte(with_block):
     i = 0
     length = len(with_block)
