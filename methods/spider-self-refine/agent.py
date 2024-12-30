@@ -232,7 +232,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             # if response.startswith("WITH"):
             #     e += get_cte_info(response)
             csv_buffer = StringIO(csv_data_str)
-            df_csv = pd.read_csv(csv_buffer)
+            df_csv = pd.read_csv(csv_buffer).fillna(0)
             df_csv_copy = df_csv.copy()
             for col in df_csv.select_dtypes(include=['float']):
                 df_csv_copy[col] = df_csv[col].round(2)
@@ -289,7 +289,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         response = chat_session.get_model_response(e, "sql")
         logger.info(chat_session.messages[-1]['content'])
         if response == "Exceeded":
-            print(response)
+            logger.info(response)
             if os.path.exists(complete_save_path):
                 os.remove(complete_save_path)
             break
@@ -303,7 +303,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         error_rec.append(e)
         if len(error_rec) > 3:
             if len(set(error_rec[-4:])) == 1 and error_rec[-1] == "No data found for the specified query.\n":
-                print("No data found for the specified query, remove file.\n")                    
+                logger.info("No data found for the specified query, remove file.\n")                    
                 if os.path.exists(complete_save_path):
                     os.remove(complete_save_path)
                 break

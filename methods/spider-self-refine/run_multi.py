@@ -7,7 +7,7 @@ import glob
 from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 
-from multiprocessing import Pool, Manager
+from multiprocessing import Pool, Manager, Lock
 from model import GPTChat, modelChat
 from prompt import Prompts
 
@@ -89,6 +89,9 @@ def process_folder(sql_data):
     table_struct = table_info[table_info.find("({project name: {database name: {table name}}}):"):]
     # format
     response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
+    if response_csv == "Exceeded":
+        logger.info(response_csv)
+        return
 
     # preparation
     LIMIT = 10
@@ -106,12 +109,12 @@ def process_folder(sql_data):
     self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session)
 
 
-def worker(task_queue):
+def worker(task_queue, result_queue):
     while not task_queue.empty():
         try:
-            folder = task_queue.get(timeout=1)
+            folder = task_queue.get()
             process_folder(folder)
-            progress_bar.update(1)
+            result_queue.put(1)
         except Exception as e:
             print(f"Error processing folder: {e}")
 
@@ -131,7 +134,9 @@ if __name__ == '__main__':
     parser.add_argument('--use_CoT', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
     parser.add_argument('--rerun', action="store_true")
+    parser.add_argument('--num_process', type=str, default=2)
     args = parser.parse_args()
+    num_process = int(args.num_process)
     # main(args)
     dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
 
@@ -140,9 +145,14 @@ if __name__ == '__main__':
         result_queue = manager.Queue()
         for folder in dictionaries:
             task_queue.put(folder)
+
+        lock = Lock()
         with tqdm(total=len(dictionaries), desc="Processing Folders") as progress_bar:
-            with Pool(processes=2) as pool:
-                for _ in range(2):
-                    pool.apply_async(worker, args=(task_queue,))
+            with Pool(processes=num_process) as pool:
+                for _ in range(num_process):
+                    pool.apply_async(worker, args=(task_queue, result_queue))
                 pool.close()
+                while not task_queue.empty() or not result_queue.empty():
+                    result_queue.get()
+                    progress_bar.update(1)
                 pool.join()

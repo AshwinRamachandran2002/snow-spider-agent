@@ -1,7 +1,14 @@
 # spider2 snow subset by self-refine prompting
 
 ## Set up
-Put `snowflake_credential.json` in this folder.
+Put `snowflake_credential.json` in folder `snow-spider-agent/methods/spider-self-refine`.
+
+Run:
+```
+conda create -n sql python=3.10 -y
+conda activate sql
+pip install -r requirements.txt
+```
 
 Set up folders: 
 ```
