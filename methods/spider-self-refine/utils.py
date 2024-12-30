@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import snowflake.connector
 import json
+import logging
 
 def extract_all_blocks(main_content, code_format):
     sql_blocks = []
@@ -60,25 +61,24 @@ def execute_sql_snow(sql_query, save_path=None, max_len=10000):
 
                         # Check if the result is empty
                         if df.empty:
-                            print("No data found for the specified query.")
+                            # print("No data found for the specified query.")
                             return "No data found for the specified query.\n"
                         else:
                             # Save or print the results based on the is_save flag
                             if save_path:
                                 df.to_csv(f"{save_path}", index=False)
-                                print(f"Results saved to {save_path}")
+                                # print(f"Results saved to {save_path}")
                                 return 0
                             else:
-                                # print(df)
                                 return hard_cut(df.to_csv(), max_len)
                     except Exception as e:
-                        print("Error occurred: ", str(e))
+                        # print("Error occurred: ", str(e))
                         return e
             except Exception as e:
-                print("Error occurred: ", str(e))
+                # print("Error occurred: ", str(e))
                 return e       
     except Exception as e:
-        print("Error occurred: ", str(e))
+        # print("Error occurred: ", str(e))
         return e  
     
 def split_cte(with_block):
@@ -146,3 +146,13 @@ def get_longest(sql_list):
     sql_list_len = [len(i) for i in sql_list]
     sql_list_len_index = sql_list_len.index(max(sql_list_len))
     return sql_list[sql_list_len_index]
+
+def initialize_logger(log_path):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    file_handler = logging.FileHandler(log_path, mode='w')
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    file_handler.setFormatter(formatter)
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+    return logger
