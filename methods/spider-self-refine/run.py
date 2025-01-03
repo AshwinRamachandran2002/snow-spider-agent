@@ -5,9 +5,7 @@ from tqdm import tqdm
 import logging
 import argparse
 import glob
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from openai import AzureOpenAI
-from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 import numpy as np
@@ -40,6 +38,7 @@ def main(args):
         chat_session = GPTChat(args.azure, args.model)
         chat_session4o = GPTChat(args.azure, args.understanding_model)
     else:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
         model = AutoModelForCausalLM.from_pretrained(
             args.model,
             torch_dtype="auto",
