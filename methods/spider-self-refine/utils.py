@@ -70,7 +70,7 @@ def execute_sql_snow(sql_query, save_path=None, max_len=10000):
                                 # print(f"Results saved to {save_path}")
                                 return 0
                             else:
-                                return hard_cut(df.to_csv(), max_len)
+                                return hard_cut(df.to_csv(index=False), max_len)
                     except Exception as e:
                         # print("Error occurred: ", str(e))
                         return e

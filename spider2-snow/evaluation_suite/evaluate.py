@@ -3,13 +3,13 @@ import json
 import re
 import pandas as pd
 import math
-import duckdb
+# import duckdb
 from typing import List, Union
 import os
 import os.path as osp
 import pandas as pd
 import argparse
-from google.cloud import bigquery
+# from google.cloud import bigquery
 import shutil
 import sqlite3
 from tqdm import tqdm

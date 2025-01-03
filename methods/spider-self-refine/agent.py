@@ -10,10 +10,20 @@ output: results for each sql
 '''
 def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=None, get_max=False):
     result_dic = {}
+    error_rec = []
     for sql in sqls:
+        check_again_flag = False
         if api == "snow":
             results = execute_sql_snow(sql, save_path, max_len=max_len)
-            if isinstance(results, str) and results != "No data found for the specified query.\n":
+            try:
+                if not results.startswith("Too long") and results != "No data found for the specified query.\n":
+                    df_csv = StringIO(results)
+                    df_csv = pd.read_csv(df_csv).fillna(0)
+                    if ((df_csv == 0) | (df_csv == "")).all().any():
+                        check_again_flag = True
+            except:
+                pass
+            if isinstance(results, str) and results != "No data found for the specified query.\n" and not check_again_flag:
                 # results = hard_cut(results, max_len)
                 result_dic[sql] = results
                 chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
@@ -28,12 +38,13 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
                 # print(f"Solving err: {results}")
                 max_iter = 3
                 simplify = False
-                while hasattr(results, 'msg') or results == "No data found for the specified query.\n":
+                while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
                     if max_iter == 0:
                         break
                     if results == "No data found for the specified query.\n":
                         simplify = True
-                    corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify)
+                    corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
+                    check_again_flag = False
                     if not corrected_sql:
                         results = "Empty. No data found for the specified query.\n"
                         break
@@ -43,10 +54,14 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
                     simplify = False
                 if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
                     # print("Corrected.\n")
+                    error_rec.append(1)
                     pass
                 else:
                     # print("Max iter, failed to correct.\n")
+                    error_rec.append(0)
                     results = results.msg if hasattr(results, 'msg') else results
+                if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
+                    return result_dic, chat_session
                 if not corrected_sql:
                     # print(f"Results: {results}")
                     # print("No corrected_sql, skip")
@@ -60,11 +75,13 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
         return max(result_dic.keys(), key=len)
     return result_dic, chat_session
                 
-def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False):
+def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
     # while hasattr(error, 'msg'):
     prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
     if simplify:
         prompt += "Since output is empty, please simplify some conditions of the past sql.\n"
+    if check_again_flag:
+        prompt += "Some columns are empty values. Please check it again.\n"
     response = chat_session.get_model_response(prompt, "sql")
     logger.info(chat_session.messages[-1]['content'])
     return response, chat_session
@@ -96,7 +113,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt = "This is an SQL task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential types and conditions, rather than real values.\n"
     format_prompt += "For bool type, just write bool, don't fill with true or false. e.g. Please display the drug id, drug type and withdrawal status. Format: ```csv\ndrug_id,drug_type,hasBeenWithdrawn\npremarin_id,known_drug_type,bool\nhumira_id,known_drug_type,bool```\n"
     format_prompt += prompt_class.get_prompt_decimal_places()
-    format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases, ensure the result is limited to just one row. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` And emphasize only one row.\n"
+    format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases (like highest, maximum, largest), ensure the result is limited to just one row. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` And emphasize only one row.\n"
     format_prompt += "e.g. Calculate the chi-square value of A, B, C. You should only focus on chi-square value. Format: ```csv\nchi-value\nv1:float\n e.g. Number of active and closed stations in 2012, 2013. Format: ```csv\nyear,number_active,number_closed\n2012,num:int,num:int\n2013,num:int,num:int```\n" # bq159\n" # ga010
     format_prompt += "e.g. Calculate the difference between A and B. You should only focus on difference value.\n"
     format_prompt += "e.g. Calculate proportion of A and B. You should only focus on proportion. Format: ```csv\nproportion\nnum:float```\n"
@@ -118,7 +135,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "You can also add a column related to the task. e.g. The month with the highest number. Format: ```csv\nmonth,month_num,number\nstr,int,int```\n"
     format_prompt += "Please output only one format. If there could be 2 tables as the complete answers, return the latter one as format. e.g. Identify the top five states by daily increases. Then, examine the state that ranks fourth overall and identify its top five counties. Format: ```csv\ntop_five_counties,count\ncounty1,count1\ncounty2,count2\ncounty3,count3\ncounty4,count4\ncounty5,count5```In this case, return results of the later one table.\n"
     format_prompt += "If there is any math relationship between columns, you should note it. e.g. Get a number added to the cart, without being purchased in the cart and count of actual purchases. Format: ```csv\nnumber added to the cart, without being purchased in the cart and count of actual purchases,num1,num2,num3``` Note: num1=num2+num3\n"
-    # format_prompt += "For blockchain timestamp cases, Format: ```csv\nblock_timestamp\n2021-05-12 01:40:17.000000 UTC```\n"
+    format_prompt += "If the value is nonnegative, emphasize this value. e.g. How much higher the average intrinsic value is. Format: ```csv\ndifference\nvalue:float > 0```\n"
     format_prompt += "Do not output any SQL queries.\n"
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
@@ -146,15 +163,16 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
         ans_pre += "For the keyword in the task that appears in two tables, explore two of them. e.g. Provide the total number of confirmed cases: explore table CONFIRMED_CASES and also SUMMARY which has column \"confirmed\"\n"
         # ans_pre += "If you can get information you want in one table, then there's no need to join another.\n"
         ans_pre += f"You can only use tables in {table_struct}"
+        ans_pre += prompt_all.get_prompt_knowledge()
         # logger.info(ans_pre)
         
         response_pre = chat_session4o.get_model_response(ans_pre, "sql")
-        response_pre_txt = chat_session4o.get_model_response_txt(ans_pre)
+        response_pre_txt = chat_session4o.messages[-1]['content'][:chat_session4o.messages[-1]['content'].find("```sql")]
         if len(response_pre) == 1:
             response_pre = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
         if len(response_pre) < 10:
             ans_pre = ''
-            LIMIT -= 3
+            LIMIT -= 5
             print("Few sqls, retry preparation.")
             continue
         results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, max_len=5000)
@@ -167,14 +185,14 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
         if sql_count < len(response_pre) // 2:
             print(f"sql_count: {sql_count}, len(response_pre): {len(response_pre)}. Inadequate preparation, retry preparation.\n")
             pre_info = ''
-            LIMIT -= 3
+            LIMIT -= 10
             continue
 
         if len(pre_info) < 1e5:
             break
         print("Too long, retry preparation.")
         pre_info = ''
-        LIMIT -= 3
+        LIMIT -= 5
     return pre_info, response_pre_txt, LIMIT, chat_session4o
 
 def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session):
@@ -193,12 +211,13 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     e += prompt_all.get_prompt_fuzzy_query()
     e += "Be careful one country may have different names in different columns in a database.\n"
     #  However, if the task is to match string regardless of upper and lowercase, use ILIKE.
-    e += "Don't be disturbed by extra description in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
+    if "and others" in task:
+        e += prompt_all.get_prompt_examples()
     e += "When handling TO_TIMESTAMP_NTZ conversions, use query like: SELECT CASE WHEN \"date\" >= 1e15 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000000) WHEN \"date\" >= 1e12 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000) ELSE TO_TIMESTAMP_NTZ(\"date\") END AS parsed_timestamp FROM my_table;\n"
     e += "Be careful of information in nested JSON columns. e.g.1. When it comes to active users, it refers to has engagement_time_msec parameter rather than directly counting users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec'\n"
     e += "e.g. When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
     e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
-    e += prompt_all.get_prompt_filter_null()
+    # e += prompt_all.get_prompt_filter_null()
     e += "When counting for rows of a column, ensure they are distinct: SELECT COUNT(DISTINCT col_name) FROM table;\n"
     # e += "When the condition is superlative, use ROW_NUMBER() to rank first and get rn=1.\n"
     e += prompt_all.get_prompt_decimal_places()
@@ -207,7 +226,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         e += prompt_all.get_prompt_quantile_duration()
     if "’" in task:
         e += prompt_all.get_prompt_convert_symbols()
-
+    if "> 0" in response_csv:
+        e += "You need to follow the format's positive and negative signs.\n"
     # self-refine
     error_rec = []
     while itercount < args.max_iter:
@@ -233,10 +253,11 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             #     e += get_cte_info(response)
             csv_buffer = StringIO(csv_data_str)
             df_csv = pd.read_csv(csv_buffer)
-            df_csv_copy = df_csv.copy()
+            df_csv_copy = df_csv.copy().fillna(0)
             for col in df_csv.select_dtypes(include=['float']):
                 df_csv_copy[col] = df_csv[col].round(2)
-            csv_data_str_round2 = df_csv_copy.to_string()
+            df_csv_copy_sorted = df_csv_copy.sort_values(by=df_csv_copy.columns[0])
+            csv_data_str_round2 = df_csv_copy_sorted.to_string()
             if get_values_from_table(csv_data_str_round2) not in results_values:
                 if not ((df_csv == 0) | (df_csv == "")).all().any():
                     # if len(format_csv.split('\n')) == len(csv_data_str.split('\n')):
@@ -283,8 +304,10 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += prompt_all.get_prompt_full_outer_join()
             if "ILIKE" in response or ("LIKE" in response and "%" in response):
                 e += prompt_all.get_prompt_fuzzy_query()
-            # if "NPM" in task and "packages" in task:
-            #     e += prompt_all.get_prompt_NPM_package()
+            if "and others" in task:
+                e += prompt_all.get_prompt_examples()
+            if any(keyword in task for keyword in ["start", "end", "time"]):
+                e += prompt_all.get_prompt_combine_time_range()
             logger.info(e)
         response = chat_session.get_model_response(e, "sql")
         logger.info(chat_session.messages[-1]['content'])

@@ -3,7 +3,7 @@ class Prompts:
     def __init__(self):
         pass
     def get_condition_onmit_tables(self):
-        return ["-- Include all", "-- Omit", "-- Continue", "-- Union all", "-- ...", "-- List all", "-- Replace this", "-- Each table"]
+        return ["-- Include all", "-- Omit", "-- Continue", "-- Union all", "-- ...", "-- List all", "-- Replace this", "-- Each table", "-- Add other"]
     def get_prompt_list_all_tables(self, table_struct):
         return f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT \"col1\", \"col2\" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use {self.get_condition_onmit_tables()} to omit any table. Table names here: {table_struct}\n"
     def get_prompt_quantile_duration(self):
@@ -34,3 +34,9 @@ class Prompts:
         return "If the column is not the main part of the answer, there's no need to filter NULL. e.g. Get the name, the trip ID, the ride duration, the start time, the starting station, and the gender of the rider. In this case, no need to filter NULL for the gender of the rider.\n"
     def get_prompt_name(self):
         return "For tasks asking fullname or name, you may combine first name and last name into one column called name.\n"
+    def get_prompt_knowledge(self):
+        return "Your knowledge is based on information in tables. Don't use your own knowledge.\n"
+    def get_prompt_examples(self):
+        return "Don't be disturbed by extra description in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
+    def get_prompt_combine_time_range(self):
+        return "If the task involves a time range and certain rows can be merged into a single continuous time range, perform the combination. e.g. Merge 00:00:00 - 00:00:20 and 00:00:20 - 00:00:40 into 00:00:00 - 00:00:40."

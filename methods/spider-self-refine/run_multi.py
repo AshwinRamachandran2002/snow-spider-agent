@@ -126,7 +126,7 @@ if __name__ == '__main__':
     parser.add_argument('--understanding_model', type=str, default="gpt-4o")
     parser.add_argument('--overwrite_results', action="store_true")
     parser.add_argument('--azure', action="store_true")
-    parser.add_argument('--max_iter', type=int, default=8)
+    parser.add_argument('--max_iter', type=int, default=10)
     parser.add_argument('--save_all_results', action="store_true")
     parser.add_argument('--use_CoT', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
