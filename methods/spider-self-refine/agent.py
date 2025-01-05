@@ -113,7 +113,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt = "This is an SQL task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential types and conditions, rather than real values.\n"
     format_prompt += "For bool type, just write bool, don't fill with true or false. e.g. Please display the drug id, drug type and withdrawal status. Format: ```csv\ndrug_id,drug_type,hasBeenWithdrawn\npremarin_id,known_drug_type,bool\nhumira_id,known_drug_type,bool```\n"
     format_prompt += prompt_class.get_prompt_decimal_places()
-    format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases (like highest, maximum, largest), ensure the result is limited to just one row. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` And emphasize only one row.\n"
+    format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases (like highest, maximum, largest, lowest, average total), ensure the result is limited to just one row. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nxx:int,name:str``` And emphasize only one row.\n"
     format_prompt += "e.g. Calculate the chi-square value of A, B, C. You should only focus on chi-square value. Format: ```csv\nchi-value\nv1:float\n e.g. Number of active and closed stations in 2012, 2013. Format: ```csv\nyear,number_active,number_closed\n2012,num:int,num:int\n2013,num:int,num:int```\n" # bq159\n" # ga010
     format_prompt += "e.g. Calculate the difference between A and B. You should only focus on difference value.\n"
     format_prompt += "e.g. Calculate proportion of A and B. You should only focus on proportion. Format: ```csv\nproportion\nnum:float```\n"
@@ -135,7 +135,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "You can also add a column related to the task. e.g. The month with the highest number. Format: ```csv\nmonth,month_num,number\nstr,int,int```\n"
     format_prompt += "Please output only one format. If there could be 2 tables as the complete answers, return the latter one as format. e.g. Identify the top five states by daily increases. Then, examine the state that ranks fourth overall and identify its top five counties. Format: ```csv\ntop_five_counties,count\ncounty1,count1\ncounty2,count2\ncounty3,count3\ncounty4,count4\ncounty5,count5```In this case, return results of the later one table.\n"
     format_prompt += "If there is any math relationship between columns, you should note it. e.g. Get a number added to the cart, without being purchased in the cart and count of actual purchases. Format: ```csv\nnumber added to the cart, without being purchased in the cart and count of actual purchases,num1,num2,num3``` Note: num1=num2+num3\n"
-    format_prompt += "If the value is nonnegative, emphasize this value. e.g. How much higher the average intrinsic value is. Format: ```csv\ndifference\nvalue:float > 0```\n"
+    format_prompt += "If the value is nonnegative, emphasize this value. e.g. How much higher the average intrinsic value is. Format: ```csv\ndifference\nvalue:float > 0```\n e.g. What is the different between A and B. The different should be nonnegative.\n"
     format_prompt += "Do not output any SQL queries.\n"
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
@@ -246,7 +246,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             if "first" in csv_data_str.lower() and "name" in csv_data_str.lower():
                 e += prompt_all.get_prompt_name()
             if '"""' in csv_data_str:
-                e += 'Please remove """ in results.\n'
+                e += 'Please remove """ in results. Use CAST: CAST(column_name AS STRING).\n'
             # e += "Remember the task is :" + task
             
             # if response.startswith("WITH"):
@@ -264,7 +264,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                         results_values.append(get_values_from_table(csv_data_str_round2))
                         results_tables.append(csv_data_str)
                 else:
-                    e += "Some columns are empty results. Please correct it.\n"
+                    empty_columns = df_csv.columns[((df_csv == 0) | (df_csv == "")).all()].to_list()
+                    e += f"Empty results in Column {empty_columns}. Please correct them.\n"
             else:
                 with open(complete_save_path_sql, "w") as f:
                     f.write(response)
@@ -308,6 +309,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += prompt_all.get_prompt_examples()
             if any(keyword in task for keyword in ["start", "end", "time"]):
                 e += prompt_all.get_prompt_combine_time_range()
+            if "The percentage should be shown with %" in task:
+                e += prompt_all.get_prompt_percentage_shown()
             logger.info(e)
         response = chat_session.get_model_response(e, "sql")
         logger.info(chat_session.messages[-1]['content'])

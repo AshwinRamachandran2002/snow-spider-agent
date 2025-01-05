@@ -40,3 +40,5 @@ class Prompts:
         return "Don't be disturbed by extra description in the task. e.g. When searching tags about Android development, example tags such as 'android-layout', 'android-activity', 'android-intent', and others. In this case, the condition of string matching should be `\"tags\" ILIKE %android%` rather than matching examples.\n"
     def get_prompt_combine_time_range(self):
         return "If the task involves a time range and certain rows can be merged into a single continuous time range, perform the combination. e.g. Merge 00:00:00 - 00:00:20 and 00:00:20 - 00:00:40 into 00:00:00 - 00:00:40."
+    def get_prompt_percentage_shown(self):
+        return "If the task states that 'The percentage should be shown with %', please add '%' in the answer.\n"
