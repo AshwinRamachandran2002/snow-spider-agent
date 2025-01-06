@@ -38,6 +38,7 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
                 # print(f"Solving err: {results}")
                 max_iter = 3
                 simplify = False
+                corrected_sql = None
                 while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
                     if max_iter == 0:
                         break
