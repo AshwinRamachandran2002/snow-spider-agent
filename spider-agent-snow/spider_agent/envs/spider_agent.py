@@ -18,6 +18,7 @@ from spider_agent.agent.actions import Action
 from spider_agent.agent.actions import Bash
 from spider_agent.agent.actions import CreateFile
 from spider_agent.agent.actions import EditFile
+from spider_agent.agent.actions import ExecutePython
 from spider_agent.agent.actions import SnowflakeExecuteSQL
 from spider_agent.agent.actions import Terminate
 from spider_agent.controllers.python import PythonController
@@ -39,7 +40,7 @@ START_UP_DELAY = 2  # start up delay for docker container
 DEFAULT_TIME_OUT = 200  # default waiting time for each action
 MAX_OBS_LENGTH = 40000
 EMPTY_DATA_PATH = "spider_agent/data/empty"  # an empty data directory
-DEFAULT_IMAGE_DIR = "spider_agent/images"  # default directory to store docker images
+DEFAULT_IMAGE_DIR = "./spider-agent-snow/spider_agent/images"  # default directory to store docker images, relative to the repo root
 DEFAULT_WORK_DIR = "/workspace"  # default working directory in the container
 DEFAULT_MNT_DIR = "spider_agent/mnt"  # default directory to copy and mount data path, also the output directory
 TASK_FINISHED = "task_finished"  # infos key
@@ -177,12 +178,15 @@ class Spider_Agent_Env(gym.Env):
             )
         except ImageNotFound:
             dockerfile_path = os.path.join(DEFAULT_IMAGE_DIR, self.image_name)
-            if os.path.exists(dockerfile_path):
+            if os.path.exists(os.path.join("../", dockerfile_path)):
                 logger.info(
                     f"Image {self.image_name} not found, try to build from dockerfile {dockerfile_path} ..."
                 )
                 image = client.images.build(
-                    path=dockerfile_path, tag=self.image_name, rm=True
+                    path="../",
+                    dockerfile=f"{dockerfile_path}/Dockerfile",
+                    tag=self.image_name,
+                    rm=True,
                 )[0]
             else:
                 logger.info(
@@ -263,6 +267,8 @@ class Spider_Agent_Env(gym.Env):
                     observation = self.create_file_action(action)
                 elif isinstance(action, EditFile):
                     observation = self.edit_file_action(action)
+                elif isinstance(action, ExecutePython):
+                    observation = self.execute_python_action(action)
                 elif isinstance(action, Terminate):
                     observation = "Terminate"
                     done = True
@@ -314,6 +320,14 @@ class Spider_Agent_Env(gym.Env):
                 obs = f"File {action.filepath} edited successfully."
             else:
                 obs = f"Falied to validate file {action.filepath}, error: {error}"
+        return obs
+
+    def execute_python_action(self, action: Action):
+        """Execute action in python"""
+        obs = self.controller.execute_ipython_code(action.code)
+        if obs is None or obs.strip() == "":
+            obs = "Python command executed successfully. No output."
+
         return obs
 
     def execute_tmp_action(self, action: Action):

@@ -86,6 +86,20 @@ class PythonController:
         command = f'echo """{code}""" > {temp_file_path} && python3 {temp_file_path}'
         return self.execute_command(command)
 
+    def execute_ipython_code(self, action: str) -> None:
+        try:
+            logger.info(f"IPython run: {action}")
+            observation = self._execute_ipython_code(action)
+        except Exception as err:
+            observation = f"Error executing action: {err}"
+        return observation
+
+    def _execute_ipython_code(self, code: str) -> None:
+        tmp_file_path = "/tmp/temp_script.py"
+        code = code.replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
+        command = f'echo """{code}""" > {tmp_file_path} && aipy < {tmp_file_path}'
+        return self.execute_command(command)
+
     def execute_command(self, command: str):
         cmd = ["bash", "-c", command]
         exit_code, output = self.container.exec_run(cmd, workdir=self.work_dir)

@@ -18,7 +18,12 @@ RUN apt-get update && apt-get install -y \
 # Upgrade pip and install Python packages
 RUN pip install --upgrade pip
 
+COPY agent-ipython /usr/local/agent-ipython
+RUN pip install /usr/local/agent-ipython
+
 RUN pip install google-cloud-bigquery pyarrow db-dtypes pandas matplotlib scikit-learn seaborn numpy scipy statsmodels xgboost plotly tabulate snowflake-connector-python duckdb openpyxl
 RUN pip install dbt-duckdb
+RUN pip install "snowflake-snowpark-python[pandas]"
 # Set the default command to run when starting the container
-CMD ["/bin/bash"]
+
+CMD aipy-server & tail -f /dev/null
