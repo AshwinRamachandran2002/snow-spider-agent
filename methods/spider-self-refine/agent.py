@@ -119,7 +119,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "e.g. Calculate the difference between A and B. You should only focus on difference value.\n"
     format_prompt += "e.g. Calculate proportion of A and B. You should only focus on proportion. Format: ```csv\nproportion\nnum:float```\n"
     format_prompt += "For coordinate-related cases, use the ST_POINT() function. e.g. Including its travel coordinates and the cumulative travel distance at each point. Format: ```csv\ngeom,cumulative_distance\nPOINT(longitude latitude),distance```\n"
-    format_prompt += "For task asking percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Otherwise, for portion, proportion, answer a float number < 1.\n"
+    format_prompt += "For task asking percentage values, omit the '%' symbol and retain only the numeric format as xx.xx. Otherwise, for portion, proportion, rate, answer a float number < 1.\n"
     format_prompt += "Ensure that no columns are omitted in the response format by assigning each attribute to its own column and representing each record in a separate row. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nxx.xx,xx.xx``` rather than ```csv\nMetric,rate\nrate1,xx.xx\nrate2,xx.xx```\n" # bq112
     format_prompt += "Don't lose any column: e.g. Top 5 states and counties counts and rank. Format: ```csv\nstate_name,state_num,state_rank,county_name,county_num,county_rank\nstr,int,int,str,int,int```\n"
     # format_prompt += "Don't output format like: ```csv\nSection,name,appearance_count,rank\nState Ranking,State1,num1,1\nCounty Ranking for State4,County1,num1,1```\n Because state and county can be different columns\n"
@@ -129,7 +129,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "For distance task, no need to convert from meters to miles unless requested.\n"
     format_prompt += prompt_class.get_prompt_name()
     format_prompt += "For other cases string should be separate, return both 2 strings. e.g. Ask team name: ```csv\nmarket,name\nstr1,str2```\n When asked for income, don't concatenate income with '$', just output number." # local056
-    format_prompt += "If there are some records specified in the task, you should follow and capitalize them. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3```\n" # local008
+    format_prompt += "If there are some records specified in the task, you should follow and capitalize them. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3```\n Or you may provide the potential values. e.g. Format: ```csv\nSize,number\nsize:str,num:int``` Potential values for the size: Small, Medium, Large.\n" # local008
     format_prompt += "For month cases, form format in both month_num and month: ```csv\nMonth_num,Month\n01,Jan\n02,Feb```.\n" # local028
     format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. 60 minutes trip durations 10 quantiles: Format: ```csv\ntime_range,distance\n00m to 10m,dis1\n10m to 20m,dis2\n...\n50m to 60m,dis3``` Start from 0.\n"
     format_prompt += "If you meet with an ambiguous name in the task that may match 2 columns, feel free to add 2 columns of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code```\n"
@@ -253,7 +253,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             # if response.startswith("WITH"):
             #     e += get_cte_info(response)
             csv_buffer = StringIO(csv_data_str)
-            df_csv = pd.read_csv(csv_buffer).fillna(0)
+            df_csv = pd.read_csv(csv_buffer).fillna("")
             df_csv_copy = df_csv.copy()
             for col in df_csv.select_dtypes(include=['float']):
                 df_csv_copy[col] = df_csv[col].round(2)
