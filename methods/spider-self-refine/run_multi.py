@@ -95,7 +95,7 @@ def process_folder(sql_data):
 
     # preparation
     LIMIT = 10
-    prompt = table_info + "\n" + "Task: " + task + "\n"
+    prompt = "Task: " + task + "\n"
     pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
         # chat_session4o.init_messages()
     print(f"{sql_data}: len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")

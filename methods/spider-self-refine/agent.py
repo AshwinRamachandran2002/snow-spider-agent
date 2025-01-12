@@ -11,7 +11,9 @@ output: results for each sql
 def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=None, get_max=False):
     result_dic = {}
     error_rec = []
-    for sql in sqls:
+    while sqls:
+        sql = sqls[0]
+        sqls = sqls[1:]
         check_again_flag = False
         if api == "snow":
             results = execute_sql_snow(sql, save_path, max_len=max_len)
@@ -29,11 +31,10 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
                 chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
                 logger.info(chat_session.messages[-1]['content'])
             # multiple queries
-            # elif hasattr(results, 'msg') and "0A000" in results.msg:
-            #     queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
-                
-            #     for q in queries:
-            #         result_dic[q] = execute_sql(q, chat_session, max_len=max_len)
+            elif hasattr(results, 'msg') and "0A000" in results.msg:
+                queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
+                sqls += queries
+                continue
             else:
                 # print(f"Solving err: {results}")
                 max_iter = 3
@@ -75,7 +76,76 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
     if get_max:
         return max(result_dic.keys(), key=len)
     return result_dic, chat_session
-                
+
+def execute_sql_step(sqls, chat_session, logger, api="snow", max_len=0, save_path=None, get_max=False):
+    result_dic = {}
+    error_rec = []
+    while sqls:
+        sql = sqls[0]
+        sqls = sqls[1:]
+        check_again_flag = False
+        if api == "snow":
+            results = execute_sql_snow(sql, save_path, max_len=max_len)
+            try:
+                if not results.startswith("Too long") and results != "No data found for the specified query.\n":
+                    df_csv = StringIO(results)
+                    df_csv = pd.read_csv(df_csv).fillna(0)
+                    if ((df_csv == 0) | (df_csv == "")).all().any():
+                        check_again_flag = True
+            except:
+                pass
+            if isinstance(results, str) and results != "No data found for the specified query.\n" and not check_again_flag:
+                # results = hard_cut(results, max_len)
+                result_dic[sql] = results
+                chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
+                logger.info(chat_session.messages[-1]['content'])
+            # multiple queries
+            elif hasattr(results, 'msg') and "0A000" in results.msg:
+                queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
+                sqls += queries
+                continue
+            else:
+                # print(f"Solving err: {results}")
+                max_iter = 3
+                simplify = False
+                corrected_sql = None
+                while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
+                    if max_iter == 0:
+                        break
+                    if results == "No data found for the specified query.\n":
+                        simplify = True
+                    corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
+                    check_again_flag = False
+                    if not corrected_sql:
+                        results = "Empty. No data found for the specified query.\n"
+                        break
+                    corrected_sql = get_longest(corrected_sql)
+                    results = execute_sql_snow(corrected_sql, max_len=max_len)
+                    max_iter -= 1
+                    simplify = False
+                if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
+                    # print("Corrected.\n")
+                    error_rec.append(1)
+                    pass
+                else:
+                    # print("Max iter, failed to correct.\n")
+                    error_rec.append(0)
+                    results = results.msg if hasattr(results, 'msg') else results
+                if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
+                    return result_dic, chat_session
+                if not corrected_sql:
+                    # print(f"Results: {results}")
+                    # print("No corrected_sql, skip")
+                    continue
+                result_dic[corrected_sql] = results
+                chat_session.messages.append({"role": "user", "content": f"SQL:\n{corrected_sql}\nResults:\n{results}"})
+                logger.info(chat_session.messages[-1]['content'])
+        else:
+            raise NotImplementedError("Support Snowflake API only.")
+    if get_max:
+        return max(result_dic.keys(), key=len)
+    return result_dic, chat_session
+
 def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
     # while hasattr(error, 'msg'):
     prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
@@ -86,29 +156,6 @@ def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, ch
     response = chat_session.get_model_response(prompt, "sql")
     logger.info(chat_session.messages[-1]['content'])
     return response, chat_session
-
-# def self_check(sql, table, chat_session, format_restrict=None):
-#     iter_count = 0
-#     max_len = 1000
-
-#     while iter_count > 5:
-#         prompt = "Query:\n" + sql + "Result:\n" + table
-#         if format_restrict:
-#             prompt += "Format:\n" + format_restrict
-#         table = hard_cut(table, max_len)
-#         prompt += "Do you think the result is: A. Reasonable or B. Unreasonable? Please respond with either A or B.\n"
-#         response_look_results = chat_session.get_model_response(prompt)[0]
-#         if format_restrict:
-#             return response_look_results
-#         if response_look_results == 'A':
-#             return sql, table, chat_session
-#         elif response_look_results == 'B':
-#             prompt += "Your answer is B. Please write a sql query in ```sql``` format to refine it.\n"
-#             response_refine_sql = chat_session.get_model_response(prompt, "sql")[0]
-#             response_refine_results = execute_sql(response_refine_sql, api="snow", max_len=max_len, get_max=True)
-#             sql, table, chat_session = self_correct(sql, response_refine_results, chat_session, max_len=max_len)
-#         iter_count += 1
-#     return sql, table, chat_session
 
 def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt = "This is an SQL task. Please provide the simplest possible answer in ```csv``` format like a table and include a brief explanation. Fill the table according to the task description rather than the actual database. For values that cannot be inferred from the task description, use metanames with potential types and conditions, rather than real values.\n"
@@ -141,13 +188,13 @@ def format_answer(prompt_class, table_info, task, chat_session):
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
 
-def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o):
+def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, pre_step):
     pre_info = ''
     ans_pre = prompt
     ans_pre = ''
     while LIMIT > 0:
 
-        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 simple, short, non-nested SQL queries like ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM PROJECT.DATABASE.TABLE WHERE ... ``` (Adjust \"PROJECT\", \"DATABASE\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
+        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 simple, short, non-nested SQL queries like ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust \"DATABASE\", \"SCHEMA\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns. Each query should be independent, without using `WITH`. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM   PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
         # ans_pre += "e.g. Retrieve all products whose product_name contains the word \"Professor’s book\". Simple non-nested sql queries: SELECT \"product_id\", \"product_name\" FROM products WHERE product_name LIKE '%Professor%' OR '%Book%'; (For string matching cases, firstly look if the substring exists)"
         # ensure all characters are converted to standard symbols (e.g., replace ’ with Escape Character \', replace ” with Escape Character \"'). And also u
         ans_pre += "For nested columns like event_params, when you don't know the structure of it, first watch the whole column: SELECT f.value FROM table, LATERAL FLATTEN(input => t.\"event_params\") f;\n"
@@ -168,7 +215,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
         # logger.info(ans_pre)
         
         response_pre = chat_session4o.get_model_response(ans_pre, "sql")
-        response_pre_txt = chat_session4o.messages[-1]['content'][:chat_session4o.messages[-1]['content'].find("```sql")]
+        response_pre_txt = chat_session4o.messages[-1]['content']
         if len(response_pre) == 1:
             response_pre = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
         if len(response_pre) < 10:
@@ -176,7 +223,10 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
             LIMIT -= 5
             print("Few sqls, retry preparation.")
             continue
-        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, max_len=5000)
+        if pre_step:
+            results_pre_dic, chat_session4o = execute_sql_step(response_pre, chat_session4o, logger, max_len=5000)
+        else:
+            results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, max_len=5000)
         sql_count = 0
         for key, value in results_pre_dic.items():
             pre_info += "Query:\n" + key + "\nAnswer:\n" + value
@@ -203,7 +253,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     results_tables = []
     complete_save_path = search_directory + "/" + save_path
     complete_save_path_sql = search_directory + "/" + sql_save_path
-    e += "Task: " + task + "\n"+'\nPlease answer only one complete SQL in snowflake dialect in ```sql``` format.\nUsage example: SELECT S."Column_Name" FROM {Project Name}.{Database Name}.{Table_name} (ensure all column names are enclosed in double quotations)\n'
+    e += "Task: " + task + "\n"+'\nPlease answer only one complete SQL in snowflake dialect in ```sql``` format.\nUsage example: SELECT S."Column_Name" FROM {Database Name}.{Schema Name}.{Table_name} (ensure all column names are enclosed in double quotations)\n'
     e += f"Follow the answer format like: {response_csv}.\n"
     e += "Here are some useful tips for answering:\n"
     e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make a point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"

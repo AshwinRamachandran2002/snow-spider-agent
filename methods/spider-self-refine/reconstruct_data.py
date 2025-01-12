@@ -70,8 +70,8 @@ def compress_all(args):
                 project_name_path = os.path.join(entry1_path, project_name)
                 if os.path.isdir(os.path.join(project_name_path)):
                     for db_name in os.listdir(project_name_path):
-                        prompts += f"Project Name: {project_name}\n"
-                        prompts += f"Database Name: {db_name}\n"
+                        prompts += f"Database Name: {project_name}\n"
+                        prompts += f"Schema Name: {db_name}\n"
                         if project_name not in table_dict:
                             table_dict[project_name] = {db_name: []}
                         else:
@@ -113,7 +113,7 @@ def compress_all(args):
         
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
-                prompts += "In conclusion, the table inforation is ({project name: {database name: {table name}}}): \n" + str(table_dict) + "\n"
+                prompts += "In conclusion, the table inforation is ({database name: {schema name: {table name}}}): \n" + str(table_dict) + "\n"
                 f.writelines(prompts)
         
 
@@ -132,8 +132,8 @@ def compress_ddl(args):
                 project_name_path = os.path.join(entry1_path, project_name)
                 if os.path.isdir(os.path.join(project_name_path)):
                     for db_name in os.listdir(project_name_path):
-                        prompts += f"Project Name: {project_name}\n"
-                        prompts += f"Database Name: {db_name}\n"
+                        prompts += f"Database Name: {project_name}\n"
+                        prompts += f"Schema Name: {db_name}\n"
                         if project_name not in table_dict:
                             table_dict[project_name] = {db_name: []}
                         else:
@@ -175,7 +175,7 @@ def compress_ddl(args):
         
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
-                prompts += "The table structure information is ({project name: {database name: {table name}}}): \n" + str(table_dict) + "\n"
+                prompts += "The table structure information is ({database name: {schema name: {table name}}}): \n" + str(table_dict) + "\n"
                 f.writelines(prompts)
 
 if __name__ == '__main__':

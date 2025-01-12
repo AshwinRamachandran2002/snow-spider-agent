@@ -103,8 +103,8 @@ def main(args):
 
         # preparation
         LIMIT = 10
-        prompt = table_info + "\n" + "Task: " + task + "\n"
-        pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
+        prompt = "Task: " + task + "\n"
+        pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, args.pre_step)
             # chat_session4o.init_messages()
         print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
         print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
@@ -130,7 +130,7 @@ if __name__ == '__main__':
     parser.add_argument('--azure', action="store_true")
     parser.add_argument('--max_iter', type=int, default=10)
     parser.add_argument('--save_all_results', action="store_true")
-    parser.add_argument('--use_CoT', action="store_true")
+    parser.add_argument('--pre_step', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
     parser.add_argument('--rerun', action="store_true")
     args = parser.parse_args()

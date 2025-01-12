@@ -1,0 +1,179 @@
+import os
+import json
+from openai import OpenAI
+from tqdm import tqdm
+import logging
+import argparse
+import glob
+from openai import AzureOpenAI
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger
+from agent import execute_sql, self_correct, format_answer, preparation, self_refine
+import numpy as np
+import pandas as pd
+from io import StringIO
+from model import GPTChat, modelChat
+from prompt import Prompts
+import multiprocessing
+
+def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o):
+    
+    # search_directory = args.test_path +  '/' + sql_data
+    
+    if not os.path.exists(search_directory):
+        os.makedirs(search_directory)
+
+    # rerun for empty results
+    if args.rerun:
+        if os.path.exists(os.path.join(search_directory, save_path)):
+            return
+        else:
+            print("Rerun")
+    # if log.log exists, pass
+    elif not args.overwrite_results and os.path.exists(os.path.join(search_directory, log_path)):
+        return
+    # overwrite
+    self_files = glob.glob(os.path.join(search_directory, f'*{save_path}*'))
+    for self_file in self_files:
+        os.remove(self_file)
+
+    # log
+    log_file_path = os.path.join(search_directory, log_path)
+    logger = initialize_logger(log_file_path)
+
+    table_struct = table_info[table_info.find("({database name: {schema name: {table name}}}):"):]
+    # format
+    response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
+
+    # preparation
+    LIMIT = 10
+    prompt = "Task: " + task + "\n"
+    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, args.pre_step)
+        # chat_session4o.init_messages()
+    print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
+    print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
+    if LIMIT <= 0:
+        print("Inadequate preparation, skip")
+        return
+    
+
+    # answer
+    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session)
+
+def main(args):
+
+    prompt_all = Prompts()
+
+    # read file
+    # json_path = search_file(search_directory, target_json)[0]
+
+    json_path = os.path.join(args.test_path, "spider2-snow.jsonl")
+    task_dict = {}
+    with open(json_path) as f:
+        for line in f:
+            line_js = json.loads(line)
+            task_dict[line_js['instance_id']] = line_js['instruction']
+
+    dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
+
+    if "gpt" in args.model or "o1" in args.model:
+        chat_session = GPTChat(args.azure, args.model)
+        chat_session4o = GPTChat(args.azure, args.understanding_model)
+    else:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype="auto",
+            device_map="auto"
+        )
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        chat_session = modelChat(model, tokenizer)
+
+
+    for sql_data in tqdm(dictionaries):
+        chat_session.init_messages()
+        chat_session4o.init_messages()
+
+        
+        table_info_txt = ["prompts.txt"]
+        target_json = "result.json"
+        
+        table_info = ''
+        for txt in table_info_txt:
+            txt_path = search_file(os.path.join(args.test_path, sql_data), txt)
+            for path in txt_path:
+                with open(path) as f:
+                    table_info += f.read()
+        task = task_dict[sql_data]
+        search_directory = os.path.join(args.output_path, sql_data)
+
+        print(sql_data)
+
+        num_processes = args.num_processes
+
+        sql_paths = {}
+        processes = []
+        save_path = "result.csv"
+        sql_save_path = "result.sql"
+        log_path = "log.log"
+
+        complete_save_path = os.path.join(search_directory, save_path)
+        complete_sql_save_path = os.path.join(search_directory, sql_save_path)
+
+        for i in range(num_processes):
+
+            save_pathi = str(i) + save_path
+            log_pathi = str(i) + log_path
+            sql_save_pathi = str(i) + sql_save_path
+            sql_paths[sql_save_pathi] = save_pathi
+            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o))
+            processes.append(process)
+            process.start()
+
+        for process in processes:
+            process.join()
+
+        prompt = f"The table info is: {table_info}\nThe task is: {task}. Here are some candidate sqls and answers: \n"
+        count = 0
+        for sql, csv in sql_paths.items():
+            sql_path = os.path.join(search_directory, sql)
+            csv_path = os.path.join(search_directory, csv)
+            if os.path.exists(sql_path):
+                sql_path_exist = sql_path
+                csv_path_exist = csv_path
+                count += 1
+                prompt += sql + "\n"
+                with open(sql_path) as f:
+                    prompt += f.read()
+                prompt += csv + "\n"
+                with open(csv_path) as f:
+                    prompt += hard_cut(f.read())
+
+        if count == 0:
+            print("Empty\n")
+            continue
+        elif count == 1:
+            os.rename(sql_path_exist, complete_sql_save_path)
+            os.rename(csv_path_exist, complete_save_path)
+        else:
+            prompt += "Compare the SQL and results of each answer and choose one as the correct answer. Output SQL only, in ```sql``` format.\n"
+            selected_sql = chat_session.get_model_response(prompt, "sql")
+            if execute_sql_snow(selected_sql[0], complete_save_path) == 0:
+                with open(complete_sql_save_path, "w") as f:
+                    f.write(selected_sql)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test_path', type=str, default="examples")
+    parser.add_argument('--output_path', type=str, default="output/gpt-4o-test1-log")
+    parser.add_argument('--model', type=str, default="gpt-4o")
+    parser.add_argument('--understanding_model', type=str, default="gpt-4o")
+    parser.add_argument('--overwrite_results', action="store_true")
+    parser.add_argument('--azure', action="store_true")
+    parser.add_argument('--max_iter', type=int, default=10)
+    parser.add_argument('--num_processes', type=int, default=3)
+    parser.add_argument('--save_all_results', action="store_true")
+    parser.add_argument('--pre_step', action="store_true")
+    parser.add_argument('--model_vote', action="store_true")
+    parser.add_argument('--rerun', action="store_true")
+    args = parser.parse_args()
+    main(args)
