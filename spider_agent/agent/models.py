@@ -11,7 +11,7 @@ from openai import AzureOpenAI
 from typing import Dict, List, Optional, Tuple, Any, TypedDict
 import dashscope
 from groq import Groq
-import google.generativeai as genai
+# import google.generativeai as genai
 import openai
 import requests
 import tiktoken
@@ -31,7 +31,7 @@ def call_llm(payload):
         logger.info("Generating content with GPT model: %s", model)
         
 
-        for i in range(3):
+        for i in range(1):
             try:
                 response = requests.post(
                             "https://api.openai.com/v1/chat/completions",
@@ -88,7 +88,7 @@ def call_llm(payload):
         del payload["temperature"]
         del payload["top_p"]
 
-        for i in range(3):
+        for i in range(1):
             try:
                 response = requests.post(
                             "https://api.openai.com/v1/chat/completions",
@@ -100,8 +100,8 @@ def call_llm(payload):
                 return True, output_message
             except Exception as e:
                 logger.error("Failed to call LLM: " + str(e))
-                logger.error("Retrying ...")
-                time.sleep(10 * (2 ** (i + 1)))
+                # logger.error("Retrying ...")
+                # time.sleep(10 * (2 ** (i + 1)))
         return False, code_value
 
     elif model.startswith("azure"):
@@ -111,6 +111,22 @@ def call_llm(payload):
             azure_endpoint = os.environ['AZURE_ENDPOINT']
             )
         model_name = model.split("/")[-1]
+        
+            
+        o1_messages = []
+        messages = payload["messages"]
+
+        for i, message in enumerate(messages):
+            o1_message = {
+                "role": message["role"] if message["role"] != "system" else "user",
+                "content": ""
+            }
+            for part in message["content"]:
+                o1_message['content'] = part['text'] if part['type'] == "text" else ""
+                
+                o1_messages.append(o1_message)
+
+        payload["messages"] = o1_messages
         for i in range(3):
             try:
                 response = client.chat.completions.create(model=model_name,messages=payload['messages'], max_tokens=payload['max_tokens'], top_p=payload['top_p'], temperature=payload['temperature'], stop=stop)
