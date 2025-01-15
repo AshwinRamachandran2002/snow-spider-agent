@@ -6,7 +6,7 @@ import logging
 import argparse
 import glob
 from openai import AzureOpenAI
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger, extract_between, compare_pandas_table
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 import numpy as np
 import pandas as pd
@@ -18,9 +18,6 @@ import multiprocessing
 def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o):
     
     # search_directory = args.test_path +  '/' + sql_data
-    
-    if not os.path.exists(search_directory):
-        os.makedirs(search_directory)
 
     # rerun for empty results
     if args.rerun:
@@ -118,6 +115,12 @@ def main(args):
 
         complete_save_path = os.path.join(search_directory, save_path)
         complete_sql_save_path = os.path.join(search_directory, sql_save_path)
+        complete_vote_log_path = os.path.join(search_directory, "vote.log")
+
+        if not args.overwrite_results and os.path.exists(complete_save_path):
+            continue
+        if not os.path.exists(search_directory):
+            os.makedirs(search_directory)
 
         for i in range(num_processes):
 
@@ -132,11 +135,33 @@ def main(args):
         for process in processes:
             process.join()
 
-        prompt = f"The table info is: {table_info}\nThe task is: {task}. Here are some candidate sqls and answers: \n"
+        if not args.overwrite_results and os.path.exists(complete_save_path):
+            continue
+
+        pre_info = 'Based on some observations on the database:\n'
+        prompt = f"The task is: {task}. Here are some candidate sqls and answers: \n"
         count = 0
+
+        # filter answer
+        result = {}
+        all_values = []
+        for v in sql_paths.values():
+            if os.path.exists(os.path.join(search_directory, v)):
+                all_values.append(os.path.join(search_directory, v))
+        for key, value in sql_paths.items():
+            complete_value = os.path.join(search_directory, value)
+            if os.path.exists(complete_value):
+                if any(v != complete_value and compare_pandas_table(pd.read_csv(v), pd.read_csv(complete_value)) for v in all_values):
+                    result[key] = value
+        if result:
+            sql_paths = result
+
+
         for sql, csv in sql_paths.items():
             sql_path = os.path.join(search_directory, sql)
             csv_path = os.path.join(search_directory, csv)
+            logfile_path = os.path.join(search_directory, csv[0] + log_path)
+            pre_info += extract_between(logfile_path, "Begin Exploring Related Columns\n", "End Exploring Related Columns\n")[0]
             if os.path.exists(sql_path):
                 sql_path_exist = sql_path
                 csv_path_exist = csv_path
@@ -146,7 +171,7 @@ def main(args):
                     prompt += f.read()
                 prompt += csv + "\n"
                 with open(csv_path) as f:
-                    prompt += hard_cut(f.read())
+                    prompt += hard_cut(f.read(), 5000)
 
         if count == 0:
             print("Empty\n")
@@ -155,11 +180,20 @@ def main(args):
             os.rename(sql_path_exist, complete_sql_save_path)
             os.rename(csv_path_exist, complete_save_path)
         else:
-            prompt += "Compare the SQL and results of each answer and choose one as the correct answer. Output SQL only, in ```sql``` format.\n"
-            selected_sql = chat_session.get_model_response(prompt, "sql")
-            if execute_sql_snow(selected_sql[0], complete_save_path) == 0:
+            compare_pandas_table
+            prompt += "Compare the SQL and results of each answer and choose one SQL as the correct answer and tell me the reason. Output the name of sql in ```plain\nxxx.sql``` format.\n"
+            prompt += "Ensure that float values are rounded to 4 decimal places.\n"
+            response = chat_session.get_model_response(hard_cut(pre_info, 150000) + prompt, "plain")
+            if not response:
+                continue
+            with open(os.path.join(search_directory, response[0])) as f:
+                selected_sql = f.read()
+            if execute_sql_snow(selected_sql, complete_save_path) == 0:
                 with open(complete_sql_save_path, "w") as f:
                     f.write(selected_sql)
+                with open(complete_vote_log_path, "w") as f:
+                    f.write(chat_session.messages[-1]['content'])
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

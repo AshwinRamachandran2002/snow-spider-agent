@@ -248,7 +248,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
 
 def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session):
     itercount = 0
-    e = table_info + response_pre_txt + pre_info
+    e = table_info + "Begin Exploring Related Columns\n" + response_pre_txt + pre_info + "End Exploring Related Columns\n"
     results_values = []
     results_tables = []
     complete_save_path = search_directory + "/" + save_path
