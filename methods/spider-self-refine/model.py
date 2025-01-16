@@ -3,7 +3,7 @@ from utils import extract_all_blocks
 import os
 
 class GPTChat:
-    def __init__(self, azure=False, model="gpt-4o") -> None:
+    def __init__(self, azure=False, model="gpt-4o", temperature=1) -> None:
         if model in ["gpt-4o", "o1-2024-12-17"] or not azure:
             self.client = OpenAI(
                 api_key=os.environ.get("OPENAI_API_KEY"),  # This is the default and can be omitted
@@ -17,13 +17,15 @@ class GPTChat:
 
         self.messages = []
         self.model = model
+        self.temperature = temperature
 
     def get_model_response(self, prompt, code_format):
         self.messages.append({"role": "user", "content": prompt})
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.messages
+                messages=self.messages,
+                temperature=self.temperature
             )
         except Exception as e:
             print(e)
@@ -43,7 +45,8 @@ class GPTChat:
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.messages
+                messages=self.messages,
+                temperature=self.temperature
             )
         except Exception as e:
             print(e)
