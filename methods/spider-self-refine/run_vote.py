@@ -188,7 +188,8 @@ def main(args):
             prompt += "Compare the SQL and results of each answer and choose one SQL as the correct answer and tell me the reason. Output the name of sql in ```plain\nxxx.sql``` format.\n"
             prompt += "Ensure that float values are rounded to 4 decimal places.\n"
             response = chat_session.get_model_response(hard_cut(pre_info, 150000) + prompt, "plain")
-            if not response:
+            if not response or not isinstance(response, list):
+                print(response)
                 continue
             with open(os.path.join(search_directory, response[0])) as f:
                 selected_sql = f.read()
