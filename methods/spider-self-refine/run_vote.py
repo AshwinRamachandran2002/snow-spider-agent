@@ -148,11 +148,12 @@ def main(args):
         for v in sql_paths.values():
             if os.path.exists(os.path.join(search_directory, v)):
                 all_values.append(os.path.join(search_directory, v))
-        for key, value in sql_paths.items():
-            complete_value = os.path.join(search_directory, value)
-            if os.path.exists(complete_value):
-                if any(v != complete_value and compare_pandas_table(pd.read_csv(v), pd.read_csv(complete_value)) for v in all_values):
-                    result[key] = value
+        if len(all_values) > 1:
+            for key, value in sql_paths.items():
+                complete_value = os.path.join(search_directory, value)
+                if os.path.exists(complete_value):
+                    if any(v != complete_value and compare_pandas_table(pd.read_csv(v), pd.read_csv(complete_value)) for v in all_values):
+                        result[key] = value
         if result:
             sql_paths = result
 
@@ -164,7 +165,7 @@ def main(args):
             try:
                 pre_info += extract_between(logfile_path, "Begin Exploring Related Columns\n", "End Exploring Related Columns\n")[0]
             except Exception as e:
-                print(e)
+                print([logfile_path, e])
             if os.path.exists(sql_path):
                 sql_path_exist = sql_path
                 csv_path_exist = csv_path
