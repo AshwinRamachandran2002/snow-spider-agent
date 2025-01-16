@@ -148,7 +148,7 @@ def execute_sql_step(sqls, chat_session, logger, api="snow", max_len=0, save_pat
 
 def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
     # while hasattr(error, 'msg'):
-    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
+    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
     if simplify:
         prompt += "Since output is empty, please simplify some conditions of the past sql.\n"
     if check_again_flag:
@@ -257,24 +257,24 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     e += f"Follow the answer format like: {response_csv}.\n"
     e += "Here are some useful tips for answering:\n"
     e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make a point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
-    e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
+    # e += "Please refrain from adding any conditions that are not explicitly specified in the task.\n" # bq398
     e += prompt_all.get_prompt_list_all_tables(table_struct)
     e += prompt_all.get_prompt_fuzzy_query()
-    e += "Be careful one country may have different names in different columns in a database.\n"
+    # e += "Be careful one country may have different names in different columns in a database.\n"
     #  However, if the task is to match string regardless of upper and lowercase, use ILIKE.
-    if "and others" in task:
-        e += prompt_all.get_prompt_examples()
+    # if "and others" in task:
+    #     e += prompt_all.get_prompt_examples()
     e += "When handling TO_TIMESTAMP_NTZ conversions, use query like: SELECT CASE WHEN \"date\" >= 1e15 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000000) WHEN \"date\" >= 1e12 THEN TO_TIMESTAMP_NTZ(\"date\" / 1000) ELSE TO_TIMESTAMP_NTZ(\"date\") END AS parsed_timestamp FROM my_table;\n"
-    e += "Be careful of information in nested JSON columns. e.g.1. When it comes to active users, it refers to has engagement_time_msec parameter rather than directly counting users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec'\n"
-    e += "e.g. When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
+    # e += "Be careful of information in nested JSON columns. e.g.1. When it comes to active users, it refers to has engagement_time_msec parameter rather than directly counting users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec'\n"
+    # e += "e.g. When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
     e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
     # e += prompt_all.get_prompt_filter_null()
-    e += "When counting for rows of a column, ensure they are distinct: SELECT COUNT(DISTINCT col_name) FROM table;\n"
+    # e += "When counting for rows of a column, ensure they are distinct: SELECT COUNT(DISTINCT col_name) FROM table;\n"
     # e += "When the condition is superlative, use ROW_NUMBER() to rank first and get rn=1.\n"
     e += prompt_all.get_prompt_decimal_places()
     # e += "For complex tasks, use CTEs to think step by step.\n"
-    if "duration" in task and "quantile" in task:
-        e += prompt_all.get_prompt_quantile_duration()
+    # if "duration" in task and "quantile" in task:
+    #     e += prompt_all.get_prompt_quantile_duration()
     if "’" in task:
         e += prompt_all.get_prompt_convert_symbols()
     if "> 0" in response_csv:
@@ -304,13 +304,17 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             #     e += get_cte_info(response)
             csv_buffer = StringIO(csv_data_str)
             df_csv = pd.read_csv(csv_buffer).fillna("")
+
+            nested_val = [(item) for i, row in enumerate(df_csv.values.tolist()) for j, item in enumerate(row) if isinstance(item, str) and '\n' in item in item]
             df_csv_copy = df_csv.copy()
             for col in df_csv.select_dtypes(include=['float']):
                 df_csv_copy[col] = df_csv[col].round(2)
             df_csv_copy_sorted = df_csv_copy.sort_values(by=df_csv_copy.columns[0])
             csv_data_str_round2 = df_csv_copy_sorted.to_string()
             if get_values_from_table(csv_data_str_round2) not in results_values:
-                if not ((df_csv == 0) | (df_csv == "")).all().any():
+                if nested_val:
+                    e += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\nA,\n B\n]' to 'A, B'.\n"
+                elif not ((df_csv == 0) | (df_csv == "")).all().any():
                     # if len(format_csv.split('\n')) == len(csv_data_str.split('\n')):
                         results_values.append(get_values_from_table(csv_data_str_round2))
                         results_tables.append(csv_data_str)
@@ -329,10 +333,10 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         if e == "No data found for the specified query.\n":
             e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
         if itercount > 0:
-            if "LEFT JOIN" in response:
-                e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table.\n"
-                e += "e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\"); In this case we just need their intersection to count specific samples, so we shouldn't use LEFT JOIN." # local131, bq150, local099
-                e += "e.g. 2 List each musical style with the number of times it appears as a preference. You should write a query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
+            # if "LEFT JOIN" in response:
+            #     e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table.\n"
+            #     e += "e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\"); In this case we just need their intersection to count specific samples, so we shouldn't use LEFT JOIN." # local131, bq150, local099
+            #     e += "e.g. 2 List each musical style with the number of times it appears as a preference. You should write a query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
             if "Google Analytics" in table_info:
                 e += "Be careful of information in nested JSON columns. e.g.1. When it comes to active users in a date range, it refers to has engagement_time_msec parameter rather than directly counting users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec' rather than directly count number in or not in the date range.\n"
                 e += "e.g.2 When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
@@ -344,22 +348,22 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
             if any(keyword in response for keyword in prompt_all.get_condition_onmit_tables()):
                 e += prompt_all.get_prompt_list_all_tables(table_struct)
-            if "duration" in task and "quantile" in task:
-                e += prompt_all.get_prompt_quantile_duration()
-            if "GENERATOR" in response:
-                e += prompt_all.get_prompt_generator()
+            # if "duration" in task and "quantile" in task:
+            #     e += prompt_all.get_prompt_quantile_duration()
+            # if "GENERATOR" in response:
+            #     e += prompt_all.get_prompt_generator()
             if any(keyword in response for keyword in ["ST_INTERSECTS", "ARRAY_", "ST_OVERLAPS", "CARDINALITY", "OBJECT_AGG"]):
                 e += prompt_all.get_prompt_ST_INTERSECTS_FUNC()
-            if "trip duration" in task:
-                e += prompt_all.get_prompt_trip_duration()
-            if "FULL OUTER JOIN" in response:
-                e += prompt_all.get_prompt_full_outer_join()
-            if "ILIKE" in response or ("LIKE" in response and "%" in response):
-                e += prompt_all.get_prompt_fuzzy_query()
-            if "and others" in task:
-                e += prompt_all.get_prompt_examples()
-            if any(keyword in task for keyword in ["start", "end", "time"]):
-                e += prompt_all.get_prompt_combine_time_range()
+            # if "trip duration" in task:
+            #     e += prompt_all.get_prompt_trip_duration()
+            # if "FULL OUTER JOIN" in response:
+            #     e += prompt_all.get_prompt_full_outer_join()
+            # if "ILIKE" in response or ("LIKE" in response and "%" in response):
+            #     e += prompt_all.get_prompt_fuzzy_query()
+            # if "and others" in task:
+            #     e += prompt_all.get_prompt_examples()
+            # if any(keyword in task for keyword in ["start", "end", "time"]):
+            #     e += prompt_all.get_prompt_combine_time_range()
             if "The percentage should be shown with %" in task:
                 e += prompt_all.get_prompt_percentage_shown()
             logger.info(e)

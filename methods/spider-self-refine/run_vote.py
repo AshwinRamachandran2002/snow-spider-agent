@@ -161,7 +161,10 @@ def main(args):
             sql_path = os.path.join(search_directory, sql)
             csv_path = os.path.join(search_directory, csv)
             logfile_path = os.path.join(search_directory, csv[0] + log_path)
-            pre_info += extract_between(logfile_path, "Begin Exploring Related Columns\n", "End Exploring Related Columns\n")[0]
+            try:
+                pre_info += extract_between(logfile_path, "Begin Exploring Related Columns\n", "End Exploring Related Columns\n")[0]
+            except Exception as e:
+                print(e)
             if os.path.exists(sql_path):
                 sql_path_exist = sql_path
                 csv_path_exist = csv_path
@@ -204,6 +207,7 @@ if __name__ == '__main__':
     parser.add_argument('--overwrite_results', action="store_true")
     parser.add_argument('--azure', action="store_true")
     parser.add_argument('--max_iter', type=int, default=10)
+    parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--num_processes', type=int, default=3)
     parser.add_argument('--save_all_results', action="store_true")
     parser.add_argument('--pre_step', action="store_true")
