@@ -275,6 +275,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     # e += "For complex tasks, use CTEs to think step by step.\n"
     # if "duration" in task and "quantile" in task:
     #     e += prompt_all.get_prompt_quantile_duration()
+    if 'contains the word "' in task:
+        e += prompt_all.get_prompt_no_fuzzy_query()
     if "’" in task:
         e += prompt_all.get_prompt_convert_symbols()
     if "> 0" in response_csv:
@@ -335,8 +337,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         if itercount > 0:
             # if "LEFT JOIN" in response:
             #     e += "Be careful of using JOIN and LEFT JOIN. JOIN: The length of the result corresponds to the intersection of the two tables based on the ON condition. LEFT JOIN: The result will include all rows from the left table.\n"
-            #     e += "e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\"); In this case we just need their intersection to count specific samples, so we shouldn't use LEFT JOIN." # local131, bq150, local099
-            #     e += "e.g. 2 List each musical style with the number of times it appears as a preference. You should write a query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\", for the task is to get the intersection of style and preference.\n"
+            #     e += "e.g. 1 Assess whether different genetic variants affect the log10-transformed TP53 expression levels in TCGA-BRCA samples using sequencing and mutation data: SELECT COUNT(*) FROM (SELECT * FROM expression_data e JOIN mutation_data m ON e.\"case_barcode\" = m.\"case_barcode\"); In this case we just need their intersection to count the intersection, so we use JOIN not LEFT JOIN." # local131, bq150, local099
+            #     e += "e.g. 2 List each musical style with the number of times it appears as a preference. You should write a query like: SELECT * FROM \"MUSICAL_STYLES\" s JOIN \"MUSICAL_PREFERENCES\" p ON s.\"StyleID\" = p.\"StyleID\". In this case we just need their intersection of style and preference, so we use JOIN not LEFT JOIN.\n"
             if "Google Analytics" in table_info:
                 e += "Be careful of information in nested JSON columns. e.g.1. When it comes to active users in a date range, it refers to has engagement_time_msec parameter rather than directly counting users. So the right query is: SELECT DISTINCT USER_PSEUDO_ID FROM all_user_activity, LATERAL FLATTEN(input => event_params) AS flattened_params WHERE flattened_params.value:key = 'engagement_time_msec' rather than directly count number in or not in the date range.\n"
                 e += "e.g.2 When it comes to top-selling product, you should pay attention to hits2.value:\"eCommerceAction\":\"action_type\"::INTEGER = 6 where 6 means sold product.\n"
@@ -358,8 +360,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             #     e += prompt_all.get_prompt_trip_duration()
             # if "FULL OUTER JOIN" in response:
             #     e += prompt_all.get_prompt_full_outer_join()
-            # if "ILIKE" in response or ("LIKE" in response and "%" in response):
-            #     e += prompt_all.get_prompt_fuzzy_query()
+            if 'contains the word "' in task:
+                e += prompt_all.get_prompt_no_fuzzy_query()
             # if "and others" in task:
             #     e += prompt_all.get_prompt_examples()
             # if any(keyword in task for keyword in ["start", "end", "time"]):

@@ -22,6 +22,8 @@ class Prompts:
         return "Calculation of trip duration in date range (A, B): pickup_datetime in (A, B) and dropoff_datetime in (A, B), not only pickup_datetime.\n"
     def get_prompt_full_outer_join(self):
         return "Avoid using FULL OUTER JOIN\n"
+    def get_prompt_no_fuzzy_query(self):
+        return "For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" SQL: WHERE \"title\" LIKE '%book%'\n"
     def get_prompt_fuzzy_query(self):
         return "For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" SQL: WHERE \"title\" LIKE '%book%'\nHowever, if the string is not decided, you may use ILIKE and %. e.g. Get articles that mention \"education\": SQL: \"body\" ILIKE '%education%' OR \"title\" ILIKE '%education%'\n"
     def get_prompt_decimal_places(self):
