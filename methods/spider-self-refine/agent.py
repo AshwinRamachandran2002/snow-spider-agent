@@ -99,9 +99,9 @@ def format_answer(prompt_class, table_info, task, chat_session):
 
     format_prompt += "For coordinate-related cases, use POINT(longitude latitude). e.g. Including its travel coordinates and the cumulative travel distance at each point. Format: ```csv\ngeom,cumulative_distance\nPOINT(longitude1 latitude1),distance1:int\nPOINT(longitude2 latitude2),distance2:int\n...```\n"
     
-    format_prompt += "For task asking percentage or rate values, omit the '%' symbol and retain only the numeric format as xx.xx. Otherwise, for portion, proportion, answer a float number < 1.\n"
+    format_prompt += "For task asking percentage or rate values, omit the '%' symbol and retain only the numeric value in [0, 100]. Otherwise, for portion, proportion, answer a float number < 1.\n"
     
-    format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nrate:float:xx.xx,rate:float:xx.xx```, not ```csv\nMetric,Rate\nGrowth Rate,rate1:xx.xx\nInflation,rate2:xx.xx```\n"
+    format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nwage:0<=float<=100,inflation:0<=float<=100```, not ```csv\nMetric,Rate\nGrowth Rate,rate1:0<=float<=100\nInflation,rate2:0<=float<=100```\n"
 
     format_prompt += "For tasks about distances, no need to convert from meters to miles unless requested.\n"
 
@@ -193,6 +193,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     e += prompt_all.get_prompt_fuzzy_query()
 
     e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
+    e += "When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion."
 
     e += prompt_all.get_prompt_decimal_places()
 
@@ -249,9 +250,9 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         if e == "No data found for the specified query.\n":
             e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
         if itercount > 0:
-            if "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response:
+            if "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response or "6371000 * 2 * ASIN" in response:
                 e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make a point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
-            if "ORDER BY" in response and "DESC" in response:
+            if "ORDER BY" in response and "DESC" in response and "DESC NULLS LAST" not in response:
                 e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
             if 'day_of_week' in response:
                 e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
