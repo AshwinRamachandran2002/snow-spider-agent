@@ -102,12 +102,13 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "For task asking percentage or rate values, omit the '%' symbol and retain only the numeric value in [0, 100]. Otherwise, for portion, proportion, answer a float number < 1.\n"
     
     format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nwage:0<=float<=100,inflation:0<=float<=100```, not ```csv\nMetric,Rate\nGrowth Rate,rate1:0<=float<=100\nInflation,rate2:0<=float<=100```\n"
+    format_prompt += "If there are multiple names for one feature, you should split them to different columns. e.g. Get scores of team A vs team B with period and description. Format: ```csv\nscore_a,score_b,period,description\nscore_a:float,score_b:float,period,description:str```\n"
 
     format_prompt += "For tasks about distances, no need to convert from meters to miles unless requested.\n"
 
     format_prompt += prompt_class.get_prompt_name()
     
-    format_prompt += "For other cases string should be separate, return both 2 strings and don't concatenate them. e.g. Ask team name: ```csv\nmarket,name\nstr1,str2```\n When asked for income, don't concatenate income with '$', just output numbers.\n"
+    format_prompt += "For other cases string should be separate, return both 2 strings and don't concatenate them. e.g. Asked team name, there may be team_name and market_name that match: ```csv\nmarket_name,team_name\nstr1,str2```\n When asked for income, don't concatenate income with '$', just output numbers.\n"
     
     format_prompt += "For month cases, form format in both month_num and month: ```csv\nMonth_num,Month\n01,Jan\n02,Feb```.\n"
 
@@ -264,6 +265,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += prompt_all.get_prompt_no_fuzzy_query()
             if "The percentage should be shown with %" in task:
                 e += prompt_all.get_prompt_percentage_shown()
+            if "GENERATOR" in response:
+                e += prompt_all.get_prompt_generator()
             logger.info(e)
         response = chat_session.get_model_response(e, "sql")
         logger.info(chat_session.messages[-1]['content'])
