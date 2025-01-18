@@ -123,7 +123,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
 
-def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, pre_step):
+def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o):
     pre_info = ''
     ans_pre = prompt
     ans_pre = ''

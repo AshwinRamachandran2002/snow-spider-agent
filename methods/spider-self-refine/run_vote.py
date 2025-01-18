@@ -44,7 +44,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     # preparation
     LIMIT = 10
     prompt = "Task: " + task + "\n"
-    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, args.pre_step)
+    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
         # chat_session4o.init_messages()
     print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
     print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
