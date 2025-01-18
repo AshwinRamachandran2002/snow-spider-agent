@@ -77,80 +77,11 @@ def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=Non
         return max(result_dic.keys(), key=len)
     return result_dic, chat_session
 
-def execute_sql_step(sqls, chat_session, logger, api="snow", max_len=0, save_path=None, get_max=False):
-    result_dic = {}
-    error_rec = []
-    while sqls:
-        sql = sqls[0]
-        sqls = sqls[1:]
-        check_again_flag = False
-        if api == "snow":
-            results = execute_sql_snow(sql, save_path, max_len=max_len)
-            try:
-                if not results.startswith("Too long") and results != "No data found for the specified query.\n":
-                    df_csv = StringIO(results)
-                    df_csv = pd.read_csv(df_csv).fillna(0)
-                    if ((df_csv == 0) | (df_csv == "")).all().any():
-                        check_again_flag = True
-            except:
-                pass
-            if isinstance(results, str) and results != "No data found for the specified query.\n" and not check_again_flag:
-                # results = hard_cut(results, max_len)
-                result_dic[sql] = results
-                chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
-                logger.info(chat_session.messages[-1]['content'])
-            # multiple queries
-            elif hasattr(results, 'msg') and "0A000" in results.msg:
-                queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
-                sqls += queries
-                continue
-            else:
-                # print(f"Solving err: {results}")
-                max_iter = 3
-                simplify = False
-                corrected_sql = None
-                while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
-                    if max_iter == 0:
-                        break
-                    if results == "No data found for the specified query.\n":
-                        simplify = True
-                    corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
-                    check_again_flag = False
-                    if not corrected_sql:
-                        results = "Empty. No data found for the specified query.\n"
-                        break
-                    corrected_sql = get_longest(corrected_sql)
-                    results = execute_sql_snow(corrected_sql, max_len=max_len)
-                    max_iter -= 1
-                    simplify = False
-                if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
-                    # print("Corrected.\n")
-                    error_rec.append(1)
-                    pass
-                else:
-                    # print("Max iter, failed to correct.\n")
-                    error_rec.append(0)
-                    results = results.msg if hasattr(results, 'msg') else results
-                if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
-                    return result_dic, chat_session
-                if not corrected_sql:
-                    # print(f"Results: {results}")
-                    # print("No corrected_sql, skip")
-                    continue
-                result_dic[corrected_sql] = results
-                chat_session.messages.append({"role": "user", "content": f"SQL:\n{corrected_sql}\nResults:\n{results}"})
-                logger.info(chat_session.messages[-1]['content'])
-        else:
-            raise NotImplementedError("Support Snowflake API only.")
-    if get_max:
-        return max(result_dic.keys(), key=len)
-    return result_dic, chat_session
-
 def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
     # while hasattr(error, 'msg'):
     prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
     if simplify:
-        prompt += "Since output is empty, please simplify some conditions of the past sql.\n"
+        prompt += "Since the output is empty, please simplify some conditions of the past sql.\n"
     if check_again_flag:
         prompt += "Some columns are empty values. Please check it again.\n"
     response = chat_session.get_model_response(prompt, "sql")
@@ -161,7 +92,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt = "This is an SQL task. Please provide the simplest possible answer format in ```csv``` format like a table and include a brief explanation.\n"
     
     format_prompt += "If there are some records specified in the task, you should follow and capitalize them and note answering in the order. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3(Attention: answer in this order)```\n If not specified, just fill with the metaname and its data type. e.g. Provide the names and ranks of faculty. Format: ```csv\nName,Rank\nname1:str,rank1:str\nname2:str,rank2:str\n...``` In this case, list 2 rows with '...' if you don't know how many rows will be. Don't fill values like 'Professor', 'AP' that you inferred.\n"
-    format_prompt += "For bool type, just write bool, don't fill true or false. e.g. Please display the drug id, drug type and withdrawal status. Format: ```csv\ndrug_id,drug_type,hasBeenWithdrawn\nid1:int,type1:str,status1:bool\nid2:int,type2:str,status2:bool\n...```\n"
+    format_prompt += "For bool type, don't fill true or false. e.g. Please display the drug id, drug type and withdrawal status. Format: ```csv\ndrug_id,drug_type,hasBeenWithdrawn\nid1:int,type1:str,status1:bool\nid2:int,type2:str,status2:bool\n...```\n"
 
     format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases (like highest, maximum, largest, lowest, average total, most), ensure the result is limited to just one row and emphasize it in parentheses. e.g. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nnum:int,name:str(Attention: answer in one row)```\n"
     format_prompt += "e.g. Calculate the value between A and B. You should only focus on the value. Format: ```csv\nvalue\nv1:float\n(Attention: answer in one row)```\n"
@@ -170,9 +101,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     
     format_prompt += "For task asking percentage or rate values, omit the '%' symbol and retain only the numeric format as xx.xx. Otherwise, for portion, proportion, answer a float number < 1.\n"
     
-    format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nrate:float:xx.xx,rate:float:xx.xx```, not ```csv\nMetric,Rate\nrate1:xx.xx\nrate2:xx.xx```\n"
-
-    format_prompt += "For the Magnificent 7 tech companies, their ticker names are: META, GOOGL (not GOOG), AMZN, MSFT, AAPL, TSLA, NVDA\n"
+    format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nrate:float:xx.xx,rate:float:xx.xx```, not ```csv\nMetric,Rate\nGrowth Rate,rate1:xx.xx\nInflation,rate2:xx.xx```\n"
 
     format_prompt += "For tasks about distances, no need to convert from meters to miles unless requested.\n"
 
@@ -229,10 +158,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
             LIMIT -= 5
             print("Few sqls, retry preparation.")
             continue
-        if pre_step:
-            results_pre_dic, chat_session4o = execute_sql_step(response_pre, chat_session4o, logger, max_len=5000)
-        else:
-            results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, max_len=5000)
+        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, max_len=5000)
         sql_count = 0
         for key, value in results_pre_dic.items():
             pre_info += "Query:\n" + key + "\nAnswer:\n" + value

@@ -212,7 +212,6 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--num_processes', type=int, default=3)
     parser.add_argument('--save_all_results', action="store_true")
-    parser.add_argument('--pre_step', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
     parser.add_argument('--rerun', action="store_true")
     args = parser.parse_args()
