@@ -140,6 +140,7 @@ if __name__ == '__main__':
     # args.test_path = "output/test_with_sql"
     # args.test_path = "output/test"
     # args.test_path = "output/o1-preview-test1"
+    parser.add_argument('--task', type=str, default="snow")
     parser.add_argument('--test_path', type=str, default="examples")
     parser.add_argument('--output_path', type=str, default="output/gpt-4o-test1-log")
     parser.add_argument('--model', type=str, default="gpt-4o")

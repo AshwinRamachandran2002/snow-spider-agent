@@ -6,7 +6,7 @@ import logging
 import argparse
 import glob
 from openai import AzureOpenAI
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger, extract_between, compare_pandas_table
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_api, get_cte_info, initialize_logger, extract_between, compare_pandas_table
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 import numpy as np
 import pandas as pd
@@ -15,7 +15,7 @@ from model import GPTChat, modelChat
 from prompt import Prompts
 import multiprocessing
 
-def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o, api="snowflake", sqlite_path=None):
+def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o, response_csv, api="snowflake", sqlite_path=None):
     
     # search_directory = args.test_path +  '/' + sql_data
 
@@ -38,8 +38,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     logger = initialize_logger(log_file_path)
 
     table_struct = table_info[table_info.find("({database name: {schema name: {table name}}}):"):]
-    # format
-    response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
+
 
     # preparation
     LIMIT = 10
@@ -140,13 +139,16 @@ def main(args):
         if not os.path.exists(search_directory):
             os.makedirs(search_directory)
 
+        # format
+        response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
+
         for i in range(num_processes):
 
             save_pathi = str(i) + save_path
             log_pathi = str(i) + log_path
             sql_save_pathi = str(i) + sql_save_path
             sql_paths[sql_save_pathi] = save_pathi
-            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o, api, sqlite_path))
+            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o, response_csv, api, sqlite_path))
             processes.append(process)
             process.start()
 
@@ -211,7 +213,7 @@ def main(args):
                 continue
             with open(os.path.join(search_directory, response[0])) as f:
                 selected_sql = f.read()
-            if execute_sql_snow(selected_sql, complete_save_path, api=api) == 0:
+            if execute_sql_api(selected_sql, complete_save_path, api=api) == 0:
                 with open(complete_sql_save_path, "w") as f:
                     f.write(selected_sql)
                 with open(complete_vote_log_path, "w") as f:
@@ -220,6 +222,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--task', type=str, default="snow")
     parser.add_argument('--test_path', type=str, default="examples")
     parser.add_argument('--output_path', type=str, default="output/gpt-4o-test1-log")
     parser.add_argument('--model', type=str, default="gpt-4o")

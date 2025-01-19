@@ -250,7 +250,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         if e == "No data found for the specified query.\n":
             e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
         if itercount > 0:
-            if api == "snowflake" and "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response or "6371000 * 2 * ASIN" in response:
+            if api == "snowflake" and "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or ("2" in response and "6371" in response and "ASIN" in response):
                 e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make a point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
             if "ORDER BY" in response and "DESC" in response and "DESC NULLS LAST" not in response and api == "snowflake":
                 e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
