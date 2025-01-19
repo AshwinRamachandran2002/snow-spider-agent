@@ -213,7 +213,7 @@ def main(args):
                 continue
             with open(os.path.join(search_directory, response[0])) as f:
                 selected_sql = f.read()
-            if execute_sql_api(selected_sql, complete_save_path, api=api) == 0:
+            if execute_sql_api(selected_sql, complete_save_path, api=api, sqlite_path=sqlite_path) == 0:
                 with open(complete_sql_save_path, "w") as f:
                     f.write(selected_sql)
                 with open(complete_vote_log_path, "w") as f:

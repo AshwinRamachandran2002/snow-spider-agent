@@ -104,7 +104,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nwage:0<=float<=100,inflation:0<=float<=100```, not ```csv\nMetric,Rate\nGrowth Rate,rate1:0<=float<=100\nInflation,rate2:0<=float<=100```\n"
     format_prompt += "If there are multiple names for one feature, you should split them to different columns. e.g. Get scores of team A vs team B with period and description. Format: ```csv\nscore_a,score_b,period,description\nscore_a:float,score_b:float,period,description:str```\n"
 
-    format_prompt += "For tasks about distances, no need to convert from meters to miles unless requested.\n"
+    format_prompt += "For tasks about distances, no need to convert from meters to miles or km unless requested. In this case, note meters in the format: ```csv\ntotal_distance_meters\ndist:float```\n"
 
     format_prompt += prompt_class.get_prompt_name()
     
@@ -114,7 +114,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
 
     format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. 60 minutes trip durations 10 quantiles: Format: ```csv\ntime_range,distance\n00m to 10m,dis1\n10m to 20m,dis2\n...\n50m to 60m,dis3``` Start from 0.\n"
     
-    format_prompt += "If you meet with an ambiguous name in the task that may match 2 columns, feel free to add 2 columns of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code```\n"
+    format_prompt += "If you meet with an ambiguous name in the task that may match 2 columns, feel free to add 2 columns (like name and name_id) of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code```\n"
 
     format_prompt += "Please output only one format. If there could be 2 tables as the complete answers, return the latter one as format. e.g. Identify the top five states by daily increases. Then, examine the state that ranks fourth overall and identify its top five counties. Format: ```csv\ntop_five_counties,count\ncounty1,count1\ncounty2,count2\ncounty3,count3\ncounty4,count4\ncounty5,count5```In this case, return results of the later one table.\n"
     
