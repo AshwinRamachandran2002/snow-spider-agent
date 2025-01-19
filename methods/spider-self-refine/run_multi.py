@@ -22,12 +22,16 @@ def process_folder(sql_data):
     # read file
     # json_path = search_file(search_directory, target_json)[0]
 
-    json_path = os.path.join(args.test_path, "spider2-snow.jsonl")
+    json_path = os.path.join(args.test_path, f"spider2-{args.task}.jsonl")
     task_dict = {}
     with open(json_path) as f:
         for line in f:
             line_js = json.loads(line)
-            task_dict[line_js['instance_id']] = line_js['instruction']
+            if args.task == "snow":
+                task_dict[line_js['instance_id']] = line_js['instruction']
+            elif args.task == "lite":
+                task_dict[line_js['instance_id']] = line_js['question']
+
 
     
 
@@ -50,10 +54,15 @@ def process_folder(sql_data):
     # logger = initialize_logger()
 
     print(sql_data)
+    sqlite_path = None
     if sql_data.startswith("sf"):
         api = "snowflake"
     elif sql_data.startswith("local"):
         api = "sqlite"
+        sql_data_path = os.path.join(args.test_path, sql_data)
+        for sqlite in os.listdir(sql_data_path):
+            if sqlite.endswith(".sqlite"):
+                sqlite_path = os.path.join(sql_data_path, sqlite)
     elif sql_data.startswith("bq") or sql_data.startswith("ga"):
         api = "bigquery"
     else:
@@ -104,7 +113,7 @@ def process_folder(sql_data):
     # preparation
     LIMIT = 10
     prompt = "Task: " + task + "\n"
-    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api=api)
+    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api=api, sqlite_path=sqlite_path)
         # chat_session4o.init_messages()
     print(f"{sql_data}: len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
     print(f"{sql_data}: len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
@@ -114,7 +123,7 @@ def process_folder(sql_data):
     
 
     # answer
-    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api=api)
+    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api=api, sqlite_path=sqlite_path)
 
 
 def worker(task_queue, result_queue):

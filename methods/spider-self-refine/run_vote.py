@@ -15,7 +15,7 @@ from model import GPTChat, modelChat
 from prompt import Prompts
 import multiprocessing
 
-def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o, api="snowflake"):
+def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o, api="snowflake", sqlite_path=None):
     
     # search_directory = args.test_path +  '/' + sql_data
 
@@ -44,7 +44,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     # preparation
     LIMIT = 10
     prompt = "Task: " + task + "\n"
-    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api=api)
+    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api=api, sqlite_path=sqlite_path)
         # chat_session4o.init_messages()
     print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
     print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
@@ -54,7 +54,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     
 
     # answer
-    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api=api)
+    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api=api, sqlite_path=sqlite_path)
 
 def main(args):
 
@@ -63,12 +63,16 @@ def main(args):
     # read file
     # json_path = search_file(search_directory, target_json)[0]
 
-    json_path = os.path.join(args.test_path, "spider2-snow.jsonl")
+    json_path = os.path.join(args.test_path, f"spider2-{args.task}.jsonl")
     task_dict = {}
     with open(json_path) as f:
         for line in f:
             line_js = json.loads(line)
-            task_dict[line_js['instance_id']] = line_js['instruction']
+            if args.task == "snow":
+                task_dict[line_js['instance_id']] = line_js['instruction']
+            elif args.task == "lite":
+                task_dict[line_js['instance_id']] = line_js['question']
+
 
     dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
 
@@ -104,10 +108,15 @@ def main(args):
         search_directory = os.path.join(args.output_path, sql_data)
 
         print(sql_data)
+        sqlite_path = None
         if sql_data.startswith("sf"):
             api = "snowflake"
         elif sql_data.startswith("local"):
             api = "sqlite"
+            sql_data_path = os.path.join(args.test_path, sql_data)
+            for sqlite in os.listdir(sql_data_path):
+                if sqlite.endswith(".sqlite"):
+                    sqlite_path = os.path.join(sql_data_path, sqlite)
         elif sql_data.startswith("bq") or sql_data.startswith("ga"):
             api = "bigquery"
         else:
@@ -137,7 +146,7 @@ def main(args):
             log_pathi = str(i) + log_path
             sql_save_pathi = str(i) + sql_save_path
             sql_paths[sql_save_pathi] = save_pathi
-            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o, api))
+            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o, api, sqlite_path))
             processes.append(process)
             process.start()
 

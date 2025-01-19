@@ -8,14 +8,14 @@ import os
 input: sqls
 output: results for each sql
 '''
-def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_path=None, get_max=False):
+def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_path=None, get_max=False, sqlite_path=None):
     result_dic = {}
     error_rec = []
     while sqls:
         sql = sqls[0]
         sqls = sqls[1:]
         check_again_flag = False
-        results = execute_sql_api(sql, save_path, api=api, max_len=max_len)
+        results = execute_sql_api(sql, save_path, api=api, max_len=max_len, sqlite_path=sqlite_path)
         try:
             if not results.startswith("Too long") and results != "No data found for the specified query.\n":
                 df_csv = StringIO(results)
@@ -29,17 +29,12 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
             result_dic[sql] = results
             chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
             logger.info(chat_session.messages[-1]['content'])
-        # multiple queries
-        elif hasattr(results, 'msg') and "0A000" in results.msg:
-            queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
-            sqls += queries
-            continue
         else:
             # print(f"Solving err: {results}")
             max_iter = 3
             simplify = False
             corrected_sql = None
-            while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
+            while not isinstance(results, str) or results == "No data found for the specified query.\n" or check_again_flag:
                 if max_iter == 0:
                     break
                 if results == "No data found for the specified query.\n":
@@ -50,17 +45,26 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
                     results = "Empty. No data found for the specified query.\n"
                     break
                 corrected_sql = get_longest(corrected_sql)
-                results = execute_sql_api(corrected_sql, api=api, max_len=max_len)
+                results = execute_sql_api(corrected_sql, api=api, max_len=max_len, sqlite_path=sqlite_path)
                 max_iter -= 1
                 simplify = False
-            if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
+            if isinstance(results, str) and results != "No data found for the specified query.\n":
                 # print("Corrected.\n")
                 error_rec.append(1)
-                pass
+                response = chat_session.get_model_response(f"Please correct other sqls if they have similar errors: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
+                response_sql = []
+                for s in response:
+                    try:
+                        queries = [query.strip() for query in s.strip().split(';') if query.strip()]
+                        response_sql += queries
+                    except:
+                        pass
+                if len(response_sql) >= len(sqls):
+                    sqls = response_sql
             else:
                 # print("Max iter, failed to correct.\n")
                 error_rec.append(0)
-                results = results.msg if hasattr(results, 'msg') else results
+                results = str(results) if not isinstance(results, str) else results
             if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
                 return result_dic, chat_session
             if not corrected_sql:
@@ -75,8 +79,7 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
     return result_dic, chat_session
 
 def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
-    # while hasattr(error, 'msg'):
-    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + error.msg if hasattr(error, 'msg') else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
+    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
     if simplify:
         prompt += "Since the output is empty, please simplify some conditions of the past sql.\n"
     if check_again_flag:
@@ -121,7 +124,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
 
-def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api="snowflake"):
+def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api="snowflake", sqlite_path=None):
     pre_info = ''
     ans_pre = prompt
     ans_pre = ''
@@ -153,7 +156,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
             LIMIT -= 5
             print("Few sqls, retry preparation.")
             continue
-        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, api=api, max_len=5000)
+        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, api=api, max_len=5000, sqlite_path=sqlite_path)
         sql_count = 0
         for key, value in results_pre_dic.items():
             pre_info += "Query:\n" + key + "\nAnswer:\n" + value
@@ -173,7 +176,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
         LIMIT -= 5
     return pre_info, response_pre_txt, LIMIT, chat_session4o
 
-def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api="snowflake"):
+def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api="snowflake", sqlite_path=None):
     itercount = 0
     e = table_info + "Begin Exploring Related Columns\n" + response_pre_txt + pre_info + "End Exploring Related Columns\n"
     results_values = []
@@ -242,12 +245,12 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             logger.info(f"results: \n{csv_data_str}\n")
             if args.save_all_results:
                 save_path = save_path[:-4] + str(itercount) + save_path[-4:]
-        if hasattr(e, 'msg'):
-            e = f"Input sql:\n{response}\nThe error information is:\n" + e.msg + "\nPlease correct it and output only 1 complete SQL query."
+        if not isinstance(e, str):
+            e = f"Input sql:\n{response}\nThe error information is:\n" + str(e) + "\nPlease correct it and output only 1 complete SQL query."
         if e == "No data found for the specified query.\n":
             e = f"Input sql:\n{response}\nThe error information is:\n No data found for the specified query.\n"
         if itercount > 0:
-            if "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response or "6371000 * 2 * ASIN" in response:
+            if api == "snowflake" and "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response or "6371000 * 2 * ASIN" in response:
                 e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make a point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
             if "ORDER BY" in response and "DESC" in response and "DESC NULLS LAST" not in response and api == "snowflake":
                 e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
@@ -276,7 +279,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             response_len = [len(i) for i in response]
             response_index = response_len.index(max(response_len))
             response = response[response_index]
-            e = execute_sql_api(response, complete_save_path, api=api, max_len=1000000)
+            e = execute_sql_api(response, complete_save_path, api=api, max_len=1000000, sqlite_path=sqlite_path)
         itercount += 1
         error_rec.append(e)
         if len(error_rec) > 3:
