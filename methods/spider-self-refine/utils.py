@@ -4,6 +4,8 @@ import snowflake.connector
 import json
 import logging
 import math
+from google.cloud import bigquery
+import sqlite3
 
 def extract_all_blocks(main_content, code_format):
     sql_blocks = []
@@ -43,48 +45,93 @@ def search_file(directory, target_file):
             result.append(os.path.join(root, target_file))
     return result
 
-def execute_sql_snow(sql_query, save_path=None, max_len=10000):
-    # Load Snowflake credentials
-    snowflake_credential = json.load(open("./snowflake_credential.json"))
-    # Define the SQL query
-    # Execute the SQL query
-    try:
+def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=10000, local_sqlite=None):
+    if api == "snowflake":
+        # Load Snowflake credentials
+        snowflake_credential = json.load(open("./snowflake_credential.json"))
+        # Define the SQL query
+        # Execute the SQL query
         with snowflake.connector.connect(**snowflake_credential) as conn:
-            try:
-                with conn.cursor() as cursor:
-                    try:
-                        cursor.execute(sql_query)
-                        # Fetch the results
-                        results = cursor.fetchall()
-                        results = results[:max_len] if len(results) > max_len else results
-                        columns = [desc[0] for desc in cursor.description]
-                        df = pd.DataFrame(results, columns=columns)
+            with conn.cursor() as cursor:
+                try:
+                    cursor.execute(sql_query)
+                    # Fetch the results
+                    results = cursor.fetchall()
+                    results = results[:max_len] if len(results) > max_len else results
+                    columns = [desc[0] for desc in cursor.description]
+                    df = pd.DataFrame(results, columns=columns)
 
-                        # Check if the result is empty
-                        if df.empty:
-                            # print("No data found for the specified query.")
-                            return "No data found for the specified query.\n"
+                    # Check if the result is empty
+                    if df.empty:
+                        # print("No data found for the specified query.")
+                        return "No data found for the specified query.\n"
+                    else:
+                        # Save or print the results based on the is_save flag
+                        if save_path:
+                            try:
+                                df.to_csv(f"{save_path}", index=False)
+                                # print(f"Results saved to {save_path}")
+                                return 0
+                            except Exception as e:
+                                print(e)
                         else:
-                            # Save or print the results based on the is_save flag
-                            if save_path:
-                                try:
-                                    df.to_csv(f"{save_path}", index=False)
-                                    # print(f"Results saved to {save_path}")
-                                    return 0
-                                except Exception as e:
-                                    print(e)
-                            else:
-                                return hard_cut(df.to_csv(index=False), max_len)
-                    except Exception as e:
-                        # print("Error occurred: ", str(e))
-                        return e
-            except Exception as e:
-                # print("Error occurred: ", str(e))
-                return e       
-    except Exception as e:
-        # print("Error occurred: ", str(e))
-        return e  
-    
+                            return hard_cut(df.to_csv(index=False), max_len)
+                except Exception as e:
+                    # print("Error occurred: ", str(e))
+                    return e
+    elif api == "bigquery":
+        client = bigquery.Client()
+        try:
+            query_job = client.query(sql_query)
+            result_iterator = query_job.result()
+            df = pd.DataFrame([dict(row) for row in result_iterator][:max_len])
+            # Check if the result is empty
+            if df.empty:
+                # print("No data found for the specified query.")
+                return "No data found for the specified query.\n"
+            else:
+                # Save or print the results based on the is_save flag
+                if save_path:
+                    df.to_csv(f"{save_path}", index=False)
+                    # print(f"Results saved to {save_path}")
+                    return 0
+                else:
+                    return hard_cut(df.to_csv(index=False), max_len)
+        except Exception as e:
+            # print("Error occurred: ", str(e))
+            return e
+    elif api == "sqlite":
+        with sqlite3.connect(local_sqlite) as conn:
+            with conn.cursor() as cursor:
+                try:            
+                    cursor.execute(sql_query)
+                    # Fetch the results
+                    results = cursor.fetchall()
+                    results = results[:max_len] if len(results) > max_len else results
+                    columns = [desc[0] for desc in cursor.description]
+                    df = pd.DataFrame(results, columns=columns)
+
+                    # Check if the result is empty
+                    if df.empty:
+                        # print("No data found for the specified query.")
+                        return "No data found for the specified query.\n"
+                    else:
+                        # Save or print the results based on the is_save flag
+                        if save_path:
+                            try:
+                                df.to_csv(f"{save_path}", index=False)
+                                # print(f"Results saved to {save_path}")
+                                return 0
+                            except Exception as e:
+                                print(e)
+                        else:
+                            return hard_cut(df.to_csv(index=False), max_len)
+                except Exception as e:
+                    # print("Error occurred: ", str(e))
+                    return e
+    else:
+        raise NotImplementedError("Unsupported API\n")
+
 def split_cte(with_block):
     i = 0
     length = len(with_block)
@@ -143,7 +190,7 @@ def split_cte(with_block):
 def get_cte_info(ctes):
     cte_info = "Here are results for each step of the query:\n"
     for query in split_cte(ctes):
-        cte_info += "Query:\n" + query + "Results:\n" + hard_cut(execute_sql_snow(query), 1000)
+        cte_info += "Query:\n" + query + "Results:\n" + hard_cut(execute_sql_api(query), 1000)
     return cte_info
 
 def get_longest(sql_list):

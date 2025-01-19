@@ -1,4 +1,4 @@
-from utils import execute_sql_snow, hard_cut, get_longest, get_values_from_table
+from utils import execute_sql_api, hard_cut, get_longest, get_values_from_table
 import numpy as np
 import pandas as pd
 from io import StringIO
@@ -8,71 +8,68 @@ import os
 input: sqls
 output: results for each sql
 '''
-def execute_sql(sqls, chat_session, logger, api="snow", max_len=0, save_path=None, get_max=False):
+def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_path=None, get_max=False):
     result_dic = {}
     error_rec = []
     while sqls:
         sql = sqls[0]
         sqls = sqls[1:]
         check_again_flag = False
-        if api == "snow":
-            results = execute_sql_snow(sql, save_path, max_len=max_len)
-            try:
-                if not results.startswith("Too long") and results != "No data found for the specified query.\n":
-                    df_csv = StringIO(results)
-                    df_csv = pd.read_csv(df_csv).fillna(0)
-                    if ((df_csv == 0) | (df_csv == "")).all().any():
-                        check_again_flag = True
-            except:
-                pass
-            if isinstance(results, str) and results != "No data found for the specified query.\n" and not check_again_flag:
-                # results = hard_cut(results, max_len)
-                result_dic[sql] = results
-                chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
-                logger.info(chat_session.messages[-1]['content'])
-            # multiple queries
-            elif hasattr(results, 'msg') and "0A000" in results.msg:
-                queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
-                sqls += queries
-                continue
-            else:
-                # print(f"Solving err: {results}")
-                max_iter = 3
-                simplify = False
-                corrected_sql = None
-                while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
-                    if max_iter == 0:
-                        break
-                    if results == "No data found for the specified query.\n":
-                        simplify = True
-                    corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
-                    check_again_flag = False
-                    if not corrected_sql:
-                        results = "Empty. No data found for the specified query.\n"
-                        break
-                    corrected_sql = get_longest(corrected_sql)
-                    results = execute_sql_snow(corrected_sql, max_len=max_len)
-                    max_iter -= 1
-                    simplify = False
-                if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
-                    # print("Corrected.\n")
-                    error_rec.append(1)
-                    pass
-                else:
-                    # print("Max iter, failed to correct.\n")
-                    error_rec.append(0)
-                    results = results.msg if hasattr(results, 'msg') else results
-                if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
-                    return result_dic, chat_session
-                if not corrected_sql:
-                    # print(f"Results: {results}")
-                    # print("No corrected_sql, skip")
-                    continue
-                result_dic[corrected_sql] = results
-                chat_session.messages.append({"role": "user", "content": f"SQL:\n{corrected_sql}\nResults:\n{results}"})
-                logger.info(chat_session.messages[-1]['content'])
+        results = execute_sql_api(sql, save_path, api=api, max_len=max_len)
+        try:
+            if not results.startswith("Too long") and results != "No data found for the specified query.\n":
+                df_csv = StringIO(results)
+                df_csv = pd.read_csv(df_csv).fillna(0)
+                if ((df_csv == 0) | (df_csv == "")).all().any():
+                    check_again_flag = True
+        except:
+            pass
+        if isinstance(results, str) and results != "No data found for the specified query.\n" and not check_again_flag:
+            # results = hard_cut(results, max_len)
+            result_dic[sql] = results
+            chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
+            logger.info(chat_session.messages[-1]['content'])
+        # multiple queries
+        elif hasattr(results, 'msg') and "0A000" in results.msg:
+            queries = [query.strip() for query in sql.strip().split(';') if query.strip()]
+            sqls += queries
+            continue
         else:
-            raise NotImplementedError("Support Snowflake API only.")
+            # print(f"Solving err: {results}")
+            max_iter = 3
+            simplify = False
+            corrected_sql = None
+            while hasattr(results, 'msg') or results == "No data found for the specified query.\n" or check_again_flag:
+                if max_iter == 0:
+                    break
+                if results == "No data found for the specified query.\n":
+                    simplify = True
+                corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
+                check_again_flag = False
+                if not corrected_sql:
+                    results = "Empty. No data found for the specified query.\n"
+                    break
+                corrected_sql = get_longest(corrected_sql)
+                results = execute_sql_api(corrected_sql, api=api, max_len=max_len)
+                max_iter -= 1
+                simplify = False
+            if not hasattr(results, 'msg') and results != "No data found for the specified query.\n":
+                # print("Corrected.\n")
+                error_rec.append(1)
+                pass
+            else:
+                # print("Max iter, failed to correct.\n")
+                error_rec.append(0)
+                results = results.msg if hasattr(results, 'msg') else results
+            if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
+                return result_dic, chat_session
+            if not corrected_sql:
+                # print(f"Results: {results}")
+                # print("No corrected_sql, skip")
+                continue
+            result_dic[corrected_sql] = results
+            chat_session.messages.append({"role": "user", "content": f"SQL:\n{corrected_sql}\nResults:\n{results}"})
+            logger.info(chat_session.messages[-1]['content'])
     if get_max:
         return max(result_dic.keys(), key=len)
     return result_dic, chat_session
@@ -124,25 +121,22 @@ def format_answer(prompt_class, table_info, task, chat_session):
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
 
-def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o):
+def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api="snowflake"):
     pre_info = ''
     ans_pre = prompt
     ans_pre = ''
     while LIMIT > 0:
 
-        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 simple, short, non-nested SQL queries like ```sql\nSELECT DISTINCT \"COLUMN_NAME\" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust \"DATABASE\", \"SCHEMA\", and \"TABLE\" to match actual names) in ```sql``` format to have an understanding of values in related columns.\n"
-        ans_pre += "Each query should be different. For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations.\n"
-        ans_pre += "For nested columns like event_params, when you don't know the structure of it, first watch the whole column: SELECT f.value FROM table, LATERAL FLATTEN(input => t.\"event_params\") f;\n"
-        
-        ans_pre += f"Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. For each SQL LIMIT 1000 rows.\n"
-        
+        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 simple, short, non-nested {api} SQL queries like {prompt_all.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
+        ans_pre += "Each query should be different. Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. Try to use DISTINCT. For each SQL LIMIT 1000 rows.\n"
+
+        ans_pre += prompt_all.get_prompt_dialect_nested(api)
+                
         ans_pre += prompt_all.get_prompt_convert_symbols()
         
-        ans_pre += "Don't directly match strings if you are not convinced. Use fuzzy query first: WHERE str ILIKE \"%target_str%\", and avoid using REGEXP.\n"
-        ans_pre += "For string matching, e.g. meat lovers, you should use % to replace space. e.g. ILKIE %meat%lovers%.\n" 
+        ans_pre += prompt_all.get_prompt_dialect_string_matching(api)
         
-        ans_pre += "When using TO_DATE() function, use TRY_TO_DATE: WHERE TRY_TO_DATE(filing_date, 'YYYYMMDD') IS NOT NULL;\n"
-        ans_pre += "For time-related queries, given the variety of formats such as UNIX timestamp, ISO 8601, and DATETIME, avoid using time functions unless you are certain of the specific format being used.\n"
+        ans_pre += "For time-related queries, given the variety of formats, avoid using time converting functions unless you are certain of the specific format being used.\n"
         
         ans_pre += "When generating SQLs, be aware of quotation matching: 'Vegetarian\"; You sometimes match \' with \" which may cause an error.\n"
 
@@ -159,7 +153,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
             LIMIT -= 5
             print("Few sqls, retry preparation.")
             continue
-        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, max_len=5000)
+        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, api=api, max_len=5000)
         sql_count = 0
         for key, value in results_pre_dic.items():
             pre_info += "Query:\n" + key + "\nAnswer:\n" + value
@@ -179,21 +173,23 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
         LIMIT -= 5
     return pre_info, response_pre_txt, LIMIT, chat_session4o
 
-def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session):
+def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api="snowflake"):
     itercount = 0
     e = table_info + "Begin Exploring Related Columns\n" + response_pre_txt + pre_info + "End Exploring Related Columns\n"
     results_values = []
     results_tables = []
     complete_save_path = search_directory + "/" + save_path
     complete_save_path_sql = search_directory + "/" + sql_save_path
-    e += "Task: " + task + "\n"+'\nPlease answer only one complete SQL in snowflake dialect in ```sql``` format.\nUsage example: SELECT S."Column_Name" FROM {Database Name}.{Schema Name}.{Table_name} (ensure all column names are enclosed in double quotations)\n'
+    e += "Task: " + task + "\n"+f'\nPlease answer only one complete SQL in {api} dialect in ```sql``` format.\n'
+    e += f'Usage example: {prompt_all.get_prompt_dialect_basic(api)}\n'
     e += f"Follow the answer format like: {response_csv}.\n"
     e += "Here are some useful tips for answering:\n"
     
-    e += prompt_all.get_prompt_list_all_tables(table_struct)
+    e += prompt_all.get_prompt_dialect_list_all_tables(table_struct, api)
     e += prompt_all.get_prompt_fuzzy_query()
 
-    e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
+    if api == "snowflake":
+        e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
     e += "When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion."
 
     e += prompt_all.get_prompt_decimal_places()
@@ -253,19 +249,19 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
         if itercount > 0:
             if "ST_GEOGPOINT" in response or "ST_MAKEGEOGRAPHYPOINT" in response or "2 * 6371000 * ASIN" in response or "6371000 * 2 * ASIN" in response:
                 e += "When calculating distances between two geometries, use `ST_MakePoint(x, y)` to make a point and `ST_Distance(geometry1 GEOMETRY, geometry2 GEOMETRY)` to compute. No need to convert from meters to miles unless requested. Don't use Haversine like 2 * 6371000 * ASIN(...), use ST_DISTANCE for more precise results.\n"
-            if "ORDER BY" in response and "DESC" in response and "DESC NULLS LAST" not in response:
+            if "ORDER BY" in response and "DESC" in response and "DESC NULLS LAST" not in response and api == "snowflake":
                 e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
             if 'day_of_week' in response:
                 e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
             if any(keyword in response for keyword in prompt_all.get_condition_onmit_tables()):
-                e += prompt_all.get_prompt_list_all_tables(table_struct)
+                e += prompt_all.get_prompt_dialect_list_all_tables(table_struct, api)
             if any(keyword in response for keyword in ["ST_INTERSECTS", "ARRAY_", "ST_OVERLAPS", "CARDINALITY", "OBJECT_AGG"]):
                 e += prompt_all.get_prompt_ST_INTERSECTS_FUNC()
             if 'contains the word' in task:
                 e += prompt_all.get_prompt_no_fuzzy_query()
             if "The percentage should be shown with %" in task:
                 e += prompt_all.get_prompt_percentage_shown()
-            if "GENERATOR" in response:
+            if "GENERATOR" in response and api == "snowflake":
                 e += prompt_all.get_prompt_generator()
             logger.info(e)
         response = chat_session.get_model_response(e, "sql")
@@ -280,7 +276,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             response_len = [len(i) for i in response]
             response_index = response_len.index(max(response_len))
             response = response[response_index]
-            e = execute_sql_snow(response, complete_save_path)
+            e = execute_sql_api(response, complete_save_path, api=api, max_len=1000000)
         itercount += 1
         error_rec.append(e)
         if len(error_rec) > 3:

@@ -6,7 +6,7 @@ import logging
 import argparse
 import glob
 from openai import AzureOpenAI
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_snow, get_cte_info, initialize_logger
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, get_cte_info, initialize_logger
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 import numpy as np
 import pandas as pd
@@ -56,7 +56,15 @@ def main(args):
         # logger = initialize_logger()
 
         print(sql_data)
-
+        if sql_data.startswith("sf"):
+            api = "snowflake"
+        elif sql_data.startswith("local"):
+            api = "sqlite"
+        elif sql_data.startswith("bq") or sql_data.startswith("ga"):
+            api = "bigquery"
+        else:
+            print("Invalid file name, skip.\n")
+            continue
         
         task = task_dict[sql_data]
         # search_directory = args.test_path +  '/' + sql_data
@@ -104,7 +112,7 @@ def main(args):
         # preparation
         LIMIT = 10
         prompt = "Task: " + task + "\n"
-        pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
+        pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api=api)
             # chat_session4o.init_messages()
         print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
         print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
@@ -114,7 +122,7 @@ def main(args):
         
 
         # answer
-        self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session)
+        self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api=api)
 
 
 if __name__ == '__main__':

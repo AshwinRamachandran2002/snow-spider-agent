@@ -15,7 +15,7 @@ from model import GPTChat, modelChat
 from prompt import Prompts
 import multiprocessing
 
-def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o):
+def execute(task, table_info, args, save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session4o, api="snowflake"):
     
     # search_directory = args.test_path +  '/' + sql_data
 
@@ -44,7 +44,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     # preparation
     LIMIT = 10
     prompt = "Task: " + task + "\n"
-    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o)
+    pre_info, response_pre_txt, LIMIT, chat_session4o = preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api=api)
         # chat_session4o.init_messages()
     print(f"len(pre_info): {len(pre_info)}, chat_session.get_message_len(): {chat_session.get_message_len()}")
     print(f"len(pre_info): {len(pre_info)}, chat_session4o.get_message_len(): {chat_session4o.get_message_len()}")
@@ -54,7 +54,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     
 
     # answer
-    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session)
+    self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api=api)
 
 def main(args):
 
@@ -104,6 +104,15 @@ def main(args):
         search_directory = os.path.join(args.output_path, sql_data)
 
         print(sql_data)
+        if sql_data.startswith("sf"):
+            api = "snowflake"
+        elif sql_data.startswith("local"):
+            api = "sqlite"
+        elif sql_data.startswith("bq") or sql_data.startswith("ga"):
+            api = "bigquery"
+        else:
+            print("Invalid file name, skip.\n")
+            continue
 
         num_processes = args.num_processes
 
@@ -128,7 +137,7 @@ def main(args):
             log_pathi = str(i) + log_path
             sql_save_pathi = str(i) + sql_save_path
             sql_paths[sql_save_pathi] = save_pathi
-            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o))
+            process = multiprocessing.Process(target=execute, args=(task, table_info, args, save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session4o, api))
             processes.append(process)
             process.start()
 
@@ -193,7 +202,7 @@ def main(args):
                 continue
             with open(os.path.join(search_directory, response[0])) as f:
                 selected_sql = f.read()
-            if execute_sql_snow(selected_sql, complete_save_path) == 0:
+            if execute_sql_snow(selected_sql, complete_save_path, api=api) == 0:
                 with open(complete_sql_save_path, "w") as f:
                     f.write(selected_sql)
                 with open(complete_vote_log_path, "w") as f:

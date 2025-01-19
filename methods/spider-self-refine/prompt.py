@@ -4,8 +4,11 @@ class Prompts:
         pass
     def get_condition_onmit_tables(self):
         return ["-- Include all", "-- Omit", "-- Continue", "-- Union all", "-- ...", "-- List all", "-- Replace this", "-- Each table", "-- Add other"]
-    def get_prompt_list_all_tables(self, table_struct):
-        return f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT \"col1\", \"col2\" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use {self.get_condition_onmit_tables()} to omit any table. Table names here: {table_struct}\n"
+    def get_prompt_dialect_list_all_tables(self, table_struct, api):
+        if api == "snowflake" or "sqlite":
+            return f"When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT \"col1\", \"col2\" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use {self.get_condition_onmit_tables()} to omit any table. Table names here: {table_struct}\n"
+        if api == "bigquery":
+            return "When performing a UNION operation on many tables with similar prefix, you can use a wildcard table to simplify your query. e.g., SELECT col1, col2 FROM `project_id.dataset_id.table_prefix*` WHERE _TABLE_SUFFIX IN ('table1_suffix', 'table2_suffix');. Avoid manually listing tables unless absolutely necessary.\n"
     def get_prompt_quantile_duration(self):
         return "For 50 min durations divided into 10 quantiles, it's about time not distance, so calculate distance every 5 minutes. When calculating the average number of sth, no need to filter null values, as they'll be treated as 0.\n"
     # def get_prompt_quantile_trip(self):
@@ -25,7 +28,7 @@ class Prompts:
     def get_prompt_no_fuzzy_query(self):
         return "For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" SQL: WHERE \"title\" LIKE '%book%'\n"
     def get_prompt_fuzzy_query(self):
-        return "For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word \"book\" SQL: WHERE \"title\" LIKE '%book%'\nHowever, if the string is not decided, you may use ILIKE and %. e.g. Get articles that mention \"education\": SQL: \"body\" ILIKE '%education%' OR \"title\" ILIKE '%education%'\n"
+        return "For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word \"book\"\nHowever, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention \"education\".\n"
     def get_prompt_decimal_places(self):
         return "Keep all decimals to four decimal places.\n"
     def get_prompt_UNION_ALL(self):
@@ -44,3 +47,30 @@ class Prompts:
         return "If the task involves a time range and certain rows can be merged into a single continuous time range, perform the combination. e.g. Merge 00:00:00 - 00:00:20 and 00:00:20 - 00:00:40 into 00:00:00 - 00:00:40."
     def get_prompt_percentage_shown(self):
         return "If the task states that 'The percentage should be shown with %', please add '%' in the answer.\n"
+    def get_prompt_dialect_nested(self, api):
+        if api == "snowflake":
+            return "For columns in json nested format: e.g. SELECT t.\"column_name\", f.value::VARIANT:\"key_name\"::STRING AS \"abstract_text\" FROM PATENTS.PATENTS.PUBLICATIONS t, LATERAL FLATTEN(input => t.\"json_column_name\") f; DO NOT directly answer the task and ensure all column names are enclosed in double quotations. For nested columns like event_params, when you don't know the structure of it, first watch the whole column: SELECT f.value FROM table, LATERAL FLATTEN(input => t.\"event_params\") f;\n"
+        elif api == "bigquery":
+            return "Extract a specific key from a nested JSON column: SELECT t.\"column_name\", JSON_EXTRACT_SCALAR(f.value, \"$.key_name\") AS \"abstract_text\" FROM `database.schema.table` AS t, UNNEST(JSON_EXTRACT_ARRAY(t.\"json_column_name\")) AS f;\nWhen the structure of the nested column (e.g., event_params) is unknown, first inspect the whole column: SELECT f.value FROM `project.dataset.table` AS t, UNNEST(JSON_EXTRACT_ARRAY(t.\"event_params\")) AS f;\n"
+        elif api == "sqlite":
+            return "Extract a specific key from a nested JSON column: SELECT t.\"column_name\", json_extract(f.value, '$.key_name') AS \"abstract_text\" FROM \"table_name\" AS t, json_each(t.\"json_column_name\") AS f;\nWhen the structure of the nested column (e.g., event_params) is unknown, first inspect the whole column: SELECT f.value FROM \"table_name\" AS t, json_each(t.\"event_params\") AS f;\n"
+        else:
+            return "Unsupported API. Please provide a valid API name ('snowflake', 'bigquery', 'sqlite')."
+    def get_prompt_dialect_basic(self, api):
+        if api == "snowflake":
+            return "```sql\nSELECT \"COLUMN_NAME\" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust \"DATABASE\", \"SCHEMA\", and \"TABLE\" to match actual names, ensure all column names are enclosed in double quotations)"
+        elif api == "bigquery":
+            return "```sql\nSELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)"
+        elif api == "sqlite":
+            return "```sql\nSELECT DISTINCT \"column_name\" FROM \"table_name\" WHERE ... ``` (Replace \"table_name\" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)"
+        else:
+            return "Unsupported API. Please provide a valid API name ('snowflake', 'bigquery', 'sqlite')."
+    def get_prompt_dialect_string_matching(self, api):
+        if api == "snowflake":
+            return "Don't directly match strings if you are not convinced. Use fuzzy query first: WHERE str ILIKE \"%target_str%\" For string matching, e.g. meat lovers, you should use % to replace space. e.g. ILKIE %meat%lovers%.\n"
+        elif api == "bigquery":
+            return "Don't directly match strings if you are not convinced. Use LOWER for fuzzy queries: WHERE LOWER(str) LIKE LOWER('%target_str%'). For example, to match 'meat lovers', use LOWER(str) LIKE '%meat%lovers%'.\n"
+        elif api == "sqlite":
+            return "Don't directly match strings if you are not convinced. For fuzzy queries, use: WHERE str LIKE '%target_str%'. For example, to match 'meat lovers', use WHERE str LIKE '%meat%lovers%'. If case sensitivity is needed, add COLLATE BINARY: WHERE str LIKE '%target_str%' COLLATE BINARY.\n"
+        else:
+            return "Unsupported API. Please provide a valid API name ('snowflake', 'bigquery', 'sqlite')."
