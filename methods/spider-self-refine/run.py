@@ -116,6 +116,9 @@ def main(args):
         table_struct = table_info[table_info.find("({project name: {database name: {table name}}}):"):]
         # format
         response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
+        if chat_session4o.get_message_len() > 300000:
+            print("Too long, skip")
+            continue
 
         # preparation
         LIMIT = 10

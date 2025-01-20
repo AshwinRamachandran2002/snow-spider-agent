@@ -102,7 +102,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt += "For task asking percentage or rate values, omit the '%' symbol and retain only the numeric value in [0, 100]. Otherwise, for portion, proportion, answer a float number < 1.\n"
     
     format_prompt += "Columns are for features and rows are for records. e.g. When answering Wages Growth Rate and Inflation, the format should be ```csv\nWage_growth_rate,Inflation_rate\nwage:0<=float<=100,inflation:0<=float<=100```, not ```csv\nMetric,Rate\nGrowth Rate,rate1:0<=float<=100\nInflation,rate2:0<=float<=100```\n"
-    format_prompt += "If there are multiple names for one feature, you should split them to different columns. e.g. Get scores of team A vs team B with period and description. Format: ```csv\nscore_a,score_b,period,description\nscore_a:float,score_b:float,period,description:str```\n"
+    format_prompt += "If there are multiple names for one feature, you should split them to different columns, not adding rows. e.g. Get scores of team A vs team B with period and description. Format: ```csv\nscore_a,score_b,period,description\nscore_a:float,score_b:float,period,description:str``` e.g. Number of distinct active and closed bike share stations for each year 2013 and 2014. Format: ```csv\nYear,Number_of_Stations_active,Number_of_Stations_active\n2013,num_active:int,num_closed:int\n2014,num_active:int,num_closed:int```\n"
 
     format_prompt += "For tasks about distances, no need to convert from meters to miles or km unless requested. In this case, note meters in the format: ```csv\ntotal_distance_meters\ndist:float```\n"
 
@@ -127,11 +127,10 @@ def format_answer(prompt_class, table_info, task, chat_session):
 def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api="snowflake", sqlite_path=None):
     pre_info = ''
     ans_pre = prompt
-    ans_pre = ''
     while LIMIT > 0:
 
-        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 simple, short, non-nested {api} SQL queries like {prompt_all.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
-        ans_pre += "Each query should be different. Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. Try to use DISTINCT. For each SQL LIMIT 1000 rows.\n"
+        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 {api} SQL queries for simple to complex ones like {prompt_all.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
+        ans_pre += "Each query should be different. Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. Try to use DISTINCT. For each SQL LIMIT 100 rows.\n"
 
         ans_pre += prompt_all.get_prompt_dialect_nested(api)
                 
@@ -152,7 +151,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
         if len(response_pre) == 1:
             response_pre = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
         if len(response_pre) < 10:
-            ans_pre = ''
+            ans_pre = prompt
             LIMIT -= 5
             print("Few sqls, retry preparation.")
             continue
@@ -199,6 +198,11 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
 
     if "> 0" in response_csv:
         e += "You need to follow the format's positive signs.\n"
+
+    # Specific prompts
+    e += "Be careful of information in nested columns. e.g. When it comes to completed purchase, `hits.eCommerceAction.action_type` Indicates the type of ecommerce action and '6' represents completed purchases.\n"
+    e += "Be careful one country may have different country_name and country_region in different columns in a database.\n"
+    e += "Don't be misled by examples. For instance, a question related to Android development on StackOverflow might include tags like 'android-layout,' 'android-activity,' or 'android-intent.' However, you should not limit your analysis to just these three tags; instead, consider all tags related to Android: \"tags\" LIKE '%android%'.\n"
     # self-refine
     error_rec = []
     while itercount < args.max_iter:

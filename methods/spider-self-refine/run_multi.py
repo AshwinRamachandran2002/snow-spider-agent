@@ -109,6 +109,9 @@ def process_folder(sql_data):
     if response_csv == "Exceeded":
         logger.info(response_csv)
         return
+    if chat_session4o.get_message_len() > 300000:
+        print("Too long, skip")
+        return
 
     # preparation
     LIMIT = 10

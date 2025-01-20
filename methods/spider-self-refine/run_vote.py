@@ -142,6 +142,10 @@ def main(args):
         # format
         response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
 
+        if chat_session4o.get_message_len() > 300000:
+            print("Too long, skip")
+            continue
+
         for i in range(num_processes):
 
             save_pathi = str(i) + save_path
