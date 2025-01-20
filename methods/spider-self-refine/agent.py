@@ -198,7 +198,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     e += prompt_all.get_prompt_decimal_places()
 
     if "> 0" in response_csv:
-        e += "You need to follow the format's positive and negative signs.\n"
+        e += "You need to follow the format's positive signs.\n"
     # self-refine
     error_rec = []
     while itercount < args.max_iter:
@@ -266,6 +266,8 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += prompt_all.get_prompt_percentage_shown()
             if "GENERATOR" in response and api == "snowflake":
                 e += prompt_all.get_prompt_generator()
+            if "> 0" in response_csv:
+                e += "You need to follow the format's positive signs.\n"
             logger.info(e)
         response = chat_session.get_model_response(e, "sql")
         logger.info(chat_session.messages[-1]['content'])
