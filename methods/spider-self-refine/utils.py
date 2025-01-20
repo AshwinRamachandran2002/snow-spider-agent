@@ -86,9 +86,14 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=10000, s
         try:
             query_job = client.query(sql_query)
             result_iterator = query_job.result()
+            rows = []
+            current_len = 0
             for row in result_iterator:
-                pass
-            df = pd.DataFrame([dict(row) for row in result_iterator][:max_len])
+                if current_len > max_len:
+                    break
+                current_len += len(str(dict(row)))
+                rows.append(dict(row))
+            df = pd.DataFrame(rows)
             # Check if the result is empty
             if df.empty:
                 # print("No data found for the specified query.")
