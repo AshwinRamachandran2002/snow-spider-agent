@@ -209,9 +209,9 @@ def main(args):
             os.rename(csv_path_exist, complete_save_path)
         else:
             compare_pandas_table
-            prompt += "Compare the SQL and results of each answer and choose one SQL as the correct answer and tell me the reason. Output the name of sql in ```plain\nxxx.sql``` format. You should not ingnore 'plain'.\n"
+            prompt += "Compare the SQL and results of each answer and choose one SQL as the correct answer and tell me the reason. Output the name of sql in ```plaintext\nxxx.sql``` format. You should not ingnore 'plaintext'.\n"
             # prompt += "Ensure that float values are rounded to 4 decimal places.\n"
-            response = chat_session.get_model_response(hard_cut(pre_info, 150000) + prompt, "plain")
+            response = chat_session.get_model_response(hard_cut(pre_info, 150000) + prompt, "plaintext")
             if not response or not isinstance(response, list):
                 print(response)
                 continue
