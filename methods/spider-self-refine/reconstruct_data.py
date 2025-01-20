@@ -55,10 +55,10 @@ def make_folder(args):
                             elif entry.startswith("sf"):
                                 shutil.copy(db_name_path, os.path.join(folder_path, file_name))
                                 os.remove(db_name_path)                                
-                    if "DDL.csv" in os.listdir(project_name_path):
+                    if entry.startswith("sf") and "DDL.csv" in os.listdir(project_name_path):
                         ddl_path = os.path.join(project_name_path, "DDL.csv")
                         shutil.copy(ddl_path, os.path.join(folder_path, "DDL.csv"))
-                        shutil.rmtree(ddl_path)
+                        os.remove(ddl_path)
                     if entry.startswith("bq") or entry.startswith("ga"):
                         shutil.copytree(folder_path, os.path.join(entry1_path, folder_name))
                         shutil.rmtree(project_name_path)

@@ -59,7 +59,7 @@ python spider_agent_setup_lite.py
 
 ### Reconstruct data
 ```
-python reconstruct_data.py --example_folder examples
+python reconstruct_data.py --example_folder examples_lite
 ```
 
 ### Run
