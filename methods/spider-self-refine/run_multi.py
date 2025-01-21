@@ -4,7 +4,7 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 import argparse
 import glob
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, get_cte_info, initialize_logger
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, get_table_info, initialize_logger
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 
 from multiprocessing import Pool, Manager, Lock
@@ -14,13 +14,9 @@ from prompt import Prompts
 
 def process_folder(sql_data):
     prompt_all = Prompts()
-    table_info_txt = ["prompts.txt"]
-    target_json = "result.json"
     
     save_path = "result.csv"
     sql_save_path = "result.sql"
-    # read file
-    # json_path = search_file(search_directory, target_json)[0]
 
     json_path = os.path.join(args.test_path, f"spider2-{args.task}.jsonl")
     task_dict = {}
@@ -97,12 +93,7 @@ def process_folder(sql_data):
     log_file_path = os.path.join(search_directory, "log.log")
     logger = initialize_logger(log_file_path)
 
-    table_info = ''
-    for txt in table_info_txt:
-        txt_path = search_file(os.path.join(args.test_path, sql_data), txt)
-        for path in txt_path:
-            with open(path) as f:
-                table_info += f.read()
+    table_info = get_table_info(args, sql_data, api)
     table_struct = table_info[table_info.find("({project name: {database name: {table name}}}):"):]
     # format
     response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
