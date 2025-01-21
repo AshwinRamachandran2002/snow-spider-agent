@@ -1,4 +1,4 @@
-from utils import execute_sql_api, hard_cut, get_longest, get_values_from_table
+from utils import execute_sql_api, hard_cut, get_values_from_table
 import numpy as np
 import pandas as pd
 from io import StringIO
@@ -44,7 +44,7 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
                 if not corrected_sql:
                     results = "Empty. No data found for the specified query.\n"
                     break
-                corrected_sql = get_longest(corrected_sql)
+                corrected_sql = corrected_sql[0]
                 results = execute_sql_api(corrected_sql, api=api, max_len=max_len, sqlite_path=sqlite_path)
                 max_iter -= 1
                 simplify = False
@@ -79,7 +79,7 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
     return result_dic, chat_session
 
 def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
-    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL.\n"
+    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL or output several SQLs.\n"
     if simplify:
         prompt += "Since the output is empty, please simplify some conditions of the past sql.\n"
     if check_again_flag:
@@ -91,11 +91,12 @@ def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, ch
 def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt = "This is an SQL task. Please provide the simplest possible answer format in ```csv``` format like a table and include a brief explanation.\n"
     
-    format_prompt += "If there are some records specified in the task, you should follow and capitalize them and note answering in the order. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3(Attention: answer in this order)```\n If not specified, just fill with the metaname and its data type. e.g. Provide the names and ranks of faculty. Format: ```csv\nName,Rank\nname1:str,rank1:str\nname2:str,rank2:str\n...``` In this case, list 2 rows with '...' if you don't know how many rows will be. Don't fill values like 'Professor', 'AP' that you inferred.\n"
+    format_prompt += "If there are some records specified in the task, you should follow and capitalize them and note answering in the order. e.g. Task: Give me the number of small, medium and large clothes. Format: ```csv\nSize,Number\nSmall,num1\nMedium,num2\nLarge,num3\n(Attention: answer in this order)```\n If not specified, just fill with the metaname and its data type. e.g. Provide the names and ranks of faculty. Format: ```csv\nName,Rank\nname1:str,rank1:str\nname2:str,rank2:str\n...``` In this case, list 2 rows with '...' if you don't know how many rows will be. Don't fill values like 'Professor', 'AP' that you inferred.\n"
     format_prompt += "For bool type, don't fill true or false. e.g. Please display the drug id, drug type and withdrawal status. Format: ```csv\ndrug_id,drug_type,hasBeenWithdrawn\nid1:int,type1:str,status1:bool\nid2:int,type2:str,status2:bool\n...```\n"
 
-    format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases (like highest, maximum, largest, lowest, average total, most), ensure the result is limited to just one row and emphasize it in parentheses. e.g. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nnum:int,name:str(Attention: answer in one row)```\n"
+    format_prompt += "Don't ouput extra rows. e.g. When dealing with superlative cases (like highest, maximum, largest, lowest, average total, most), ensure the result is limited to just one row and emphasize it in parentheses. e.g. Get the fourth highest number of the group. Format: ```csv\nFourth-highest-num,group-name\nnum:int,name:str\n(Attention: answer in one row)```\n"
     format_prompt += "e.g. Calculate the value between A and B. You should only focus on the value. e.g. Calculate the chi-squared statistic. Format: ```csv\nchi-squared value\nv1:float\n(Attention: answer in one row)```\n"
+    format_prompt += "For superlative cases with limited rows more than 1, also note the number. e.g. Most purchased other products for the three months starting from November 2020. Format: ```csv\nMonth,Product_Name,Quantity\nNov-2020,product1:str,quantity1:int\nDec-2020,product1:str,quantity1:int\nJan-2021,product1:str,quantity1:int\n(Attention: answer in three rows)```\n"
 
     format_prompt += "For coordinate-related cases, use POINT(longitude latitude). e.g. Including its travel coordinates and the cumulative travel distance at each point. Format: ```csv\ngeom,cumulative_distance\nPOINT(longitude1 latitude1),distance1:int\nPOINT(longitude2 latitude2),distance2:int\n...```\n"
     
@@ -262,7 +263,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += "For day_of_week, 1=Sunday and 7=Saturday.\n"
             if any(keyword in response for keyword in prompt_all.get_condition_onmit_tables()):
                 e += prompt_all.get_prompt_dialect_list_all_tables(table_struct, api)
-            if any(keyword in response for keyword in ["ST_INTERSECTS", "ARRAY_", "ST_OVERLAPS", "CARDINALITY", "OBJECT_AGG"]):
+            if any(keyword in response for keyword in ["ST_INTERSECTS", "ST_OVERLAPS", "CARDINALITY"]):
                 e += prompt_all.get_prompt_ST_INTERSECTS_FUNC()
             if 'contains the word' in task:
                 e += prompt_all.get_prompt_no_fuzzy_query()

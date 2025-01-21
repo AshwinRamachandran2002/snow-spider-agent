@@ -211,6 +211,11 @@ def get_longest(sql_list):
     sql_list_len_index = sql_list_len.index(max(sql_list_len))
     return sql_list[sql_list_len_index]
 
+def get_shortest(sql_list):
+    sql_list_len = [len(i) for i in sql_list]
+    sql_list_len_index = sql_list_len.index(min(sql_list_len))
+    return sql_list[sql_list_len_index]
+
 def initialize_logger(log_path):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
