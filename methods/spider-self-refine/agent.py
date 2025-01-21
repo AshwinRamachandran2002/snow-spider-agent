@@ -115,7 +115,7 @@ def format_answer(prompt_class, table_info, task, chat_session):
 
     format_prompt += "For quantile cases, explicitly list each quantile and convince the object to quantile. e.g. 60 minutes trip durations 10 quantiles: Format: ```csv\ntime_range,distance\n00m to 10m,dis1\n10m to 20m,dis2\n...\n50m to 60m,dis3``` Start from 0.\n"
     
-    format_prompt += "If you meet with an ambiguous name in the task that may match 2 columns, feel free to add 2 columns (like name and name_id) of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code``` e.g. Which products were picked for order. Format: ```csv\nproduct_id,average_units_picked_per_batch\nproduct_id1:int,average_units1:float\nproduct_id2:int,average_units2:float\n...```\n"
+    format_prompt += "If you meet with an ambiguous name in the task that may match 2 columns, feel free to add 2 columns (like name and name_id) of them. e.g. Tell me the tract code. Tract code may mean geo_id or tract_ce, then format: ```csv\geo_id,tract_ce\nid,code``` e.g. Which products were picked for order. Format: ```csv\nproduct_id,product_name,average_units_picked_per_batch\nproduct_id1:int,product_name1:str,average_units1:float\nproduct_id2:int,product_name2:str,average_units2:float\n...```\n"
 
     format_prompt += "Please output only one format. If there could be 2 tables as the complete answers, return the latter one as format. e.g. Identify the top five states by daily increases. Then, examine the state that ranks fourth overall and identify its top five counties. Format: ```csv\ntop_five_counties,count\ncounty1,count1\ncounty2,count2\ncounty3,count3\ncounty4,count4\ncounty5,count5```In this case, return results of the later one table.\n"
     
