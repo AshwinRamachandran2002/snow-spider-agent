@@ -7,6 +7,7 @@ import math
 from google.cloud import bigquery
 from google.oauth2 import service_account
 import sqlite3
+import re
 
 def extract_all_blocks(main_content, code_format):
     sql_blocks = []
@@ -297,3 +298,19 @@ def compare_pandas_table(pred, gold, condition_cols=[], ignore_order=False):
                     break
 
     return score
+
+def clear_description(table_info):
+    return re.sub(r'OPTIONS\(description=.*?\)', '', table_info, flags=re.DOTALL)
+
+def get_table_info(args, sql_data, api):
+    table_info_txt = ["prompts.txt"]      
+    table_info = ''
+    for txt in table_info_txt:
+        txt_path = search_file(os.path.join(args.test_path, sql_data), txt)
+        for path in txt_path:
+            with open(path) as f:
+                table_info += f.read()
+    if api == "bigquery":
+        if len(table_info) > 200000:
+            table_info = clear_description(table_info)
+    return table_info

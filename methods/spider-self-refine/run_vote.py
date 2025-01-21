@@ -6,7 +6,7 @@ import logging
 import argparse
 import glob
 from openai import AzureOpenAI
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_api, get_cte_info, initialize_logger, extract_between, compare_pandas_table
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_api, get_table_info, initialize_logger, extract_between, compare_pandas_table
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine
 import numpy as np
 import pandas as pd
@@ -93,16 +93,6 @@ def main(args):
         chat_session.init_messages()
         chat_session4o.init_messages()
 
-        
-        table_info_txt = ["prompts.txt"]
-        target_json = "result.json"
-        
-        table_info = ''
-        for txt in table_info_txt:
-            txt_path = search_file(os.path.join(args.test_path, sql_data), txt)
-            for path in txt_path:
-                with open(path) as f:
-                    table_info += f.read()
         task = task_dict[sql_data]
         search_directory = os.path.join(args.output_path, sql_data)
 
@@ -138,6 +128,8 @@ def main(args):
             continue
         if not os.path.exists(search_directory):
             os.makedirs(search_directory)
+
+        table_info = get_table_info(args, sql_data, api)
 
         # format
         response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
