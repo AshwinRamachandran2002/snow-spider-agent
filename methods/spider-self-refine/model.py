@@ -12,7 +12,7 @@ class GPTChat:
             self.client = AzureOpenAI(
                 azure_endpoint = os.environ.get("AZURE_ENDPOIONT"),
                 api_key=os.environ.get("AZURE_OPENAI_KEY"),  # This is the default and can be omitted
-                api_version="2024-02-15-preview"
+                api_version="2024-12-01-preview"
             )
 
         self.messages = []
