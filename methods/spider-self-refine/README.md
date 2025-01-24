@@ -80,6 +80,6 @@ python get_metadata.py --result_path output/o1-preview-lite-log --output_path ou
 
 Run evaluation:
 ```
-cd ../../spider2-snow/evaluation_suite
+cd ../../spider2-lite/evaluation_suite
 python evaluate.py --mode exec_result --result_dir ../../methods/spider-self-refine/output/o1-preview-lite
 ```

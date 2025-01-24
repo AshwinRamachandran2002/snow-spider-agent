@@ -38,7 +38,7 @@ class Prompts:
     def get_prompt_filter_null(self):
         return "If the column is not the main part of the answer, there's no need to filter NULL. e.g. Get the name, the trip ID, the ride duration, the start time, the starting station, and the gender of the rider. In this case, no need to filter NULL for the gender of the rider.\n"
     def get_prompt_name(self):
-        return "For tasks asking fullname or name, you may combine first name and last name into one column called name.\n"
+        return "For tasks asking fullname or name, you should combine first name and last name into one column called name. Format: ```csv\nname\nname:str```\n"
     def get_prompt_knowledge(self):
         return "Your knowledge is based on information in tables. Don't use your own knowledge.\n"
     def get_prompt_examples(self):

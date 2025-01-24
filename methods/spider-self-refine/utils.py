@@ -47,7 +47,7 @@ def search_file(directory, target_file):
             result.append(os.path.join(root, target_file))
     return result
 
-def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=10000, sqlite_path=None):
+def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=1000000, sqlite_path=None):
     if api == "snowflake":
         # Load Snowflake credentials
         snowflake_credential = json.load(open("./snowflake_credential.json"))
