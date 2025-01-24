@@ -30,7 +30,7 @@ class Prompts:
     def get_prompt_fuzzy_query(self):
         return "For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word \"book\"\nHowever, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention \"education\".\n"
     def get_prompt_decimal_places(self):
-        return "Keep all decimals to four decimal places.\n"
+        return "If the task description does not specify the number of decimal places, retain all decimals to four places.\n"
     def get_prompt_UNION_ALL(self):
         return "When unioning many tables, UNION ALL first and then SELECT and add conditions.\n"
     def get_prompt_convert_symbols(self):
