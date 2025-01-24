@@ -262,7 +262,7 @@ def compare_pandas_table(pred, gold, condition_cols=[], ignore_order=False):
     """
     # print('condition_cols', condition_cols)
     
-    tolerance = 1
+    tolerance = 0.01
 
     def vectors_match(v1, v2, tol=tolerance, ignore_order_=False):
         if ignore_order_:
