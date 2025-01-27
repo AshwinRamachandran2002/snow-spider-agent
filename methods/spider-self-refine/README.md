@@ -1,4 +1,4 @@
-# Self-Refinement Workflow with Format Restriction and Column Exploration on Spider2.0-snow and Spider2.0-lite
+# Self-Refinement Agent with Format Restriction and Column Exploration on Spider2.0-snow and Spider2.0-lite
 
 ## Dependencies
 
@@ -24,14 +24,20 @@ python reconstruct_data.py --example_folder examples
 ```
 
 ### Run
+Export keys: OPENAI or AZURE
 ```
 export OPENAI_API_KEY=YOUR_API_KEY
 export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
-python run.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure
-python run_vote.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-vote-log --azure --temperature 0
 ```
-
+Run single process version:
+```
+python run.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --temperature 0
+```
+Run voting:
+```
+python run_vote.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --temperature 0 --num_processes 3
+```
 ### Evaluation
 Preparation for evaluation files:
 ```
@@ -64,14 +70,20 @@ python reconstruct_data.py --example_folder examples_lite
 ```
 
 ### Run
+Export keys: OPENAI or AZURE
 ```
 export OPENAI_API_KEY=YOUR_API_KEY
 export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
-python run.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --task lite
-python run_vote.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-vote-1.19-log --azure --temperature 0 --task lite
 ```
-
+Run single process version:
+```
+python run.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --temperature 0
+```
+Run voting:
+```
+python run_vote.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --temperature 0 --num_processes 3
+```
 ### Evaluation
 Preparation for evaluation files:
 ```
