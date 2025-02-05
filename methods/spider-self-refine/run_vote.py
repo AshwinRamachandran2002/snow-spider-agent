@@ -6,8 +6,8 @@ import logging
 import argparse
 import glob
 from openai import AzureOpenAI
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_api, get_table_info, initialize_logger, extract_between, compare_pandas_table
-from agent import execute_sql, self_correct, format_answer, preparation, self_refine
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, execute_sql_api, get_table_info, initialize_logger, extract_between, compare_pandas_table, get_api_name
+from agent import execute_sql, self_correct, format_answer, preparation, self_refine, schema_linking
 import numpy as np
 import pandas as pd
 from io import StringIO
@@ -37,7 +37,7 @@ def execute(task, table_info, args, save_path, log_path, sql_save_path, search_d
     log_file_path = os.path.join(search_directory, log_path)
     logger = initialize_logger(log_file_path)
 
-    table_struct = table_info[table_info.find("({database name: {schema name: {table name}}}):"):]
+    table_struct = table_info[table_info.find("The table structure information is "):]
 
 
     # preparation
@@ -75,17 +75,22 @@ def main(args):
 
     dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
 
-    if "gpt" in args.model or "o1" in args.model:
+    if args.model:
         chat_session = GPTChat(args.azure, args.model)
         chat_session4o = GPTChat(args.azure, args.understanding_model)
-    else:
+
+    if args.schema_linking_api:
+        chat_session_sl = GPTChat(args.azure, args.schema_linking_api) 
+        schema_linking(dictionaries, task_dict, args.test_path, chat_session_sl)
+    
+    if args.model_local:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model = AutoModelForCausalLM.from_pretrained(
-            args.model,
+            args.model_local,
             torch_dtype="auto",
             device_map="auto"
         )
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_local)
         chat_session = modelChat(model, tokenizer)
 
 
@@ -97,20 +102,12 @@ def main(args):
         search_directory = os.path.join(args.output_path, sql_data)
 
         print(sql_data)
+        api = get_api_name(sql_data)
+        sql_data_path = os.path.join(args.test_path, sql_data)
         sqlite_path = None
-        if sql_data.startswith("sf"):
-            api = "snowflake"
-        elif sql_data.startswith("local"):
-            api = "sqlite"
-            sql_data_path = os.path.join(args.test_path, sql_data)
-            for sqlite in os.listdir(sql_data_path):
-                if sqlite.endswith(".sqlite"):
-                    sqlite_path = os.path.join(sql_data_path, sqlite)
-        elif sql_data.startswith("bq") or sql_data.startswith("ga"):
-            api = "bigquery"
-        else:
-            print("Invalid file name, skip.\n")
-            continue
+        for sqlite in os.listdir(sql_data_path):
+            if sqlite.endswith(".sqlite"):
+                sqlite_path = os.path.join(sql_data_path, sqlite)
 
         num_processes = args.num_processes
 
@@ -129,7 +126,7 @@ def main(args):
         if not os.path.exists(search_directory):
             os.makedirs(search_directory)
 
-        table_info = get_table_info(args, sql_data, api)
+        table_info = get_table_info(args.test_path, sql_data, api)
 
         # format
         response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
@@ -218,16 +215,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--task', type=str, default="snow")
     parser.add_argument('--test_path', type=str, default="examples")
-    parser.add_argument('--output_path', type=str, default="output/gpt-4o-test1-log")
-    parser.add_argument('--model', type=str, default="gpt-4o")
-    parser.add_argument('--understanding_model', type=str, default="gpt-4o")
+    parser.add_argument('--output_path', type=str, default="output/o1-preview-snow-log")
+    parser.add_argument('--model', type=str, default="o1-preview")
+    parser.add_argument('--model_local', type=str, default=None)
+    parser.add_argument('--understanding_model', type=str, default="o1-preview")
     parser.add_argument('--overwrite_results', action="store_true")
     parser.add_argument('--azure', action="store_true")
     parser.add_argument('--max_iter', type=int, default=10)
     parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--num_processes', type=int, default=3)
     parser.add_argument('--save_all_results', action="store_true")
-    parser.add_argument('--model_vote', action="store_true")
+    parser.add_argument('--schema_linking_api', type=str, default=None)
     parser.add_argument('--rerun', action="store_true")
     args = parser.parse_args()
     main(args)

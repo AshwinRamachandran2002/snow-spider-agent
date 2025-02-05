@@ -21,23 +21,31 @@ class GPTChat:
 
     def get_model_response(self, prompt, code_format):
         self.messages.append({"role": "user", "content": prompt})
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                temperature=self.temperature
-            )
-        except Exception as e:
-            print(e)
-            return "Exceeded"
-        choices = response.choices
-        if choices:
-            # Extract the main message content
-            main_content = choices[0].message.content
-            # print("Main Content:\n", main_content)
-            
-            sql_query = extract_all_blocks(main_content, code_format)
-        self.messages.append({"role": "assistant", "content": main_content})
+        sql_query = []
+        count = 0
+        while not sql_query and count < 3:
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=self.messages,
+                    temperature=self.temperature
+                )
+            except Exception as e:
+                print(e)
+                return "Exceeded"
+            choices = response.choices
+            if choices:
+                # Extract the main message content
+                main_content = choices[0].message.content
+                # print("Main Content:\n", main_content)
+                
+                sql_query = extract_all_blocks(main_content, code_format)
+            if count > 0:
+                print(f"sql_query: {sql_query}, count: {count}")
+                self.messages.append({"role": "user", "content": f"Please answer in ```{code_format}``` format."})
+                
+            self.messages.append({"role": "assistant", "content": main_content})
+            count += 1
         # print(f"Current_context_len: {self.get_message_len()}")
         return sql_query
     def get_model_response_txt(self, prompt):

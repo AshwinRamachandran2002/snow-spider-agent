@@ -133,8 +133,7 @@ def compress_all(args):
                 f.writelines(prompts)
         
 
-def compress_ddl(args):
-    example_folder = args.example_folder
+def compress_ddl(example_folder):
     for entry in tqdm(os.listdir(example_folder)):
         external_knowledge = None
         prompts = ''
@@ -149,8 +148,6 @@ def compress_ddl(args):
                     project_name_path = os.path.join(entry1_path, project_name)
                     if os.path.isdir(os.path.join(project_name_path)):
                         for db_name in os.listdir(project_name_path):
-                            prompts += f"Database Name: {project_name}\n"
-                            prompts += f"Schema Name: {db_name}\n"
                             if project_name not in table_dict:
                                 table_dict[project_name] = {db_name: []}
                             else:
@@ -160,31 +157,26 @@ def compress_ddl(args):
                             for schema_name in os.listdir(db_name_path):
                                 schema_name_path = os.path.join(db_name_path, schema_name)
                                 if schema_name == "DDL.csv":
-                                    prompts += "DDL describes table information.\n"
+                                    # prompts += "DDL describes table information.\n"
                                     df = pd.read_csv(schema_name_path)
                                     ddl_file, representatives = process_ddl(df)
                                     table_name_list = ddl_file['table_name'].to_list()
                                     ddl_file.reset_index(drop=True, inplace=True)
                                     # count = 0
                                     for i in range(len(table_name_list)):
+                                        prompts += f"Database Name: {project_name}\n"
+                                        prompts += f"Schema Name: {db_name}\n"
+                                        table_dict[project_name][db_name] += [table_name_list[i]]
                                         prompts += f"{ddl_file.loc[i].to_csv()}\n"
                                         if len(representatives[remove_digits(table_name_list[i])]) > 1:
                                             prompts += f"Some other tables have the similar structure: {representatives[remove_digits(table_name_list[i])]}\n"
-                                        # table_name = representatives[remove_digits(table_name_list[i])][0].split(".")[-1]
-                                        # if os.path.exists(os.path.join(db_name_path, table_name+".json")):
-                                        #     with open(os.path.join(db_name_path, table_name+".json")) as f:
-                                        #         sample_table = f.read()                                    
-                                        #         if len(sample_table) < 1e5:
-                                        #             prompts += f"Sample rows of Table {table_name}:\n{sample_table}\n"
-                                        #             count += 1
-                                        #         else:
-                                        #             print(f"Too long, skip: db_name_path: {db_name_path}, len: {len(sample_table)}")
+                                            table_dict[project_name][db_name] += representatives[remove_digits(table_name_list[i])]
                                 elif schema_name == "json":
                                     with open(schema_name_path) as f:
                                         prompts += f.read()  
-                                else:
-                                    assert schema_name.lower().endswith("json")
-                                    table_dict[project_name][db_name] += [schema_name.split('.')[-2]]
+                                # else:
+                                #     assert schema_name.lower().endswith("json")
+                                #     table_dict[project_name][db_name] += [schema_name.split('.')[-2]]
 
                     elif is_file(project_name_path, "md"):
                         with open(project_name_path) as f:
@@ -223,4 +215,4 @@ if __name__ == '__main__':
     parser.add_argument('--example_folder', type=str, default="output/test")
     args = parser.parse_args()
     make_folder(args)
-    compress_ddl(args)
+    compress_ddl(args.example_folder)

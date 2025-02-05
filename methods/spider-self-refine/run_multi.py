@@ -4,8 +4,8 @@ from tqdm import tqdm
 from tqdm.contrib.concurrent import process_map
 import argparse
 import glob
-from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, get_table_info, initialize_logger
-from agent import execute_sql, self_correct, format_answer, preparation, self_refine
+from utils import extract_all_blocks, hard_cut, get_values_from_table, search_file, get_table_info, initialize_logger, get_api_name
+from agent import execute_sql, self_correct, format_answer, preparation, self_refine, schema_linking
 
 from multiprocessing import Pool, Manager, Lock
 from model import GPTChat, modelChat
@@ -28,42 +28,34 @@ def process_folder(sql_data):
             elif args.task == "lite":
                 task_dict[line_js['instance_id']] = line_js['question']
 
-
-    
-
-    if "gpt" in args.model or "o1" in args.model:
+    if args.model:
         chat_session = GPTChat(args.azure, args.model)
         chat_session4o = GPTChat(args.azure, args.understanding_model)
-    else:
+
+    if args.schema_linking_api:
+        chat_session_sl = GPTChat(args.azure, args.schema_linking_api) 
+        schema_linking(dictionaries, task_dict, args.test_path, chat_session_sl)
+    
+    if args.model_local:
         from transformers import AutoModelForCausalLM, AutoTokenizer
         model = AutoModelForCausalLM.from_pretrained(
-            args.model,
+            args.model_local,
             torch_dtype="auto",
             device_map="auto"
         )
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_local)
         chat_session = modelChat(model, tokenizer)
-        chat_session.init_messages()
-        chat_session4o.init_messages()
 
         
     # logger = initialize_logger()
 
     print(sql_data)
+    api = get_api_name(sql_data)
+    sql_data_path = os.path.join(args.test_path, sql_data)
     sqlite_path = None
-    if sql_data.startswith("sf"):
-        api = "snowflake"
-    elif sql_data.startswith("local"):
-        api = "sqlite"
-        sql_data_path = os.path.join(args.test_path, sql_data)
-        for sqlite in os.listdir(sql_data_path):
-            if sqlite.endswith(".sqlite"):
-                sqlite_path = os.path.join(sql_data_path, sqlite)
-    elif sql_data.startswith("bq") or sql_data.startswith("ga"):
-        api = "bigquery"
-    else:
-        print("Invalid file name, skip.\n")
-        return
+    for sqlite in os.listdir(sql_data_path):
+        if sqlite.endswith(".sqlite"):
+            sqlite_path = os.path.join(sql_data_path, sqlite)
     
     task = task_dict[sql_data]
     # search_directory = args.test_path +  '/' + sql_data
@@ -93,8 +85,8 @@ def process_folder(sql_data):
     log_file_path = os.path.join(search_directory, "log.log")
     logger = initialize_logger(log_file_path)
 
-    table_info = get_table_info(args, sql_data, api)
-    table_struct = table_info[table_info.find("({project name: {database name: {table name}}}):"):]
+    table_info = get_table_info(args.test_path, sql_data, api)
+    table_struct = table_info[table_info.find("The table structure information is "):]
     # format
     response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
     if response_csv == "Exceeded":
@@ -136,16 +128,17 @@ if __name__ == '__main__':
     # args.test_path = "output/o1-preview-test1"
     parser.add_argument('--task', type=str, default="snow")
     parser.add_argument('--test_path', type=str, default="examples")
-    parser.add_argument('--output_path', type=str, default="output/gpt-4o-test1-log")
-    parser.add_argument('--model', type=str, default="gpt-4o")
-    parser.add_argument('--understanding_model', type=str, default="gpt-4o")
+    parser.add_argument('--output_path', type=str, default="output/o1-preview-snow-log")
+    parser.add_argument('--model', type=str, default="o1-preview")
+    parser.add_argument('--model_local', type=str, default=None)
+    parser.add_argument('--understanding_model', type=str, default="o1-preview")
     parser.add_argument('--overwrite_results', action="store_true")
     parser.add_argument('--azure', action="store_true")
     parser.add_argument('--max_iter', type=int, default=10)
     parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--save_all_results', action="store_true")
     parser.add_argument('--use_CoT', action="store_true")
-    parser.add_argument('--model_vote', action="store_true")
+    parser.add_argument('--schema_linking_api', type=str, default=None)
     parser.add_argument('--rerun', action="store_true")
     parser.add_argument('--num_process', type=str, default=2)
     args = parser.parse_args()

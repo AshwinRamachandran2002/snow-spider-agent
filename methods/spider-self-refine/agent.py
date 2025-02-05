@@ -1,8 +1,13 @@
-from utils import execute_sql_api, hard_cut, get_values_from_table
+from utils import execute_sql_api, hard_cut, get_values_from_table, search_file, get_api_name, get_table_info
+from reconstruct_data import remove_digits, compress_ddl
 import numpy as np
 import pandas as pd
 from io import StringIO
 import os
+import ast
+import re
+import csv
+from tqdm import tqdm
 
 '''
 input: sqls
@@ -176,6 +181,40 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
         LIMIT -= 5
     return pre_info, response_pre_txt, LIMIT, chat_session4o
 
+def schema_linking(dictionaries, task_dict, example_path, chat_session_sl):
+    for eg_id in tqdm(dictionaries):
+        api = get_api_name(eg_id)
+        if api == "snowflake":
+            task = task_dict[eg_id]
+            table_info = get_table_info(example_path, eg_id, api)
+            table_struct = table_info[table_info.find("The table structure information is "):]
+
+            prompt = f"Table information: {table_info}\nTask: {task}\nConsider which tables are related to the task. Remove unnecessary tables in {table_struct} and answer table names in ```python``` format in a list.\n"
+            table_struct_response = chat_session_sl.get_model_response(prompt, "python")
+            table_names_no_digit = [remove_digits(s) for s in ast.literal_eval(table_struct_response[0])]
+            ddl_paths = search_file(os.path.join(example_path, eg_id), "DDL.csv")
+            
+            for ddl_path in ddl_paths:
+                temp_file = ddl_path.replace("DDL.csv", "DDL_tmp.csv")
+                with open(ddl_path, "r", newline="", encoding="utf-8", errors="ignore") as infile, \
+                    open(temp_file, "w", newline="", encoding="utf-8", errors="ignore") as outfile:
+                    
+                    reader = csv.reader(infile)
+                    writer = csv.writer(outfile)
+
+                    header = next(reader)
+                    writer.writerow(header)
+
+                    for row in reader:
+                        if remove_digits(row[0]) in table_names_no_digit:
+                            writer.writerow(row)
+
+                os.replace(temp_file, ddl_path)
+        else:
+            raise NotImplementedError()
+
+    compress_ddl(example_path)
+
 def self_refine(args, logger, task, prompt_all, response_csv, search_directory, save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session, api="snowflake", sqlite_path=None):
     itercount = 0
     e = table_info + "Begin Exploring Related Columns\n" + response_pre_txt + pre_info + "End Exploring Related Columns\n"
@@ -299,22 +338,6 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
 
     logger.info(f"Total iteration counts: {itercount}")
     if itercount == args.max_iter and not args.save_all_results:
-
-        if args.model_vote:
-            if results_tables:
-                if os.path.exists(complete_save_path):
-                    with open(complete_save_path) as f:
-                        csv_data = f.readlines()
-                        csv_data_str = ''.join(csv_data)
-                    results_tables.append(csv_data_str)
-                selected_ans = chat_session.get_model_response(f"Here are some candidate answers. The task is: {task}. Please choose one as the correct answer. Provide the output in ```csv``` format: {results_tables}.", "csv")
-                if selected_ans:
-                    try:
-                        with open(complete_save_path, "w") as file:
-                            file.writelines(selected_ans[0])
-                    except Exception as e:
-                        print(e)
-        else:
-            if os.path.exists(complete_save_path):
-                os.remove(complete_save_path)
-            print("Max Iter, remove file")
+        if os.path.exists(complete_save_path):
+            os.remove(complete_save_path)
+        print("Max Iter, remove file")

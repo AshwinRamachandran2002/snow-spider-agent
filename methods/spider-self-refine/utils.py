@@ -302,11 +302,11 @@ def compare_pandas_table(pred, gold, condition_cols=[], ignore_order=False):
 def clear_description(table_info):
     return re.sub(r'OPTIONS\(description=.*?\)', '', table_info, flags=re.DOTALL)
 
-def get_table_info(args, sql_data, api):
+def get_table_info(test_path, sql_data, api):
     table_info_txt = ["prompts.txt"]      
     table_info = ''
     for txt in table_info_txt:
-        txt_path = search_file(os.path.join(args.test_path, sql_data), txt)
+        txt_path = search_file(os.path.join(test_path, sql_data), txt)
         for path in txt_path:
             with open(path) as f:
                 table_info += f.read()
@@ -314,3 +314,13 @@ def get_table_info(args, sql_data, api):
         if len(table_info) > 200000:
             table_info = clear_description(table_info)
     return table_info
+
+def get_api_name(sql_data):
+    if sql_data.startswith("sf"):
+        return "snowflake"
+    elif sql_data.startswith("local"):
+        return "sqlite"
+    elif sql_data.startswith("bq") or sql_data.startswith("ga"):
+        return "bigquery"
+    else:
+        raise NotImplementedError("Invalid file name.")
