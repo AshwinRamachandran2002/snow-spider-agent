@@ -40,9 +40,10 @@ class GPTChat:
                 # print("Main Content:\n", main_content)
                 
                 sql_query = extract_all_blocks(main_content, code_format)
-            if count > 0:
+            if not sql_query:
                 print(f"sql_query: {sql_query}, count: {count}")
                 self.messages.append({"role": "user", "content": f"Please answer in ```{code_format}``` format."})
+                continue
                 
             self.messages.append({"role": "assistant", "content": main_content})
             count += 1
@@ -84,24 +85,35 @@ class modelChat():
 
     def get_model_response(self, prompt, code_format):
         self.messages.append({"role": "user", "content": prompt})
-        text = self.tokenizer.apply_chat_template(
-            self.messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+        sql_query = []
+        count = 0
+        while not sql_query and count < 3:
+            try:
+                text = self.tokenizer.apply_chat_template(
+                    self.messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
+                generated_ids = self.model.generate(
+                    **model_inputs,
+                    max_new_tokens=512
+                )
+            except Exception as e:
+                print(e)
+                return "Exceeded"
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
 
-        generated_ids = self.model.generate(
-            **model_inputs,
-            max_new_tokens=512
-        )
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
-
-        response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        sql_query = extract_all_blocks(response)
-        self.messages.append({"role": "assistant", "content": response})
+            response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            sql_query = extract_all_blocks(response, code_format)
+            if not sql_query:
+                print(f"sql_query: {sql_query}, count: {count}")
+                self.messages.append({"role": "user", "content": f"Please answer in ```{code_format}``` format."})
+                continue
+            self.messages.append({"role": "assistant", "content": response})
+            count += 1
         return sql_query
 
     def get_message_len(self):
