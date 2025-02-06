@@ -11,7 +11,7 @@ from agent import execute_sql, self_correct, format_answer, preparation, self_re
 import numpy as np
 import pandas as pd
 from io import StringIO
-from model import GPTChat, modelChat
+from chat import GPTChat, modelChat
 from prompt import Prompts
 
 def main(args):

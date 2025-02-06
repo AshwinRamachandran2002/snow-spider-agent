@@ -8,7 +8,7 @@ from utils import extract_all_blocks, hard_cut, get_values_from_table, search_fi
 from agent import execute_sql, self_correct, format_answer, preparation, self_refine, schema_linking
 
 from multiprocessing import Pool, Manager, Lock
-from model import GPTChat, modelChat
+from chat import GPTChat, modelChat
 from prompt import Prompts
 
 
