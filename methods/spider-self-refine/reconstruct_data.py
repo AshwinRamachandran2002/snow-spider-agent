@@ -5,18 +5,8 @@ from tqdm import tqdm
 import argparse
 import shutil
 import sqlite3
+from utils import remove_digits, is_file, matching_at_same_position
 pd.set_option('display.max_colwidth', None)
-
-def remove_digits(s):
-    return re.sub(r'\d', '', s)
-
-def is_file(filepath, suffix):
-    return os.path.isfile(filepath) and filepath.lower().endswith(suffix)
-
-def matching_at_same_position(s1, s2):
-    min_length = min(len(s1), len(s2))
-    matches = [s1[i] for i in range(min_length) if s1[i] == s2[i]]
-    return "".join(matches)
 
 def process_ddl(ddl_file):
     table_names = ddl_file['table_name'].to_list()

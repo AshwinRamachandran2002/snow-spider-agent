@@ -324,3 +324,14 @@ def get_api_name(sql_data):
         return "bigquery"
     else:
         raise NotImplementedError("Invalid file name.")
+
+def remove_digits(s):
+    return re.sub(r'\d', '', s)
+
+def is_file(filepath, suffix):
+    return os.path.isfile(filepath) and filepath.lower().endswith(suffix)
+
+def matching_at_same_position(s1, s2):
+    min_length = min(len(s1), len(s2))
+    matches = [s1[i] for i in range(min_length) if s1[i] == s2[i]]
+    return "".join(matches)
