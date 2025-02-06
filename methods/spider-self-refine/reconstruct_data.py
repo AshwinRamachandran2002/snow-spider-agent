@@ -31,6 +31,7 @@ def process_ddl(ddl_file):
     return ddl_file, representatives
 
 def make_folder(args):
+    print("Make folders for some examples.")
     example_folder = args.example_folder
     for entry in tqdm(os.listdir(example_folder)):
         entry1_path = os.path.join(example_folder, entry)
@@ -134,6 +135,7 @@ def compress_all(args):
         
 
 def compress_ddl(example_folder):
+    print("Compress DDL files.")
     for entry in tqdm(os.listdir(example_folder)):
         external_knowledge = None
         prompts = ''
@@ -189,7 +191,7 @@ def compress_ddl(example_folder):
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
                 if not entry.startswith("local"):
-                    prompts += "The table structure information is ({database name: {schema name: {table name}}}): \n" + str(table_dict) + "\n"
+                    prompts += "The table structure information is ({database name: {schema name: [table name]}}): \n" + str(table_dict) + "\n"
                 else:
                     prompts += "The table structure information is (table names): \n" + str(table_names) + "\n"
                 f.writelines(prompts)
