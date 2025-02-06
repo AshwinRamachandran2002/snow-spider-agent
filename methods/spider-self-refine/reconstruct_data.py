@@ -9,7 +9,6 @@ from utils import remove_digits, is_file, matching_at_same_position
 pd.set_option('display.max_colwidth', None)
 
 def process_ddl(ddl_file):
-    ddl_file['table_name'] = ddl_file['table_name'].str.split('.').str[-1]
     table_names = ddl_file['table_name'].to_list()
     # table_names_remove_digits = set([remove_digits(s) for s in table_names])
     representatives = {}
@@ -20,6 +19,14 @@ def process_ddl(ddl_file):
         else:
             representatives[remove_digits(table_names[i])] = [table_names[i]]
     return ddl_file, representatives
+
+def check_table_names(ddl_path):
+    # print(ddl_path)
+    ddl_file = pd.read_csv(ddl_path)
+    temp_path = ddl_path.replace("DDL.csv", "DDL_tmp.csv")
+    ddl_file['table_name'] = ddl_file['table_name'].str.split('.').str[-1]
+    ddl_file.to_csv(temp_path, index=False)
+    os.replace(temp_path, ddl_path)
 
 def make_folder(args):
     print("Make folders for some examples.")
@@ -150,6 +157,8 @@ def compress_ddl(example_folder):
                             for schema_name in os.listdir(db_name_path):
                                 schema_name_path = os.path.join(db_name_path, schema_name)
                                 if schema_name == "DDL.csv":
+                                    if entry.startswith("sf0"):
+                                        check_table_names(schema_name_path)
                                     # prompts += "DDL describes table information.\n"
                                     df = pd.read_csv(schema_name_path)
                                     ddl_file, representatives = process_ddl(df)
