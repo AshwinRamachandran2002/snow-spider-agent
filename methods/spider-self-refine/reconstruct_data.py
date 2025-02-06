@@ -9,6 +9,7 @@ from utils import remove_digits, is_file, matching_at_same_position
 pd.set_option('display.max_colwidth', None)
 
 def process_ddl(ddl_file):
+    ddl_file['table_name'] = ddl_file['table_name'].str.split('.').str[-1]
     table_names = ddl_file['table_name'].to_list()
     # table_names_remove_digits = set([remove_digits(s) for s in table_names])
     representatives = {}
