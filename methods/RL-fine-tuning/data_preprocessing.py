@@ -250,10 +250,7 @@ def save_jsonl(file_name, data):
 def data_augmentation(args, training_data, aug_prompt, aug_index):
     if not os.path.exists(args.Spider2_aug_results_path):
         os.mkdir(args.Spider2_aug_results_path)
-    chat_session_ag = GPTChat(args.azure, args.model_api)
-    prompt = f"This data point comes from a text-to-SQL task. Please perform one data augmentation based on the given task description and its corresponding gold SQL: {aug_prompt}\n"
-    prompt += "The answer format should be:\n```sql\n-- Task: Task Description\nSQL here\n```\nThe answer should be in one ```sql\n``` blocks with code comments like '-- Task: ' to describe the task.\n"
-    prompt += "SQL query should be an 'SELECT' query that can be executed. For CTEs without 'SELECT', you should add one to make it complete.\n"
+    chat_session_ag = GPTChat(args.azure, args.model_api, temperature=args.temperature)
     augmented_data = []
     sql_prompt = Prompts()
     for ex in tqdm(training_data):
@@ -262,17 +259,24 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
             api = get_api_name(ex["example_id"])
             table_struct = ex['input'][ex['input'].find("The table structure information is "):]
             table_struct = table_struct[:table_struct.find("Question")]
+            prompt = f"This data point comes from a text-to-SQL task. Please perform one data augmentation based on the given task description and its corresponding gold SQL: {aug_prompt}\n"
+            prompt += "The answer format should be:\n```sql\n-- Task: Task Description\nSQL here\n```\nThe answer should be in one ```sql\n``` blocks with code comments like '-- Task: ' to describe the task.\n"
+            prompt += "SQL query should be an 'SELECT' query that can be executed. For CTEs without 'SELECT', you should add one to make it complete.\n"
             prompt += "The table structure is: " + table_struct
             prompt += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
             prompt += "Task: " + ex['question'] + "\nGold SQL: " + ex['answer']
             response = []
-            if os.path.exists(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")):
+            if os.path.exists(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")) or len(prompt) > 300000:
                 continue
             inputs = prompt
             success_flag = False
-            while not success_flag:
+            max_iteration = 3
+            while not success_flag and max_iteration > 0:
+                max_iteration -= 1
                 response = chat_session_ag.get_model_response(inputs, "sql")
-                if all("-- Task" in i for i in response):
+                if "context_length_exceeded" in str(response):
+                    break
+                if response != [] and all("-- Task" in i for i in response):
                     response = [response[0]]
                     for i in range(len(response)):
                         ex_copy = ex.copy()
@@ -319,7 +323,7 @@ def main(args):
     dictionaries_snow, task_dict_snow = get_dict("snow", args.snow_path)
     dictionaries_lite, task_dict_lite = get_dict("lite", args.lite_path)
     if args.schema_linking:
-        chat_session_sl = GPTChat(args.azure, args.model_api)
+        chat_session_sl = GPTChat(args.azure, args.model_api, temperature=args.temperature)
         schema_linking(dictionaries_snow, task_dict_snow, args.snow_path, chat_session_sl, args.txt_len_threshold)
         schema_linking(dictionaries_lite, task_dict_lite, args.lite_path, chat_session_sl, args.txt_len_threshold)
     if args.load_data:
@@ -355,7 +359,7 @@ if __name__ == '__main__':
     parser.add_argument('--BIRD_executed_results_path', type=str, default="data/BIRD_exec_results")
     parser.add_argument('--model_api', type=str, default="o1-preview")
     parser.add_argument('--azure', action="store_true")
-    parser.add_argument('--temperature', type=float, default=0)
+    parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--txt_len_threshold', type=float, default=50000)
     parser.add_argument('--data_augmentaion', action="store_true")
     parser.add_argument('--schema_linking', action="store_true")

@@ -31,6 +31,11 @@ def extract_all_blocks(main_content, code_format):
     
     return sql_blocks
 
+def extract_all_boxes(text):
+    pattern = r"\\boxed\{(.*?)\}"
+    matches = re.findall(pattern, text, re.DOTALL)
+    return matches
+
 def hard_cut(str_e, length=0):
     if length:
         if len(str_e) > length and not str_e.startswith("Too long, hard cut"):
