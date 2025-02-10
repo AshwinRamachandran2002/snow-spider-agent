@@ -35,11 +35,11 @@ Place in `BIRD` folder like:
         - 📁 train_databses/
         - 📄 train.json
 ```
-Run:
+<!-- Run:
 ```
 cd data
 python get_dataset.py
-```
+``` -->
 ### Spider2.0 Setup:
 Setup Snow:
 ```
@@ -65,7 +65,11 @@ export OPENAI_API_KEY=YOUR_API_KEY
 export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
-Data Preprocessing:
+Schema Linking:
 ```
 python schema_linking.py --task snow --test_path data/Spider2.0 --model_api o1-preview --azure --temperature 0 --threshold 50000
+```
+Data Preprocessing:
+```
+python data_preprocessing.py --model_api o1-preview --azure --temperature 0 --data_augmentaion --load_data data/training_data.jsonl
 ```
