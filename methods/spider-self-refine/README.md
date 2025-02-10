@@ -32,11 +32,11 @@ export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 Run single process version:
 ```
-python run.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --temperature 0
+python run.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure
 ```
 Run voting:
 ```
-python run_vote.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --temperature 0 --num_processes 3
+python run_vote.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --num_processes 3
 ```
 ### Evaluation
 Preparation for evaluation files:
@@ -78,11 +78,11 @@ export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 Run single process version:
 ```
-python run.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --temperature 0
+python run.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure
 ```
 Run voting:
 ```
-python run_vote.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --temperature 0 --num_processes 3
+python run_vote.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --num_processes 3
 ```
 ### Evaluation
 Preparation for evaluation files:

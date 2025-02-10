@@ -89,7 +89,7 @@ def process_folder(sql_data):
     table_struct = table_info[table_info.find("The table structure information is "):]
     # format
     response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
-    if "context_length_exceeded" in str(response_csv):
+    if not isinstance(response_csv, list):
         logger.info(response_csv)
         return
     if chat_session4o.get_message_len() > 300000:
