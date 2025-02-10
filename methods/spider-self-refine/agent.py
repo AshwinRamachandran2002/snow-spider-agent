@@ -315,7 +315,7 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
             logger.info(e)
         response = chat_session.get_model_response(e, "sql")
         logger.info(chat_session.messages[-1]['content'])
-        if response == "Exceeded" or response == []:
+        if "context_length_exceeded" in str(response) or response == []:
             logger.info(response)
             logger.info(chat_session.messages[-1]['content'])
             if os.path.exists(complete_save_path):

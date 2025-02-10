@@ -17,13 +17,14 @@ class GPTChat:
 
         self.messages = []
         self.model = model
-        self.temperature = temperature
+        self.temperature = float(temperature)
 
     def get_model_response(self, prompt, code_format):
         self.messages.append({"role": "user", "content": prompt})
         sql_query = []
         count = 0
         while not sql_query and count < 3:
+            count += 1
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -32,7 +33,7 @@ class GPTChat:
                 )
             except Exception as e:
                 print(e)
-                return "Exceeded"
+                return e
             choices = response.choices
             if choices:
                 # Extract the main message content
@@ -40,14 +41,12 @@ class GPTChat:
                 # print("Main Content:\n", main_content)
                 
                 sql_query = extract_all_blocks(main_content, code_format)
+            self.messages.append({"role": "assistant", "content": main_content})
             if not sql_query:
                 print(f"sql_query: {sql_query}, count: {count}")
                 self.messages.append({"role": "user", "content": f"Please answer in ```{code_format}``` format."})
                 continue
                 
-            self.messages.append({"role": "assistant", "content": main_content})
-            count += 1
-        # print(f"Current_context_len: {self.get_message_len()}")
         return sql_query
     def get_model_response_txt(self, prompt):
         self.messages.append({"role": "user", "content": prompt})
@@ -59,7 +58,7 @@ class GPTChat:
             )
         except Exception as e:
             print(e)
-            return "Exceeded"
+            return e
         choices = response.choices
         if choices:
             # Extract the main message content
@@ -78,30 +77,33 @@ class GPTChat:
         self.messages = []
 
 class modelChat():
-    def __init__(self, model, tokenizer) -> None:
+    def __init__(self, model, tokenizer, device, temperature=1) -> None:
         self.model = model
         self.tokenizer = tokenizer
         self.messages = []
+        self.temperature = float(temperature)
+        self.device = device
 
     def get_model_response(self, prompt, code_format):
         self.messages.append({"role": "user", "content": prompt})
         sql_query = []
         count = 0
         while not sql_query and count < 3:
+            count += 1
+            text = self.tokenizer.apply_chat_template(
+                self.messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            model_inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
             try:
-                text = self.tokenizer.apply_chat_template(
-                    self.messages,
-                    tokenize=False,
-                    add_generation_prompt=True
-                )
-                model_inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
                 generated_ids = self.model.generate(
                     **model_inputs,
-                    max_new_tokens=512
+                    max_new_tokens=4096
                 )
             except Exception as e:
                 print(e)
-                return "Exceeded"
+                return e
             generated_ids = [
                 output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
             ]
@@ -110,12 +112,33 @@ class modelChat():
             sql_query = extract_all_blocks(response, code_format)
             if not sql_query:
                 print(f"sql_query: {sql_query}, count: {count}")
-                self.messages.append({"role": "user", "content": f"Please answer in ```{code_format}``` format."})
+                self.messages[-1] = {"role": "user", "content": f"Please answer in ```{code_format}``` format."}
                 continue
             self.messages.append({"role": "assistant", "content": response})
-            count += 1
+            
         return sql_query
-
+    def get_model_response_txt(self, prompt):
+        self.messages.append({"role": "user", "content": prompt})
+        text = self.tokenizer.apply_chat_template(
+            self.messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        model_inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
+        try:
+            generated_ids = self.model.generate(
+                **model_inputs,
+                max_new_tokens=4096
+            )
+        except Exception as e:
+            print(e)
+            return e
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+        response = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        self.messages.append({"role": "assistant", "content": response})
+        return response
     def get_message_len(self):
         return sum([len(i['content']) for i in self.messages])
 

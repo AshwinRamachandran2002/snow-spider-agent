@@ -29,11 +29,11 @@ def process_folder(sql_data):
                 task_dict[line_js['instance_id']] = line_js['question']
 
     if args.model:
-        chat_session = GPTChat(args.azure, args.model)
-        chat_session4o = GPTChat(args.azure, args.understanding_model)
+        chat_session = GPTChat(args.azure, args.model, temperature=args.temperature)
+        chat_session4o = GPTChat(args.azure, args.understanding_model, temperature=args.temperature)
 
     if args.schema_linking_api:
-        chat_session_sl = GPTChat(args.azure, args.schema_linking_api) 
+        chat_session_sl = GPTChat(args.azure, args.schema_linking_api, temperature=args.temperature) 
         schema_linking(dictionaries, task_dict, args.test_path, chat_session_sl)
     
     if args.model_local:
@@ -44,7 +44,7 @@ def process_folder(sql_data):
             device_map="auto"
         )
         tokenizer = AutoTokenizer.from_pretrained(args.model_local)
-        chat_session = modelChat(model, tokenizer)
+        chat_session = modelChat(model, tokenizer, temperature=args.temperature)
 
         
     # logger = initialize_logger()
@@ -89,7 +89,7 @@ def process_folder(sql_data):
     table_struct = table_info[table_info.find("The table structure information is "):]
     # format
     response_csv, chat_session4o = format_answer(prompt_all, table_info, task, chat_session4o)
-    if response_csv == "Exceeded":
+    if "context_length_exceeded" in str(response_csv):
         logger.info(response_csv)
         return
     if chat_session4o.get_message_len() > 300000:

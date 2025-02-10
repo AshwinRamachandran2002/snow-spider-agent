@@ -34,11 +34,11 @@ def main(args):
     dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
 
     if args.model:
-        chat_session = GPTChat(args.azure, args.model)
-        chat_session4o = GPTChat(args.azure, args.understanding_model)
+        chat_session = GPTChat(args.azure, args.model, temperature=args.temperature)
+        chat_session4o = GPTChat(args.azure, args.understanding_model, temperature=args.temperature)
 
     if args.schema_linking_api:
-        chat_session_sl = GPTChat(args.azure, args.schema_linking_api) 
+        chat_session_sl = GPTChat(args.azure, args.schema_linking_api, temperature=args.temperature) 
         schema_linking(dictionaries, task_dict, args.test_path, chat_session_sl)
     
     if args.model_local:
@@ -49,7 +49,7 @@ def main(args):
             device_map="auto"
         )
         tokenizer = AutoTokenizer.from_pretrained(args.model_local)
-        chat_session = modelChat(model, tokenizer)
+        chat_session = modelChat(model, tokenizer, temperature=args.temperature)
 
     for sql_data in tqdm(dictionaries):
         chat_session.init_messages()
