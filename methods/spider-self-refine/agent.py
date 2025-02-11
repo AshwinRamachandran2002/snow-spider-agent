@@ -46,7 +46,7 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
                     simplify = True
                 corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
                 check_again_flag = False
-                if not corrected_sql:
+                if not isinstance(corrected_sql, list) or corrected_sql == []:
                     results = "Empty. No data found for the specified query.\n"
                     break
                 corrected_sql = corrected_sql[0]
@@ -57,15 +57,16 @@ def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_pat
                 # print("Corrected.\n")
                 error_rec.append(1)
                 response = chat_session.get_model_response(f"Please correct other sqls if they have similar errors: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
-                response_sql = []
-                for s in response:
-                    try:
-                        queries = [query.strip() for query in s.strip().split(';') if query.strip()]
-                        response_sql += queries
-                    except:
-                        pass
-                if len(response_sql) >= len(sqls):
-                    sqls = response_sql
+                if isinstance(corrected_sql, list) and corrected_sql != []:
+                    response_sql = []
+                    for s in response:
+                        try:
+                            queries = [query.strip() for query in s.strip().split(';') if query.strip()]
+                            response_sql += queries
+                        except:
+                            pass
+                    if len(response_sql) >= len(sqls):
+                        sqls = response_sql
             else:
                 # print("Max iter, failed to correct.\n")
                 error_rec.append(0)
@@ -154,6 +155,9 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
 
         response_pre = chat_session4o.get_model_response(ans_pre, "sql")
         response_pre_txt = chat_session4o.messages[-1]['content']
+        if not isinstance(response_pre, list):
+            LIMIT -= 5
+            continue
         if len(response_pre) == 1:
             response_pre = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
         if len(response_pre) < 10:
