@@ -168,7 +168,7 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
         results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, api=api, max_len=5000, sqlite_path=sqlite_path)
         sql_count = 0
         for key, value in results_pre_dic.items():
-            pre_info += "Query:\n" + key + "\nAnswer:\n" + value
+            pre_info += "Query:\n" + key + "\nAnswer:\n" + str(value)
             if isinstance(value, str):
                 sql_count += 1
 
