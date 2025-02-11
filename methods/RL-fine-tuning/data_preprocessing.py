@@ -274,7 +274,7 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
             while not success_flag and max_iteration > 0:
                 max_iteration -= 1
                 response = chat_session_ag.get_model_response(inputs, "sql")
-                if "context_length_exceeded" in str(response):
+                if not isinstance(response, list):
                     break
                 if response != [] and all("-- Task" in i for i in response):
                     response = [response[0]]
