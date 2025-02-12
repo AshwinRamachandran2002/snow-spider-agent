@@ -97,8 +97,7 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                 #         print(results)
                 sql_dict["gold_results_path"] = os.path.join(args.snow_gold_sql_path.replace("sql", "exec_result"), sql_id)
                 with open(os.path.join(args.snow_path, sql_id, "prompts.txt")) as f:
-                    question = sql_dict["question"]
-                    sql_dict["input"] = f.read() + f"\nQuestion: {question}\n"
+                    sql_dict["input"] = f.read()
             else:
                 sql_dict["question"] = task_dict_lite[sql_id]
                 if task == "train":
@@ -113,8 +112,7 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                             sqlite_path = sql_dict["sqlite_path"]
                 sql_dict["gold_results_path"] = os.path.join(args.lite_gold_sql_path.replace("sql", "exec_result"), sql_id)
                 with open(os.path.join(args.lite_path, sql_id, "prompts.txt")) as f:
-                    question = sql_dict["question"]
-                    sql_dict["input"] = f.read() + f"\nQuestion: {question}\n"
+                    sql_dict["input"] = f.read()
 
             dict_list.append(sql_dict)
     return dict_list
@@ -177,8 +175,7 @@ def get_spider1_data_dict(args, min_token_len=50):
                 #     f.write(json.dumps(ex, ensure_ascii=False) + "\n")
                 table_names, prompts = get_sqlite_data(sqlite_path)
                 prompts += "The table structure information is (table names): \n" + str(table_names) + "\n"
-                question = sql_dict["question"]
-                sql_dict["input"] = prompts + f"\nQuestion: {question}\n"
+                sql_dict["input"] = prompts
                 Spider_executed_results_id_path = os.path.join(args.Spider_executed_results_path, id_name + ".csv")
                 results = execute_sql_api(sql_dict["answer"], Spider_executed_results_id_path, "sqlite", sqlite_path=sqlite_path)
                 if results != 0:
@@ -227,8 +224,7 @@ def get_bird_data_dict(args, min_token_len=50):
 
                 table_names, prompts = get_sqlite_data(sqlite_path)
                 prompts += "The table structure information is (table names): \n" + str(table_names) + "\n"
-                question = sql_dict["question"]
-                sql_dict["input"] = prompts + external + f"\nQuestion: {question}\n"
+                sql_dict["input"] = prompts + external
                 BIRD_executed_results_id_path = os.path.join(args.BIRD_executed_results_path, id_name + ".csv")
                 results = execute_sql_api(sql_dict["answer"], BIRD_executed_results_id_path, "sqlite", sqlite_path=sqlite_path)
                 if results != 0:
@@ -266,7 +262,19 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
             prompt += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
             prompt += "Task: " + ex['question'] + "\nGold SQL: " + ex['answer']
             response = []
-            if os.path.exists(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")) or len(prompt) > 300000:
+            if len(prompt) > 300000:
+                continue
+            if os.path.exists(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")):
+                ex_copy = ex.copy()
+                ex_copy["example_id"] = ex["example_id"] + f"_aug{aug_index}"
+                with open(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".txt")) as f:
+                    ex_copy["question"] = f.read()
+                with open(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".sql")) as f:
+                    ex_copy["answer"] = f.read()
+                if "sqlite_path" in ex.keys():
+                    ex_copy["sqlite_path"] = ex["sqlite_path"]
+                ex_copy["gold_results_path"] = os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")
+                augmented_data.append(ex_copy)
                 continue
             inputs = prompt
             success_flag = False
