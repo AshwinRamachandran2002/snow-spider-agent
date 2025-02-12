@@ -280,7 +280,7 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                     response = [response[0]]
                     for i in range(len(response)):
                         ex_copy = ex.copy()
-                        ex_copy["example_id"] = ex["example_id"] + f"_aug{i}"
+                        ex_copy["example_id"] = ex["example_id"] + f"_aug{aug_index}"
                         ex_copy["question"] = response[i].split("\n")[0]
                         ex_copy["answer"] = response[i]
 
