@@ -11,6 +11,9 @@ from reconstruct_data import compress_ddl
 import json
 import random
 import sys
+import shutil
+
+
 csv.field_size_limit(sys.maxsize)
 def schema_linking(dictionaries, task_dict, example_path, chat_session_sl, txt_len_threshold):
     # skip_flag = True
@@ -237,8 +240,8 @@ def get_bird_data_dict(args, min_token_len=50):
                 dict_list.append(sql_dict)
     return dict_list
 
-def save_jsonl(file_name, data):
-    with open(f"data/{file_name}.jsonl", "w", encoding="utf-8") as f:
+def save_jsonl(file_name, data, mode="w"):
+    with open(f"data/{file_name}.jsonl", mode=mode, encoding="utf-8") as f:
         for entry in data:
             json.dump(entry, f, ensure_ascii=False)
             f.write("\n")
@@ -324,8 +327,7 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                 else:
                     inputs = "The answer should be in one ```sql\n``` block with code comments like '-- Task: ' to describe the task.\n"
                     inputs += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
-    training_data_aug = training_data + augmented_data
-    save_jsonl("training_data_aug", training_data_aug)
+    save_jsonl(args.train_aug_json_name, augmented_data, "a")
 
 def main(args):
     dictionaries_snow, task_dict_snow = get_dict("snow", args.snow_path)
@@ -350,6 +352,10 @@ def main(args):
     if args.data_augmentaion:
         aug0_prompt = "\nRefine the task description to make it more precise and accurate while keeping the original SQL unchanged.\n"
         aug1_prompt = "\nSimplify the task by selecting an intermediate step from the gold SQL and generating an easier task accordingly. (You can only use tables and columns from the original SQL. If the answer could be very long, add LIMIT 100 at end and modify the task description accordingly.)\n"
+        aug_json_path = os.path.join("data", args.train_aug_json_name + ".jsonl")
+        if os.path.exists(aug_json_path):
+            os.remove(aug_json_path)
+        shutil.copy(os.path.join("data", args.train_json_name + ".jsonl"), aug_json_path)
         data_augmentation(args, training_data, aug0_prompt, 0)
         data_augmentation(args, training_data, aug1_prompt, 1)
 
@@ -364,6 +370,8 @@ if __name__ == '__main__':
     parser.add_argument('--lite_gold_sql_path_training', type=str, default="data/Spider2.0_lite_gold_sql")
     parser.add_argument('--Spider_executed_results_path', type=str, default="data/Spider_exec_results")
     parser.add_argument('--Spider2_aug_results_path', type=str, default="data/Spider2_aug_results")
+    parser.add_argument('--train_json_name', type=str, default="training_data")
+    parser.add_argument('--train_aug_json_name', type=str, default="training_data_aug")
     parser.add_argument('--BIRD_executed_results_path', type=str, default="data/BIRD_exec_results")
     parser.add_argument('--model_api', type=str, default="o1-preview")
     parser.add_argument('--azure', action="store_true")
