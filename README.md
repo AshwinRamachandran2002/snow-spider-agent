@@ -1,0 +1,112 @@
+## Getting Started 🎯
+### Installation
+```bash
+# Recommend Python 3.10.
+cd deepscaler
+pip install -e ./verl
+pip install -e .
+pip install antlr4-python3-runtime==4.9.*
+```
+
+### Data
+Our raw training data in `deepscaler/data/[train|test]`, along with preprocessing scripts. To convert the raw data into Parquet files for training, run:
+```python
+# Output parquet files in data/*.parquet.
+python scripts/data/deepscaler_dataset.py
+```
+
+### Credential
+Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`deepscaler`).
+
+### Training Scripts
+
+We provide training scripts for both single-node and multi-node setups in `scripts/train/`. Our runs' Wandb logs are available [here](https://wandb.ai/mluo/deepscaler-1.5b).
+
+#### Single-Node Training (8 GPUs)
+Our 8k context script runs on a single node with 8 A100-80GB GPUs:
+```bash
+# Set XFormers backend to avoid CUDA errors
+export VLLM_ATTENTION_BACKEND=XFORMERS
+export WANDB_API_KEY=<YOUR_WANDB_KEY>
+./scripts/train/run_deepscaler_1.5b_8k_sql.sh
+```
+
+#### Multi-Node Training (32 GPUs)
+
+Our long-context runs (16K/24K) are distributed across 4 nodes with 8 A100-80GB GPUs each. To run, follow these steps:
+
+1. On the head node:
+```bash
+# Set XFormers backend to avoid CUDA errors
+export VLLM_ATTENTION_BACKEND=XFORMERS
+# Start Ray head node
+ray start --head
+```
+
+2. On each worker node:
+```bash
+# Set XFormers backend to avoid CUDA errors
+export VLLM_ATTENTION_BACKEND=XFORMERS
+# Connect to head node (replace with your head node's address)
+ray start --address=[RAY_ADDRESS]
+```
+
+3. Finally, on the head node, run the training script:
+```bash
+# Run 16K or 24K context length training
+./scripts/train/run_deepscaler_1.5b_[16k|24k].sh --model [CHECKPOINT_PATH]
+```
+We welcome the community to try out different models, context legnths, and RL parameters in the training scripts!
+
+### Ablations
+
+Finally, we provide ablations for the 2k/4k context runs in `scripts/ablation/`. To run:
+```bash
+./scripts/ablation/run_deepscaler_1.5b_[2k|4k].sh --model [CHECKPOINT_PATH]
+```
+
+## Evaluation
+
+Our evaluation scripts automatically runs vLLM to generate 16 samples for each problem. To run our evaluation scripts, run:
+```bash
+./scripts/eval/eval_model.sh --model [CHECKPOINT_PATH] --datasets [DATASET1] [DATASET2] --output-dir [OUTPUT_DIR]
+```
+
+We report Pass@1 accuracy averaged over 16 samples for each problem. Notably, our `DeepScaleR-1.5B-Preview` surpasses many open-source 7B models! Our evaluation logs are available [here](https://drive.google.com/file/d/1V_rYKoL35WmubbmWN6PeFg4zo5QOug8X/view?pli=1).
+
+| Model | AIME 2024 | MATH 500 | AMC 2023 | Minerva Math | OlympiadBench | Avg. |
+|-------|-----------|-----------|-----------|--------------|---------------|------|
+| Qwen2.5-Math-7B-Instruct | 13.3 | 79.8 | 50.6 | 34.6 | 40.7 | 43.8 |
+| rStar-Math-7B | 26.7 | 78.4 | 47.5 | - | 47.1 | - |
+| Eurus-2-7B-PRIME | 26.7 | 79.2 | 57.8 | 38.6 | 42.1 | 48.9 |
+| Qwen2.5-7B-SimpleRL | 26.7 | 82.4 | 62.5 | <strong>39.7</strong> | 43.3 | 50.9 |
+| DeepSeek-R1-Distill-Qwen-1.5B | 28.8 | 82.8 | 62.9 | 26.5 | 43.3 | 48.9 |
+| Still-1.5B | 32.5 | 84.4 | 66.7 | 29.0 | 45.4 | 51.6 |
+| <strong>DeepScaleR-1.5B-Preview</strong> | <strong>43.1</strong> | <strong>87.8</strong> | <strong>73.6</strong> | 30.2 | <strong>50.0</strong> | <strong>57.0</strong> |
+| O1-Preview | 40.0 | 81.4 | - | - | - | - |
+
+To replicate our reported numbers for `DeepScaleR-1.5B-Preview`, run:
+```bash
+./scripts/eval/eval_model.sh --model agentica-org/DeepScaleR-1.5B-Preview --datasets aime math amc minerva olympiad_bench --output-dir $HOME/DeepScaleR-1.5B-Preview
+```
+
+
+## Acknowledgements
+
+- Our training experiments are powered by our heavily modified fork of [Verl](https://github.com/agentica-project/verl), an open-source RLHF library.
+- Our model is trained on top of [`DeepSeek-R1-Distill-Qwen-1.5B`](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B).
+- Our work is done as part of  [Berkeley Sky Computing Lab](https://skycomputing.berkeley.edu/) and [Berkeley AI Research](https://bair.berkeley.edu/).
+
+
+## Citation
+
+```bibtex
+@misc{deepscaler2025,
+  title={DeepScaleR: Surpassing O1-Preview with a 1.5B Model by Scaling RL},
+  author={Michael Luo and Sijun Tan and Justin Wong and Xiaoxiang Shi and William Y. Tang and Manan Roongta and Colin Cai and Jeffrey Luo and Tianjun Zhang and Li Erran Li and Raluca Ada Popa and Ion Stoica},
+  year={2025},
+  howpublished={\url{https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2}},
+  note={Notion Blog}
+  year={2025}
+}
+```

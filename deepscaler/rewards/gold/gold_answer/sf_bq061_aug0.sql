@@ -1,0 +1,10 @@
+-- Task: Identify the census tract in California with the largest increase in median income between 2015 and 2018, among tracts where median income data is available for both years. Provide the tract's geo_id and tract code.
+SELECT t1."geo_id", t3."tract_ce"
+FROM CENSUS_BUREAU_ACS_1.CENSUS_BUREAU_ACS."CENSUSTRACT_2015_5YR" t1
+JOIN CENSUS_BUREAU_ACS_1.CENSUS_BUREAU_ACS."CENSUSTRACT_2018_5YR" t2
+  ON t1."geo_id" = t2."geo_id"
+JOIN CENSUS_BUREAU_ACS_1.GEO_CENSUS_TRACTS."CENSUS_TRACTS_CALIFORNIA" t3
+  ON t1."geo_id" = REPLACE(t3."geo_id", '14000US', '')
+WHERE t1."median_income" IS NOT NULL AND t2."median_income" IS NOT NULL
+ORDER BY (t2."median_income" - t1."median_income") DESC NULLS LAST
+LIMIT 1;
