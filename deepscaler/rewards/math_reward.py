@@ -40,10 +40,10 @@ class RewardMathFn(RewardFn):
         else:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
-        model_answer = extract_all_blocks(model_solution, "sql")[-1]
+        model_answer = extract_all_blocks(model_solution, "sql")
         if model_answer is None:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
-
+        model_answer = model_answer[-1]
         # Process the ground truth(s)
         ground_truths = "deepscaler/rewards/gold/gold_answer"
         print(f"input.sqlite_path: {input.sqlite_path}")

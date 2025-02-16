@@ -42,7 +42,7 @@ def make_map_fn(split: str):
     """
     def process_fn(example: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
         question = example.pop('question')
-        instruction = "This is a Text-to-SQL task where you are given database information and a question, and your goal is to generate a SQL query as the answer. Let's think step by step and output the whole final SQL within ```sql``` code block.\n"
+        instruction = "This is a Text-to-SQL task where you are given database information and a question, and your goal is to generate only one SQL query as the answer. Let's think step by step and output the whole final SQL within ```sql``` code block.\n"
         instruction += "Table info:\n" + example["input"]
 
         api = get_api_name(example["example_id"])

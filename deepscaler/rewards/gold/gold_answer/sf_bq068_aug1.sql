@@ -1,4 +1,4 @@
--- Task: Using double-entry bookkeeping principles by treating transaction inputs as debits (negative values) and outputs as credits (positive values) for all Bitcoin Cash transactions between '2014-03-01' and '2014-04-01', create a double-entry book listing addresses, types, and values of all debits and credits.
+-- Task: Using double-entry bookkeeping principles by treating transaction inputs as debits (negative values) and outputs as credits (positive values) for all Bitcoin Cash transactions between '2014-03-01' and '2014-04-01', create a double-entry book listing addresses, types, and values of all debits and credits. Limit 100 rows.
 
 WITH double_entry_book AS (
     -- debits
@@ -23,4 +23,4 @@ WITH double_entry_book AS (
     WHERE TO_TIMESTAMP("block_timestamp" / 1000000) >= '2014-03-01' 
       AND TO_TIMESTAMP("block_timestamp" / 1000000) < '2014-04-01'
 )
-SELECT * FROM double_entry_book;
+SELECT * FROM double_entry_book LIMIT 100;

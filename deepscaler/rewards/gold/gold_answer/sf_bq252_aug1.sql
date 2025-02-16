@@ -1,9 +1,28 @@
--- Task: List all unique files in the dataset (based on file ID), along with their repository names and paths.
-SELECT
+-- Task: Retrieve the names of all repositories that contain non-binary Swift files in the dataset.
+WITH selected_repos AS (
+  SELECT
+    f."id",
+    f."repo_name" AS "repo_name",
+    f."path" AS "path"
+  FROM
+    GITHUB_REPOS.GITHUB_REPOS.SAMPLE_FILES AS f
+),
+deduped_files AS (
+  SELECT
     f."id",
     MIN(f."repo_name") AS "repo_name",
     MIN(f."path") AS "path"
+  FROM
+    selected_repos AS f
+  GROUP BY
+    f."id"
+)
+SELECT DISTINCT
+  f."repo_name"
 FROM
-    GITHUB_REPOS.GITHUB_REPOS.SAMPLE_FILES AS f
-GROUP BY
-    f."id";
+  deduped_files AS f
+  JOIN GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS AS c 
+  ON f."id" = c."id"
+WHERE
+  NOT c."binary"
+  AND f."path" LIKE '%.swift';
