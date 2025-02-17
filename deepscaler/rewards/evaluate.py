@@ -201,26 +201,28 @@ def get_sqlite_result(db_path, query, save_dir=None, file_name="result.csv", chu
     return True, None
 
 
-def evaluate_spider2sql(gold_csv_path, result_csv_path, example_id):
-    gold_result_dir = gold_csv_path
+def evaluate_spider2sql(gold_result_dir, result_csv_path, example_id):
     eval_standard_dict = load_jsonl_to_dict(os.path.join('/'.join(gold_result_dir.split("/")[:-1]), "eval.jsonl"))
                        
     eval_ids = list(eval_standard_dict.keys())
     eval_ids = sorted(eval_ids)  # sorted, for reproduce result
     
     try:
-        pred_pd = pd.read_csv(os.path.join(result_csv_path))
+        pred_pd = pd.read_csv(result_csv_path)
         pattern = re.compile(rf'^{re.escape(example_id)}(_[a-z])?\.csv$')
         all_files = os.listdir(gold_result_dir)
         csv_files = [file for file in all_files if pattern.match(file)]
         csv_files = sorted(csv_files)
         if len(csv_files) == 1:
-            gold_pd = pd.read_csv(os.path.join(gold_csv_path, example_id+".csv"))
+            gold_pd = pd.read_csv(os.path.join(gold_result_dir, example_id+".csv"))
             score = compare_pandas_table(pred_pd, gold_pd, eval_standard_dict.get(example_id)['condition_cols'], eval_standard_dict.get(example_id)['ignore_order'])
         elif len(csv_files) > 1:
             gold_pds = [pd.read_csv(os.path.join(gold_result_dir, file)) for file in csv_files]
             score = compare_multi_pandas_table(pred_pd, gold_pds, eval_standard_dict.get(example_id)['condition_cols'], eval_standard_dict.get(example_id)['ignore_order'])
     except Exception as e:
         print(f"{example_id} ERROR: {e}")
+        # print(f"result_csv_path: {result_csv_path}")
+        # gold_csv_path = os.path.join(gold_result_dir, example_id+".csv")
+        # print(f"gold_csv_path: {gold_csv_path}")
         score = 0
     return score

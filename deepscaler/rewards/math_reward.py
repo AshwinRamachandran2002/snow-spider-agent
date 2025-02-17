@@ -12,6 +12,7 @@ from deepscaler.system_prompts import ORM_PROMPT
 from deepscaler.utils import call_gemini_llm, call_oai_rm_llm
 from deepscaler.rewards.evaluate import evaluate_spider2sql
 import os
+import shutil
 
 ORM_USER_TEMPLATE = """
 Problem: {problem}
@@ -32,11 +33,11 @@ class RewardMathFn(RewardFn):
             "Invalid problem type: expected 'MATH', but got '{}'".format(input.problem_type)
         
         problem = input.problem
-        model_response = input.model_response
+        model_answer = input.model_response
         
         # Extract solution.
-        if THOUGHT_DELIMITER_START in model_response and THOUGHT_DELIMITER_END in model_response:
-            model_answer = model_response.split(THOUGHT_DELIMITER_END)[1]
+        if THOUGHT_DELIMITER_START in model_answer and THOUGHT_DELIMITER_END in model_answer:
+            model_answer = model_answer.split(THOUGHT_DELIMITER_END)[1]
         # else:
         #     return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
@@ -46,8 +47,8 @@ class RewardMathFn(RewardFn):
         model_answer = model_answer[-1]
         # Process the ground truth(s)
         ground_truths = "deepscaler/rewards/gold/gold_answer"
-        print(f"input.sqlite_path: {input.sqlite_path}")
-        print(f"input.example_id: {input.example_id}")
+        # print(f"input.sqlite_path: {input.sqlite_path}")
+        # print(f"input.example_id: {input.example_id}")
         # print(f"model_answer: {model_answer}")
 
 
@@ -55,12 +56,17 @@ class RewardMathFn(RewardFn):
         example_id = input.example_id.get("ex_id", None)
         csv_save_path = os.path.join("exec", example_id+".csv")
 
+        if os.path.exists("exec"):
+            shutil.rmtree("exec")
+        os.mkdir("exec")
+
         with open(f"exec/{example_id}.log", "w") as f:
             f.write(model_answer)
 
         if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
             if is_correct:
+                print(f"Correct: {example_id}")
                 return RewardOutput(reward=self.config.correct_reward, is_correct=True)
 
         # If latex heuristics fail and ORM is enabled, use LLM as ORM to evaluate correctness

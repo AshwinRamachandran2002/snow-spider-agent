@@ -22,6 +22,11 @@ Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`
 
 We provide training scripts for both single-node and multi-node setups in `scripts/train/`.
 
+### Model
+```
+huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir methods/spider-self-refine/models/QwQ-32B-Preview  --local-dir-use-symlinks False --resume
+```
+
 #### Single-Node Training (8 GPUs)
 Our 8k context script runs on a single node with 8 A100-80GB GPUs:
 ```bash

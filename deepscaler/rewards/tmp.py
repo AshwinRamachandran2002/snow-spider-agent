@@ -1,10 +1,3 @@
-from typing import List, Union
-
-from deepscaler.globals import THOUGHT_DELIMITER_START, THOUGHT_DELIMITER_END, OAI_RM_MODEL
-from deepscaler.rewards import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
-from deepscaler.rewards.math_utils.utils import extract_answer, grade_answer_sympy, grade_answer_mathd, execute_sql_api, get_api_name
-from deepscaler.system_prompts import ORM_PROMPT
-from deepscaler.utils import call_gemini_llm, call_oai_rm_llm
 from deepscaler.rewards.evaluate import evaluate_spider2sql
 import os
 
@@ -14,5 +7,6 @@ sqlite_path = None
 example_id = "sf_local072_aug0"
 csv_save_path = os.path.join("exec", example_id+".csv")
 
-if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
-    is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
+# if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
+is_correct = evaluate_spider2sql(ground_truths, "exec/bq230.csv", "bq230")
+print(is_correct)
