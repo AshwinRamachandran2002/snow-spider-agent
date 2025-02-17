@@ -1,5 +1,5 @@
 from openai import OpenAI, AzureOpenAI
-from utils import extract_all_blocks
+from utils.utils import extract_all_blocks
 import os
 
 class GPTChat:

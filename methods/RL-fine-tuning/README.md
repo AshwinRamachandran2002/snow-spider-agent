@@ -1,3 +1,10 @@
+## Dependencies
+```
+pip install -e ./verl
+pip install -e .
+pip uninstall grpcio-status
+pip install -r requirements.txt
+```
 ## Training Data
 
 
@@ -67,5 +74,7 @@ export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 Data Preprocessing:
 ```
-python data_preprocessing.py --model_api o1-preview --azure --schema_linking --data_augmentaion
+python -m utils.data_preprocessing --model_api o1-preview --azure --schema_linking --data_augmentaion
 ```
+
+## Deepscaler Dataset

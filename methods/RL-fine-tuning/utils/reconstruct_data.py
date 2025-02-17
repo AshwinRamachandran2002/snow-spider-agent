@@ -5,7 +5,7 @@ from tqdm import tqdm
 import argparse
 import shutil
 import sqlite3
-from utils import remove_digits, is_file, matching_at_same_position
+from utils.utils import remove_digits, is_file, matching_at_same_position
 pd.set_option('display.max_colwidth', None)
 
 def process_ddl(ddl_file):

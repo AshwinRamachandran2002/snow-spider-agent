@@ -1,13 +1,13 @@
 import argparse
-from chat import GPTChat
+from utils.chat import GPTChat
 from tqdm import tqdm
-from utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_api
-from reconstruct_data import get_sqlite_data
-from prompt import Prompts
+from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_api
+from utils.reconstruct_data import get_sqlite_data
+from utils.prompt import Prompts
 import ast
 import csv
 import os
-from reconstruct_data import compress_ddl
+from utils.reconstruct_data import compress_ddl
 import json
 import random
 import sys
@@ -98,7 +98,7 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                 #     results = execute_sql_api(sql_dict["answer"], Spider2_executed_results_id_path, api, sqlite_path=sqlite_path)
                 #     if results != 0:
                 #         print(results)
-                sql_dict["gold_results_path"] = os.path.join(args.snow_gold_sql_path.replace("sql", "exec_result"), sql_id)
+                # sql_dict["gold_results_path"] = os.path.join(args.gold_results_path, sql_id + ".csv")
                 with open(os.path.join(args.snow_path, sql_id, "prompts.txt")) as f:
                     sql_dict["input"] = f.read()
             else:
@@ -113,7 +113,7 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                             sql_dict["sqlite_path"] = os.path.join(id_path, file)
                             assert sql_dict["sqlite_path"]
                             sqlite_path = sql_dict["sqlite_path"]
-                sql_dict["gold_results_path"] = os.path.join(args.lite_gold_sql_path.replace("sql", "exec_result"), sql_id)
+                # sql_dict["gold_results_path"] = os.path.join(args.gold_results_path, sql_id + ".csv")
                 with open(os.path.join(args.lite_path, sql_id, "prompts.txt")) as f:
                     sql_dict["input"] = f.read()
 
@@ -174,8 +174,6 @@ def get_spider1_data_dict(args, min_token_len=50):
                 sql_dict["question"] = ex["question"]
                 sql_dict["answer"] = ex["query"]
                 sql_dict["sqlite_path"] = sqlite_path
-                # with open(os.path.join(spider_example_pth, f"Spider_{data_type}.jsonl"), "a") as f:
-                #     f.write(json.dumps(ex, ensure_ascii=False) + "\n")
                 table_names, prompts = get_sqlite_data(sqlite_path)
                 prompts += "The table structure information is (table names): \n" + str(table_names) + "\n"
                 sql_dict["input"] = prompts
@@ -185,7 +183,7 @@ def get_spider1_data_dict(args, min_token_len=50):
                     if results == "No data found for the specified query.\n":
                         continue
                     print(results)
-                sql_dict["gold_results_path"] = os.path.join(Spider_executed_results_id_path)
+                # sql_dict["gold_results_path"] = os.path.join(args.gold_results_path, id_name + ".csv")
                 eg_count += 1
                 dict_list.append(sql_dict)
     return dict_list
@@ -235,16 +233,27 @@ def get_bird_data_dict(args, min_token_len=50):
                     #     continue
                     # print(results)
                     continue
-                sql_dict["gold_results_path"] = os.path.join(BIRD_executed_results_id_path)
+                # sql_dict["gold_results_path"] = os.path.join(args.gold_results_path, id_name + ".csv")
                 eg_count += 1
                 dict_list.append(sql_dict)
     return dict_list
 
-def save_jsonl(file_name, data, mode="w"):
-    with open(f"data/{file_name}.jsonl", mode=mode, encoding="utf-8") as f:
-        for entry in data:
-            json.dump(entry, f, ensure_ascii=False)
-            f.write("\n")
+def save_json(file_name, new_data, mode="w"):
+    file_path = f"data/{file_name}.json"
+    if mode == "a":
+        if os.path.exists(file_path) and os.stat(file_path).st_size > 0:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        else:
+            data = []
+        # Append new data
+        data += new_data
+        # Write back the updated JSON file
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    elif mode == "w":
+        with open(file_path, mode=mode, encoding="utf-8") as f:
+            json.dump(new_data, f, ensure_ascii=False, indent=4)
 
 def data_augmentation(args, training_data, aug_prompt, aug_index):
     if not os.path.exists(args.Spider2_aug_results_path):
@@ -276,9 +285,9 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                     ex_copy["answer"] = f.read()
                 if "sqlite_path" in ex.keys():
                     ex_copy["sqlite_path"] = ex["sqlite_path"]
-                ex_copy["gold_results_path"] = os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")
+                # ex_copy["gold_results_path"] = os.path.join(args.gold_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")
                 augmented_data.append(ex_copy)
-                continue
+            continue
             inputs = prompt
             success_flag = False
             max_iteration = 3
@@ -299,7 +308,7 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                         if "sqlite_path" in ex.keys():
                             ex_copy["sqlite_path"] = ex["sqlite_path"]
                             sqlite_path = ex["sqlite_path"]
-                        gold_results_path = os.path.join(args.Spider2_aug_results_path, ex_copy["example_id"]+".csv")
+                        # gold_results_path = os.path.join(args.Spider2_aug_results_path, ex_copy["example_id"]+".csv")
                         if not os.path.exists(gold_results_path):
                             results = execute_sql_api(ex_copy["answer"], gold_results_path, api, sqlite_path=sqlite_path)
                             if results != 0:
@@ -321,13 +330,13 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                                 ex_copy["question"] = f.read()
                             with open(gold_results_path.replace(".csv", ".sql")) as f:
                                 ex_copy["answer"] = f.read()
-                        ex_copy["gold_results_path"] = gold_results_path
+                        # ex_copy["gold_results_path"] = os.path.join(args.gold_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")
                         augmented_data.append(ex_copy)
                         success_flag = True
                 else:
                     inputs = "The answer should be in one ```sql\n``` block with code comments like '-- Task: ' to describe the task.\n"
                     inputs += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
-    save_jsonl(args.train_aug_json_name, augmented_data, "a")
+    save_json(args.train_aug_json_name, augmented_data, "a")
 
 def main(args):
     dictionaries_snow, task_dict_snow = get_dict("snow", args.snow_path)
@@ -338,25 +347,25 @@ def main(args):
         schema_linking(dictionaries_lite, task_dict_lite, args.lite_path, chat_session_sl, args.txt_len_threshold)
     if args.load_data:
         with open(args.load_data, "r", encoding="utf-8") as f:
-            training_data = [json.loads(line) for line in f]
+            training_data = json.loads(f.read())
     else:
         spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data = split_Spider2(task_dict_snow, task_dict_lite, args)
         spider1_data = get_spider1_data_dict(args)
         bird_data = get_bird_data_dict(args)
         training_data = spider2_train_data + spider1_data + bird_data
-        save_jsonl("training_data", training_data)
-        save_jsonl("snow_test_data", snow_test_data)
-        save_jsonl("snow_test_all_data", snow_test_all_data)
-        save_jsonl("lite_test_data", lite_test_data)
-        save_jsonl("lite_test_all_data", lite_test_all_data)
+        save_json("training_data", training_data)
+        save_json("snow_test_data", snow_test_data)
+        save_json("snow_test_all_data", snow_test_all_data)
+        save_json("lite_test_data", lite_test_data)
+        save_json("lite_test_all_data", lite_test_all_data)
     if args.data_augmentaion:
         aug0_prompt = "\nRefine the task description to make it more precise and accurate while keeping the original SQL unchanged.\n"
         aug1_prompt = "\nSimplify the task by selecting an intermediate step from the gold SQL and generating an easier task accordingly. (You can only use tables and columns from the original SQL. If the answer could be very long, add LIMIT 100 at end and modify the task description accordingly.)\n"
-        aug_json_path = os.path.join("data", args.train_aug_json_name + ".jsonl")
+        aug_json_path = os.path.join("data", args.train_aug_json_name + ".json")
         if os.path.exists(aug_json_path):
             os.remove(aug_json_path)
-        shutil.copy(os.path.join("data", args.train_json_name + ".jsonl"), aug_json_path)
-        data_augmentation(args, training_data, aug0_prompt, 0)
+        shutil.copy(os.path.join("data", args.train_json_name + ".json"), aug_json_path)
+        # data_augmentation(args, training_data, aug0_prompt, 0)
         data_augmentation(args, training_data, aug1_prompt, 1)
 
 if __name__ == '__main__':
@@ -370,6 +379,7 @@ if __name__ == '__main__':
     parser.add_argument('--lite_gold_sql_path_training', type=str, default="data/Spider2.0_lite_gold_sql")
     parser.add_argument('--Spider_executed_results_path', type=str, default="data/Spider_exec_results")
     parser.add_argument('--Spider2_aug_results_path', type=str, default="data/Spider2_aug_results")
+    parser.add_argument('--gold_results_path', type=str, default="gold/gold_answer")
     parser.add_argument('--train_json_name', type=str, default="training_data")
     parser.add_argument('--train_aug_json_name', type=str, default="training_data_aug")
     parser.add_argument('--BIRD_executed_results_path', type=str, default="data/BIRD_exec_results")
