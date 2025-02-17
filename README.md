@@ -9,18 +9,18 @@ pip install antlr4-python3-runtime==4.9.*
 ```
 
 ### Data
-Our raw training data in `deepscaler/data/[train|test]`, along with preprocessing scripts. To convert the raw data into Parquet files for training, run:
-```python
-# Output parquet files in data/*.parquet.
-python scripts/data/deepscaler_dataset.py
-```
+Our raw training data in `deepscaler/data/[train|test]`. Parquet files in `deepscaler/data/processed`.
+
+For DB data, please dowload from [HuggingFace](https://huggingface.co/datasets/xxxbrem/sql).
+
+And put it in root folder (`deepscaler`) and unzip.
 
 ### Credential
 Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`deepscaler`).
 
 ### Training Scripts
 
-We provide training scripts for both single-node and multi-node setups in `scripts/train/`. Our runs' Wandb logs are available [here](https://wandb.ai/mluo/deepscaler-1.5b).
+We provide training scripts for both single-node and multi-node setups in `scripts/train/`.
 
 #### Single-Node Training (8 GPUs)
 Our 8k context script runs on a single node with 8 A100-80GB GPUs:

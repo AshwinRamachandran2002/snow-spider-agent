@@ -36,49 +36,30 @@ class RewardMathFn(RewardFn):
         
         # Extract solution.
         if THOUGHT_DELIMITER_START in model_response and THOUGHT_DELIMITER_END in model_response:
-            model_solution = model_response.split(THOUGHT_DELIMITER_END)[1]
-        else:
-            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+            model_answer = model_response.split(THOUGHT_DELIMITER_END)[1]
+        # else:
+        #     return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
-        model_answer = extract_all_blocks(model_solution, "sql")
-        if model_answer is None:
+        model_answer = extract_all_blocks(model_answer, "sql")
+        if model_answer is None or model_answer == []:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         model_answer = model_answer[-1]
         # Process the ground truth(s)
         ground_truths = "deepscaler/rewards/gold/gold_answer"
         print(f"input.sqlite_path: {input.sqlite_path}")
         print(f"input.example_id: {input.example_id}")
-        print(f"model_answer: {model_answer}")
-        print(f"model_solution: {model_solution}")
-        # if ground_truths is None:
-        #     return RewardOutput(reward=self.config.unk_error_reward, is_correct=False)
-        
-        # Convert single answer to list for uniform processing
-        # if isinstance(ground_truths, (str, float, int)):
-        #     ground_truths = [ground_truths]
-            
-        # Process each ground truth
-        # processed_ground_truths = []
-        # for truth in ground_truths:
-        #     truth = str(truth)
-        #     if "\\boxed" in truth:
-        #         processed_truth = extract_answer(truth)
-        #         if processed_truth is not None:
-        #             processed_ground_truths.append(processed_truth)
-        #     else:
-        #         processed_ground_truths.append(truth)
-        
-        # if not processed_ground_truths:
-        #     return RewardOutput(reward=self.config.unk_error_reward, is_correct=False)
+        # print(f"model_answer: {model_answer}")
 
-        # Check against all possible correct answers
-        # for ground_truth in ground_truths:
+
         sqlite_path = input.sqlite_path.get("sqlite_path", None)
         example_id = input.example_id.get("ex_id", None)
-        csv_save_path = os.path.join("outputs/exec", example_id+".csv")
-        
+        csv_save_path = os.path.join("exec", example_id+".csv")
+
+        with open(f"exec/{example_id}.log", "w") as f:
+            f.write(model_answer)
+
         if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
-            is_correct = evaluate_spider2sql(ground_truths, csv_save_path)
+            is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
             if is_correct:
                 return RewardOutput(reward=self.config.correct_reward, is_correct=True)
 

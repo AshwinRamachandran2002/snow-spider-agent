@@ -12,9 +12,9 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=deepscaler/data/processed/lite_test_data.parquet \
     data.train_batch_size=4 \
     data.val_batch_size=4 \
-    data.max_prompt_length=32768 \
+    data.max_prompt_length=16384 \
     data.max_response_length=8192 \
-    actor_rollout_ref.model.path=models/DeepSeek-R1-Distill-Qwen-1.5B \
+    actor_rollout_ref.model.path=models/Qwen2.5-Coder-1.5B \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
