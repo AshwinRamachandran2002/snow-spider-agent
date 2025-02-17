@@ -24,7 +24,7 @@ We provide training scripts for both single-node and multi-node setups in `scrip
 
 ### Model
 ```
-huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir methods/spider-self-refine/models/QwQ-32B-Preview  --local-dir-use-symlinks False --resume
+huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir methods/spider-self-refine/models/Qwen2.5-Coder-1.5B  --local-dir-use-symlinks False --resume
 ```
 
 #### Single-Node Training (8 GPUs)
