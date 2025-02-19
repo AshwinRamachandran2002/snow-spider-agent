@@ -12,7 +12,7 @@ from deepscaler.system_prompts import ORM_PROMPT
 from deepscaler.utils import call_gemini_llm, call_oai_rm_llm
 from deepscaler.rewards.evaluate import evaluate_spider2sql
 import os
-import logging
+import threading
 
 ORM_USER_TEMPLATE = """
 Problem: {problem}
@@ -54,12 +54,12 @@ class RewardMathFn(RewardFn):
 
         sqlite_path = input.sqlite_path.get("sqlite_path", None)
         example_id = input.example_id.get("ex_id", None)
-        csv_save_path = os.path.join("exec", example_id+f"_{os.getpid()}.csv")
+        csv_save_path = os.path.join("exec", example_id+f"_{threading.get_ident()}.csv")
 
         if not os.path.exists("exec"):
             os.mkdir("exec")
 
-        with open(f"exec/{example_id}_{os.getpid()}.log", "a") as f:
+        with open(f"exec/{example_id}_{threading.get_ident()}.log", "a") as f:
             f.write(model_answer)
 
         if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:

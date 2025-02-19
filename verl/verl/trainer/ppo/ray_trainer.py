@@ -405,6 +405,7 @@ class RayPPOTrainer(object):
     def _validate(self):
         reward_tensor_lst = []
         data_source_lst = []
+        print("self.val_dataloader")
         for test_data in tqdm(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
             # test_batch = test_batch.to('cuda')

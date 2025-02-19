@@ -90,7 +90,7 @@ class RewardManager():
             #         already_print_data_sources[data_source] += 1
             #         print(sequences_str)      
             return i, score, valid_response_length
-
+        print(f"len(data): {len(data)}")
         # Process items in parallel using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=96) as executor:
             args = [(i, data[i], already_print_data_sources) for i in range(len(data))]
