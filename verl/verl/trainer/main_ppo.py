@@ -19,7 +19,8 @@ from verl import DataProto
 import torch
 from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 from deepscaler.rewards.math_reward import deepscaler_reward_fn
 
@@ -110,7 +111,7 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init()
 
     ray.get(main_task.remote(config))
 

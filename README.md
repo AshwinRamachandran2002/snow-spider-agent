@@ -3,10 +3,10 @@
 ```bash
 # Recommend Python 3.10.
 cd snow-spider-agent
+pip install -r requirements.txt
 pip install -e ./verl
 pip install -e .
 pip install antlr4-python3-runtime==4.9.*
-pip install -r requirements.txt
 ```
 
 ### Data
@@ -23,14 +23,14 @@ Unzip and put `data` folder in root folder (`snow-spider-agent`).
 ### Credential
 Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`snow-spider-agent`).
 
-### Training Scripts
-
-We provide training scripts for both single-node and multi-node setups in `scripts/train/`.
-
 ### Model
 ```
 huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir models/Qwen2.5-Coder-1.5B --local-dir-use-symlinks False --resume
 ```
+
+### Training Scripts
+
+We provide training scripts for both single-node and multi-node setups in `scripts/train/`.
 
 #### Single-Node Training (8 GPUs)
 Our 8k context script runs on a single node with 8 A100-80GB GPUs:

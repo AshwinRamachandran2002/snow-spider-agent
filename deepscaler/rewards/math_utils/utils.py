@@ -502,7 +502,7 @@ def hard_cut(str_e, length=0):
             str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
     return str_e
 
-def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=1000000, sqlite_path=None):
+def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
     if api == "snowflake":
         # Load Snowflake credentials
         snowflake_credential = json.load(open("./snowflake_credential.json"))
