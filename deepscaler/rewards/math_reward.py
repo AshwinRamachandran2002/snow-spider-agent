@@ -56,9 +56,8 @@ class RewardMathFn(RewardFn):
         example_id = input.example_id.get("ex_id", None)
         csv_save_path = os.path.join("exec", example_id+".csv")
 
-        if os.path.exists("exec"):
-            shutil.rmtree("exec")
-        os.mkdir("exec")
+        if not os.path.exists("exec"):
+            os.mkdir("exec")
 
         with open(f"exec/{example_id}.log", "w") as f:
             f.write(model_answer)

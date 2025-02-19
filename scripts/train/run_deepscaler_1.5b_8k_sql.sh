@@ -5,6 +5,24 @@ set -x
 # vLLM without XFORMERS will results in CUDA errors.
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model)
+            MODEL_PATH="$2"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Set default model path if not provided
+if [ -z "$MODEL_PATH" ]; then
+    MODEL_PATH="models/Qwen2.5-Coder-1.5B"
+fi
+
 # Train over a single node, 8 A100-80GB GPUs.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \

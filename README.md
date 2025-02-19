@@ -2,7 +2,7 @@
 ### Installation
 ```bash
 # Recommend Python 3.10.
-cd deepscaler
+cd snow-spider-agent
 pip install -e ./verl
 pip install -e .
 pip install antlr4-python3-runtime==4.9.*
@@ -13,10 +13,14 @@ Our raw training data in `deepscaler/data/[train|test]`. Parquet files in `deeps
 
 For DB data, please dowload from [HuggingFace](https://huggingface.co/datasets/xxxbrem/sql).
 
-And put it in root folder (`deepscaler`) and unzip.
+```
+huggingface-cli download --resume-download xxxbrem/sql --include "data.zip" --local-dir ./ --repo-type dataset --local-dir-use-symlinks False --resume
+```
+
+Unzip and put `data` folder in root folder (`snow-spider-agent`).
 
 ### Credential
-Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`deepscaler`).
+Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`snow-spider-agent`).
 
 ### Training Scripts
 
@@ -24,7 +28,7 @@ We provide training scripts for both single-node and multi-node setups in `scrip
 
 ### Model
 ```
-huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir methods/spider-self-refine/models/Qwen2.5-Coder-1.5B  --local-dir-use-symlinks False --resume
+huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir methods/spider-self-refine/models/Qwen2.5-Coder-1.5B --local-dir-use-symlinks False --resume
 ```
 
 #### Single-Node Training (8 GPUs)
@@ -32,6 +36,8 @@ Our 8k context script runs on a single node with 8 A100-80GB GPUs:
 ```bash
 # Set XFormers backend to avoid CUDA errors
 export VLLM_ATTENTION_BACKEND=XFORMERS
+# Run 8K context length training
+export MODEL_PATH="models/Qwen2.5-Coder-1.5B"
 export WANDB_API_KEY=<YOUR_WANDB_KEY>
 ./scripts/train/run_deepscaler_1.5b_8k_sql.sh
 ```
