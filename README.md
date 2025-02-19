@@ -6,6 +6,7 @@ cd snow-spider-agent
 pip install -e ./verl
 pip install -e .
 pip install antlr4-python3-runtime==4.9.*
+pip install -r requirements.txt
 ```
 
 ### Data
@@ -28,7 +29,7 @@ We provide training scripts for both single-node and multi-node setups in `scrip
 
 ### Model
 ```
-huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir methods/spider-self-refine/models/Qwen2.5-Coder-1.5B --local-dir-use-symlinks False --resume
+huggingface-cli download --resume-download Qwen/Qwen2.5-Coder-1.5B --local-dir models/Qwen2.5-Coder-1.5B --local-dir-use-symlinks False --resume
 ```
 
 #### Single-Node Training (8 GPUs)
