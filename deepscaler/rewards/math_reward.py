@@ -33,15 +33,15 @@ class RewardMathFn(RewardFn):
             "Invalid problem type: expected 'MATH', but got '{}'".format(input.problem_type)
         
         problem = input.problem
-        model_answer = input.model_response
+        response = input.model_response
         
         # Extract solution.
-        if THOUGHT_DELIMITER_START in model_answer and THOUGHT_DELIMITER_END in model_answer:
-            model_answer = model_answer.split(THOUGHT_DELIMITER_END)[1]
+        if THOUGHT_DELIMITER_START in response and THOUGHT_DELIMITER_END in response:
+            response = response.split(THOUGHT_DELIMITER_END)[1]
         # else:
         #     return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
-        model_answer = extract_all_blocks(model_answer, "sql")
+        model_answer = extract_all_blocks(response, "sql")
         if model_answer is None or model_answer == []:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         model_answer = model_answer[-1]
@@ -60,7 +60,7 @@ class RewardMathFn(RewardFn):
             os.mkdir("exec")
 
         with open(f"exec/{example_id}_{threading.get_ident()}.log", "a") as f:
-            f.write(model_answer)
+            f.write(response)
 
         if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
