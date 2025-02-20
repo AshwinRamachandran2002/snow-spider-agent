@@ -46,7 +46,7 @@ class RewardMathFn(RewardFn):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         model_answer = model_answer[-1]
         # Process the ground truth(s)
-        ground_truths = "deepscaler/rewards/gold/gold_answer"
+        ground_truths = "rewards/gold/gold_answer" # TODO: make configurable
         # print(f"input.sqlite_path: {input.sqlite_path}")
         # print(f"input.example_id: {input.example_id}")
         # print(f"model_answer: {model_answer}")
@@ -56,8 +56,8 @@ class RewardMathFn(RewardFn):
         example_id = input.example_id.get("ex_id", None)
         csv_save_path = os.path.join("exec", example_id+f"_{threading.get_ident()}.csv")
 
-        if not os.path.exists("exec"):
-            os.mkdir("exec")
+        #if not os.path.exists("exec"):
+        #    os.mkdir("exec")
 
         with open(f"exec/{example_id}_{threading.get_ident()}.log", "a") as f:
             f.write(response)

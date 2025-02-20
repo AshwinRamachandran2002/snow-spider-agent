@@ -111,7 +111,7 @@ import hydra
 def main(config):
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(_temp_dir="/workspace/snow-spider-agent/exec")
+        ray.init()
 
     ray.get(main_task.remote(config))
 
