@@ -65,7 +65,7 @@ class RewardMathFn(RewardFn):
         if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
             if is_correct:
-                print(f"Correct: {example_id}")
+                print(f"Correct: {example_id}_{threading.get_ident()}")
                 return RewardOutput(reward=self.config.correct_reward, is_correct=True)
 
         # If latex heuristics fail and ORM is enabled, use LLM as ORM to evaluate correctness

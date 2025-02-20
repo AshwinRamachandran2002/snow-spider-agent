@@ -201,9 +201,8 @@ def get_sqlite_result(db_path, query, save_dir=None, file_name="result.csv", chu
     return True, None
 
 
-def evaluate_spider2sql(gold_result_dir, csv_str, example_id_thread):
+def evaluate_spider2sql(gold_result_dir, csv_str, example_id):
     eval_standard_dict = load_jsonl_to_dict(os.path.join('/'.join(gold_result_dir.split("/")[:-1]), "eval.jsonl"))
-    example_id = "_".join(example_id_thread.split("_")[:-1])
     eval_ids = list(eval_standard_dict.keys())
     eval_ids = sorted(eval_ids)  # sorted, for reproduce result
     
