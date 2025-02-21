@@ -536,7 +536,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                             return hard_cut(df.to_csv(index=False), max_len)
                 except Exception as e:
                     # print("Error occurred: ", str(e))
-                    return e
+                    return str(e)
     elif api == "bigquery":
         bigquery_credential = service_account.Credentials.from_service_account_file("./bigquery_credential.json")
         client = bigquery.Client(credentials=bigquery_credential, project=bigquery_credential.project_id)
@@ -565,7 +565,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                     return hard_cut(df.to_csv(index=False), max_len)
         except Exception as e:
             # print("Error occurred: ", str(e))
-            return e
+            return str(e)
     elif api == "sqlite":
         try:
             conn = sqlite3.connect(sqlite_path)
@@ -594,7 +594,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                     return hard_cut(df.to_csv(index=False), max_len)
         except Exception as e:
             print("Error occurred: ", str(e))
-            return e
+            return str(e)
         finally:
             cursor.close()  # Close the cursor manually
             conn.close()    # Close the connection manually
