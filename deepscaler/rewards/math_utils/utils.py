@@ -503,6 +503,16 @@ def hard_cut(str_e, length=0):
             str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
     return str_e
 
+class SQLiteConnection:
+    _conn = None
+
+    @staticmethod
+    def get_connection(db_path):
+        if SQLiteConnection._conn is None:
+            SQLiteConnection._conn = sqlite3.connect(db_path, check_same_thread=False)
+        return SQLiteConnection._conn
+
+
 def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
     if api == "snowflake":
         # Load Snowflake credentials
@@ -568,7 +578,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
             return str(e)
     elif api == "sqlite":
         try:
-            conn = sqlite3.connect(sqlite_path)
+            conn = SQLiteConnection.get_connection(sqlite_path)
             cursor = conn.cursor()
             cursor.execute(sql_query)
             # Fetch the results
