@@ -3,12 +3,8 @@ import os
 from deepscaler.rewards.math_utils.utils import execute_sql_with_timeout, get_api_name
 ground_truths = "deepscaler/rewards/gold/gold_answer"
 model_answer = """
-SELECT DISTINCT T1.item_nbr
-FROM sales_in_weather AS T1
-JOIN weather AS T2 ON T1.date = T2.date AND T1.store_nbr = T2.station_nbr
-WHERE T2.tmax = (SELECT MAX(tmax) FROM weather WHERE T2.date = (SELECT max(date) FROM sales_in_weather WHERE store_nbr = 3 AND strftime('%Y', date) = '2012'))
-ORDER BY T1.units DESC
-LIMIT 1
+SELECT CAST(COUNT(s.units) AS REAL) * 100 / SUM(s.units) FROM sales_in_weather s JOIN (SELECT date FROM weather WHERE station_nbr IN (SELECT station_nbr FROM relation WHERE store_nbr = 3) AND year(date) = 2012 ORDER BY tmax DESC LIMIT 1) f ON s.date = f.date WHERE s.item_nbr = 5
+
 """
 sqlite_path = "data/BIRD/train/train_databases/sales_in_weather/sales_in_weather.sqlite"
 example_id = "local_BIRD_train_238"

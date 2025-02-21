@@ -593,7 +593,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                 else:
                     return hard_cut(df.to_csv(index=False), max_len)
         except Exception as e:
-            print("Error occurred: ", str(e))
+            # print("Error occurred: ", str(e))
             return str(e)
         finally:
             cursor.close()  # Close the cursor manually
@@ -623,7 +623,7 @@ def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len
     if process.is_alive():
         process.terminate()
         process.join()
-        print("Query timed out")
+        print(f"{sql_query} Query timed out")
         return "Query timed out"
 
     return result_dict.get("output", "Query execution failed")

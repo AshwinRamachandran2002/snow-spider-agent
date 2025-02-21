@@ -92,10 +92,10 @@ class RewardManager():
             return i, score, valid_response_length
         print(f"len(data): {len(data)}")
         # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=1) as executor:
             args = [(i, data[i], already_print_data_sources) for i in range(len(data))]
             results = list(executor.map(process_item, args))
-
+        print(f"Finish Reward")
         # Fill reward tensor with results
         for i, score, valid_response_length in results:
             reward_tensor[i, valid_response_length - 1] = score
