@@ -63,7 +63,7 @@ python3 -m verl.trainer.main_ppo \
     +trainer.val_before_train=False \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
+    trainer.save_freq=20 \
     trainer.test_freq=100 \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=30 "${@:1}"
