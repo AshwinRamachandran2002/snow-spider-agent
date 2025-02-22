@@ -166,10 +166,15 @@ def compress_ddl(example_folder):
                                     ddl_file.reset_index(drop=True, inplace=True)
                                     # count = 0
                                     for i in range(len(table_name_list)):
-                                        prompts += f"Database Name: {project_name}\n"
-                                        prompts += f"Schema Name: {db_name}\n"
+                                        # prompts += f"Database Name: {project_name}\n"
+                                        # prompts += f"Schema Name: {db_name}\n"
                                         table_dict[project_name][db_name] += [table_name_list[i]]
-                                        prompts += f"{ddl_file.loc[i].to_csv()}\n"
+                                        table_name_past = ddl_file.loc[i]["table_name"]
+                                        table_name_complete = f"{project_name}.{db_name}.{table_name_past}"
+                                        ddl_file.loc[i, "table_name"] = table_name_complete
+                                        table_name_past_with_tb = "TABLE " + table_name_past
+                                        table_name_complete_with_tb = "TABLE " + table_name_complete
+                                        prompts += f"{ddl_file.loc[i].to_csv().replace(table_name_past_with_tb, table_name_complete_with_tb)}\n"
                                         if len(representatives[remove_digits(table_name_list[i])]) > 1:
                                             prompts += f"Some other tables have the similar structure: {representatives[remove_digits(table_name_list[i])]}\n"
                                             table_dict[project_name][db_name] += representatives[remove_digits(table_name_list[i])]

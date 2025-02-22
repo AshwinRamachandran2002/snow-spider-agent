@@ -1,7 +1,7 @@
 import argparse
 from utils.chat import GPTChat
 from tqdm import tqdm
-from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_api
+from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_api, split_cte
 from utils.reconstruct_data import get_sqlite_data
 from utils.prompt import Prompts
 import ast
@@ -12,7 +12,7 @@ import json
 import random
 import sys
 import shutil
-
+import pandas as pd
 
 csv.field_size_limit(sys.maxsize)
 def schema_linking(dictionaries, task_dict, example_path, chat_session_sl, txt_len_threshold):
@@ -255,6 +255,17 @@ def save_json(file_name, new_data, mode="w"):
         with open(file_path, mode=mode, encoding="utf-8") as f:
             json.dump(new_data, f, ensure_ascii=False, indent=4)
 
+def sample_json_data(json_path, sample_size=200, output_path=None):
+    with open(json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    df = pd.DataFrame(data)
+    sample_size = min(sample_size, len(df))
+    sampled_df = df.sample(n=sample_size, replace=False, random_state=42)
+    if output_path:
+        sampled_df.to_json(output_path, orient='records', force_ascii=False, indent=4)
+    
+    return sampled_df
+
 def data_augmentation(args, training_data, aug_prompt, aug_index):
     if not os.path.exists(args.Spider2_aug_results_path):
         os.mkdir(args.Spider2_aug_results_path)
@@ -287,7 +298,7 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                     ex_copy["sqlite_path"] = ex["sqlite_path"]
                 # ex_copy["gold_results_path"] = os.path.join(args.gold_results_path, ex["example_id"]+ f"_aug{aug_index}"+".csv")
                 augmented_data.append(ex_copy)
-            continue
+                continue
             inputs = prompt
             success_flag = False
             max_iteration = 3
@@ -308,7 +319,7 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                         if "sqlite_path" in ex.keys():
                             ex_copy["sqlite_path"] = ex["sqlite_path"]
                             sqlite_path = ex["sqlite_path"]
-                        # gold_results_path = os.path.join(args.Spider2_aug_results_path, ex_copy["example_id"]+".csv")
+                        gold_results_path = os.path.join(args.Spider2_aug_results_path, ex_copy["example_id"]+".csv")
                         if not os.path.exists(gold_results_path):
                             results = execute_sql_api(ex_copy["answer"], gold_results_path, api, sqlite_path=sqlite_path)
                             if results != 0:
@@ -320,6 +331,13 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                                     inputs += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
                                     inputs += f"You can get database name, schema name in {table_struct}.\n"
                                     # inputs += f"You should follow names of database.schema.table in: " + ex["answer"]
+                                break
+                            elif os.path.getsize(gold_results_path) > 30000 and aug_index > 0:
+                                print(ex["example_id"])
+                                print("Too large csv")
+                                inputs = f"Input SQL: {response[0]}"
+                                inputs += "The result csv is too large. Please correct it by adding LIMIT 10 to the task and SQL.\n"
+                                os.remove(gold_results_path)
                                 break
                             with open(gold_results_path.replace(".csv", ".txt"), "w") as f:
                                 f.write(ex_copy["question"])
@@ -338,6 +356,43 @@ def data_augmentation(args, training_data, aug_prompt, aug_index):
                     inputs += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
     save_json(args.train_aug_json_name, augmented_data, "a")
 
+# def data_augmentation_CTE(args, training_data, aug_prompt, aug_index):
+#     if not os.path.exists(args.Spider2_aug_results_path):
+#         os.mkdir(args.Spider2_aug_results_path)
+#     chat_session_ag = GPTChat(args.azure, args.model_api, temperature=args.temperature)
+#     augmented_data = []
+#     sql_prompt = Prompts()
+#     for ex in tqdm(training_data):
+#         chat_session_ag.init_messages()
+#         if ex["data_source"] == "Spider2.0":
+#             api = get_api_name(ex["example_id"])
+#             split_cte_queries = split_cte(ex["answer"])
+#             for i in range(len(split_cte_queries)):
+#                 aug_index_ = aug_index + i
+#                 ex_copy = ex.copy()
+#                 if os.path.exists(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index_}"+".csv")):
+                    
+#                     ex_copy["example_id"] = ex["example_id"] + f"_aug{aug_index_}"
+#                     with open(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index_}"+".txt")) as f:
+#                         ex_copy["question"] = f.read()
+#                     with open(os.path.join(args.Spider2_aug_results_path, ex["example_id"]+ f"_aug{aug_index_}"+".sql")) as f:
+#                         ex_copy["answer"] = f.read()
+#                     if "sqlite_path" in ex.keys():
+#                         ex_copy["sqlite_path"] = ex["sqlite_path"]
+#                     augmented_data.append(ex_copy)
+#                     continue
+
+#             success_flag = False
+#             max_iteration = 3
+#             prompt = "Given the original task description, the corresponding gold SQL query, and part of its Common Table Expressions (CTEs), generate a complete task description and append a SELECT * query after the CTEs to ensure completeness.\n"
+#             prompt += "The answer format should be:\n```sql\n-- Task: Task Description\nSQL here\n```\nThe answer should be in one ```sql\n``` blocks with code comments like '-- Task: ' to describe the task.\n"
+#             prompt += "SQL query should be an 'SELECT' query that can be executed. For CTEs without 'SELECT', you should add one to make it complete.\n"
+#             while not success_flag and max_iteration > 0:
+#                 max_iteration -= 1
+#                 response = chat_session_ag.get_model_response(prompt, "sql")
+#                 if not isinstance(response, list):
+#                     break                
+
 def main(args):
     dictionaries_snow, task_dict_snow = get_dict("snow", args.snow_path)
     dictionaries_lite, task_dict_lite = get_dict("lite", args.lite_path)
@@ -354,19 +409,21 @@ def main(args):
         bird_data = get_bird_data_dict(args)
         training_data = spider2_train_data + spider1_data + bird_data
         save_json("training_data", training_data)
+        sample_json_data("data/training_data.json", 200, "data/val_data.json")
         save_json("snow_test_data", snow_test_data)
         save_json("snow_test_all_data", snow_test_all_data)
         save_json("lite_test_data", lite_test_data)
         save_json("lite_test_all_data", lite_test_all_data)
     if args.data_augmentaion:
         aug0_prompt = "\nRefine the task description to make it more precise and accurate while keeping the original SQL unchanged.\n"
-        aug1_prompt = "\nSimplify the task by selecting an intermediate step from the gold SQL and generating an easier task accordingly. (You can only use tables and columns from the original SQL. If the answer could be very long, add LIMIT 100 at end and modify the task description accordingly.)\n"
+        aug1_prompt = "\nSimplify the task by selecting an intermediate step from the gold SQL and generating an easier task accordingly. Add 'LIMIT 10' to the simplified task and SQL.\n"
         aug_json_path = os.path.join("data", args.train_aug_json_name + ".json")
         if os.path.exists(aug_json_path):
             os.remove(aug_json_path)
         shutil.copy(os.path.join("data", args.train_json_name + ".json"), aug_json_path)
-        # data_augmentation(args, training_data, aug0_prompt, 0)
+        data_augmentation(args, training_data, aug0_prompt, 0)
         data_augmentation(args, training_data, aug1_prompt, 1)
+        # data_augmentation(args, training_data, aug1_prompt, 2)
 
 if __name__ == '__main__':
     random.seed(42)

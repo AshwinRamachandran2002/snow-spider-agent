@@ -62,8 +62,8 @@ python spider_agent_setup_lite.py
 ```
 Reconstruct Dataset:
 ```
-python reconstruct_data.py --example_folder data/Spider2.0_snow
-python reconstruct_data.py --example_folder data/Spider2.0_lite
+python -m utils.reconstruct_data --example_folder data/Spider2.0_snow
+python -m utils.reconstruct_data --example_folder data/Spider2.0_lite
 ```
 ### Get Training and Testing Data:
 Export GPT or Azure API:
