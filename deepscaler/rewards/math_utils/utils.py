@@ -503,16 +503,6 @@ def hard_cut(str_e, length=0):
             str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
     return str_e
 
-class SQLiteConnection:
-    _conn = None
-
-    @staticmethod
-    def get_connection(db_path):
-        if SQLiteConnection._conn is None:
-            SQLiteConnection._conn = sqlite3.connect(db_path, check_same_thread=False)
-        return SQLiteConnection._conn
-
-
 def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
     if api == "snowflake":
         # Load Snowflake credentials
@@ -578,8 +568,10 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
             return str(e)
     elif api == "sqlite":
         try:
-            conn = SQLiteConnection.get_connection(sqlite_path)
+            uri = f"file:{sqlite_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=60)
             cursor = conn.cursor()
+            cursor.execute("PRAGMA read_uncommitted = true;")
             cursor.execute(sql_query)
             # Fetch the results
             results = cursor.fetchall()
@@ -611,16 +603,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
     else:
         raise NotImplementedError("Unsupported API\n")
 
-# def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None, timeout=300):
-#     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-#         future = executor.submit(execute_sql_api, sql_query, save_path, api, max_len, sqlite_path)
-#         try:
-#             return future.result(timeout=timeout)
-#         except concurrent.futures.TimeoutError:
-#             print("Query timed out")
-#             return "Query timed out"
-
-def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None, timeout=300):
+def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None, timeout=180):
     def target(result_dict):
         result_dict["output"] = execute_sql_api(sql_query, save_path, api, max_len, sqlite_path)
 
@@ -631,7 +614,7 @@ def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len
     process.join(timeout)
 
     if process.is_alive():
-        process.terminate()
+        process.kill()
         process.join()
         print(f"{sql_query} Query timed out")
         return "Query timed out"

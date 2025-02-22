@@ -36,7 +36,8 @@ class TestDataset(enum.Enum):
     SNOW_TEST_DATA = 'SNOW_TEST_DATA'
     LITE_TEST_DATA = 'LITE_TEST_DATA'
     SNOW_TEST_ALL_DATA = 'SNOW_TEST_ALL_DATA'
-    LITE_TEST_ALL_DATA = 'LITE_TEST_ALL_DATA'    
+    LITE_TEST_ALL_DATA = 'LITE_TEST_ALL_DATA'
+    VAL_DATA = "VAL_DATA"
 
 """Type alias for either training or testing dataset types."""
 Dataset = Union[TrainDataset, TestDataset]

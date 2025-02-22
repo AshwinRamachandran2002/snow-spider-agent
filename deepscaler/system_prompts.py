@@ -1,3 +1,5 @@
+import re
+import json
 """System prompts for DeepScaler repo."""
 
 DEEPSEEK_MATH_SYSTEM_PROMPT = """Let's think step by step and output the final answer within \\boxed{}. """
@@ -346,3 +348,17 @@ class Prompts:
             return "Don't directly match strings if you are not convinced. For fuzzy queries, use: WHERE str LIKE '%target_str%'. For example, to match 'meat lovers', use WHERE str LIKE '%meat%lovers%'. If case sensitivity is needed, add COLLATE BINARY: WHERE str LIKE '%target_str%' COLLATE BINARY.\n"
         else:
             return "Unsupported API. Please provide a valid API name ('snowflake', 'bigquery', 'sqlite')."
+    def get_prompt_dialect_basic_eg(self, api, table_struct):
+        if api == "snowflake" or api == "bigquery":
+            json_str = table_struct.replace("'", '"')
+            json_obj = json.loads(json_str)
+            
+            for db_name, schemas in json_obj.items():
+                for schema_name, tables in schemas.items():
+                    for table in tables:
+                        if table:
+                            whole_table_name = f"{db_name}.{schema_name}.{table}"
+                            if api == "snowflake":
+                                return f"Example Usage: SELECT \"col_name\" FROM {whole_table_name} WHERE ...;\n"
+                            if api == "bigquery":
+                                return f"Example Usage: SELECT `col_name` FROM `{whole_table_name}` WHERE ...;\n"
