@@ -359,6 +359,6 @@ class Prompts:
                         if table:
                             whole_table_name = f"{db_name}.{schema_name}.{table}"
                             if api == "snowflake":
-                                return f"Example Usage: SELECT \"col_name\" FROM {whole_table_name} WHERE ...;\n"
+                                return f"Example Usage: SELECT \"col_name\" FROM {whole_table_name} WHERE ...; Add double quotations to the column name: \"col_name\".\n"
                             if api == "bigquery":
                                 return f"Example Usage: SELECT `col_name` FROM `{whole_table_name}` WHERE ...;\n"
