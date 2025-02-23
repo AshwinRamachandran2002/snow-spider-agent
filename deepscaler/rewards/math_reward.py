@@ -39,8 +39,8 @@ class RewardMathFn(RewardFn):
         # Extract solution.
         if THOUGHT_DELIMITER_START in response and THOUGHT_DELIMITER_END in response:
             response = response.split(THOUGHT_DELIMITER_END)[1]
-        # else:
-        #     return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+        else:
+            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
         model_answer = extract_all_blocks(response, "sql")
         if model_answer is None or model_answer == []:
