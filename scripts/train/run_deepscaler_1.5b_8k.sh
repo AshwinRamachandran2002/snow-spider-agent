@@ -28,8 +28,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=deepscaler/data/processed/train.parquet \
     data.val_files=deepscaler/data/processed/val_data.parquet \
-    data.train_batch_size=64 \
-    data.val_batch_size=64 \
+    data.train_batch_size=32 \
+    data.val_batch_size=32 \
     data.max_prompt_length=16384 \
     data.max_response_length=8192 \
     actor_rollout_ref.model.path=$MODEL_PATH  \
@@ -60,10 +60,10 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console','wandb'] \
     trainer.project_name='deepscaler' \
     trainer.experiment_name='deepscaler-1.5b-8k' \
-    +trainer.val_before_train=True \
+    +trainer.val_before_train=False \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=20 \
-    trainer.test_freq=20 \
+    trainer.save_freq=40 \
+    trainer.test_freq=40 \
     trainer.default_hdfs_dir=null \
     trainer.total_epochs=30 "${@:1}"
