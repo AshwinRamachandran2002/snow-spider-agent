@@ -232,7 +232,7 @@ class DataParallelPPOActor(BasePPOActor):
                 self.actor_optimizer.zero_grad()
 
                 for data in micro_batches:
-                    print("MICROBATCH STEP")
+                    print(f"MICROBATCH STEP")
                     data = data.cuda()  # actor device is cpu when using offload
                     responses = data['responses']
                     response_length = responses.size(1)

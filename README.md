@@ -18,7 +18,7 @@ For DB data, please dowload from [HuggingFace](https://huggingface.co/datasets/x
 huggingface-cli download --resume-download xxxbrem/sql --include "data.zip" --local-dir ./ --repo-type dataset --local-dir-use-symlinks False --resume
 ```
 
-Unzip and put `data` folder in root folder (`snow-spider-agent`).
+Unzip `7z x data.zip -mmt=$(nproc)` and put `data` folder in root folder (`snow-spider-agent`).
 
 ### Credential
 Put `snowflake_credential.json` and `bigquery_credential.json` in root folder (`snow-spider-agent`).

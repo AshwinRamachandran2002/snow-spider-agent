@@ -7,12 +7,13 @@ from typing import List, Union
 
 from deepscaler.globals import THOUGHT_DELIMITER_START, THOUGHT_DELIMITER_END, OAI_RM_MODEL
 from deepscaler.rewards import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
-from deepscaler.rewards.math_utils.utils import extract_answer, grade_answer_sympy, grade_answer_mathd, execute_sql_api, get_api_name, extract_all_blocks
+from deepscaler.rewards.math_utils.utils import extract_answer, grade_answer_sympy, grade_answer_mathd, execute_sql_with_timeout, get_api_name, extract_all_blocks
 from deepscaler.system_prompts import ORM_PROMPT
 from deepscaler.utils import call_gemini_llm, call_oai_rm_llm
 from deepscaler.rewards.evaluate import evaluate_spider2sql
 import os
 import threading
+import torch
 
 ORM_USER_TEMPLATE = """
 Problem: {problem}
@@ -38,8 +39,8 @@ class RewardMathFn(RewardFn):
         # Extract solution.
         if THOUGHT_DELIMITER_START in response and THOUGHT_DELIMITER_END in response:
             response = response.split(THOUGHT_DELIMITER_END)[1]
-        # else:
-        #     return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+        else:
+            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
         model_answer = extract_all_blocks(response, "sql")
         if model_answer is None or model_answer == []:
@@ -55,14 +56,20 @@ class RewardMathFn(RewardFn):
         sqlite_path = input.sqlite_path.get("sqlite_path", None)
         example_id = input.example_id.get("ex_id", None)
         csv_save_path = os.path.join("exec", example_id+f"_{threading.get_ident()}.csv")
+<<<<<<< HEAD
 
         #if not os.path.exists("exec"):
         #    os.mkdir("exec")
+=======
+        print(f"Start Reward {example_id}")
+        if not os.path.exists("exec"):
+            os.mkdir("exec")
+>>>>>>> origin/bruce-rl
 
         with open(f"exec/{example_id}_{threading.get_ident()}.log", "a") as f:
             f.write(response)
 
-        if execute_sql_api(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
+        if execute_sql_with_timeout(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
             if is_correct:
                 print(f"Correct: {example_id}_{threading.get_ident()}")
@@ -92,7 +99,7 @@ class RewardMathFn(RewardFn):
         #             if "[[YES]]" in orm_response:
         #                 return RewardOutput(reward=self.config.correct_reward, is_correct=True)
         #             continue
-                
+        print(f"End Reward {example_id}")
         return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
 
 def deepscaler_reward_fn(solution_str: str, sqlite_path: Union[str, List[str]], example_id: Union[str, List[str]], enable_llm = False):

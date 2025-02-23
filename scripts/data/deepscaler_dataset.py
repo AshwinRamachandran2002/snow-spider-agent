@@ -50,7 +50,12 @@ def make_map_fn(split: str):
         if api == "sqlite":
             sqlite_path = example["sqlite_path"]
         sql_prompt = Prompts()
+        tb_str = "The table structure information is ({database name: {schema name: [table name]}}): \n"
+        table_struct = example['input'][example['input'].find(tb_str)+len(tb_str):].replace("\n", "")
         instruction += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
+        if sql_prompt.get_prompt_dialect_basic_eg(api, table_struct):
+            # print(sql_prompt.get_prompt_dialect_basic_eg(api, table_struct))
+            instruction += sql_prompt.get_prompt_dialect_basic_eg(api, table_struct)
         instruction += f"Question: {question}\n"
         question = instruction
         
@@ -98,7 +103,7 @@ if __name__ == '__main__':
     # Initialize datasets
     train_datasets = [TrainDataset.TRAINING_DATA_AUG]
     train_dataset = load_dataset(train_datasets[0])
-    test_datasets = [TestDataset.LITE_TEST_ALL_DATA, TestDataset.LITE_TEST_DATA, TestDataset.SNOW_TEST_ALL_DATA, TestDataset.SNOW_TEST_DATA]
+    test_datasets = [TestDataset.LITE_TEST_ALL_DATA, TestDataset.LITE_TEST_DATA, TestDataset.SNOW_TEST_ALL_DATA, TestDataset.SNOW_TEST_DATA, TestDataset.VAL_DATA]
     
     test_datasets_data = [load_dataset(d) for d in test_datasets]
 
