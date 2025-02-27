@@ -506,7 +506,8 @@ def hard_cut(str_e, length=0):
 def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
     if api == "snowflake":
         # Load Snowflake credentials
-        snowflake_credential = json.load(open("./snowflake_credential.json"))
+        with open("./snowflake_credential.json") as f:
+            snowflake_credential = json.load(f)
         # Define the SQL query
         # Execute the SQL query
         with snowflake.connector.connect(**snowflake_credential) as conn:
@@ -569,7 +570,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
     elif api == "sqlite":
         try:
             uri = f"file:{sqlite_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=60)
+            conn = sqlite3.connect(uri, uri=True, timeout=60)
             cursor = conn.cursor()
             cursor.execute("PRAGMA read_uncommitted = true;")
             cursor.execute(sql_query)

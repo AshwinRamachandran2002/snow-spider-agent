@@ -35,6 +35,20 @@ class RewardMathFn(RewardFn):
         
         problem = input.problem
         response = input.model_response
+
+
+        sqlite_path = input.sqlite_path.get("sqlite_path", None)
+        example_id = input.example_id.get("ex_id", None)
+        exec_folder = "exec_7B"
+        # exec_folder = "exec_1.5B"
+        # exec_folder = "exec"
+        csv_save_path = os.path.join(exec_folder, example_id+f"_{threading.get_ident()}.csv")
+        print(f"Start Reward {example_id}")
+        if not os.path.exists(exec_folder):
+            os.mkdir(exec_folder)
+
+        with open(f"{exec_folder}/{example_id}_{threading.get_ident()}.log", "a") as f:
+            f.write(response)
         
         # Extract solution.
         if THOUGHT_DELIMITER_START in response and THOUGHT_DELIMITER_END in response:
@@ -52,16 +66,6 @@ class RewardMathFn(RewardFn):
         # print(f"input.example_id: {input.example_id}")
         # print(f"model_answer: {model_answer}")
 
-
-        sqlite_path = input.sqlite_path.get("sqlite_path", None)
-        example_id = input.example_id.get("ex_id", None)
-        csv_save_path = os.path.join("exec", example_id+f"_{threading.get_ident()}.csv")
-        print(f"Start Reward {example_id}")
-        if not os.path.exists("exec"):
-            os.mkdir("exec")
-
-        with open(f"exec/{example_id}_{threading.get_ident()}.log", "a") as f:
-            f.write(response)
 
         if execute_sql_with_timeout(model_answer, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)
