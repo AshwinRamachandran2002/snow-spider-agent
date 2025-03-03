@@ -15,13 +15,13 @@ import shutil
 import pandas as pd
 
 csv.field_size_limit(sys.maxsize)
+# better dealing with time
 def schema_linking(dictionaries, task_dict, example_path, chat_session_sl, txt_len_threshold):
-    # skip_flag = True
-    skip_flag = False
     for eg_id in tqdm(dictionaries):
+        skip_flag = False
         chat_session_sl.init_messages()
         print(eg_id)
-        # if eg_id == "bq151":
+        # if eg_id == "sf_bq191":
         #     skip_flag = False
         api = get_api_name(eg_id)
         task = task_dict[eg_id]
@@ -32,11 +32,23 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl, txt_l
         table_struct = table_info[table_info.find("The table structure information is "):]
 
         prompt = f"Table information: {table_info}\nTask: {task}\nConsider which tables are related to the task. Remove unnecessary tables in {table_struct} and answer table names in ```python``` format in a list.\n"
-        table_struct_response = chat_session_sl.get_model_response(prompt, "python")
-        try:
-            table_names_no_digit = [remove_digits(s) for s in ast.literal_eval(table_struct_response[0])]
-        except Exception as e:
-            print(e)
+        
+        max_iter = 3
+        while max_iter > 0:
+            chat_session_sl.init_messages()
+            e = None
+            table_struct_response = chat_session_sl.get_model_response(prompt, "python")
+            try:
+                table_names = ast.literal_eval(table_struct_response[0])
+                table_names_no_digit = [remove_digits(s) for s in table_names]
+            except Exception as e:
+                print(str(table_struct_response))
+                continue
+            if table_names_no_digit != []:
+                break
+            max_iter -= 1
+        if e is not None or max_iter <= 0:
+            print([max_iter, e])
             continue
         ddl_paths = search_file(os.path.join(example_path, eg_id), "DDL.csv")
         
@@ -50,10 +62,20 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl, txt_l
 
                 header = next(reader)
                 writer.writerow(header)
-
+                row_count = 0
+                row_list_all = []
+                row_list = []
                 for row in reader:
                     if any(remove_digits(row[0]) in item for item in table_names_no_digit):
-                        writer.writerow(row)
+                        row_count += 1
+                        row_list_all.append(row)
+                    if any(row[0] in item for item in table_names):
+                        row_list.append(row)
+
+                if row_count > 100:
+                    writer.writerows(row_list)
+                else:
+                    writer.writerows(row_list_all)
 
             os.replace(temp_file, ddl_path)
 
@@ -409,7 +431,7 @@ def main(args):
         bird_data = get_bird_data_dict(args)
         training_data = spider2_train_data + spider1_data + bird_data
         save_json("training_data", training_data)
-        sample_json_data("data/training_data.json", 200, "data/val_data.json")
+        # sample_json_data("data/training_data.json", 200, "data/val_data.json")
         save_json("snow_test_data", snow_test_data)
         save_json("snow_test_all_data", snow_test_all_data)
         save_json("lite_test_data", lite_test_data)
@@ -443,7 +465,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_api', type=str, default="o1-preview")
     parser.add_argument('--azure', action="store_true")
     parser.add_argument('--temperature', type=float, default=1)
-    parser.add_argument('--txt_len_threshold', type=float, default=50000)
+    parser.add_argument('--txt_len_threshold', type=float, default=25000)
     parser.add_argument('--data_augmentaion', action="store_true")
     parser.add_argument('--schema_linking', action="store_true")
     parser.add_argument('--load_data', type=str, default=None)

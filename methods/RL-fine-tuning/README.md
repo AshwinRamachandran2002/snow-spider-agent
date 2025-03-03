@@ -1,8 +1,5 @@
 ## Dependencies
 ```
-pip install -e ./verl
-pip install -e .
-pip uninstall grpcio-status
 pip install -r requirements.txt
 ```
 ## Training Data
