@@ -16,6 +16,7 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from tqdm import tqdm
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import PretrainedConfig, PreTrainedTokenizer, PreTrainedTokenizerFast
@@ -146,6 +147,8 @@ class LLM(LLM):
             )
         self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, engine_args)  # TODO: check usagecontext
         self.request_counter = Counter()
+        
+        self.logging = False
 
     def init_cache_engine(self):
         self.llm_engine.init_cache_engine()
@@ -163,7 +166,8 @@ class LLM(LLM):
         self.llm_engine.tokenizer = tokenizer
 
     def _run_engine(self, *, use_tqdm: bool) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
-        outputs = super()._run_engine(use_tqdm=use_tqdm)
+        outputs = self._run_engine_helper(use_tqdm=use_tqdm)
+        # outputs = super()._run_engine(use_tqdm=use_tqdm)
         return self._post_process_outputs(outputs)
 
     # # NOTE(shengguangming): add for verl
@@ -203,3 +207,54 @@ class LLM(LLM):
 
     def offload_model_weights(self) -> None:
         self.llm_engine.offload_model_weights()
+
+    def _run_engine_helper(
+            self, *, use_tqdm: bool
+    ) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
+        # Initialize tqdm.
+        if use_tqdm:
+            num_requests = self.llm_engine.get_num_unfinished_requests()
+            pbar = tqdm(
+                total=num_requests,
+                desc="Processed prompts",
+                dynamic_ncols=True,
+                postfix=(f"est. speed input: {0:.2f} toks/s, "
+                         f"output: {0:.2f} toks/s"),
+            )
+
+        # Run the engine.
+        outputs: List[Union[RequestOutput, EmbeddingRequestOutput]] = []
+        total_in_toks = 0
+        total_out_toks = 0
+        while self.llm_engine.has_unfinished_requests():
+            step_outputs = self.llm_engine.step()
+            for output in step_outputs:
+                if self.logging:
+                    print("Step output", output)
+                if output.finished:
+                    if self.logging:
+                        print("Finished output", output)
+                    request_id = output.request_id
+                    self.llm_engine.sql_executor_context.remove(request_id)
+                    outputs.append(output)
+                    if use_tqdm:
+                        if isinstance(output, RequestOutput):
+                            # Calculate tokens only for RequestOutput
+                            assert output.prompt_token_ids is not None
+                            total_in_toks += len(output.prompt_token_ids)
+                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            total_out_toks += sum(
+                                len(stp.token_ids) for stp in output.outputs)
+                            out_spd = (total_out_toks /
+                                       pbar.format_dict["elapsed"])
+                            pbar.postfix = (
+                                f"est. speed input: {in_spd:.2f} toks/s, "
+                                f"output: {out_spd:.2f} toks/s")
+                        pbar.update(1)
+
+        if use_tqdm:
+            pbar.close()
+        # Sort the outputs by request ID.
+        # This is necessary because some requests may be finished earlier than
+        # its previous requests.
+        return sorted(outputs, key=lambda x: int(x.request_id))
