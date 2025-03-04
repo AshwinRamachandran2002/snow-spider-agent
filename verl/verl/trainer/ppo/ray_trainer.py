@@ -437,7 +437,7 @@ class RayPPOTrainer(object):
 
             # evaluate using reward_function
             # for certain reward function (e.g. sandbox), the generation can overlap with reward
-            reward_tensor = self.val_reward_fn(test_batch)
+            reward_tensor = self.val_reward_fn(test_batch, max_workers=self.config.trainer.max_workers, exec_folder=self.config.trainer.exec_folder)
 
             reward_tensor_lst.append(reward_tensor)
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
@@ -622,7 +622,7 @@ class RayPPOTrainer(object):
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        reward_tensor = self.reward_fn(batch)
+                        reward_tensor = self.reward_fn(batch, max_workers=self.config.trainer.max_workers, exec_folder=self.config.trainer.exec_folder)
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # Rejection sampling based on rewards

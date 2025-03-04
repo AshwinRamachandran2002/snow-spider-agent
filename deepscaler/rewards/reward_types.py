@@ -50,6 +50,7 @@ class RewardInput:
     ground_truth: dict = field(default_factory=dict)
     sqlite_path: dict = field(default_factory=dict)
     example_id: dict = field(default_factory=dict)
+    exec_folder: str = None
 
 
 @dataclass

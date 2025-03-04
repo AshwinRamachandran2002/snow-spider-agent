@@ -39,22 +39,21 @@ class RewardMathFn(RewardFn):
 
         sqlite_path = input.sqlite_path.get("sqlite_path", None)
         example_id = input.example_id.get("ex_id", None)
-        exec_folder = "exec_7B"
-        # exec_folder = "exec_1.5B"
-        # exec_folder = "exec"
+        exec_folder = input.exec_folder.get("exec_folder", None)
         csv_save_path = os.path.join(exec_folder, example_id+f"_{threading.get_ident()}.csv")
         print(f"Start Reward {example_id}")
-        if not os.path.exists(exec_folder):
-            os.mkdir(exec_folder)
-
+        # if not os.path.exists(exec_folder):
+        #     os.mkdir(exec_folder)
+        
         with open(f"{exec_folder}/{example_id}_{threading.get_ident()}.log", "a") as f:
             f.write(response)
         
         # Extract solution.
-        if THOUGHT_DELIMITER_START in response and THOUGHT_DELIMITER_END in response:
-            response = response.split(THOUGHT_DELIMITER_END)[1]
-        else:
-            return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
+        if "R1" in exec_folder:
+            if THOUGHT_DELIMITER_START in response and THOUGHT_DELIMITER_END in response:
+                response = response.split(THOUGHT_DELIMITER_END)[1]
+            else:
+                return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         
         model_answer = extract_all_blocks(response, "sql")
         if model_answer is None or model_answer == []:
@@ -100,11 +99,11 @@ class RewardMathFn(RewardFn):
         print(f"End Reward {example_id}")
         return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
 
-def deepscaler_reward_fn(solution_str: str, sqlite_path: Union[str, List[str]], example_id: Union[str, List[str]], enable_llm = False):
+def deepscaler_reward_fn(solution_str: str, sqlite_path: Union[str, List[str]], example_id: Union[str, List[str]], exec_folder=None, enable_llm = False):
     reward_config = RewardConfig()
     reward_config.use_math_orm = enable_llm
     reward_fn = RewardMathFn(reward_config)
-    reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, sqlite_path={"sqlite_path": sqlite_path}, example_id={"ex_id": example_id}))
+    reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, sqlite_path={"sqlite_path": sqlite_path}, example_id={"ex_id": example_id}, exec_folder={"exec_folder": exec_folder}))
     return reward_response.is_correct
 
 if __name__ == "__main__":
