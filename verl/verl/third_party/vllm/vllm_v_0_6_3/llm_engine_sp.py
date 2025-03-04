@@ -54,28 +54,33 @@ from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
+from deepscaler.rewards.math_utils.utils import execute_sql_with_timeout
+
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 
 class SQLExecutor():
-    
+
     def __init__(self, tokenizer_group, exec_func_sql):
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
+        self.initial_prompts = {}
         # TODO: replace with a single token
         self.monitor_token_id = [522, 11748, 18063, 397]
         self.start_token_id_1 = [366, 11748, 18063, 397]
         self.start_token_id_2 = [27, 11748, 18063, 397]
         self.tokenizer = tokenizer_group.tokenizer
-        self.exec_func_sql = exec_func_sql
+        # TODO: get the prompt tokens also
+        self.exec_func_sql = execute_sql_with_timeout
 
-    def fetch_execution_result(self, completion):
+    def fetch_execution_result(self, completion, request_id):
         for index in range(len(completion)-4, 0, -1):
             if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
-                exec_result = "<exec_result>\n" + self.exec_func_sql(sql_string) + "\n</exec_result>"
+                dialect = self.initial_prompts[str(request_id)]
+                exec_result = "<exec_result>\n" + self.exec_func_sql(sql_string, api=dialect) + "\n</exec_result>"
                 return self.tokenizer.encode(exec_result)
         return []
 
@@ -86,7 +91,25 @@ class SQLExecutor():
         if request_id in self.monitor_parent_seq_ids:
             del self.monitor_parent_seq_ids[request_id]
 
-    def process(self, outputs, logging=False):
+    def determine_dialect(self, prompt_token_ids):
+        prompt_str = self.tokenizer.decode(prompt_token_ids)
+        if "sqlite" in prompt_str:
+            return "sqlite"
+        elif "bigquery" in prompt_str:
+            return "bigquery"
+        else:
+            return "snowflake"
+            # raise ValueError("Unknown dialect")
+
+    def process(self, outputs, scheduler_outputs, logging=False):
+
+        # Save the initial prompts for each request ID
+        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
+            seq_group = scheduled_seq_group.seq_group
+            request_id = seq_group.request_id
+            if request_id not in self.initial_prompts:
+                self.initial_prompts[str(request_id)] = self.determine_dialect(seq_group.prompt_token_ids)
+
         # Process each CompletionSequenceGroupOutput object
         for output_sample in outputs:
             for output in output_sample.outputs:
@@ -134,7 +157,7 @@ class SQLExecutor():
                     if logging:
                         print("Detected monitor token for seq_id", seq_id)
                     self.monitor_parent_seq_ids[seq_id] = {
-                        "exec_result": self.fetch_execution_result(completions),
+                        "exec_result": self.fetch_execution_result(completions, seq_id),
                         "curr_pointer": 0
                     }
 
@@ -606,7 +629,7 @@ class LLMEngine(LLMEngine):
             # Add results to the output_queue
             if self.logging:
                 print("llm engine otuput", outputs)
-            outputs = self.sql_executor_context.process(outputs)
+            outputs = self.sql_executor_context.process(outputs, scheduler_outputs)
             if self.logging:
                 print("llm engine otuput after process", outputs)
             ctx.append_output(outputs=outputs,
