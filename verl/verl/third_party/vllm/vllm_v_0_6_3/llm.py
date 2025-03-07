@@ -230,8 +230,8 @@ class LLM(LLM):
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
                 if output.finished:
-                    if self.logging:
-                        print("Finished output", output)
+                    # if self.logging:
+                        # print("Finished output", output)
                     request_id = output.request_id
                     self.llm_engine.sql_executor_context.remove(request_id)
                     outputs.append(output)

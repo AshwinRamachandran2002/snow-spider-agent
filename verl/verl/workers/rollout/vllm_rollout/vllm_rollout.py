@@ -32,6 +32,7 @@ import torch.distributed
 from tensordict import TensorDict
 import traceback
 from torch import nn
+import numpy as np
 
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
@@ -247,6 +248,7 @@ class vLLMRollout(BaseRollout):
                         self.config.n, dim=0)
                     position_ids = position_ids.repeat_interleave(
                         self.config.n, dim=0)
+                    reward_model = np.repeat(reward_model, self.config.n, axis=0)
                     batch_size = batch_size * self.config.n
 
                 # Concatenate prompt and response

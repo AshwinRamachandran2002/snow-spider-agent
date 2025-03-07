@@ -568,6 +568,8 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
             # print("Error occurred: ", str(e))
             return str(e)
     elif api == "sqlite":
+        conn = None
+        cursor = None
         try:
             uri = f"file:{sqlite_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, timeout=60)
@@ -599,8 +601,10 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
             # print("Error occurred: ", str(e))
             return str(e)
         finally:
-            cursor.close()  # Close the cursor manually
-            conn.close()    # Close the connection manually
+            if cursor:
+                cursor.close()  # Close the cursor manually
+            if conn:
+                conn.close()    # Close the connection manually
     else:
         raise NotImplementedError("Unsupported API\n")
 

@@ -27,11 +27,7 @@ class RewardMathFn(RewardFn):
         response = input.model_response
         sqlite_path = input.sqlite_path.get("sqlite_path", None)
         example_id = input.example_id.get("ex_id", None)
-
         print(f"Start Reward {example_id}")
-        print("math reward response", response)
-        print("math reward sqlite_path", sqlite_path)
-        print("math reward example_id", example_id)
 
         exec_folder = "exec_3B"
         csv_save_path = os.path.join(exec_folder, example_id+f"_{threading.get_ident()}.csv")
@@ -48,10 +44,13 @@ class RewardMathFn(RewardFn):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
 
         ground_truths = "deepscaler/rewards/gold/gold_answer"
-        
-        print("math reward model answer", response)
+
+        if False:
+            print("math reward response", response)
+            print("math reward sqlite_path", sqlite_path)
+            print("math reward model api", get_api_name(example_id))
         print("math reward model csv path", csv_save_path)
-        print("math reward model api", get_api_name(example_id))
+        print("math reward model model answer", response)
 
         if execute_sql_with_timeout(response, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(ground_truths, csv_save_path, example_id)

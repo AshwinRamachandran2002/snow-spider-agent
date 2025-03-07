@@ -15,7 +15,7 @@
 
 from functools import partial
 from typing import Callable, Dict, Optional, Type, Union, List
-
+import time
 import torch
 import torch.nn as nn
 from vllm.config import (
@@ -83,7 +83,10 @@ class SQLExecutor():
                 kwargs = self.initial_prompts[str(seq_group_id)]
                 if False:
                     print("exec sql for ", request_id, sql_string, kwargs)
-                exec_result = self.exec_func_sql(sql_string, max_len=100, **kwargs)
+                start = time.time()
+                exec_result = self.exec_func_sql(sql_string, max_len=200, **kwargs)
+                if False:
+                    print("time for api", kwargs["api"], "is", time.time()-start, "sqlite_path", kwargs["sqlite_path"])
                 exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
                 return self.tokenizer.encode(exec_result)
         return []
@@ -97,7 +100,8 @@ class SQLExecutor():
 
     def determine_dialect(self, prompt_token_ids):
         prompt_str = self.tokenizer.decode(prompt_token_ids)
-        print("Prompt", prompt_str)
+        if False:
+            print("Prompt", prompt_str)
         if "sqlite" in prompt_str:
             return "sqlite"
         elif "bigquery" in prompt_str:

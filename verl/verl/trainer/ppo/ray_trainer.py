@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import uuid
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -90,71 +91,20 @@ import torch
 from verl.utils.torch_functional import masked_mean
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+
+    token_level_rewards = data.batch['token_level_rewards']
+    index = data.non_tensor_batch['uid']
     responses = data.batch['responses']
-    response_length = responses.size(1)
-    token_level_scores = data.batch['token_level_scores']
-    batch_size = data.batch.batch_size[0]
+    response_length = responses.size(-1)
     attention_mask = data.batch['attention_mask']
     response_mask = attention_mask[:, -response_length:]
-
-    # compute kl between ref_policy and current policy
-    if 'ref_log_prob' in data.batch.keys():
-        kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
-                                    kl_penalty=kl_penalty)  # (batch_size, response_length)
-        kld = kld * response_mask
-        beta = kl_ctrl.value
-    else:
-        beta = 0
-        kld = torch.zeros_like(response_mask, dtype=torch.float32)
-
-    token_level_rewards = token_level_scores - beta * kld
-
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
-
-    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
-    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
-    data.batch['token_level_rewards'] = token_level_rewards
-
-    metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
-
-    return data, metrics
-
-
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
-    # prepare response group
-    # TODO: add other ways to estimate advantages
-    if adv_estimator == 'gae':
-        values = data.batch['values']
-        responses = data.batch['responses']
-        response_length = responses.size(-1)
-        attention_mask = data.batch['attention_mask']
-        response_mask = attention_mask[:, -response_length:]
-        token_level_rewards = data.batch['token_level_rewards']
-        advantages, returns = core_algos.compute_gae_advantage_return(token_level_rewards=token_level_rewards,
-                                                                      values=values,
-                                                                      eos_mask=response_mask,
-                                                                      gamma=gamma,
-                                                                      lam=lam)
-        data.batch['advantages'] = advantages
-        data.batch['returns'] = returns
-    elif adv_estimator == 'grpo':
-        token_level_rewards = data.batch['token_level_rewards']
-        index = data.non_tensor_batch['uid']
-        responses = data.batch['responses']
-        response_length = responses.size(-1)
-        attention_mask = data.batch['attention_mask']
-        response_mask = attention_mask[:, -response_length:]
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
-                                                                        eos_mask=response_mask,
-                                                                        index=index)
-        data.batch['advantages'] = advantages
-        data.batch['returns'] = returns
-    else:
-        raise NotImplementedError
+    advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                    eos_mask=response_mask,
+                                                                    index=index)
+    data.batch['advantages'] = advantages
+    data.batch['returns'] = returns
     return data
-
 
 def reduce_metrics(metrics: dict):
     for key, val in metrics.items():
@@ -593,7 +543,7 @@ class RayPPOTrainer(object):
         self.global_steps += 1
 
         for _ in range(self.config.trainer.total_epochs):
-            
+
             for batch_dict in self.train_dataloader:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
@@ -608,27 +558,18 @@ class RayPPOTrainer(object):
 
                 with _timer('step', timing_raw):
                     # generate a batch
+                    start = time.time()
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-
+                    print(f"Time for generation batch dict: {time.time() - start}")
                     # This code matches a prompt ID with its N responses.
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    # compute values
-                    if self.use_critic:
-                        with _timer('values', timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
                     with _timer('adv', timing_raw):
                         # compute scores using reward model and/or reward function
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
-
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
 
@@ -655,27 +596,6 @@ class RayPPOTrainer(object):
                         metrics['batch/solve_none'] = solve_none
                         metrics['batch/solve_all'] = solve_all
 
-
-                        if self.config.trainer.rejection_sample:
-                            # If no valid samples remain, skip this batch and get a new one
-                            if not valid_mask.any():
-                                continue
-
-                            # Filter batch to keep only valid samples
-                            batch = batch[valid_mask]
-                            batch = dataprotoitem_to_dataproto(batch)
-                            # Round down to the nearest multiple of world size
-                            num_trainer_replicas = self.actor_rollout_wg.world_size 
-                            max_batch_size = (batch.batch['input_ids'].shape[0] // num_trainer_replicas) * num_trainer_replicas
-                            if not max_batch_size:
-                                # give up, you got everything either all wrong or right.
-                                continue
-
-                            size_mask = torch.zeros(batch.batch['input_ids'].shape[0], dtype=torch.bool)
-                            size_mask[:max_batch_size] = True
-                            batch = batch[size_mask]
-                            batch = dataprotoitem_to_dataproto(batch)
-
                         # recompute old_log_probs
                         with _timer('old_log_prob', timing_raw):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -691,15 +611,6 @@ class RayPPOTrainer(object):
 
                         # Note: This kl penalty applied directly over the rewards is disabled for GRPO. The kl penalty is applied at dp_actor.py
                         # where it is subtracted directly from the policy loss
-
-                        # if not self.config.actor_rollout_ref.actor.use_kl_loss:
-                        #     batch, kl_metrics = apply_kl_penalty(batch,
-                        #                                        kl_ctrl=self.kl_ctrl,
-                        #                                        kl_penalty=self.config.algorithm.kl_penalty)
-                        #     metrics.update(kl_metrics)
-                        # else:
-                        #     batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-
 
                         batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
@@ -718,20 +629,11 @@ class RayPPOTrainer(object):
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer('update_critic', timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+                    # update actor
+                    with _timer('update_actor', timing_raw):
+                        actor_output = self.actor_rollout_wg.update_actor(batch)
+                    actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                    metrics.update(actor_output_metrics)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \

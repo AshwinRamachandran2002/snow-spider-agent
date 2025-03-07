@@ -46,7 +46,7 @@ class RewardManager():
 
         from concurrent.futures import ThreadPoolExecutor
         
-        def process_item(args, logging=True):
+        def process_item(args, logging=False):
             i, data_item, already_print_data_sources = args
             prompt_ids = data_item.batch['prompts']
             prompt_length = prompt_ids.shape[-1]
