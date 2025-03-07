@@ -24,14 +24,6 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 from deepscaler.rewards.math_reward import deepscaler_reward_fn
 
-def _select_rm_score_fn(data_source):
-    if data_source == 'openai/gsm8k':
-        return gsm8k.compute_score
-    elif data_source == 'lighteval/MATH':
-        return math.compute_score
-    else:
-        return deepscaler_reward_fn
-
 
 class RewardManager():
     """The reward manager.
@@ -53,42 +45,41 @@ class RewardManager():
         already_print_data_sources = {}
 
         from concurrent.futures import ThreadPoolExecutor
-        from typing import Dict, Any
-        #import threading
-        # Thread-safe dict for tracking printed data sources
-        # print_lock = threading.Lock()
         
-        def process_item(args):
+        def process_item(args, logging=True):
             i, data_item, already_print_data_sources = args
             prompt_ids = data_item.batch['prompts']
             prompt_length = prompt_ids.shape[-1]
             
+            
             valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
             valid_prompt_ids = prompt_ids[-valid_prompt_length:]
 
-            response_ids = data_item.batch['responses'] 
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-
+            response_ids = data_item.batch['responses']
+            end_index = len(data_item.batch['attention_mask'][prompt_length:]) - 1
+            while data_item.batch['attention_mask'][prompt_length:][end_index] == 0:
+                end_index -= 1
+            valid_response_ids = response_ids[:end_index + 1]
+            valid_response_length = valid_response_ids.shape[-1]
             # decode
             sequences = torch.cat((valid_prompt_ids, valid_response_ids))
             sequences_str = self.tokenizer.decode(sequences)
+            if logging:
+                print("prompt ids", prompt_ids)
+                print("prompt length", prompt_length)
+                print("attention mask", data_item.batch['attention_mask'])
+                print("response_ids", response_ids)
+                print("valid response ids", valid_response_ids)
+                print("valid response length", valid_response_length)
+                print("main ppo sequences", sequences)
+                print("main ppo str", sequences_str)
 
             sqlite_path = data_item.non_tensor_batch['reward_model']['sqlite_path']
             example_id = data_item.non_tensor_batch['reward_model']['example_id']
 
             # select rm_score
-            data_source = data_item.non_tensor_batch['data_source']
-            compute_score_fn = _select_rm_score_fn(data_source)
-            score = compute_score_fn(solution_str=sequences_str, sqlite_path=sqlite_path, example_id=example_id)
-            
-            # with print_lock:
-            #     if data_source not in already_print_data_sources:
-            #         already_print_data_sources[data_source] = 0
+            score = deepscaler_reward_fn(solution_str=sequences_str, sqlite_path=sqlite_path, example_id=example_id)
 
-            #     if already_print_data_sources[data_source] < self.num_examine:
-            #         already_print_data_sources[data_source] += 1
-            #         print(sequences_str)      
             return i, score, valid_response_length
         print(f"len(data): {len(data)}")
         # Process items in parallel using ThreadPoolExecutor

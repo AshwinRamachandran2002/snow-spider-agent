@@ -179,11 +179,22 @@ class vLLMRollout(BaseRollout):
                 attention_mask = prompts.batch['attention_mask']
                 position_ids = prompts.batch['position_ids']
                 eos_token_id = prompts.meta_info['eos_token_id']
+                reward_model = prompts.non_tensor_batch['reward_model']
                 batch_size = idx.size(0)
 
                 # Pre-process input token ids
                 idx_list = [
                     _pre_process_inputs(self.pad_token_id, idx[i])
+                    for i in range(batch_size)
+                ]
+
+                # add
+                example_id_list = [
+                    reward_model[i]['example_id']
+                    for i in range(batch_size)
+                ]
+                sqlite_path_list = [
+                    reward_model[i]['sqlite_path']
                     for i in range(batch_size)
                 ]
 
@@ -200,13 +211,23 @@ class vLLMRollout(BaseRollout):
                     }
                 if prompts.meta_info.get('val_temperature', None):
                     kwargs['temperature'] = prompts.meta_info['val_temperature']
-                # Generate sequences
-                with self.update_sampling_params(**kwargs):
-                    output = self.inference_engine.generate(
-                        prompts=None,
-                        sampling_params=self.sampling_params,
-                        prompt_token_ids=idx_list,
-                        use_tqdm=False)
+
+                # Generating sequences
+                batch_sampling_params = []
+                for _idx in range(batch_size):
+                    with self.update_sampling_params(
+                            example_id=example_id_list[_idx],
+                            sqlite_path=sqlite_path_list[_idx],
+                            **kwargs
+                    ):
+                        # Inside the context, perform the operations to generate the sequence
+                        batch_sampling_params.append(self.sampling_params.clone())
+
+                output = self.inference_engine.generate(
+                    prompts=None,
+                    sampling_params=batch_sampling_params,
+                    prompt_token_ids=idx_list,
+                    use_tqdm=False)
 
                 # Process outputs
                 response = output[0].to(idx.device)
@@ -245,6 +266,19 @@ class vLLMRollout(BaseRollout):
                     response_id=response,
                     eos_token=eos_token_id,
                     dtype=attention_mask.dtype)
+                
+                ignore_now = False
+                for batch in range(len(response)):
+                    for index in range(4, len(response[batch])-4):
+                        target_tensor = torch.tensor([27, 11748, 5287, 397], dtype=response.dtype, device=response.device)
+                        if torch.equal(response[batch][index-4:index], target_tensor):
+                            ignore_now = True
+                            continue
+                        target_tensor = torch.tensor([522, 11748, 5287, 397], dtype=response.dtype, device=response.device)
+                        if torch.equal(response[batch][index:index+4], target_tensor):
+                            ignore_now = False
+                        if ignore_now:
+                            response_attention_mask[batch][index] = 0
                 attention_mask = torch.cat(
                     (attention_mask, response_attention_mask), dim=-1)
 
@@ -263,7 +297,7 @@ class vLLMRollout(BaseRollout):
                 if self.config.free_cache_engine:
                     self.inference_engine.free_cache_engine()
 
-                return DataProto(batch=batch)
+                return DataProto(batch=batch, non_tensor_batch={'reward_model': reward_model})
 
             except Exception as e:
                 traceback.print_exc()

@@ -148,7 +148,7 @@ class LLM(LLM):
         self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, engine_args)  # TODO: check usagecontext
         self.request_counter = Counter()
         
-        self.logging = False
+        self.logging = True
 
     def init_cache_engine(self):
         self.llm_engine.init_cache_engine()
@@ -229,8 +229,6 @@ class LLM(LLM):
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
-                if self.logging:
-                    print("Step output", output)
                 if output.finished:
                     if self.logging:
                         print("Finished output", output)

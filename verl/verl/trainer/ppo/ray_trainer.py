@@ -416,7 +416,11 @@ class RayPPOTrainer(object):
 
             n_val_samples = self.config.actor_rollout_ref.rollout.n_val
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+
+            test_gen_batch = test_batch.pop(
+                batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                non_tensor_batch_keys=['reward_model']
+            )
             test_gen_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
@@ -597,7 +601,10 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
+                gen_batch = batch.pop(
+                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
+                    non_tensor_batch_keys=['reward_model']
+                )
 
                 with _timer('step', timing_raw):
                     # generate a batch

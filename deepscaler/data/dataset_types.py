@@ -21,6 +21,7 @@ class TrainDataset(enum.Enum):
     # STILL = 'STILL'  # STILL dataset
     # DEEPSCALER = 'DEEPSCALER'  # DeepScaler (AIME, AMC, OMNI_MATH, MATH, STILL)
     TRAINING_DATA_AUG = "TRAINING_DATA_AUG"
+    TRAINING_DATA = "TRAINING_DATA"
 
 
 class TestDataset(enum.Enum):

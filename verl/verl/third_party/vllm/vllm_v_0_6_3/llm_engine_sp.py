@@ -74,13 +74,17 @@ class SQLExecutor():
         self.tokenizer = tokenizer_group.tokenizer
         # TODO: get the prompt tokens also
         self.exec_func_sql = execute_sql_with_timeout
+        self.beginning = True
 
-    def fetch_execution_result(self, completion, request_id):
+    def fetch_execution_result(self, completion, request_id, seq_group_id):
         for index in range(len(completion)-4, 0, -1):
             if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
-                dialect = self.initial_prompts[str(request_id)]
-                exec_result = "<exec_result>\n" + self.exec_func_sql(sql_string, api=dialect) + "\n</exec_result>"
+                kwargs = self.initial_prompts[str(seq_group_id)]
+                if False:
+                    print("exec sql for ", request_id, sql_string, kwargs)
+                exec_result = self.exec_func_sql(sql_string, max_len=100, **kwargs)
+                exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
                 return self.tokenizer.encode(exec_result)
         return []
 
@@ -93,6 +97,7 @@ class SQLExecutor():
 
     def determine_dialect(self, prompt_token_ids):
         prompt_str = self.tokenizer.decode(prompt_token_ids)
+        print("Prompt", prompt_str)
         if "sqlite" in prompt_str:
             return "sqlite"
         elif "bigquery" in prompt_str:
@@ -103,17 +108,40 @@ class SQLExecutor():
 
     def process(self, outputs, scheduler_outputs, logging=False):
 
+        if self.beginning:
+            self.beginning = False
+            return outputs
+
         # Save the initial prompts for each request ID
         for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
             seq_group = scheduled_seq_group.seq_group
-            request_id = seq_group.request_id
-            if request_id not in self.initial_prompts:
-                self.initial_prompts[str(request_id)] = self.determine_dialect(seq_group.prompt_token_ids)
+            seq_group_id = seq_group.request_id
+            sqlite_path = seq_group.sampling_params.sqlite_path
+            if seq_group_id not in self.initial_prompts:
+                if logging:
+                    print("Saving initial prompt for seq_group_id", seq_group_id, "sqlite_path", sqlite_path)
+                self.initial_prompts[str(seq_group_id)] = {
+                    "api": self.determine_dialect(seq_group.prompt_token_ids),
+                    "sqlite_path": f"/workspace/ashwin/fine-tuning/snow-spider-agent/methods/RL-fine-tuning/{sqlite_path}"
+                }
 
+        # Assumption: There is only one Sampler Output Object
+        assert len(outputs) == 1
+        outputs = outputs[0]
         # Process each CompletionSequenceGroupOutput object
-        for output_sample in outputs:
-            for output in output_sample.outputs:
-                seq_id = output.samples[0].parent_seq_id
+        for seq_group_id, completion_seq_output in enumerate(outputs.outputs):
+            if logging:
+                print("processing group", seq_group_id)
+            seq_id_analyzed = []
+            for seq_output in completion_seq_output.samples:
+                seq_id = seq_output.parent_seq_id
+
+
+                if seq_id in seq_id_analyzed:
+                    print("WARNING", outputs)
+
+                seq_id_analyzed.append(seq_id)
+
                 if logging:
                     print("Processing output for seq_id", seq_id)
 
@@ -123,23 +151,25 @@ class SQLExecutor():
                         print("Monitoring seq_id", seq_id)
                     monitor_info = self.monitor_parent_seq_ids[seq_id]
 
-                    actual_output_token = output.samples[0].output_token
+                    actual_output_token = seq_output.output_token
                     replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
                     monitor_info["curr_pointer"] += 1
 
                     # replace output token
-                    output.samples[0].output_token = replacement_token
+                    seq_output.output_token = replacement_token
                     
                     # replace the logprobs also
-                    output.samples[0].logprobs[replacement_token] = output.samples[0].logprobs[actual_output_token]
+                    seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
                     if replacement_token != actual_output_token:
-                        del output.samples[0].logprobs[actual_output_token]
+                        del seq_output.logprobs[actual_output_token]
 
                     # Remove from monitoring if all tokens have been processed
                     if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
+                        if logging:
+                            print("Removing seq_id", seq_id, "from monitoring")
                         del self.monitor_parent_seq_ids[seq_id]
 
-                output_token = output.samples[0].output_token
+                output_token = seq_output.output_token
                 if logging:
                     print("Output token", output_token)
                     print("Output word", self.tokenizer.decode([output_token]))
@@ -149,19 +179,19 @@ class SQLExecutor():
                     self.parent_seq_ids_completions[seq_id] = []
                 self.parent_seq_ids_completions[seq_id].append(output_token)
 
-            # Check for the monitor token sequence in completions
-            for seq_id, completions in self.parent_seq_ids_completions.items():
+                # Check for the monitor token sequence in completions
+                completions = self.parent_seq_ids_completions[seq_id]
                 if logging:
                     print("For seq_id", seq_id, "completions", completions)
                 if completions[-4:] == self.monitor_token_id:
                     if logging:
                         print("Detected monitor token for seq_id", seq_id)
                     self.monitor_parent_seq_ids[seq_id] = {
-                        "exec_result": self.fetch_execution_result(completions, seq_id),
+                        "exec_result": self.fetch_execution_result(completions, seq_id, seq_group_id),
                         "curr_pointer": 0
                     }
 
-        return outputs
+        return [outputs]
 
 class LLMEngine(LLMEngine):
     """An LLM engine that receives requests and generates texts.
@@ -629,6 +659,7 @@ class LLMEngine(LLMEngine):
             # Add results to the output_queue
             if self.logging:
                 print("llm engine otuput", outputs)
+                print("scheduler outputs", scheduler_outputs)
             outputs = self.sql_executor_context.process(outputs, scheduler_outputs)
             if self.logging:
                 print("llm engine otuput after process", outputs)

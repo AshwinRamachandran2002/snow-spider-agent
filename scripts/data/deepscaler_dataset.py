@@ -1,34 +1,9 @@
-"""Script to prepare DeepScaler training and test datasets.
-
-This script processes math problem datasets into a standardized format for training
-and testing DeepScaler models. It loads problems from specified datasets, adds
-instruction prompts, and saves the processed data as parquet files.
-"""
-
 import argparse
 import os
 from typing import Dict, List, Optional, Any
 
 import pandas as pd
-from verl.utils.hdfs_io import copy, makedirs
-from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
-
-from deepscaler.system_prompts import Prompts
-from deepscaler.data.utils import load_dataset
 from deepscaler.rewards.math_utils.utils import get_api_name
-from deepscaler.data.dataset_types import TrainDataset, TestDataset
-
-
-def extract_solution(solution_str: str) -> str:
-    """Extract the final boxed solution from a solution string.
-
-    Args:
-        solution_str: Raw solution string that may contain multiple boxed answers
-
-    Returns:
-        The final boxed answer with box notation removed
-    """
-    return remove_boxed(last_boxed_only_string(solution_str))
 
 
 def make_map_fn(split: str):
@@ -41,38 +16,41 @@ def make_map_fn(split: str):
         Function that processes individual dataset examples
     """
     def process_fn(example: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
-        question = example.pop('question')
-        instruction = "This is a Text-to-SQL task where you are given database information and a question, and your goal is to generate only one SQL query as the answer. Let's think step by step and output the whole final SQL within ```sql``` code block.\n"
-        instruction += "Table info:\n" + example["input"]
-
         api = get_api_name(example["example_id"])
         sqlite_path = None
         if api == "sqlite":
             sqlite_path = example["sqlite_path"]
-        sql_prompt = Prompts()
-        tb_str = "The table structure information is ({database name: {schema name: [table name]}}): \n"
-        table_struct = example['input'][example['input'].find(tb_str)+len(tb_str):].replace("\n", "")
-        instruction += f"The SQL dialect is {api}. Basic usage: " + sql_prompt.get_prompt_dialect_basic(api)
-        if sql_prompt.get_prompt_dialect_basic_eg(api, table_struct):
-            # print(sql_prompt.get_prompt_dialect_basic_eg(api, table_struct))
-            instruction += sql_prompt.get_prompt_dialect_basic_eg(api, table_struct)
-        instruction += f"Question: {question}\n"
-        question = instruction
-        
-        # gold_results_path = example.pop('gold_results_path')
-        # answer = gold_results_path
+
         ex_id = example["example_id"]
+        
+        sql_input = example["input"]
+        user_prompt = ""
+        if isinstance(sql_input, list):
+            user_prompt += sql_input[0]
+            table_structure = sql_input[1]
+            if api == "sqlite":
+                user_prompt += "The table structure information is [table name]: \n" + table_structure + "\n"
+            else:
+                user_prompt += "The table structure information is ({database name: {schema name: {table name}}}): \n" + table_structure + "\n"
+        else:
+            user_prompt += sql_input
+
+        user_prompt += "\nTask: " + example["question"]
+
+        sys_prompt = f"You are a data scientist proficient in database, SQL and DBT Project. You may use <exec_sql> tags to execute SQL functions. Execution results will be returned in <exec_result> tags. Use this tool to investigate the schema before writing the final SQL.\nThe dialect of the SQL must be {api}.\n"
 
         data = {
             "data_source": "",
             "prompt": [{
+                "role": "system",
+                "content": sys_prompt
+            }, {
                 "role": "user",
-                "content": question
+                "content": user_prompt
             }],
             "ability": "code",
             "reward_model": {
                 "style": "rule",
-                # "ground_truth": answer,
                 "sqlite_path": sqlite_path,
                 "example_id": ex_id
             },
@@ -89,23 +67,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Process datasets for DeepScaler training')
     parser.add_argument('--local_dir', default='deepscaler/data/processed',
                        help='Local directory to save processed datasets')
-    parser.add_argument('--hdfs_dir', default=None,
-                       help='Optional HDFS directory to copy datasets to')
     args = parser.parse_args()
 
     local_dir = args.local_dir
-    hdfs_dir = args.hdfs_dir
-    
-    # Make local directory if it doesn't exist
-    if not os.path.exists(local_dir):
-        makedirs(local_dir)
 
     # Initialize datasets
-    train_datasets = [TrainDataset.TRAINING_DATA_AUG]
-    train_dataset = load_dataset(train_datasets[0])
-    test_datasets = [TestDataset.LITE_TEST_ALL_DATA, TestDataset.LITE_TEST_DATA, TestDataset.SNOW_TEST_ALL_DATA, TestDataset.SNOW_TEST_DATA, TestDataset.VAL_DATA]
-    
-    test_datasets_data = [load_dataset(d) for d in test_datasets]
+    import json
+    file_path = "/workspace/ashwin/fine-tuning/snow-spider-agent/methods/RL-fine-tuning/data/training_data.json"
+    with open(file_path, "r", encoding="utf-8") as file:
+        train_dataset = json.load(file)
 
     # Process training data
     train_data: List[Dict[str, Any]] = []
@@ -115,6 +85,18 @@ if __name__ == '__main__':
         if processed_example is not None:
             train_data.append(processed_example)
 
+
+    test_datasets = [
+        "lite_test_data",
+        "snow_test_data",
+        "lite_test_all_data",
+        "snow_test_all_data"
+    ]    
+    def load_dataset(file_path):
+        file_path = f"/workspace/ashwin/fine-tuning/snow-spider-agent/methods/RL-fine-tuning/data/{file_path}.json"
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    test_datasets_data = [load_dataset(d) for d in test_datasets]
     # Process and save each test dataset separately
     for test_dataset, test_data_list in zip(test_datasets, test_datasets_data):
         test_data: List[Dict[str, Any]] = []
@@ -124,7 +106,7 @@ if __name__ == '__main__':
             if processed_example is not None:
                 test_data.append(processed_example)
 
-        dataset_name = test_dataset.value.lower()
+        dataset_name = test_dataset.lower()
         test_df = pd.DataFrame(test_data)
         test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}.parquet'))
         print(f"{dataset_name} test data size:", len(test_data))
@@ -134,7 +116,8 @@ if __name__ == '__main__':
     train_df = pd.DataFrame(train_data)
     train_df.to_parquet(os.path.join(local_dir, 'train.parquet'))
 
-    # Optionally copy to HDFS
-    if hdfs_dir is not None:
-        makedirs(hdfs_dir)
-        copy(src=local_dir, dst=hdfs_dir)
+    # Save training dataset
+    val_data = train_data[:50]
+    print("val data size:", len(val_data))
+    val_df = pd.DataFrame(val_data)
+    val_df.to_parquet(os.path.join(local_dir, 'val_data.parquet'))
