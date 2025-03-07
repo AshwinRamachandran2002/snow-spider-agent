@@ -169,8 +169,7 @@ def split_Spider2(task_dict_snow, task_dict_lite, args):
     lite_test_all_data = get_spider2_data_dict(task_dict_snow, task_dict_lite, lite_test_all_list, args, task="test")
     return spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data
 
-def get_spider1_data_dict(args, min_token_len=50):
-    json_paths = ["data/Spider/spider_data/train_spider.json", "data/Spider/spider_data/train_others.json", "data/Spider/spider_data/test.json", "data/Spider/spider_data/dev.json"]
+def get_spider1_data_dict(args, json_paths, min_token_len=50):
     eg_count = 0
     dict_list = []
     if not os.path.exists(args.Spider_executed_results_path):
@@ -210,8 +209,7 @@ def get_spider1_data_dict(args, min_token_len=50):
                 dict_list.append(sql_dict)
     return dict_list
 
-def get_bird_data_dict(args, min_token_len=50):
-    json_paths = ["data/BIRD/dev/dev.json", "data/BIRD/train/train.json"]
+def get_bird_data_dict(args, json_paths, min_token_len=50):
     eg_count = 0
     dict_list = []
     if not os.path.exists(args.BIRD_executed_results_path):
@@ -427,11 +425,15 @@ def main(args):
             training_data = json.loads(f.read())
     else:
         spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data = split_Spider2(task_dict_snow, task_dict_lite, args)
-        spider1_data = get_spider1_data_dict(args)
-        bird_data = get_bird_data_dict(args)
+        spider1_data = get_spider1_data_dict(args, ["data/Spider/spider_data/train_spider.json", "data/Spider/spider_data/train_others.json", "data/Spider/spider_data/dev.json"])
+        spider1_test_data = get_spider1_data_dict(args, ["data/Spider/spider_data/test.json"], 0)
+        bird_data = get_bird_data_dict(args, ["data/BIRD/train/train.json"])
+        bird_test_data = get_bird_data_dict(args, ["data/BIRD/dev/dev.json"], 0)
         training_data = spider2_train_data + spider1_data + bird_data
         save_json("training_data", training_data)
         # sample_json_data("data/training_data.json", 200, "data/val_data.json")
+        save_json("spider1_test_data", spider1_test_data)
+        save_json("bird_test_data", bird_test_data)
         save_json("snow_test_data", snow_test_data)
         save_json("snow_test_all_data", snow_test_all_data)
         save_json("lite_test_data", lite_test_data)
