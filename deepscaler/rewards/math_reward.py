@@ -29,7 +29,7 @@ class RewardMathFn(RewardFn):
         example_id = input.example_id.get("ex_id", None)
         print(f"Start Reward {example_id}")
 
-        exec_folder = "exec_3B"
+        exec_folder = input.exec_folder.get("exec_folder", None)
         csv_save_path = os.path.join(exec_folder, example_id+f"_{threading.get_ident()}.csv")
         if not os.path.exists(exec_folder):
             os.mkdir(exec_folder)
@@ -60,9 +60,9 @@ class RewardMathFn(RewardFn):
         print(f"End Reward {example_id}")
         return RewardOutput(reward=self.config.incorrect_reward, is_correct=False)
 
-def deepscaler_reward_fn(solution_str: str, sqlite_path: Union[str, List[str]], example_id: Union[str, List[str]], enable_llm = False):
+def deepscaler_reward_fn(solution_str: str, sqlite_path: Union[str, List[str]], example_id: Union[str, List[str]], exec_folder=None, enable_llm = False):
     reward_config = RewardConfig()
     reward_config.use_math_orm = enable_llm
     reward_fn = RewardMathFn(reward_config)
-    reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, sqlite_path={"sqlite_path": sqlite_path}, example_id={"ex_id": example_id}))
+    reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, sqlite_path={"sqlite_path": sqlite_path}, example_id={"ex_id": example_id}, exec_folder={"exec_folder": exec_folder}))
     return reward_response.is_correct

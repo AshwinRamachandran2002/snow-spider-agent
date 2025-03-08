@@ -21,7 +21,7 @@ from verl.utils.reward_score import gsm8k, math
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-
+import shutil
 from deepscaler.rewards.math_reward import deepscaler_reward_fn
 
 
@@ -33,7 +33,7 @@ class RewardManager():
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
 
-    def __call__(self, data: DataProto):
+    def __call__(self, data: DataProto, max_workers=96, exec_folder=None):
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
@@ -78,12 +78,24 @@ class RewardManager():
             example_id = data_item.non_tensor_batch['reward_model']['example_id']
 
             # select rm_score
-            score = deepscaler_reward_fn(solution_str=sequences_str, sqlite_path=sqlite_path, example_id=example_id)
+            score = deepscaler_reward_fn(solution_str=sequences_str, sqlite_path=sqlite_path, example_id=example_id, exec_folder=exec_folder)
 
             return i, score, valid_response_length
         print(f"len(data): {len(data)}")
+        if exec_folder is not None:
+            if os.path.exists(exec_folder):
+                try:
+                    shutil.rmtree(exec_folder)
+                except OSError:
+                    print("Already deleted")
+                    pass
+            try:
+                os.makedirs(exec_folder, exist_ok=True)
+            except FileExistsError:
+                print("Already created")
+                pass
         # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             args = [(i, data[i], already_print_data_sources) for i in range(len(data))]
             results = list(executor.map(process_item, args))
         print(f"Finish Reward")
