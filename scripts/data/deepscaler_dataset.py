@@ -3,7 +3,7 @@ import os
 from typing import Dict, List, Optional, Any
 
 import pandas as pd
-from deepscaler.rewards.math_utils.utils import get_api_name
+from verl.workers.reward_model.reward_utils import get_api_name
 
 
 def make_map_fn(split: str):
