@@ -390,43 +390,52 @@ class RayPPOTrainer(object):
         """
         uids = batch.non_tensor_batch['uid']
         unique_uids = np.unique(uids)
-        solve_sqlite = []
-        solve_bigquery = []
-        solve_snowflake = []
-        intermediate_sqlite = []
-        intermediate_bigquery = []
-        intermediate_snowflake = []
+
+        init_dict = {'sqlite': [], 'bigquery': [], 'snowflake': []}
+        successful_final_sql_rewards = init_dict.copy()
+        unsuccessful_intermediate_sql_rewards = init_dict.copy()
+        absent_intermediate_thought_rewards = init_dict.copy()
+        undiverse_intermediate_sql_rewards = init_dict.copy()
+        absent_final_sql_rewards = init_dict.copy()
+
         for uid in unique_uids:
             uid_mask = uids == uid
-            final_sql_rewards = reward_tensor[uid_mask][:, -1] / self.config.rewards.successful_final_sql
-            intermediate_rewards = reward_tensor[uid_mask][:, -2] / self.config.rewards.unsuccessful_intermediate_sql
-            num_solved = final_sql_rewards.sum()
 
             example_id = batch.non_tensor_batch['reward_model'][uid]['example_id']
             from verl.workers.reward_model.reward_utils import get_api_name
             api = get_api_name(example_id)
-            if api == 'sqlite':
-                solve_sqlite.append(num_solved / len(final_sql_rewards))
-                intermediate_sqlite.append(intermediate_rewards)
-            elif api == 'bigquery':
-                solve_bigquery.append(num_solved / len(final_sql_rewards))
-                intermediate_bigquery.append(intermediate_rewards)
-            elif api == 'snowflake':
-                solve_snowflake.append(num_solved / len(final_sql_rewards))
-                intermediate_snowflake.append(intermediate_rewards)
+
+            final_sql_rewards = reward_tensor[uid_mask][:, -1] / self.config.rewards.successful_final_sql_reward
+            num_solved = final_sql_rewards.sum()
+            successful_final_sql_rewards[api].append(num_solved / len(final_sql_rewards))
+
+            unsuccessful_intermediate_sql_rewards[api].append((reward_tensor[uid_mask][:, -2].sum() / self.config.rewards.unsuccessful_intermediate_sql_reward) / len(final_sql_rewards))
+            absent_intermediate_thought_rewards[api].append((reward_tensor[uid_mask][:, -3].sum() / self.config.rewards.absent_intermediate_thought_reward) / len(final_sql_rewards))
+            undiverse_intermediate_sql_rewards[api].append((reward_tensor[uid_mask][:, -4].sum() / self.config.rewards.undiverse_intermediate_sql_reward) / len(final_sql_rewards))
+            absent_final_sql_rewards[api].append((reward_tensor[uid_mask][:, -5].sum() / self.config.rewards.absent_final_sql_reward) / len(final_sql_rewards))
 
         # Log to metrics
-        atleast_one_lambda = lambda x: 1 if x > 0 else 0
-        metrics['batch/solve_sqlite_atleast_one'] = sum(map(atleast_one_lambda, solve_sqlite)) / len(solve_sqlite)
-        metrics['batch/solve_sqlite_total'] = sum(solve_sqlite) / len(solve_sqlite)
-        metrics['batch/solve_bigquery_atleast_one'] = sum(map(atleast_one_lambda, solve_bigquery)) / len(solve_bigquery)
-        metrics['batch/solve_bigquery_total'] = sum(solve_bigquery) / len(solve_bigquery)
-        metrics['batch/solve_snowflake_atleast_one'] = sum(map(atleast_one_lambda, solve_snowflake)) / len(solve_snowflake)
-        metrics['batch/solve_snowflake_total'] = sum(solve_snowflake) / len(solve_snowflake)
-
-        metrics['batch/intermediate_sqlite_mean'] = np.mean(intermediate_sqlite)
-        metrics['batch/intermediate_bigquery_mean'] = np.mean(intermediate_bigquery)
-        metrics['batch/intermediate_snowflake_mean'] = np.mean(intermediate_snowflake)
+        for api in ['sqlite', 'bigquery', 'snowflake']:
+            metrics[f"reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api])
+            metrics[f"reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]])
+            metrics[f"reward/successful_final_sql_reward/{api}/min"] = np.min(successful_final_sql_rewards[api])
+            metrics[f"reward/successful_final_sql_reward/{api}/max"] = np.max(successful_final_sql_rewards[api])
+            
+            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/mean"] = np.mean(unsuccessful_intermediate_sql_rewards[api])
+            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/min"] = np.min(unsuccessful_intermediate_sql_rewards[api])
+            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/max"] = np.max(unsuccessful_intermediate_sql_rewards[api])
+            
+            metrics[f"reward/absent_intermediate_thought_reward/{api}/mean"] = np.mean(absent_intermediate_thought_rewards[api])
+            metrics[f"reward/absent_intermediate_thought_reward/{api}/min"] = np.min(absent_intermediate_thought_rewards[api])
+            metrics[f"reward/absent_intermediate_thought_reward/{api}/max"] = np.max(absent_intermediate_thought_rewards[api])
+            
+            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/mean"] = np.mean(undiverse_intermediate_sql_rewards[api])
+            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/min"] = np.min(undiverse_intermediate_sql_rewards[api])
+            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/max"] = np.max(undiverse_intermediate_sql_rewards[api])
+            
+            metrics[f"reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api])
+            metrics[f"reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api])
+            metrics[f"reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api])
 
         return metrics
 

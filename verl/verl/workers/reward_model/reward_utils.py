@@ -16,7 +16,7 @@ def hard_cut(str_e, length=0):
     return str_e
 
 def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
-    #TODO: sql syntax error in without exception clause
+
     if api == "snowflake":
         # Load Snowflake credentials
         with open("./snowflake_credential.json") as f:
@@ -46,6 +46,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                         else:
                             return hard_cut(df.to_csv(index=False), max_len)
                 except Exception as e:
+                    # in snowflake, syntax errors, wrong table, column come here in exception
                     return "Incorrect SQL Syntax:\n" + str(e)
 
     elif api == "bigquery":
@@ -73,6 +74,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                 else:
                     return hard_cut(df.to_csv(index=False), max_len)
         except Exception as e:
+            # in bigquery, syntax errors, wrong table, column come here in exception
             return "Incorrect SQL Syntax:\n" + str(e)
 
     elif api == "sqlite":
@@ -104,6 +106,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
                 else:
                     return hard_cut(df.to_csv(index=False), max_len)
         except Exception as e:
+            # in sqlite, syntax errors, wrong table, column come here in exception
             return "Incorrect SQL Syntax:\n" + str(e)
         finally:
             if cursor:
