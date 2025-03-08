@@ -14,6 +14,5 @@
 
 from .base import BaseRollout
 from .naive import NaiveRollout
-from .hf_rollout import HFRollout
 
 __all__ = ["BaseRollout", "NaiveRollout", "HFRollout"]
