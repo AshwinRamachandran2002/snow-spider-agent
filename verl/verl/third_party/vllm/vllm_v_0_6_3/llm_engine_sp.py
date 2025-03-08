@@ -66,12 +66,14 @@ class SQLExecutor():
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
         self.initial_prompts = {}
-        # TODO: replace with a single token
+        self.calls_per_parent_seq_id = {}
+        self.max_calls = 30
+
         self.monitor_token_id = [522, 11748, 18063, 397]
         self.start_token_id_1 = [366, 11748, 18063, 397]
         self.start_token_id_2 = [27, 11748, 18063, 397]
         self.tokenizer = tokenizer_group.tokenizer
-        # TODO: get the prompt tokens also
+
         self.exec_func_sql = execute_sql_with_timeout
         self.beginning = True
 
@@ -189,10 +191,23 @@ class SQLExecutor():
                 if completions[-4:] == self.monitor_token_id:
                     if logging:
                         print("Detected monitor token for seq_id", seq_id)
-                    self.monitor_parent_seq_ids[seq_id] = {
-                        "exec_result": self.fetch_execution_result(completions, seq_id, seq_group_id),
-                        "curr_pointer": 0
-                    }
+
+                    # Check if a lot of calls have been made for this seq_id
+                    if seq_id not in self.calls_per_parent_seq_id:
+                        self.calls_per_parent_seq_id[seq_id] = 0
+                    self.calls_per_parent_seq_id[seq_id] += 1
+                    if self.calls_per_parent_seq_id[seq_id] > self.max_calls:
+                        if logging:
+                            print("Exceeded max calls for seq_id", seq_id)
+                        self.monitor_parent_seq_ids[seq_id] = {
+                            "exec_result": [self.tokenizer.eos_token_id],
+                            "curr_pointer": 0
+                        }
+                    else:
+                        self.monitor_parent_seq_ids[seq_id] = {
+                            "exec_result": self.fetch_execution_result(completions, seq_id, seq_group_id),
+                            "curr_pointer": 0
+                        }
 
         return [outputs]
 
