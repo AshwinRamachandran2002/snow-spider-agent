@@ -268,7 +268,6 @@ class RayPPOTrainer(object):
         OmegaConf.set_struct(self.config, True)
         with open_dict(self.config):
             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-            self.config.critic.optim.total_training_steps = total_training_steps
 
     def _validate(self):
         reward_tensor_lst = []
@@ -347,21 +346,12 @@ class RayPPOTrainer(object):
         self.resource_pool_to_cls[resource_pool]['ref'] = ref_policy_cls
 
         # initialize WorkerGroup
-        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
-        # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
-        self.wg_dicts = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
-            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
-            self.wg_dicts.append(wg_dict)
-
-        self.critic_wg = all_wg['critic']
-        self.critic_wg.init_model()
 
         self.ref_policy_wg = all_wg['ref']
         self.ref_policy_wg.init_model()
@@ -403,19 +393,27 @@ class RayPPOTrainer(object):
         solve_sqlite = []
         solve_bigquery = []
         solve_snowflake = []
+        intermediate_sqlite = []
+        intermediate_bigquery = []
+        intermediate_snowflake = []
         for uid in unique_uids:
             uid_mask = uids == uid
-            uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
-            num_solved = (uid_rewards > 0).sum()
+            final_sql_rewards = reward_tensor[uid_mask][:, -1] / self.config.rewards.successful_final_sql
+            intermediate_rewards = reward_tensor[uid_mask][:, -2] / self.config.rewards.unsuccessful_intermediate_sql
+            num_solved = final_sql_rewards.sum()
+
             example_id = batch.non_tensor_batch['reward_model'][uid]['example_id']
-            from deepscaler.rewards.math_utils.utils import get_api_name
+            from verl.workers.reward_model.reward_utils import get_api_name
             api = get_api_name(example_id)
             if api == 'sqlite':
-                solve_sqlite.append(num_solved / len(uid_rewards))
+                solve_sqlite.append(num_solved / len(final_sql_rewards))
+                intermediate_sqlite.append(intermediate_rewards)
             elif api == 'bigquery':
-                solve_bigquery.append(num_solved / len(uid_rewards))
+                solve_bigquery.append(num_solved / len(final_sql_rewards))
+                intermediate_bigquery.append(intermediate_rewards)
             elif api == 'snowflake':
-                solve_snowflake.append(num_solved / len(uid_rewards))
+                solve_snowflake.append(num_solved / len(final_sql_rewards))
+                intermediate_snowflake.append(intermediate_rewards)
 
         # Log to metrics
         atleast_one_lambda = lambda x: 1 if x > 0 else 0
@@ -425,6 +423,10 @@ class RayPPOTrainer(object):
         metrics['batch/solve_bigquery_total'] = sum(solve_bigquery) / len(solve_bigquery)
         metrics['batch/solve_snowflake_atleast_one'] = sum(map(atleast_one_lambda, solve_snowflake)) / len(solve_snowflake)
         metrics['batch/solve_snowflake_total'] = sum(solve_snowflake) / len(solve_snowflake)
+
+        metrics['batch/intermediate_sqlite_mean'] = np.mean(intermediate_sqlite)
+        metrics['batch/intermediate_bigquery_mean'] = np.mean(intermediate_bigquery)
+        metrics['batch/intermediate_snowflake_mean'] = np.mean(intermediate_snowflake)
 
         return metrics
 
@@ -484,7 +486,7 @@ class RayPPOTrainer(object):
                     with _timer('adv', timing_raw):
                         # compute scores using reward model and/or reward function
                         reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                        batch.batch['token_level_rewards'] = reward_tensor
 
                         # compute per api metrics
                         metrics = self.compute_per_api_metrics(batch, reward_tensor, metrics)
@@ -499,8 +501,6 @@ class RayPPOTrainer(object):
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                        batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(batch)
 
@@ -508,7 +508,7 @@ class RayPPOTrainer(object):
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     # TODO: should i do this?
-                    self._balance_batch(batch, metrics=metrics)
+                    # self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()

@@ -20,9 +20,8 @@ import pandas as pd
 
 import torch
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, PreTrainedTokenizer
-from verl.utils.fs import copy_local_path_from_hdfs
+from torch.utils.data import Dataset
+from transformers import PreTrainedTokenizer
 
 from verl.utils.model import compute_position_id_with_mask
 import verl.utils.torch_functional as verl_F

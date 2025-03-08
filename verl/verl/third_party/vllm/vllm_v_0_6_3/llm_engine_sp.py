@@ -54,7 +54,7 @@ from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
-from deepscaler.rewards.math_utils.utils import execute_sql_with_timeout
+from verl.workers.reward_model.reward_utils import execute_sql_with_timeout
 
 
 logger = init_logger(__name__)

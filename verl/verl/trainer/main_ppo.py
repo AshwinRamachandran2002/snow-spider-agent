@@ -47,8 +47,8 @@ def main_task(config):
         Role.RefPolicy: global_pool_id,
     }
 
-    reward_fn = RewardManager(tokenizer=tokenizer, mode='train')
-    val_reward_fn = RewardManager(tokenizer=tokenizer, mode='val')
+    reward_fn = RewardManager(tokenizer=tokenizer, mode='train', rewards_config=config.rewards)
+    val_reward_fn = RewardManager(tokenizer=tokenizer, mode='val', rewards_config=config.rewards)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
     trainer = RayPPOTrainer(
