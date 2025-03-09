@@ -79,6 +79,8 @@ class RewardManager():
                 sql_dict[exec_sql_str] = 0
             sql_dict[exec_sql_str] += 1
             num_total += 1
+        if num_total == 0:
+            return 0
         num_distinct = len(sql_dict)
         with open(log_path, "a") as f:
             f.write(f"Reward: distinct_intermediate_sql\n")

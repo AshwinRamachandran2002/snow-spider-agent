@@ -81,7 +81,7 @@ class SQLExecutor():
         self.max_calls = sql_executor_config.max_calls
 
         self.logging = False
-        self.log_path = f"sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        self.log_path = f"logs/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     def fetch_execution_result(self, completion, seq_group_id):
         for index in range(len(completion)-4, 0, -1):
@@ -97,6 +97,7 @@ class SQLExecutor():
                         f.write(f"{sql_string}\n")
                         f.write(f"result is {exec_result}\n")
                         f.write(f"time for api is {time.time()-start}")
+                print(f"executed below SQL with kwargs {kwargs}\n, {sql_string}\n, result is {exec_result}\n")
                 return self.tokenizer.encode(exec_result)
         return []
 
@@ -129,7 +130,7 @@ class SQLExecutor():
                         f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
                 self.initial_prompts[str(seq_group_id)] = {
                     "api": get_api_name(example_id),
-                    "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path),
+                    "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
                 }
 
         # Assumption: There is only one Sampler Output Object
@@ -201,12 +202,14 @@ class SQLExecutor():
 
                     # Check if a lot of calls have been made for this seq_id
                     if seq_id not in self.calls_per_parent_seq_id:
-                        self.calls_per_parent_seq_id[seq_id] = 0
-                    self.calls_per_parent_seq_id[seq_id] += 1
-                    if self.calls_per_parent_seq_id[seq_id] > self.max_calls:
+                        self.calls_per_parent_seq_id[seq_id] = [time.time()]
+                    self.calls_per_parent_seq_id[seq_id] += [time.time()]
+                    used_time = self.calls_per_parent_seq_id[seq_id][-1] - self.calls_per_parent_seq_id[seq_id][0]
+                    if used_time > self.max_calls:
                         if self.logging:
                             with open(self.log_path, "a") as f:
                                 f.write(f"Exceeded max calls for seq_id {seq_id}\n")
+                        print(f"Timeout max calls for seq_id {seq_id}, time: {used_time}\n")
 
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": [self.tokenizer.eos_token_id],
@@ -541,6 +544,7 @@ class LLMEngine(LLMEngine):
         cls,
         model,
         tokenizer,
+        sql_executor_config: DictConfig,
         engine_args: EngineArgs,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
@@ -561,6 +565,7 @@ class LLMEngine(LLMEngine):
         engine = cls(
             model,
             tokenizer,
+            sql_executor_config,
             **engine_config.to_dict(),
             executor_class=executor_class,
             log_stats=not engine_args.disable_log_stats,

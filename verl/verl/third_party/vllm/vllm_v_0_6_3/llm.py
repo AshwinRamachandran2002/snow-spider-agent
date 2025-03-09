@@ -20,6 +20,7 @@ from tqdm import tqdm
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import PretrainedConfig, PreTrainedTokenizer, PreTrainedTokenizerFast
+from omegaconf import DictConfig
 from verl.workers.rollout.tokenizer import HybridEngineBaseTokenizer
 from vllm import LLM
 from vllm.outputs import EmbeddingRequestOutput, RequestOutput
@@ -87,6 +88,7 @@ class LLM(LLM):
         self,
         model: Union[nn.Module, Dict],  # model itself or its parameter dict
         tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast, HybridEngineBaseTokenizer],
+        sql_executor_config: DictConfig,
         model_hf_config: PretrainedConfig,
         tokenizer_mode: str = "auto",
         trust_remote_code: bool = False,
@@ -145,7 +147,7 @@ class LLM(LLM):
                 f"Unexpected tokenizer type: {type(tokenizer)}. Must be"
                 "one of the following: PreTrainedTokenizer, PreTrainedTokenizerFast, verl.workers.rollout.HybridEngineBaseTokenizer"
             )
-        self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, engine_args)  # TODO: check usagecontext
+        self.llm_engine = LLMEngine.from_engine_args(model, tokenizer, sql_executor_config, engine_args)  # TODO: check usagecontext
         self.request_counter = Counter()
         
         self.logging = True

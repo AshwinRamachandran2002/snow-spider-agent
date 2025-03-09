@@ -98,6 +98,7 @@ class vLLMRollout(BaseRollout):
             "model context length should be greater than total sequence length"
         self.inference_engine = LLM(actor_module,
                                     tokenizer=tokenizer,
+                                    sql_executor_config=config.sql_executor,
                                     model_hf_config=model_hf_config,
                                     tensor_parallel_size=tensor_parallel_size,
                                     dtype=config.dtype,
@@ -108,7 +109,7 @@ class vLLMRollout(BaseRollout):
                                     max_num_batched_tokens=max_num_batched_tokens,
                                     enable_chunked_prefill=config.enable_chunked_prefill,
                                     load_format=config.load_format,
-                                    sql_executor_config=config.sql_executor)
+                                    )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.offload_model_weights()
 

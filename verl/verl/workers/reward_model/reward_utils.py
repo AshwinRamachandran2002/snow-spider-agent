@@ -85,6 +85,9 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, s
             conn = sqlite3.connect(uri, uri=True, timeout=60)
             cursor = conn.cursor()
             cursor.execute("PRAGMA read_uncommitted = true;")
+            # TODO: parameter for cache_size
+            cursor.execute("PRAGMA cache_size = -422656000;")
+            cursor.execute("PRAGMA temp_store = MEMORY;")
             cursor.execute(sql_query)
             # Fetch the results
             results = cursor.fetchall()
