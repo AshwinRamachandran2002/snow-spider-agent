@@ -96,7 +96,7 @@ class RewardManager():
         csv_save_path = os.path.join(self.exec_folder, example_id+f"_{threading.get_ident()}.csv")
         
         log_path = f"{self.exec_folder}/{example_id}_{threading.get_ident()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{str(uuid.uuid4())}.log"
-
+        sqlite_path = os.path.join(os.getenv("PATH_TO_SQLITE_PATH"), sqlite_path)
         with open(log_path, "a") as f:
             f.write(f"starting report for {example_id}\n")
             f.write(f"prompt:\n{prompt_str}\n")

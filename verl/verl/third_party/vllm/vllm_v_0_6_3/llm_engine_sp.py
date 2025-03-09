@@ -130,7 +130,7 @@ class SQLExecutor():
                         f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
                 self.initial_prompts[str(seq_group_id)] = {
                     "api": get_api_name(example_id),
-                    "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
+                    "sqlite_path": os.path.join(os.getenv("PATH_TO_SQLITE_PATH"), sqlite_path) if sqlite_path else '',
                 }
 
         # Assumption: There is only one Sampler Output Object
