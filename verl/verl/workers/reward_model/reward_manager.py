@@ -31,7 +31,7 @@ class RewardManager():
 
         self.ground_truths = "deepscaler/rewards/gold/gold_answer"
 
-    def enum_unsuccessful_intermediate_sql(self, response_str):
+    def enum_unsuccessful_intermediate_sql(self, response_str, log_path):
         num_total = 0
         num_incorrect = 0
         for part in response_str.split("<exec_sql>")[1:]:
@@ -41,9 +41,13 @@ class RewardManager():
             if "Incorrect SQL Syntax" in exec_result_str:
                 num_incorrect += 1
             num_total += 1
+        with open(log_path, "a") as f:
+            f.write(f"Reward: unsuccessful_intermediate_sql\n")
+            f.write(f"num_total: {num_total}\n")
+            f.write(f"num_incorrect: {num_incorrect}\n")
         return (num_incorrect / num_total) * self.unsuccessful_intermediate_sql_reward if num_total > 0 else 0
     
-    def enum_absent_intermediate_thought(self, response_str):
+    def enum_absent_intermediate_thought(self, response_str, log_path):
         num_total = 0
         num_absent = 0
         for part in response_str.split("</exec_result>")[1:]:
@@ -51,12 +55,19 @@ class RewardManager():
             if intermediate_thought == "":
                 num_absent += 1
             num_total += 1
+        with open(log_path, "a") as f:
+            f.write(f"Reward: absent_intermediate_thought\n")
+            f.write(f"num_total: {num_total}\n")
+            f.write(f"num_absent: {num_absent}\n")
         return (num_absent / num_total) * self.absent_intermediate_thought_reward if num_total > 0 else 0
 
-    def enum_absent_final_sql(self, response_str):
+    def enum_absent_final_sql(self, response_str, log_path):
+        with open(log_path, "a") as f:
+            f.write(f"Reward: absent_final_sql\n")
+            f.write(f"is absent: {1 if '<|im_start|>SQL' not in response_str else 0}\n")
         return self.absent_final_sql_reward if "<|im_start|>SQL" not in response_str else 0
-    
-    def enum_distinct_intermediate_sql(self, response_str):
+
+    def enum_distinct_intermediate_sql(self, response_str, log_path):
         num_total = 0
         sql_dict = {}
         for part in response_str.split("<exec_sql>")[1:]:
@@ -66,16 +77,24 @@ class RewardManager():
             sql_dict[exec_sql_str] += 1
             num_total += 1
         num_distinct = len(sql_dict)
+        with open(log_path, "a") as f:
+            f.write(f"Reward: distinct_intermediate_sql\n")
+            f.write(f"num_total: {num_total}\n")
+            f.write(f"num_distinct: {num_distinct}\n")
+            f.write(f"distinct ratio: {num_distinct / num_total}\n")
         return ((num_total - num_distinct) / num_total) * self.undiverse_intermediate_sql_reward if num_total > 0 else 0
 
-    def compute_reward_tensor(self, response_str, response_ids, sqlite_path, example_id):
+    def compute_reward_tensor(self, prompt_str, response_str, response_ids, sqlite_path, example_id):
         print(f"Start Reward {example_id}")
 
         reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32)
-        csv_save_path = os.path.join(self.exec_folder, example_id+f"_{threading.get_ident()}.csv")    
-  
-        with open(f"{self.exec_folder}/{example_id}_{threading.get_ident()}.log", "a") as f:
-            f.write(f"example_id:\n{example_id}\n")
+        csv_save_path = os.path.join(self.exec_folder, example_id+f"_{threading.get_ident()}.csv")
+        
+        log_path = f"{self.exec_folder}/{example_id}_{threading.get_ident()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+
+        with open(log_path, "a") as f:
+            f.write(f"starting report for {example_id}\n")
+            f.write(f"prompt:\n{prompt_str}\n")
             f.write(f"response:\n{response_str}\n")
             f.write(f"sqlite_path:\n{sqlite_path}\n")
             f.write(f"api:\n{get_api_name(example_id)}\n")
@@ -87,10 +106,10 @@ class RewardManager():
         # this is to enable latr metrics calculation
         # hacky method
         if reward_tensor.shape[0] > 4:
-            reward_tensor[-2] = self.enum_unsuccessful_intermediate_sql(response_str)
-            reward_tensor[-3] = self.enum_absent_intermediate_thought(response_str)
-            reward_tensor[-4] = self.enum_distinct_intermediate_sql(response_str)
-            reward_tensor[-5] = self.enum_absent_final_sql(response_str)
+            reward_tensor[-2] = self.enum_unsuccessful_intermediate_sql(response_str, log_path)
+            reward_tensor[-3] = self.enum_absent_intermediate_thought(response_str, log_path)
+            reward_tensor[-4] = self.enum_distinct_intermediate_sql(response_str, log_path)
+            reward_tensor[-5] = self.enum_absent_final_sql(response_str, log_path)
 
         # Extract solution.
         if "<|im_start|>SQL" in response_str:
@@ -101,7 +120,8 @@ class RewardManager():
         if execute_sql_with_timeout(final_sql, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(self.ground_truths, csv_save_path, example_id)
             if is_correct:
-                print(f"Correct: {example_id}_{threading.get_ident()}")
+                with open(log_path, "a") as f:
+                    f.write(f"Reward: successful_final_sql\n")
                 reward_tensor[-1] = self.successful_final_sql_reward
 
         print(f"End Reward {example_id}")
@@ -113,6 +133,9 @@ class RewardManager():
         # recover the prompt
         prompt_ids = data_item.batch['prompts']
         prompt_length = prompt_ids.shape[-1]
+        valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
+        valid_prompt_ids = prompt_ids[-valid_prompt_length:]
+        prompt_str = self.tokenizer.decode(valid_prompt_ids)
 
         # recover the response
         response_ids = data_item.batch['responses']
@@ -124,7 +147,7 @@ class RewardManager():
         sqlite_path = data_item.non_tensor_batch['reward_model']['sqlite_path']
         example_id = data_item.non_tensor_batch['reward_model']['example_id']
 
-        reward_tensor = self.compute_reward_tensor(response_str, response_ids, sqlite_path, example_id)
+        reward_tensor = self.compute_reward_tensor(prompt_str, response_str, response_ids, sqlite_path, example_id)
         return i, reward_tensor
 
     def __call__(self, data: DataProto):

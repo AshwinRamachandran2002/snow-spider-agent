@@ -401,7 +401,7 @@ class RayPPOTrainer(object):
         for uid in unique_uids:
             uid_mask = uids == uid
 
-            example_id = batch.non_tensor_batch['reward_model'][uid]['example_id']
+            example_id = batch.non_tensor_batch['reward_model'][uid_mask][0]['example_id']
             from verl.workers.reward_model.reward_utils import get_api_name
             api = get_api_name(example_id)
 
@@ -416,26 +416,26 @@ class RayPPOTrainer(object):
 
         # Log to metrics
         for api in ['sqlite', 'bigquery', 'snowflake']:
-            metrics[f"reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api])
-            metrics[f"reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]])
-            metrics[f"reward/successful_final_sql_reward/{api}/min"] = np.min(successful_final_sql_rewards[api])
-            metrics[f"reward/successful_final_sql_reward/{api}/max"] = np.max(successful_final_sql_rewards[api])
+            metrics[f"reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]]) if len(successful_final_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/successful_final_sql_reward/{api}/min"] = np.min(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/successful_final_sql_reward/{api}/max"] = np.max(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
             
-            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/mean"] = np.mean(unsuccessful_intermediate_sql_rewards[api])
-            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/min"] = np.min(unsuccessful_intermediate_sql_rewards[api])
-            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/max"] = np.max(unsuccessful_intermediate_sql_rewards[api])
+            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/mean"] = np.mean(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/min"] = np.min(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/max"] = np.max(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
             
-            metrics[f"reward/absent_intermediate_thought_reward/{api}/mean"] = np.mean(absent_intermediate_thought_rewards[api])
-            metrics[f"reward/absent_intermediate_thought_reward/{api}/min"] = np.min(absent_intermediate_thought_rewards[api])
-            metrics[f"reward/absent_intermediate_thought_reward/{api}/max"] = np.max(absent_intermediate_thought_rewards[api])
+            metrics[f"reward/absent_intermediate_thought_reward/{api}/mean"] = np.mean(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
+            metrics[f"reward/absent_intermediate_thought_reward/{api}/min"] = np.min(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
+            metrics[f"reward/absent_intermediate_thought_reward/{api}/max"] = np.max(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
             
-            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/mean"] = np.mean(undiverse_intermediate_sql_rewards[api])
-            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/min"] = np.min(undiverse_intermediate_sql_rewards[api])
-            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/max"] = np.max(undiverse_intermediate_sql_rewards[api])
+            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/mean"] = np.mean(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/min"] = np.min(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/max"] = np.max(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
             
-            metrics[f"reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api])
-            metrics[f"reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api])
-            metrics[f"reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api])
+            metrics[f"reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
+            metrics[f"reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
 
         return metrics
 
@@ -466,7 +466,7 @@ class RayPPOTrainer(object):
         # we start from step 1
         self.global_steps += 1
 
-        for _ in range(self.config.trainer.total_epochs):
+        for epoch_idx in range(self.config.trainer.total_epochs):
 
             for batch_dict in self.train_dataloader:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -487,7 +487,7 @@ class RayPPOTrainer(object):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                     print(f"Time for generation batch dict: {time.time() - start}")
                     # This code matches a prompt ID with its N responses.
-                    batch.non_tensor_batch['uid'] = np.array([str(i) for i in range(len(batch.batch))],
+                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
