@@ -127,7 +127,7 @@ class SQLExecutor():
                         f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
                 self.initial_prompts[str(seq_group_id)] = {
                     "api": get_api_name(example_id),
-                    "sqlite_path": f"/workspace/ashwin/fine-tuning/snow-spider-agent/methods/RL-fine-tuning/{sqlite_path}"
+                    "sqlite_path": f"/workspace/ashwin/snow-spider-agent/data_prep/snow-spider-agent/methods/RL-fine-tuning/{sqlite_path}"
                 }
 
         # Assumption: There is only one Sampler Output Object

@@ -23,7 +23,7 @@ done
 
 # Set default model path if not provided
 if [ -z "$MODEL_PATH" ]; then
-    MODEL_PATH="/workspace/ashwin/func_call_model/checkpoint-50"    
+    MODEL_PATH="/workspace/ashwin/func_call_model/checkpoint-100"    
 fi
 
 LOGDIR="/tmp/1.5B-test"
