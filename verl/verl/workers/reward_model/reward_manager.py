@@ -31,6 +31,8 @@ class RewardManager():
             os.mkdir(self.exec_folder)
 
         self.ground_truths = "deepscaler/rewards/gold/gold_answer"
+        
+        self.max_workers = rewards_config.max_workers
 
     def enum_unsuccessful_intermediate_sql(self, response_str, log_path):
         num_total = 0
@@ -156,7 +158,7 @@ class RewardManager():
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
 
         # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             args = [(i, data[i]) for i in range(len(data))]
             results = list(executor.map(self.process_item, args))
 

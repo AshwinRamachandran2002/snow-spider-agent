@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/engine/llm_engine.py
-
+import os
 from functools import partial
 from typing import Callable, Dict, Optional, Type, Union, List
 import time
@@ -32,6 +32,7 @@ from vllm.config import (
     SchedulerConfig,
     SpeculativeConfig,
 )
+from omegaconf import DictConfig
 from vllm.core.scheduler import Scheduler
 from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.llm_engine import LLMEngine, SchedulerContext, SchedulerOutputState, _load_generation_config_dict
@@ -63,12 +64,11 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 class SQLExecutor():
 
-    def __init__(self, tokenizer_group, exec_func_sql):
+    def __init__(self, tokenizer_group, sql_executor_config):
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
         self.initial_prompts = {}
         self.calls_per_parent_seq_id = {}
-        self.max_calls = 30
 
         self.monitor_token_id = [522, 11748, 18063, 397]
         self.start_token_id_1 = [366, 11748, 18063, 397]
@@ -77,7 +77,9 @@ class SQLExecutor():
 
         self.exec_func_sql = execute_sql_with_timeout
         self.beginning = True
-        
+        self.sqlite_source_path = sql_executor_config.sqlite_source_path
+        self.max_calls = sql_executor_config.max_calls
+
         self.logging = False
         self.log_path = f"sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
@@ -127,7 +129,7 @@ class SQLExecutor():
                         f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
                 self.initial_prompts[str(seq_group_id)] = {
                     "api": get_api_name(example_id),
-                    "sqlite_path": f"/workspace/ashwin/snow-spider-agent/data_prep/snow-spider-agent/methods/RL-fine-tuning/{sqlite_path}"
+                    "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path),
                 }
 
         # Assumption: There is only one Sampler Output Object
@@ -260,6 +262,7 @@ class LLMEngine(LLMEngine):
         # NOTE(sgm): first two arguments are added for verl
         model: Union[nn.Module, Dict],  # model itself or its parameter dict
         tokenizer: nn.Module,
+        sql_executor_config: DictConfig,
         # NOTE(sgm): vllm original arguments
         model_config: ModelConfig,
         cache_config: CacheConfig,
@@ -495,9 +498,8 @@ class LLMEngine(LLMEngine):
                 get_tokenizer_for_seq,
             ),
         )
-        
-        self.exec_func_sql = lambda x: "col_1,col_2\n1,2\n3,4\n5,6\n"
-        self.sql_executor_context = SQLExecutor(self.tokenizer, self.exec_func_sql)
+
+        self.sql_executor_context = SQLExecutor(self.tokenizer, sql_executor_config)
 
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
