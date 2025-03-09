@@ -73,7 +73,7 @@ if __name__ == '__main__':
 
     # Initialize datasets
     import json
-    file_path = "/workspace/ashwin/snow-spider-agent/data_prep/snow-spider-agent/methods/RL-fine-tuning/data/training_data.json"
+    file_path = "deepscaler/data/training_data.json"
     with open(file_path, "r", encoding="utf-8") as file:
         train_dataset = json.load(file)
 
@@ -93,7 +93,7 @@ if __name__ == '__main__':
         "snow_test_all_data"
     ]    
     def load_dataset(file_path):
-        file_path = f"/workspace/ashwin/snow-spider-agent/data_prep/snow-spider-agent/methods/RL-fine-tuning/data/{file_path}.json"
+        file_path = f"deepscaler/data/{file_path}.json"
         with open(file_path, "r", encoding="utf-8") as file:
             return json.load(file)
     test_datasets_data = [load_dataset(d) for d in test_datasets]
