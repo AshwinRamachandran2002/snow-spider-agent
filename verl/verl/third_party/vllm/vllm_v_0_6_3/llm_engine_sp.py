@@ -53,8 +53,9 @@ from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
-from verl.workers.reward_model.reward_utils import execute_sql_with_timeout
-
+from verl.workers.reward_model.reward_utils import execute_sql_with_timeout, get_api_name
+import uuid
+import datetime
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -76,19 +77,24 @@ class SQLExecutor():
 
         self.exec_func_sql = execute_sql_with_timeout
         self.beginning = True
+        
+        self.logging = False
+        self.log_path = f"sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
-    def fetch_execution_result(self, completion, request_id, seq_group_id):
+    def fetch_execution_result(self, completion, seq_group_id):
         for index in range(len(completion)-4, 0, -1):
             if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
                 kwargs = self.initial_prompts[str(seq_group_id)]
-                if False:
-                    print("exec sql for ", request_id, sql_string, kwargs)
                 start = time.time()
                 exec_result = self.exec_func_sql(sql_string, max_len=200, **kwargs)
-                if False:
-                    print("time for api", kwargs["api"], "is", time.time()-start, "sqlite_path", kwargs["sqlite_path"])
                 exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
+                if self.logging:
+                    with open(self.log_path, "a") as f:
+                        f.write(f"executed below SQL with kwargs {kwargs}\n")
+                        f.write(f"{sql_string}\n")
+                        f.write(f"result is {exec_result}\n")
+                        f.write(f"time for api is {time.time()-start}")
                 return self.tokenizer.encode(exec_result)
         return []
 
@@ -99,19 +105,11 @@ class SQLExecutor():
         if request_id in self.monitor_parent_seq_ids:
             del self.monitor_parent_seq_ids[request_id]
 
-    def determine_dialect(self, prompt_token_ids):
-        prompt_str = self.tokenizer.decode(prompt_token_ids)
-        if False:
-            print("Prompt", prompt_str)
-        if "sqlite" in prompt_str:
-            return "sqlite"
-        elif "bigquery" in prompt_str:
-            return "bigquery"
-        else:
-            return "snowflake"
-            # raise ValueError("Unknown dialect")
-
-    def process(self, outputs, scheduler_outputs, logging=False):
+    def process(self, outputs, scheduler_outputs):
+        """
+        Each new completion request has a unique request_id in Scheduler Outputs.
+        Depending on number of rollouts, in each Scheduler Ouput request id, multiple parent seq id are started
+        """
 
         if self.beginning:
             self.beginning = False
@@ -122,11 +120,13 @@ class SQLExecutor():
             seq_group = scheduled_seq_group.seq_group
             seq_group_id = seq_group.request_id
             sqlite_path = seq_group.sampling_params.sqlite_path
+            example_id = seq_group.sampling_params.example_id
             if seq_group_id not in self.initial_prompts:
-                if logging:
-                    print("Saving initial prompt for seq_group_id", seq_group_id, "sqlite_path", sqlite_path)
+                if self.logging:
+                    with open(self.log_path, "a") as f:
+                        f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
                 self.initial_prompts[str(seq_group_id)] = {
-                    "api": self.determine_dialect(seq_group.prompt_token_ids),
+                    "api": get_api_name(example_id),
                     "sqlite_path": f"/workspace/ashwin/fine-tuning/snow-spider-agent/methods/RL-fine-tuning/{sqlite_path}"
                 }
 
@@ -134,26 +134,30 @@ class SQLExecutor():
         assert len(outputs) == 1
         outputs = outputs[0]
         # Process each CompletionSequenceGroupOutput object
-        for seq_group_id, completion_seq_output in enumerate(outputs.outputs):
-            if logging:
-                print("processing group", seq_group_id)
+        for index, completion_seq_output in enumerate(outputs.outputs):
+            seq_group_id = scheduler_outputs.scheduled_seq_groups[index].seq_group.request_id
+            if self.logging:
+                with open(self.log_path, "a") as f:
+                    f.write(f"processing group {seq_group_id}\n")
             seq_id_analyzed = []
             for seq_output in completion_seq_output.samples:
                 seq_id = seq_output.parent_seq_id
-
 
                 if seq_id in seq_id_analyzed:
                     print("WARNING", outputs)
 
                 seq_id_analyzed.append(seq_id)
 
-                if logging:
-                    print("Processing output for seq_id", seq_id)
+                if self.logging:
+                    with open(self.log_path, "a") as f:
+                        f.write(f"processing seq_id {seq_id}\n")
 
                 # Check if the sequence ID is being monitored
                 if seq_id in self.monitor_parent_seq_ids:
-                    if logging:
-                        print("Monitoring seq_id", seq_id)
+                    if self.logging:
+                        with open(self.log_path, "a") as f:
+                            f.write(f"Monitoring seq_id {seq_id}\n")
+
                     monitor_info = self.monitor_parent_seq_ids[seq_id]
 
                     actual_output_token = seq_output.output_token
@@ -170,14 +174,16 @@ class SQLExecutor():
 
                     # Remove from monitoring if all tokens have been processed
                     if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                        if logging:
-                            print("Removing seq_id", seq_id, "from monitoring")
+                        if self.logging:
+                            with open(self.log_path, "a") as f:
+                                f.write(f"Removing seq_id {seq_id} from monitoring\n")
                         del self.monitor_parent_seq_ids[seq_id]
 
                 output_token = seq_output.output_token
-                if logging:
-                    print("Output token", output_token)
-                    print("Output word", self.tokenizer.decode([output_token]))
+                if self.logging:
+                    with open(self.log_path, "a") as f:
+                        f.write(f"Output token {output_token}\n")
+                        f.write(f"Output word {self.tokenizer.decode([output_token])}\n")
 
                 # Store the output token for the sequence ID
                 if seq_id not in self.parent_seq_ids_completions:
@@ -186,26 +192,30 @@ class SQLExecutor():
 
                 # Check for the monitor token sequence in completions
                 completions = self.parent_seq_ids_completions[seq_id]
-                if logging:
-                    print("For seq_id", seq_id, "completions", completions)
                 if completions[-4:] == self.monitor_token_id:
-                    if logging:
-                        print("Detected monitor token for seq_id", seq_id)
+                    if self.logging:
+                        with open(self.log_path, "a") as f:
+                            f.write(f"Detected monitor token for seq_id {seq_id}\n")
 
                     # Check if a lot of calls have been made for this seq_id
                     if seq_id not in self.calls_per_parent_seq_id:
                         self.calls_per_parent_seq_id[seq_id] = 0
                     self.calls_per_parent_seq_id[seq_id] += 1
                     if self.calls_per_parent_seq_id[seq_id] > self.max_calls:
-                        if logging:
-                            print("Exceeded max calls for seq_id", seq_id)
+                        if self.logging:
+                            with open(self.log_path, "a") as f:
+                                f.write(f"Exceeded max calls for seq_id {seq_id}\n")
+
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": [self.tokenizer.eos_token_id],
                             "curr_pointer": 0
                         }
                     else:
+                        if self.logging:
+                            with open(self.log_path, "a") as f:
+                                f.write(f"Making API call for seq_id {seq_id}\n")
                         self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": self.fetch_execution_result(completions, seq_id, seq_group_id),
+                            "exec_result": self.fetch_execution_result(completions, seq_group_id),
                             "curr_pointer": 0
                         }
 
@@ -488,7 +498,6 @@ class LLMEngine(LLMEngine):
         
         self.exec_func_sql = lambda x: "col_1,col_2\n1,2\n3,4\n5,6\n"
         self.sql_executor_context = SQLExecutor(self.tokenizer, self.exec_func_sql)
-        self.logging = False
 
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
@@ -675,12 +684,14 @@ class LLMEngine(LLMEngine):
                 else seq_group_metadata_list[0].state.num_steps == 1
 
             # Add results to the output_queue
-            if self.logging:
-                print("llm engine otuput", outputs)
-                print("scheduler outputs", scheduler_outputs)
+            if self.sql_executor_context.logging:
+                with open(self.sql_executor_context.log_path, "a") as f:
+                    f.write(f"llm engine otuput before process {outputs}\n")
+                    f.write(f"scheduler outputs {scheduler_outputs}\n")
             outputs = self.sql_executor_context.process(outputs, scheduler_outputs)
-            if self.logging:
-                print("llm engine otuput after process", outputs)
+            if self.sql_executor_context.logging:
+                with open(self.sql_executor_context.log_path, "a") as f:
+                    f.write(f"llm engine otuput after process {outputs}\n")
             ctx.append_output(outputs=outputs,
                               seq_group_metadata_list=seq_group_metadata_list,
                               scheduler_outputs=scheduler_outputs,

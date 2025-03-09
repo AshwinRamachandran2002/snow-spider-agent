@@ -1,6 +1,7 @@
 import os
 import torch
 import threading
+import uuid
 import datetime
 from verl import DataProto
 from concurrent.futures import ThreadPoolExecutor
@@ -90,7 +91,7 @@ class RewardManager():
         reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32)
         csv_save_path = os.path.join(self.exec_folder, example_id+f"_{threading.get_ident()}.csv")
         
-        log_path = f"{self.exec_folder}/{example_id}_{threading.get_ident()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        log_path = f"{self.exec_folder}/{example_id}_{threading.get_ident()}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{str(uuid.uuid4())}.log"
 
         with open(log_path, "a") as f:
             f.write(f"starting report for {example_id}\n")
