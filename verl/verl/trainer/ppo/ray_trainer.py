@@ -400,9 +400,17 @@ class RayPPOTrainer(object):
         absent_intermediate_thought_rewards = init_dict.copy()
         undiverse_intermediate_sql_rewards = init_dict.copy()
         absent_final_sql_rewards = init_dict.copy()
-
+        solve_none = 0
+        solve_all = 0
         for uid in unique_uids:
             uid_mask = uids == uid
+            uid_rewards = reward_tensor[uid_mask][:, -1].sum(-1)  # Sum rewards for each sequence
+                            
+            # Check if all rewards are 0 or all are 1 for this uid
+            if (uid_rewards == 0).all():
+                solve_none += 1
+            elif (uid_rewards == 1).all():
+                solve_all += 1
 
             example_id = batch.non_tensor_batch['reward_model'][uid_mask][0]['example_id']
             from verl.workers.reward_model.reward_utils import get_api_name
@@ -419,6 +427,9 @@ class RayPPOTrainer(object):
 
         # Log to metrics
         for api in ['sqlite', 'bigquery', 'snowflake']:
+            metrics['batch/solve_none'] = solve_none
+            metrics['batch/solve_all'] = solve_all
+
             metrics[f"reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
             metrics[f"reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]]) if len(successful_final_sql_rewards[api]) > 0 else 0
             metrics[f"reward/successful_final_sql_reward/{api}/min"] = np.min(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0

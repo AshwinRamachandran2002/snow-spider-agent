@@ -125,6 +125,7 @@ class RewardManager():
         if execute_sql_with_timeout(final_sql, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
             is_correct = evaluate_spider2sql(self.ground_truths, csv_save_path, example_id)
             if is_correct:
+                print(f"Correct: {example_id}_{threading.get_ident()}")
                 with open(log_path, "a") as f:
                     f.write(f"Reward: successful_final_sql\n")
                 reward_tensor[-1] = self.successful_final_sql_reward
