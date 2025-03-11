@@ -278,6 +278,8 @@ class RayPPOTrainer(object):
             # test_batch = test_batch.to('cuda')
 
             n_val_samples = self.config.actor_rollout_ref.rollout.n_val
+            test_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(test_batch.batch))],
+                                                             dtype=object)
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
 
             test_gen_batch = test_batch.pop(
@@ -309,12 +311,10 @@ class RayPPOTrainer(object):
             reward_tensor_lst.append(reward_tensor)
             test_batch_lst.append(test_batch)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        test_batch = DataProto.concat(test_batch_lst)
-
-        metric_dict = {}
-        metric_dict = self.compute_per_api_metrics(test_batch, reward_tensor, metric_dict, prefix='val/')
-        metric_dict[f'val/mean_rewards'] = np.mean(reward_tensor.cpu().numpy())
+            print(f"reward_tensor.shape: {reward_tensor.shape}")
+            metric_dict = {}
+            metric_dict = self.compute_per_api_metrics(test_batch, reward_tensor, metric_dict, prefix=f'val_{len(reward_tensor_lst)}/')
+            metric_dict[f'val_{len(reward_tensor_lst)}/mean_rewards'] = np.mean(reward_tensor.cpu().numpy())
 
         return metric_dict
 
