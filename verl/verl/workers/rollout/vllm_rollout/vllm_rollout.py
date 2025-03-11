@@ -231,6 +231,8 @@ class vLLMRollout(BaseRollout):
                     sampling_params=batch_sampling_params,
                     prompt_token_ids=idx_list,
                     use_tqdm=False)
+                
+                self.inference_engine.llm_engine.sql_executor_context.remove_all_ids()
 
                 # Process outputs
                 response = output[0].to(idx.device)
@@ -318,6 +320,7 @@ class vLLMRollout(BaseRollout):
                 self.inference_engine = LLM(
                     self.actor_module,
                     tokenizer=self.tokenizer,
+                    sql_executor_config=self.config.sql_executor,
                     model_hf_config=self.model_hf_config,
                     tensor_parallel_size=self.tensor_parallel_size,
                     dtype=self.config.dtype,

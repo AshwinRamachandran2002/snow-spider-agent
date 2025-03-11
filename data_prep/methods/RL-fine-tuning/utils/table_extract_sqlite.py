@@ -100,9 +100,10 @@ def get_directory_tree(work_dir):
     return md_files_content, json_files
 
 
-def fetch_table_metadata(sql_id, fetch_exec_result=False):
+def fetch_table_metadata(sql_id, main_dir):
+    
+    work_dir = os.path.join(main_dir, f"Spider2.0_lite/{sql_id}")
 
-    work_dir = f'/workspace/ashwin/snow-spider-agent/data_prep/snow-spider-agent/methods/RL-fine-tuning/data/Spider2.0_lite/{sql_id}'
 
     table_structure = []
 

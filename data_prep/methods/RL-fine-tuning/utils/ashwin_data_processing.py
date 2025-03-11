@@ -41,7 +41,7 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                 if task == "train":
                     with open(os.path.join(args.snow_gold_sql_path_training, sql_id + ".sql")) as f:
                         sql_dict["answer"] = f.read()
-                answer = fetch_table_metadata_snowflake(sql_id)
+                answer = fetch_table_metadata_snowflake(sql_id, main_dir=args.data_path)
                 if isinstance(answer, str):
                     continue
                 sql_dict["input"] = answer
@@ -57,12 +57,12 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                             sql_dict["sqlite_path"] = os.path.join(id_path, file)
                             assert sql_dict["sqlite_path"]
                 if "local" in sql_id :
-                    answer = fetch_table_metadata_sqlite(sql_id)
+                    answer = fetch_table_metadata_sqlite(sql_id, main_dir=args.data_path)
                     if isinstance(answer, str):
                         continue
                     sql_dict["input"] = answer
                 elif "bq" in sql_id or "ga" in sql_id:
-                    answer = fetch_table_metadata_bigquery(sql_id)
+                    answer = fetch_table_metadata_bigquery(sql_id, main_dir=args.data_path)
                     if isinstance(answer, str):
                         continue
                     sql_dict["input"] = answer
@@ -230,13 +230,15 @@ def main(args):
     spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data = split_Spider2(task_dict_snow, task_dict_lite, args)
     spider1_data = get_spider1_data_dict(args)
     bird_data = get_bird_data_dict(args)
-    training_data = spider2_train_data + spider1_data + bird_data
+    training_data = spider2_train_data
     save_json("training_data", training_data)
 
     save_json("snow_test_data", snow_test_data)
     save_json("snow_test_all_data", snow_test_all_data)
     save_json("lite_test_data", lite_test_data)
     save_json("lite_test_all_data", lite_test_all_data)
+    save_json("spider1_data", spider1_data)
+    save_json("bird_data", bird_data)
 
 
 if __name__ == '__main__':
@@ -261,5 +263,6 @@ if __name__ == '__main__':
     parser.add_argument('--data_augmentaion', action="store_true")
     parser.add_argument('--schema_linking', action="store_true")
     parser.add_argument('--load_data', type=str, default=None)
+    parser.add_argument('--data_path', type=str, default="/workspace/ashwin/snow-spider-agent/data_prep/methods/RL-fine-tuning/data")
     args = parser.parse_args()
     main(args)

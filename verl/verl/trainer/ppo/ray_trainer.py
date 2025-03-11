@@ -271,7 +271,7 @@ class RayPPOTrainer(object):
 
     def _validate(self):
         reward_tensor_lst = []
-        data_source_lst = []
+        test_batch_lst = []
         print("self.val_dataloader")
         for test_data in tqdm(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
@@ -307,21 +307,14 @@ class RayPPOTrainer(object):
             reward_tensor = self.val_reward_fn(test_batch)
 
             reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+            test_batch_lst.append(test_batch)
 
         reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        # evaluate test_score based on data source
-        data_source_reward = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+        test_batch = DataProto.concat(test_batch_lst)
 
         metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+        metric_dict = self.compute_per_api_metrics(test_batch, reward_tensor, metric_dict, prefix='val/')
+        metric_dict[f'val/mean_rewards'] = np.mean(reward_tensor.cpu().numpy())
 
         return metric_dict
 
@@ -387,7 +380,7 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
-    def compute_per_api_metrics(self, batch: DataProto, reward_tensor, metrics):
+    def compute_per_api_metrics(self, batch: DataProto, reward_tensor, metrics, prefix=''):
         """
         Compute per api metrics
         """
@@ -426,30 +419,31 @@ class RayPPOTrainer(object):
             absent_final_sql_rewards[api].append((reward_tensor[uid_mask][:, -5].sum() / self.config.rewards.absent_final_sql_reward) / len(final_sql_rewards))
 
         # Log to metrics
-        for api in ['sqlite', 'bigquery', 'snowflake']:
-            metrics['batch/solve_none'] = solve_none
-            metrics['batch/solve_all'] = solve_all
+        metrics[f'{prefix}batch/solve_none'] = solve_none
+        metrics[f'{prefix}batch/solve_all'] = solve_all
 
-            metrics[f"reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]]) if len(successful_final_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/successful_final_sql_reward/{api}/min"] = np.min(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/successful_final_sql_reward/{api}/max"] = np.max(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
+        for api in ['sqlite', 'bigquery', 'snowflake']:
+
+            metrics[f"{prefix}reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]]) if len(successful_final_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/successful_final_sql_reward/{api}/min"] = np.min(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/successful_final_sql_reward/{api}/max"] = np.max(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
             
-            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/mean"] = np.mean(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/min"] = np.min(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/unsuccessful_intermediate_sql_reward/{api}/max"] = np.max(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/unsuccessful_intermediate_sql_reward/{api}/mean"] = np.mean(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/unsuccessful_intermediate_sql_reward/{api}/min"] = np.min(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/unsuccessful_intermediate_sql_reward/{api}/max"] = np.max(unsuccessful_intermediate_sql_rewards[api]) if len(unsuccessful_intermediate_sql_rewards[api]) > 0 else 0
             
-            metrics[f"reward/absent_intermediate_thought_reward/{api}/mean"] = np.mean(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
-            metrics[f"reward/absent_intermediate_thought_reward/{api}/min"] = np.min(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
-            metrics[f"reward/absent_intermediate_thought_reward/{api}/max"] = np.max(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/absent_intermediate_thought_reward/{api}/mean"] = np.mean(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/absent_intermediate_thought_reward/{api}/min"] = np.min(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/absent_intermediate_thought_reward/{api}/max"] = np.max(absent_intermediate_thought_rewards[api]) if len(absent_intermediate_thought_rewards[api]) > 0 else 0
             
-            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/mean"] = np.mean(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/min"] = np.min(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/undiverse_intermediate_sql_reward/{api}/max"] = np.max(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/undiverse_intermediate_sql_reward/{api}/mean"] = np.mean(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/undiverse_intermediate_sql_reward/{api}/min"] = np.min(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/undiverse_intermediate_sql_reward/{api}/max"] = np.max(undiverse_intermediate_sql_rewards[api]) if len(undiverse_intermediate_sql_rewards[api]) > 0 else 0
             
-            metrics[f"reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
-            metrics[f"reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
+            metrics[f"{prefix}reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
 
         return metrics
 

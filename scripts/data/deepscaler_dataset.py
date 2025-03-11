@@ -90,34 +90,29 @@ if __name__ == '__main__':
         "lite_test_data",
         "snow_test_data",
         "lite_test_all_data",
-        "snow_test_all_data"
+        "snow_test_all_data",
+        "spider1_data",
+        "bird_data"
     ]    
     def load_dataset(file_path):
         file_path = f"deepscaler/data/test/{file_path}.json"
         with open(file_path, "r", encoding="utf-8") as file:
             return json.load(file)
     test_datasets_data = [load_dataset(d) for d in test_datasets]
-    # Process and save each test dataset separately
+    # Process and save combined together
+    test_data: List[Dict[str, Any]] = []
     for test_dataset, test_data_list in zip(test_datasets, test_datasets_data):
-        test_data: List[Dict[str, Any]] = []
         process_fn = make_map_fn('test')
         for idx, example in enumerate(test_data_list):
             processed_example = process_fn(example, idx)
             if processed_example is not None:
                 test_data.append(processed_example)
 
-        dataset_name = test_dataset.lower()
-        test_df = pd.DataFrame(test_data)
-        test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}.parquet'))
-        print(f"{dataset_name} test data size:", len(test_data))
+    test_df = pd.DataFrame(test_data)
+    test_df.to_parquet(os.path.join(local_dir, f'val_data.parquet'))
+    print(f" test data size:", len(test_data))
 
     # Save training dataset
     print("train data size:", len(train_data))
     train_df = pd.DataFrame(train_data)
     train_df.to_parquet(os.path.join(local_dir, 'train.parquet'))
-
-    # Save training dataset
-    val_data = train_data[:50]
-    print("val data size:", len(val_data))
-    val_df = pd.DataFrame(val_data)
-    val_df.to_parquet(os.path.join(local_dir, 'val_data.parquet'))

@@ -69,7 +69,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name='deepscaler-1.5b-8k' \
     +trainer.exec_folder='exec-Coder-3b-test' \
     +trainer.max_workers=96 \
-    +trainer.val_before_train=False \
+    +trainer.val_before_train=True \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=1 \

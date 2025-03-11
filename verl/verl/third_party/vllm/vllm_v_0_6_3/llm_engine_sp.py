@@ -79,15 +79,17 @@ class SQLExecutor():
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
         self.max_calls = sql_executor_config.max_calls
+        
+        print(f"SQLExecutor initialized with sqlite_source_path {self.sqlite_source_path} and max_calls {self.max_calls}")
 
-        self.logging = False
+        self.logging = True
         self.log_path = f"logs/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
-    def fetch_execution_result(self, completion, seq_group_id):
+    def fetch_execution_result(self, completion, request_id):
         for index in range(len(completion)-4, 0, -1):
             if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
-                kwargs = self.initial_prompts[str(seq_group_id)]
+                kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
                 exec_result = self.exec_func_sql(sql_string, max_len=200, **kwargs)
                 exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
@@ -107,6 +109,18 @@ class SQLExecutor():
 
         if request_id in self.monitor_parent_seq_ids:
             del self.monitor_parent_seq_ids[request_id]
+        
+        if request_id in self.calls_per_parent_seq_id:
+            del self.calls_per_parent_seq_id[request_id]
+        
+        if request_id in self.initial_prompts:
+            del self.initial_prompts[str(request_id)]
+
+    def remove_all_ids(self):
+        self.parent_seq_ids_completions = {}
+        self.monitor_parent_seq_ids = {}
+        self.calls_per_parent_seq_id = {}
+        self.initial_prompts = {}
 
     def process(self, outputs, scheduler_outputs):
         """
@@ -118,42 +132,44 @@ class SQLExecutor():
             self.beginning = False
             return outputs
 
-        # Save the initial prompts for each request ID
-        for scheduled_seq_group in scheduler_outputs.scheduled_seq_groups:
-            seq_group = scheduled_seq_group.seq_group
-            seq_group_id = seq_group.request_id
-            sqlite_path = seq_group.sampling_params.sqlite_path
-            example_id = seq_group.sampling_params.example_id
-            if seq_group_id not in self.initial_prompts:
-                if self.logging:
-                    with open(self.log_path, "a") as f:
-                        f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
-                self.initial_prompts[str(seq_group_id)] = {
-                    "api": get_api_name(example_id),
-                    "sqlite_path": os.path.join(os.getenv("PATH_TO_SQLITE_PATH"), sqlite_path) if sqlite_path else '',
-                }
-
         # Assumption: There is only one Sampler Output Object
         assert len(outputs) == 1
         outputs = outputs[0]
+
         # Process each CompletionSequenceGroupOutput object
+        seq_id_analyzed = []
         for index, completion_seq_output in enumerate(outputs.outputs):
             seq_group_id = scheduler_outputs.scheduled_seq_groups[index].seq_group.request_id
+
             if self.logging:
                 with open(self.log_path, "a") as f:
                     f.write(f"processing group {seq_group_id}\n")
-            seq_id_analyzed = []
+
             for seq_output in completion_seq_output.samples:
                 seq_id = seq_output.parent_seq_id
 
                 if seq_id in seq_id_analyzed:
                     print("WARNING", outputs)
-
                 seq_id_analyzed.append(seq_id)
 
                 if self.logging:
                     with open(self.log_path, "a") as f:
                         f.write(f"processing seq_id {seq_id}\n")
+
+                # Save the initial prompts for each request ID
+                if seq_id not in self.initial_prompts:
+                    seq_group = scheduler_outputs.scheduled_seq_groups[index].seq_group
+                    seq_group_id = seq_group.request_id
+                    sqlite_path = seq_group.sampling_params.sqlite_path
+                    example_id = seq_group.sampling_params.example_id
+                    if self.logging:
+                        with open(self.log_path, "a") as f:
+                            f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
+                    self.initial_prompts[str(seq_id)] = {
+                        "api": get_api_name(example_id),
+                        "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
+                    }
+
 
                 # Check if the sequence ID is being monitored
                 if seq_id in self.monitor_parent_seq_ids:
@@ -183,10 +199,6 @@ class SQLExecutor():
                         del self.monitor_parent_seq_ids[seq_id]
 
                 output_token = seq_output.output_token
-                if self.logging:
-                    with open(self.log_path, "a") as f:
-                        f.write(f"Output token {output_token}\n")
-                        f.write(f"Output word {self.tokenizer.decode([output_token])}\n")
 
                 # Store the output token for the sequence ID
                 if seq_id not in self.parent_seq_ids_completions:
@@ -220,9 +232,29 @@ class SQLExecutor():
                             with open(self.log_path, "a") as f:
                                 f.write(f"Making API call for seq_id {seq_id}\n")
                         self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": self.fetch_execution_result(completions, seq_group_id),
+                            "exec_result": self.fetch_execution_result(completions, seq_id),
                             "curr_pointer": 0
                         }
+
+        to_be_removed = []
+        for index in self.monitor_parent_seq_ids:
+            if index not in seq_id_analyzed:
+                to_be_removed.append(index)
+
+        for index in self.calls_per_parent_seq_id:
+            if index not in seq_id_analyzed:
+                to_be_removed.append(index)
+
+        for index in self.parent_seq_ids_completions:
+            if index not in seq_id_analyzed:
+                to_be_removed.append(index)
+
+        for index in self.initial_prompts:
+            if index not in seq_id_analyzed:
+                to_be_removed.append(index)
+
+        for index in to_be_removed:
+            self.remove(index)
 
         return [outputs]
 
