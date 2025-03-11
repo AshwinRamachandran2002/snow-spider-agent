@@ -125,7 +125,10 @@ def compress_ddl(example_folder):
                 for sqlite in os.listdir(entry1_path):
                     if sqlite.endswith(".sqlite"):
                         sqlite_path = os.path.join(entry1_path, sqlite)
-                table_names, prompts = get_sqlite_data(sqlite_path)
+                if "bird" in sqlite_path.lower():
+                    table_names, prompts = get_sqlite_data_bird(sqlite_path)
+                else:
+                    table_names, prompts = get_sqlite_data_spider(sqlite_path)
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
                 if not entry.startswith("local"):

@@ -98,17 +98,33 @@ def get_directory_tree(work_dir):
     json_files = [json_file for json_file in json_files if json_file and not json_file.endswith("credential.json")]
     return md_files_content, json_files
 
+def execute_sf_inspect_table_json(json_file_path, work_dir):
+    content = json.loads(get_file(json_file_path, work_dir))
+    info = {}
+    column_names = []
+    info["table_fullname"] = content["table_fullname"]
+    for i, column in enumerate(content["column_names"]):
+        type = content["column_types"][i]
+        description = content["description"][i]
+        if description is None:
+            description = ""
+        info[column] = {"type": type, "description": description}
+        column_names.append(column)
+    return info, column_names
 
 def fetch_table_metadata(sql_id, main_dir):
-    
-    work_dir = os.path.join(main_dir, f"Spider2.0_snow/{sql_id}")
+
+    work_dir = os.path.join(main_dir, "Spider2.0_snow", sql_id)
 
     table_structure = {}
 
     md_files_content, json_files = get_directory_tree(work_dir)
 
+
     for json_file in json_files:
+        
         json_file = json_file[2:].split(".json")[0]
+        json_file = json_file.replace(".", "/")
         database = json_file.split("/")[0]
         schema = json_file.split("/")[1]
         table = json_file.split("/")[2]
@@ -118,6 +134,7 @@ def fetch_table_metadata(sql_id, main_dir):
             table_structure[database][schema] = []
         table_structure[database][schema].append(table)
 
+
     if len(json_files) >= 100:
         return "TOO_LONG"
 
@@ -126,18 +143,7 @@ def fetch_table_metadata(sql_id, main_dir):
 
     observation = ""
     for json_file in json_files:
-        json_file_simplified = json_file.replace("/", "-")
-        if os.path.exists("data/table_metadata/table_" + json_file_simplified + ".pkl"):
-            with open("data/table_metadata/table_" + json_file_simplified + ".pkl", "rb") as f:
-                info, column_names = pickle.load(f)
-        else:
-            return "TOO_LONG"
-            start = time.time()
-            info, column_names = execute_sf_inspect_table_json(json_file, work_dir)
-            with open("data/table_metadata/table_" + json_file_simplified + ".pkl", "wb") as f:
-                pickle.dump((info, column_names), f)
-            print("Time taken to inspect table:", time.time() - start)
-
+        info, column_names = execute_sf_inspect_table_json(json_file, work_dir)
         table_name = info["table_fullname"]
         observation += "\n" + "-"*50
         observation += "\nTable: " + table_name + "\n"
@@ -145,36 +151,12 @@ def fetch_table_metadata(sql_id, main_dir):
             row = info[col]
 
             observation += '\nColumn:"' + col
-            def go_in(obj):
-                if isinstance(obj, list):
-                    if len(obj) > 0:
-                        return "list of " + go_in(obj[0])
-                    else:
-                        return "list"
-                elif isinstance(obj, dict):
-                    answer = "a dict consisting of keys: " + ", ".join([f"{key} of type {go_in(obj[key])}" for key in obj])
-                    return answer
-                else:
-                    return str(type(obj))
-            if row["type"] == "VARIANT":
-                single_val = str(row["distinct_values"]).split("-->")[-1].strip()
-                if "..." in single_val:
-                    observation += '", (variant), '
-                else:
-                    try:
-                        json_ting = (json.loads(single_val))
-                        observation += '", (' + go_in(json_ting) + "), "
-                    except:
-                        observation += '", (VARIANT), '
-            else:
-                observation += '", (' + row["type"] + '), '
+            observation += '", (' + row["type"] + '), '
             if row["description"]:
                 observation += " with description, " + row["description"]
-
         observation += "\n" + "-"*50
     observation = observation + "\nExternal knowledge that might be helpful:\n" + md_files_content + "\n"
     return observation, str(table_structure)
-
 
 if __name__ == "__main__":
     sql_id = "sf001"

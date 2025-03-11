@@ -54,7 +54,7 @@ from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
-from verl.workers.reward_model.reward_utils import execute_sql_with_timeout, get_api_name
+from verl.workers.reward_model.reward_utils import execute_sql_with_timeout, get_api_name, execute_sql_with_timeout_sf
 import uuid
 import datetime
 
@@ -69,6 +69,7 @@ class SQLExecutor():
         self.monitor_parent_seq_ids = {}
         self.initial_prompts = {}
         self.calls_per_parent_seq_id = {}
+        self.time_per_parent_seq_id = {}
 
         self.monitor_token_id = [522, 11748, 18063, 397]
         self.start_token_id_1 = [366, 11748, 18063, 397]
@@ -76,14 +77,15 @@ class SQLExecutor():
         self.tokenizer = tokenizer_group.tokenizer
 
         self.exec_func_sql = execute_sql_with_timeout
+        self.exec_func_sf = execute_sql_with_timeout_sf
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
         self.max_calls = sql_executor_config.max_calls
         
         print(f"SQLExecutor initialized with sqlite_source_path {self.sqlite_source_path} and max_calls {self.max_calls}")
 
-        self.logging = True
-        self.log_path = f"logs/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+        self.logging = False
+        self.log_path = f"log/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
     def fetch_execution_result(self, completion, request_id):
         for index in range(len(completion)-4, 0, -1):
@@ -91,7 +93,11 @@ class SQLExecutor():
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
-                exec_result = self.exec_func_sql(sql_string, max_len=200, **kwargs)
+                if kwargs['api'] == "snowflake":
+                    exec_result = self.exec_func_sf(sql_string, max_len=200, LIMIT=100, **kwargs)
+                else:
+                    exec_result = self.exec_func_sql(sql_string, max_len=200, LIMIT=100, **kwargs)
+                
                 exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
                 if self.logging:
                     with open(self.log_path, "a") as f:
@@ -99,7 +105,8 @@ class SQLExecutor():
                         f.write(f"{sql_string}\n")
                         f.write(f"result is {exec_result}\n")
                         f.write(f"time for api is {time.time()-start}")
-                print(f"executed below SQL with kwargs {kwargs}\n, {sql_string}\n, result is {exec_result}\n")
+                if kwargs['api'] == "snowflake":
+                    print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result)
         return []
 
@@ -214,19 +221,29 @@ class SQLExecutor():
 
                     # Check if a lot of calls have been made for this seq_id
                     if seq_id not in self.calls_per_parent_seq_id:
-                        self.calls_per_parent_seq_id[seq_id] = [time.time()]
-                    self.calls_per_parent_seq_id[seq_id] += [time.time()]
-                    used_time = self.calls_per_parent_seq_id[seq_id][-1] - self.calls_per_parent_seq_id[seq_id][0]
+                        self.calls_per_parent_seq_id[seq_id] = 0
+                    if seq_id not in self.time_per_parent_seq_id:
+                        self.time_per_parent_seq_id[seq_id] = [time.time()]
+                    self.calls_per_parent_seq_id[seq_id] += 1
+                    self.time_per_parent_seq_id[seq_id] += [time.time()]
+                    used_time = self.time_per_parent_seq_id[seq_id][-1] - self.time_per_parent_seq_id[seq_id][0]
                     if used_time > self.max_calls:
                         if self.logging:
                             with open(self.log_path, "a") as f:
                                 f.write(f"Exceeded max calls for seq_id {seq_id}\n")
-                        print(f"Timeout max calls for seq_id {seq_id}, time: {used_time}\n")
+                        print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
 
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": [self.tokenizer.eos_token_id],
                             "curr_pointer": 0
                         }
+                    elif self.calls_per_parent_seq_id[seq_id] > 30:
+
+                        self.monitor_parent_seq_ids[seq_id] = {
+                            "exec_result": [self.tokenizer.eos_token_id],
+                            "curr_pointer": 0
+                        }
+                        print(f"Max calls for seq_id {seq_id}, Current GPU Index: {torch.cuda.current_device()}\n")
                     else:
                         if self.logging:
                             with open(self.log_path, "a") as f:

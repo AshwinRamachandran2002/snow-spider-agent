@@ -73,17 +73,29 @@ if __name__ == '__main__':
 
     # Initialize datasets
     import json
-    file_path = "deepscaler/data/train/training_data.json"
-    with open(file_path, "r", encoding="utf-8") as file:
-        train_dataset = json.load(file)
+    train_datasets = [
+        "spider2_train_data",
+        "spider1_bird_train_data",
+        "bird_train_data"
+    ]
+    def load_dataset_train(file_path):
+        file_path = f"deepscaler/data/train/{file_path}.json"
+        with open(file_path, "r", encoding="utf-8") as file:
+            return json.load(file)
+    train_datasets_data = [load_dataset_train(d) for d in train_datasets]
+    # Process and save combined together
+    
+    for train_dataset, train_data_list in zip(train_datasets, train_datasets_data):
+        train_data: List[Dict[str, Any]] = []
+        process_fn = make_map_fn('train')
+        for idx, example in enumerate(train_data_list):
+            processed_example = process_fn(example, idx)
+            if processed_example is not None:
+                train_data.append(processed_example)
 
-    # Process training data
-    train_data: List[Dict[str, Any]] = []
-    process_fn = make_map_fn('train')
-    for idx, example in enumerate(train_dataset):
-        processed_example = process_fn(example, idx)
-        if processed_example is not None:
-            train_data.append(processed_example)
+        train_df = pd.DataFrame(train_data)
+        train_df.to_parquet(os.path.join(local_dir, f'{train_dataset}.parquet'))
+        print(f"{train_dataset} size:", len(train_data))
 
 
     test_datasets = [
@@ -91,8 +103,9 @@ if __name__ == '__main__':
         "snow_test_data",
         "lite_test_all_data",
         "snow_test_all_data",
-        "spider1_data",
-        "bird_data"
+        "spider1_dev_data",
+        "spider1_test_data",
+        "bird_test_data"
     ]    
     def load_dataset(file_path):
         file_path = f"deepscaler/data/test/{file_path}.json"
@@ -100,19 +113,16 @@ if __name__ == '__main__':
             return json.load(file)
     test_datasets_data = [load_dataset(d) for d in test_datasets]
     # Process and save combined together
-    test_data: List[Dict[str, Any]] = []
+    
     for test_dataset, test_data_list in zip(test_datasets, test_datasets_data):
+        test_data: List[Dict[str, Any]] = []
         process_fn = make_map_fn('test')
         for idx, example in enumerate(test_data_list):
             processed_example = process_fn(example, idx)
             if processed_example is not None:
                 test_data.append(processed_example)
 
-    test_df = pd.DataFrame(test_data)
-    test_df.to_parquet(os.path.join(local_dir, f'val_data.parquet'))
-    print(f" test data size:", len(test_data))
+        test_df = pd.DataFrame(test_data)
+        test_df.to_parquet(os.path.join(local_dir, f'{test_dataset}.parquet'))
+        print(f"{test_dataset} size:", len(test_data))
 
-    # Save training dataset
-    print("train data size:", len(train_data))
-    train_df = pd.DataFrame(train_data)
-    train_df.to_parquet(os.path.join(local_dir, 'train.parquet'))

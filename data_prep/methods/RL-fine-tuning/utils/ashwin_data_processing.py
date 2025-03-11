@@ -1,6 +1,6 @@
 import argparse
 from tqdm import tqdm
-from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_api, split_cte
+from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_with_timeout, split_cte
 from utils.reconstruct_data import get_sqlite_data_bird, get_sqlite_data_spider
 import csv
 import os
@@ -8,7 +8,7 @@ import json
 import random
 import sys
 import pandas as pd
-
+import concurrent
 from utils.table_extract_snowflake import fetch_table_metadata as fetch_table_metadata_snowflake
 from utils.table_extract_sqlite import fetch_table_metadata as fetch_table_metadata_sqlite
 from utils.table_extract_bigquery import fetch_table_metadata as fetch_table_metadata_bigquery
@@ -57,7 +57,7 @@ def get_spider2_data_dict(task_dict_snow, task_dict_lite, combined_list, args, t
                             sql_dict["sqlite_path"] = os.path.join(id_path, file)
                             assert sql_dict["sqlite_path"]
                 if "local" in sql_id :
-                    answer = fetch_table_metadata_sqlite(sql_id, main_dir=args.data_path)
+                    answer = fetch_table_metadata_sqlite(sql_id, main_dir=args.data_path, sqlite_path=sql_dict["sqlite_path"])
                     if isinstance(answer, str):
                         continue
                     sql_dict["input"] = answer
@@ -99,8 +99,7 @@ def split_Spider2(task_dict_snow, task_dict_lite, args):
     lite_test_all_data = get_spider2_data_dict(task_dict_snow, task_dict_lite, lite_test_all_list, args, task="test")
     return spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data
 
-def get_spider1_data_dict(args, min_token_len=50):
-    json_paths = ["data/Spider/spider_data/train_spider.json", "data/Spider/spider_data/train_others.json", "data/Spider/spider_data/test.json", "data/Spider/spider_data/dev.json"]
+def get_spider1_data_dict(args, json_paths, min_token_len=50):
     eg_count = 0
     dict_list = []
     if not os.path.exists(args.Spider_executed_results_path):
@@ -114,41 +113,73 @@ def get_spider1_data_dict(args, min_token_len=50):
         print(f"Processing Spider {data_type}")
         with open(json_path) as f:
             examples = json.load(f)
-        err_1 = 0
-        err_2 = 0
-        for ex in tqdm(examples):
-            sql_dict = {}
-            tokens = len(ex["query_toks"])
-            if tokens > min_token_len:
-                id_name = f"local_Spider_{eg_count:03d}" if eg_count < 1000 else f"local_Spider_{eg_count}"
+        # Define the function to process a single example
+        def process_example(index_ex):
+            i, ex = index_ex
+            err1, err2 = 0, 0
+            
+            # Check if the token length exceeds the minimum threshold
+            if len(ex["query_toks"]) > min_token_len:
+                # Create a unique id based on the index
+                id_name = f"local_Spider_{i:03d}" if i < 1000 else f"local_Spider_{i}"
                 sqlite_path = os.path.join(db_path, ex["db_id"], ex["db_id"] + ".sqlite")
-                assert os.path.exists(sqlite_path)
-                sql_dict["data_source"] = "Spider1.0"
-                sql_dict["example_id"] = id_name
-                sql_dict["question"] = ex["question"]
-                sql_dict["answer"] = ex["query"]
-                sql_dict["sqlite_path"] = sqlite_path
+                if not os.path.exists(sqlite_path):
+                    raise FileNotFoundError(f"File not exists: {sqlite_path}")
+                
+                # Build the sql_dict dictionary
+                sql_dict = {
+                    "data_source": "Spider1.0",
+                    "example_id": id_name,
+                    "question": ex["question"],
+                    "answer": ex["query"],
+                    "sqlite_path": sqlite_path,
+                }
+                
+                # Retrieve table structure information and prompts
                 table_names, prompts = get_sqlite_data_bird(sqlite_path)
-
                 prompts += "The table structure information is [table name]: \n" + str(table_names) + "\n"
                 sql_dict["input"] = prompts
+                
+                # Specify the output path for the executed results
                 Spider_executed_results_id_path = os.path.join(args.Spider_executed_results_path, id_name + ".csv")
-                results = execute_sql_api(sql_dict["answer"], Spider_executed_results_id_path, "sqlite", sqlite_path=sqlite_path)
+                results = execute_sql_with_timeout(sql_dict["answer"], Spider_executed_results_id_path, "sqlite", sqlite_path=sqlite_path)
+                
+                # Handle errors if the results are not as expected
                 if results != 0:
                     if results == "No data found for the specified query.\n":
-                        err_1 += 1
-                        continue
+                        err1 += 1
                     print(results)
-                eg_count += 1
-                dict_list.append(sql_dict)
+                    return None, err1, err2
+                
+                return sql_dict, err1, err2
             else:
-                err_2 += 1
-        print(f"Error 1: {err_1}, Error 2: {err_2}")
+                err2 += 1
+                return None, err1, err2
+
+        # Initialize a list to save successful examples and error counters
+        
+        total_err1 = 0
+        total_err2 = 0
+
+        # Use ThreadPoolExecutor for parallel processing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=224) as executor:
+            # Submit each example to the executor with its unique index
+            futures = {executor.submit(process_example, pair): pair for pair in enumerate(examples)}
+            
+            # Iterate over the results as they complete
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+                result, e1, e2 = future.result()
+                total_err1 += e1
+                total_err2 += e2
+                if result is not None:
+                    dict_list.append(result)
+                    eg_count += 1
+
+        print(f"Error 1: {total_err1}, Error 2: {total_err2}")
         print("Total examples: ", eg_count)
     return dict_list
 
-def get_bird_data_dict(args, min_token_len=50):
-    json_paths = ["data/BIRD/dev/dev.json", "data/BIRD/train/train.json"]
+def get_bird_data_dict(args, json_paths, min_token_len=50, timeout=60):
     eg_count = 0
     dict_list = []
     if not os.path.exists(args.BIRD_executed_results_path):
@@ -159,25 +190,40 @@ def get_bird_data_dict(args, min_token_len=50):
         print(f"Processing BIRD {data_type}")
         with open(json_path) as f:
             examples = json.load(f)
-        for ex in tqdm(examples):
+        def process_example(index_ex):
+            """
+            Process a single sample:
+            - Check if the number of tokens in ex["SQL"] is greater than min_token_len.
+            - Construct the sql_dict with data source, question, answer, and sqlite path.
+            - If available, read additional external knowledge from the "database_description" folder.
+            - Append the table structure information using get_sqlite_data_bird.
+            - Execute the SQL using execute_sql_api.
+            Returns the sql_dict if successful; otherwise, returns None.
+            """
+            i, ex = index_ex
             sql_dict = {}
             tokens = ex["SQL"].split()
             if len(tokens) > min_token_len:
-                id_name = f"local_BIRD_{data_type}_{eg_count:03d}" if eg_count < 1000 else f"local_BIRD_{data_type}_{eg_count}"
+                # Create a unique id_name using the sample index
+                id_name = f"local_BIRD_{data_type}_{i:03d}" if i < 1000 else f"local_BIRD_{data_type}_{i}"
                 sqlite_path = os.path.join(db_path, ex["db_id"], ex["db_id"] + ".sqlite")
-                assert os.path.exists(sqlite_path)
+                if not os.path.exists(sqlite_path):
+                    raise FileNotFoundError(f"SQLite file does not exist: {sqlite_path}")
                 sql_dict["data_source"] = "BIRD"
                 sql_dict["example_id"] = id_name
                 sql_dict["question"] = ex["question"]
                 sql_dict["answer"] = ex["SQL"]
                 sql_dict["sqlite_path"] = sqlite_path
 
+                # Build the external knowledge if available
                 external = ''
-                if os.path.exists(os.path.join(db_path, "database_description")):
+                desc_path = os.path.join(db_path, "database_description")
+                if os.path.exists(desc_path):
                     external = 'Column description:\n'
-                    for table_name in os.listdir(os.path.join(db_path, "database_description")):
-                        with open(os.path.join(db_path, "database_description", table_name), errors="ignore") as f:
-                            table_name = table_name.removesuffix(".csv")
+                    for table_file in os.listdir(desc_path):
+                        # Remove .csv suffix to obtain the table name
+                        table_name = table_file.removesuffix(".csv")
+                        with open(os.path.join(desc_path, table_file), errors="ignore") as f:
                             external += f"Table name: {table_name}\n"
                             external += f.read()
                     external += f"\nEvidence of the task: {ex['evidence']}"
@@ -187,11 +233,30 @@ def get_bird_data_dict(args, min_token_len=50):
                 sql_dict["input"] = prompts + f"\nExternal knowledge that might be helpful:\n{external}\n"
 
                 BIRD_executed_results_id_path = os.path.join(args.BIRD_executed_results_path, id_name + ".csv")
-                results = execute_sql_api(sql_dict["answer"], BIRD_executed_results_id_path, "sqlite", sqlite_path=sqlite_path)
+                results = execute_sql_with_timeout(sql_dict["answer"], BIRD_executed_results_id_path, "sqlite", sqlite_path=sqlite_path, timeout=timeout)
                 if results != 0:
+                    # If the SQL execution fails, skip this sample
+                    return None
+                return sql_dict
+            else:
+                return None
+
+        # Parallel execution using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=224) as executor:
+            # Use enumerate to assign a unique index to each sample
+            futures = {executor.submit(process_example, pair): pair for pair in enumerate(examples)}
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
+                res = None
+                try:
+                    # Set a timeout for each future's result retrieval (in seconds)
+                    res = future.result(timeout=60)
+                except concurrent.futures.TimeoutError:
+                    print("Timeout occurred for one task.")
                     continue
-                eg_count += 1
-                dict_list.append(sql_dict)
+                if res is not None:
+                    dict_list.append(res)
+
+        print("Total examples: ", len(dict_list))
     return dict_list
 
 def save_json(file_name, new_data, mode="w"):
@@ -228,24 +293,32 @@ def main(args):
     dictionaries_lite, task_dict_lite = get_dict("lite", args.lite_path)
 
     spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data = split_Spider2(task_dict_snow, task_dict_lite, args)
-    spider1_data = get_spider1_data_dict(args)
-    bird_data = get_bird_data_dict(args)
-    training_data = spider2_train_data
-    save_json("training_data", training_data)
-
+    save_json("spider2_train_data", spider2_train_data)
     save_json("snow_test_data", snow_test_data)
     save_json("snow_test_all_data", snow_test_all_data)
     save_json("lite_test_data", lite_test_data)
     save_json("lite_test_all_data", lite_test_all_data)
-    save_json("spider1_data", spider1_data)
-    save_json("bird_data", bird_data)
+
+    spider1_test_data = get_spider1_data_dict(args, ["data/Spider/spider_data/test.json"], 0)
+    save_json("spider1_test_data", spider1_test_data)
+
+    spider1_dev_data = get_spider1_data_dict(args, ["data/Spider/spider_data/dev.json"], 0)
+    save_json("spider1_dev_data", spider1_dev_data)
+
+    bird_test_data = get_bird_data_dict(args, ["data/BIRD/dev/dev.json"], 0, timeout=300)
+    save_json("bird_test_data", bird_test_data)
+
+    spider1_train_data = get_spider1_data_dict(args, ["data/Spider/spider_data/train_spider.json", "data/Spider/spider_data/train_others.json"], 0)
+    bird_train_data = get_bird_data_dict(args, ["data/BIRD/train/train.json"], 0)
+    save_json("spider1_bird_train_data", spider1_train_data + bird_train_data)
+    
 
 
 if __name__ == '__main__':
     random.seed(42)
     parser = argparse.ArgumentParser()
     parser.add_argument('--snow_path', type=str, default="data/Spider2.0_snow")
-    parser.add_argument('--lite_path', type=str, default="data/Spider2.0_lite_old")
+    parser.add_argument('--lite_path', type=str, default="data/Spider2.0_lite")
     parser.add_argument('--snow_gold_sql_path', type=str, default="../../spider2-snow/evaluation_suite/gold/sql")
     parser.add_argument('--snow_gold_sql_path_training', type=str, default="data/Spider2.0_snow_gold_sql")
     parser.add_argument('--lite_gold_sql_path', type=str, default="../../spider2-lite/evaluation_suite/gold/sql")
@@ -263,6 +336,6 @@ if __name__ == '__main__':
     parser.add_argument('--data_augmentaion', action="store_true")
     parser.add_argument('--schema_linking', action="store_true")
     parser.add_argument('--load_data', type=str, default=None)
-    parser.add_argument('--data_path', type=str, default="/workspace/ashwin/snow-spider-agent/data_prep/methods/RL-fine-tuning/data")
+    parser.add_argument('--data_path', type=str, default="./data")
     args = parser.parse_args()
     main(args)

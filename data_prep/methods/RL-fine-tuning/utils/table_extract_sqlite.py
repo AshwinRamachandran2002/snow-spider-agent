@@ -2,7 +2,7 @@ import os
 import json
 import pickle
 import time
-
+from utils.reconstruct_data import get_sqlite_data_bird
 def exec_run(cmd, workdir=None):
     import subprocess
     exit_code = None
@@ -100,7 +100,7 @@ def get_directory_tree(work_dir):
     return md_files_content, json_files
 
 
-def fetch_table_metadata(sql_id, main_dir):
+def fetch_table_metadata(sql_id, main_dir, sqlite_path=None):
     
     work_dir = os.path.join(main_dir, f"Spider2.0_lite/{sql_id}")
 
@@ -136,6 +136,9 @@ def fetch_table_metadata(sql_id, main_dir):
             if row["description"]:
                 observation += " with description, " + row["description"]
         observation += "\n" + "-"*50
+    if "local" in sql_id:
+        table_structure, prompts = get_sqlite_data_bird(sqlite_path)
+        observation = prompts
     observation = observation + "\nExternal knowledge that might be helpful:\n" + md_files_content + "\n"
     return observation, str(table_structure)
 

@@ -102,7 +102,7 @@ def get_directory_tree(work_dir):
 
 def fetch_table_metadata(sql_id, main_dir):
 
-    work_dir = os.path.join(main_dir, "Spider2.0_lite_old", sql_id)
+    work_dir = os.path.join(main_dir, "Spider2.0_lite", sql_id)
 
     table_structure = {}
 
@@ -113,7 +113,6 @@ def fetch_table_metadata(sql_id, main_dir):
         
         json_file = json_file[2:].split(".json")[0]
         json_file = json_file.replace(".", "/")
-        json_file = "/".join(json_file.split("/")[1:])
         database = json_file.split("/")[0]
         schema = json_file.split("/")[1]
         table = json_file.split("/")[2]

@@ -19,43 +19,6 @@ def clear_folder(folder_path):
         print(f"The folder {folder_path} does not exist.")
 
 
-
-def setup_snowflake():
-    credential_path = 'snowflake_credential.json'
-    with open(JSONL_PATH, "r") as f:
-        examples = [json.loads(line) for line in f]
-    for example in examples:
-        instance_id = example['instance_id']
-        folder_path = f'data/Spider2.0_lite/{instance_id}'
-        target_credential_path = os.path.join(folder_path, 'snowflake_credential.json')
-
-        if os.path.exists(target_credential_path):
-            os.remove(target_credential_path)
-
-        shutil.copy(credential_path, target_credential_path)
-        print(f"Copied Snowflake credential for instance {instance_id}.")
-    
-    print("Finished Snowflake setup...")
-
-
-def setup_bigquery():
-    credential_path = 'bigquery_credential.json'
-    with open(JSONL_PATH, "r") as f:
-        examples = [json.loads(line) for line in f]
-    for example in examples:
-        instance_id = example['instance_id']
-        folder_path = f'data/Spider2.0_lite/{instance_id}'
-        target_credential_path = os.path.join(folder_path, 'bigquery_credential.json')
-
-        if os.path.exists(target_credential_path):
-            os.remove(target_credential_path)
-
-        shutil.copy(credential_path, target_credential_path)
-        print(f"Copied Bigquery credential for instance {instance_id}.")
-    
-    print("Finished Bigquery setup...")
-
-
     
 error_dbs = []
 def setup_add_schema(args):
@@ -141,31 +104,6 @@ def add_agent_setting():
             shutil.copy(db_path, dest_path)
 
 
-
-    for example in examples:
-        instance_id = example['instance_id']
-        credential_path_sf = 'snowflake_credential.json'
-        credential_path_bq = 'bigquery_credential.json'
-
-        if instance_id.startswith('bq') or instance_id.startswith('ga'):
-
-            folder_path = f'data/Spider2.0_lite/{instance_id}'
-            target_credential_path = os.path.join(folder_path, credential_path_bq)
-
-            if os.path.exists(target_credential_path):
-                os.remove(target_credential_path)
-
-            shutil.copy(credential_path_bq, target_credential_path)
-        
-        elif instance_id.startswith('sf'):
-
-            folder_path = f'data/Spider2.0_lite/{instance_id}'
-            target_credential_path = os.path.join(folder_path, credential_path_sf)
-
-            if os.path.exists(target_credential_path):
-                os.remove(target_credential_path)
-
-            shutil.copy(credential_path_sf, target_credential_path)
         
 
 
