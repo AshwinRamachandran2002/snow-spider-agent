@@ -397,6 +397,8 @@ class RayPPOTrainer(object):
         absent_final_sql_rewards = init_dict.copy()
         solve_none = 0
         solve_all = 0
+        count_correct = 0
+        count_all = 0
         for uid in unique_uids:
             uid_mask = uids == uid
             uid_rewards = reward_tensor[uid_mask][:, -1].sum(-1)  # Sum rewards for each sequence
@@ -423,8 +425,11 @@ class RayPPOTrainer(object):
         # Log to metrics
         metrics[f'{prefix}batch/solve_none'] = solve_none
         metrics[f'{prefix}batch/solve_all'] = solve_all
-
+        rewards_sum = 0
+        rewards_num = 0
         for api in ['sqlite', 'bigquery', 'snowflake']:
+            rewards_sum += np.sum(successful_final_sql_rewards[api])
+            rewards_num += len(successful_final_sql_rewards[api])
 
             metrics[f"{prefix}reward/successful_final_sql_reward/{api}/mean"] = np.mean(successful_final_sql_rewards[api]) if len(successful_final_sql_rewards[api]) > 0 else 0
             metrics[f"{prefix}reward/successful_final_sql_reward/{api}/atleast_1"] = np.mean([1 if x > 0 else 0 for x in successful_final_sql_rewards[api]]) if len(successful_final_sql_rewards[api]) > 0 else 0
@@ -446,7 +451,8 @@ class RayPPOTrainer(object):
             metrics[f"{prefix}reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
             metrics[f"{prefix}reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
             metrics[f"{prefix}reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
-
+        metrics[f'{prefix}batch/acc'] = rewards_sum / rewards_num if rewards_num != 0 else 0
+        print(f"acc: {rewards_sum}/{rewards_num}={rewards_sum / rewards_num}")
         return metrics
 
     def fit(self):

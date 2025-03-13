@@ -126,8 +126,10 @@ class RewardManager():
         #         with open(log_path, "a") as f:
         #             f.write(f"Reward: successful_final_sql\n")
         #         reward_tensor[-1] = self.successful_final_sql_reward
-        
+        response_str = response_str.strip('\n')
         log_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".log")
+        # print(f"log_path: {log_path}")
+        # print(f"response_str: {response_str}, MD5: {calculate_md5(response_str)}")
         if not os.path.exists(log_path):
             return reward_tensor
         # TODO: not unique        
@@ -175,13 +177,25 @@ class RewardManager():
         reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
         print(f"CPU num: {os.cpu_count()}")
         # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            args = [(i, data[i]) for i in range(len(data))]
-            results = list(executor.map(self.process_item, args))
+        # with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        #     args = [(i, data[i]) for i in range(len(data))]
+        #     results = list(executor.map(self.process_item, args))
+        results = []
+        for i in range(len(data)):
+            result = self.process_item((i, data[i]))
+            results.append(result)
 
         # Fill reward tensor with results
         for i, reward_tensor_item in results:
             reward_tensor[i] = reward_tensor_item
+        num_gen = 0
+        log_gen = 0
+        for i in os.listdir(os.getenv("EXEC_FOLDER")):
+            if i.endswith("csv"):
+                num_gen += 1
+            if i.endswith("log"):
+                log_gen += 1
+        print(f"Gen results: {num_gen}/{log_gen}")
         shutil.rmtree(os.getenv("EXEC_FOLDER"))
         os.mkdir(os.getenv("EXEC_FOLDER"))
         return reward_tensor

@@ -58,6 +58,7 @@ from verl.workers.reward_model.reward_utils import get_api_name, SqlEnv, calcula
 from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql
 import uuid
 import datetime
+import numpy as np
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -90,7 +91,17 @@ class SQLExecutor():
         self.logging = False
         self.log_path = f"log/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
-    def fetch_execution_result(self, completion, request_id):
+    def fetch_execution_result(self, completion, request_id, failed=False):
+        if failed:
+            kwargs = self.initial_prompts[str(request_id)]
+            example_id = kwargs["example_id"]
+            log = self.tokenizer.decode(completion).strip('\n')
+            file_name = f"{example_id}_{calculate_md5(log)}"
+            with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
+                f.write(log)
+            with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
+                f.write('0')
+            return [self.tokenizer.eos_token_id]
         for index in range(len(completion)-4, 0, -1):
             if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
@@ -121,8 +132,9 @@ class SQLExecutor():
                     example_id = kwargs["example_id"]
                     start = time.time()
                     exec_result = self.exec_func_sql(sql_string, timeout=300, **kwargs)
-                    log = self.tokenizer.decode(completion)
+                    log = self.tokenizer.decode(completion).strip('\n')
                     file_name = f"{example_id}_{calculate_md5(log)}"
+                    # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), "w") as f:
                         f.write(exec_result) 
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
@@ -233,7 +245,13 @@ class SQLExecutor():
                             del self.monitor_parent_seq_ids[seq_id]
 
                 output_token = seq_output.output_token
-
+                start_time_path = os.path.join(os.getenv("EXEC_FOLDER"), "start_time.log")
+                if not os.path.exists(start_time_path) or os.path.getsize(start_time_path) < 100:
+                    with open(start_time_path, "a") as f:
+                        f.write(str(time.time()) + "\n")
+                    with open(start_time_path, "r") as f:
+                        start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
+                        print(f"Mean start time: {start_time}")
                 # Store the output token for the sequence ID
                 if seq_id not in self.parent_seq_ids_completions:
                     self.parent_seq_ids_completions[seq_id] = []
@@ -253,7 +271,9 @@ class SQLExecutor():
                         self.time_per_parent_seq_id[seq_id] = [time.time()]
                     self.calls_per_parent_seq_id[seq_id] += 1
                     self.time_per_parent_seq_id[seq_id] += [time.time()]
-                    used_time = self.time_per_parent_seq_id[seq_id][-1] - self.time_per_parent_seq_id[seq_id][0]
+                    with open(start_time_path, "r") as f:
+                        start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
+                    used_time = self.time_per_parent_seq_id[seq_id][-1] - start_time
                     if used_time > self.max_time:
                         if self.logging:
                             with open(self.log_path, "a") as f:
@@ -261,13 +281,13 @@ class SQLExecutor():
                         print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
 
                         self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": [self.tokenizer.eos_token_id],
+                            "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
                             "curr_pointer": 0
                         }
                     elif self.calls_per_parent_seq_id[seq_id] > self.max_calls:
 
                         self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": [self.tokenizer.eos_token_id],
+                            "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
                             "curr_pointer": 0
                         }
                         print(f"Max calls for seq_id {seq_id}, Current GPU Index: {torch.cuda.current_device()}\n")
@@ -279,7 +299,7 @@ class SQLExecutor():
                         if exec_res == "Timed out":
                             print(f"Timeout for one execution, return")
                             self.monitor_parent_seq_ids[seq_id] = {
-                                "exec_result": [self.tokenizer.eos_token_id],
+                                "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
                                 "curr_pointer": 0
                             }
                         else:

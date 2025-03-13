@@ -196,6 +196,7 @@ class SqlEnv:
             columns = [desc[0] for desc in cursor.description]
             df = pd.DataFrame(rows, columns=columns)
         except Exception as e:
+            # TODO: bugs here
             print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}")
             return str(e)
 
@@ -214,7 +215,7 @@ class SqlEnv:
                 return hard_cut(df.to_csv(index=False), max_len)
         cursor.close()
             
-    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=60, example_id=None):
+    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=40, example_id=None):
         if save_path not in self.conns.keys():
             self.start_db(sqlite_path)
         future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
