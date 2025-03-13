@@ -1,6 +1,6 @@
 import argparse
 from tqdm import tqdm
-from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_with_timeout, split_cte
+from utils.utils import get_api_name, get_table_info, remove_digits, search_file, execute_sql_with_timeout, split_cte, SqlEnv
 from utils.reconstruct_data import get_sqlite_data_bird, get_sqlite_data_spider
 import csv
 import os
@@ -179,7 +179,7 @@ def get_spider1_data_dict(args, json_paths, min_token_len=50):
         print("Total examples: ", eg_count)
     return dict_list
 
-def get_bird_data_dict(args, json_paths, min_token_len=50, timeout=60):
+def get_bird_data_dict(args, json_paths, min_token_len=50, timeout=600):
     eg_count = 0
     dict_list = []
     if not os.path.exists(args.BIRD_executed_results_path):
@@ -233,7 +233,7 @@ def get_bird_data_dict(args, json_paths, min_token_len=50, timeout=60):
                 sql_dict["input"] = prompts + f"\nExternal knowledge that might be helpful:\n{external}\n"
 
                 BIRD_executed_results_id_path = os.path.join(args.BIRD_executed_results_path, id_name + ".csv")
-                results = execute_sql_with_timeout(sql_dict["answer"], BIRD_executed_results_id_path, "sqlite", sqlite_path=sqlite_path, timeout=timeout)
+                results = sqlenv.execute_sql_with_timeout(sql_dict["answer"], BIRD_executed_results_id_path, "sqlite", sqlite_path=sqlite_path, timeout=timeout)
                 if results != 0:
                     # If the SQL execution fails, skip this sample
                     return None
@@ -242,14 +242,14 @@ def get_bird_data_dict(args, json_paths, min_token_len=50, timeout=60):
                 return None
 
         # Parallel execution using ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=224) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1024) as executor:
             # Use enumerate to assign a unique index to each sample
             futures = {executor.submit(process_example, pair): pair for pair in enumerate(examples)}
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures)):
                 res = None
                 try:
                     # Set a timeout for each future's result retrieval (in seconds)
-                    res = future.result(timeout=60)
+                    res = future.result(timeout=timeout)
                 except concurrent.futures.TimeoutError:
                     print("Timeout occurred for one task.")
                     continue
@@ -292,30 +292,33 @@ def main(args):
     dictionaries_snow, task_dict_snow = get_dict("snow", args.snow_path)
     dictionaries_lite, task_dict_lite = get_dict("lite", args.lite_path)
 
-    spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data = split_Spider2(task_dict_snow, task_dict_lite, args)
-    save_json("spider2_train_data", spider2_train_data)
-    save_json("snow_test_data", snow_test_data)
-    save_json("snow_test_all_data", snow_test_all_data)
-    save_json("lite_test_data", lite_test_data)
-    save_json("lite_test_all_data", lite_test_all_data)
+    # spider2_train_data, snow_test_data, snow_test_all_data, lite_test_data, lite_test_all_data = split_Spider2(task_dict_snow, task_dict_lite, args)
+    # save_json("spider2_train_data", spider2_train_data)
+    # save_json("snow_test_data", snow_test_data)
+    # save_json("snow_test_all_data", snow_test_all_data)
+    # save_json("lite_test_data", lite_test_data)
+    # save_json("lite_test_all_data", lite_test_all_data)
 
-    spider1_test_data = get_spider1_data_dict(args, ["data/Spider/spider_data/test.json"], 0)
-    save_json("spider1_test_data", spider1_test_data)
+    # spider1_test_data = get_spider1_data_dict(args, ["data/Spider/spider_data/test.json"], 0)
+    # save_json("spider1_test_data", spider1_test_data)
 
-    spider1_dev_data = get_spider1_data_dict(args, ["data/Spider/spider_data/dev.json"], 0)
-    save_json("spider1_dev_data", spider1_dev_data)
+    # spider1_dev_data = get_spider1_data_dict(args, ["data/Spider/spider_data/dev.json"], 0)
+    # save_json("spider1_dev_data", spider1_dev_data)
 
-    bird_test_data = get_bird_data_dict(args, ["data/BIRD/dev/dev.json"], 0, timeout=300)
-    save_json("bird_test_data", bird_test_data)
+    bird_dev_data = get_bird_data_dict(args, ["data/BIRD/dev/dev.json"], 0)
+    save_json("bird_dev_data", bird_dev_data)
 
-    spider1_train_data = get_spider1_data_dict(args, ["data/Spider/spider_data/train_spider.json", "data/Spider/spider_data/train_others.json"], 0)
-    bird_train_data = get_bird_data_dict(args, ["data/BIRD/train/train.json"], 0)
-    save_json("spider1_bird_train_data", spider1_train_data + bird_train_data)
+    # spider1_train_data = get_spider1_data_dict(args, ["data/Spider/spider_data/train_spider.json", "data/Spider/spider_data/train_others.json"], 0)
+    # bird_train_data = get_bird_data_dict(args, ["data/BIRD/train/train.json"], 0)
+    # save_json("bird_train_data", bird_train_data)
+    # save_json("spider1_bird_train_data", spider1_train_data + bird_train_data)
     
 
 
 if __name__ == '__main__':
     random.seed(42)
+
+    sqlenv = SqlEnv()
     parser = argparse.ArgumentParser()
     parser.add_argument('--snow_path', type=str, default="data/Spider2.0_snow")
     parser.add_argument('--lite_path', type=str, default="data/Spider2.0_lite")

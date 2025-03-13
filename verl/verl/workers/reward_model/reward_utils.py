@@ -8,7 +8,9 @@ from google.oauth2 import service_account
 import sqlite3
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
-import time
+import threading
+import hashlib
+
 def hard_cut(str_e, length=0):
     if length:
         if len(str_e) > length and not str_e.startswith("Too long, hard cut"):
@@ -135,24 +137,106 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, L
                 memory_conn.close()    # Close the connection manually
     else:
         raise NotImplementedError("Unsupported API\n")
-executor = ThreadPoolExecutor(max_workers=200)
-def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, timeout=90):
-    future = executor.submit(execute_sql_api, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
-    try:
-        result = future.result(timeout=timeout)
-        return result
-    except TimeoutError:
-        print(f"{sql_query} Timed out\n")
-        return f"{sql_query} Timed out\n"
-executor_sf = ThreadPoolExecutor(max_workers=200)
-def execute_sql_with_timeout_sf(sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, timeout=30):
-    future = executor_sf.submit(execute_sql_api, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
-    try:
-        result = future.result(timeout=timeout)
-        return result
-    except TimeoutError:
-        print(f"{sql_query} sfTimed out\n")
-        return f"{sql_query} sfTimed out\n"
+# executor = ThreadPoolExecutor(max_workers=2048)
+# def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, timeout=300):
+#     future = executor.submit(execute_sql_api, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
+#     try:
+#         result = future.result(timeout=timeout)
+#         return result
+#     except TimeoutError:
+#         print(f"{sql_query} Timed out\n")
+#         return f"{sql_query} Timed out\n"
+
+class SqlEnv:
+    def __init__(self):
+        self.conns = {}
+        self.db_lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=20480)
+
+    def start_db(self, sqlite_path):
+        with self.db_lock:
+            if sqlite_path not in self.conns:
+                uri = f"file:{sqlite_path}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                # TODO: locking protocol in backup for multi nodes
+                try:
+                    memory_conn = sqlite3.connect(f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared", uri=True, check_same_thread=False)
+                    conn.backup(memory_conn)
+                    
+                    self.conns[sqlite_path] = memory_conn
+                    conn.close()
+                except Exception as e:
+                    print(f"self.conns.keys(): {self.conns.keys()}, {str(e)}, {sqlite_path}")
+                    self.conns[sqlite_path] = conn
+
+    def close_db(self):
+        for conn in self.conns.values():
+            conn.close()
+        self.conns = {}
+
+    def exec_sql(self, sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
+        cursor = self.conns[sqlite_path].cursor()
+        try:
+            cursor.execute(sql_query)
+        except Exception as e:
+            # in sqlite, syntax errors, wrong table, column come here in exception
+            return "Incorrect SQL Syntax:\n" + str(e)
+        def get_rows(cursor):
+            rows = []
+            current_len = 0
+            for row in cursor:
+                rows.append(row)
+                row_str = str(row)
+                if current_len + len(row_str) > max_len:
+                    break
+                current_len += len(row_str)
+            return rows
+        try:
+            rows = get_rows(cursor)
+            columns = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame(rows, columns=columns)
+        except Exception as e:
+            print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}")
+            return str(e)
+
+        # Check if the result is empty
+        if df.empty:
+            return "No data found for the specified query.\n"
+        else:
+            # Save or print the results based on the is_save flag
+            if save_path:
+                try:
+                    df.to_csv(f"{save_path}", index=False)
+                    return 0
+                except Exception as e:
+                    print(e)
+            else:
+                return hard_cut(df.to_csv(index=False), max_len)
+        cursor.close()
+            
+    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=60, example_id=None):
+        if save_path not in self.conns.keys():
+            self.start_db(sqlite_path)
+        future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
+        try:
+            result = future.result(timeout=timeout)
+            return result
+        except TimeoutError:
+            print(f"{sql_query} Timed out\n")
+            return f"{sql_query} Timed out\n"
+
+    def __del__(self):
+        self.close_db()
+
+# executor_sf = ThreadPoolExecutor(max_workers=200)
+# def execute_sql_with_timeout_sf(sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, timeout=30):
+#     future = executor_sf.submit(execute_sql_api, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
+#     try:
+#         result = future.result(timeout=timeout)
+#         return result
+#     except TimeoutError:
+#         print(f"{sql_query} sfTimed out\n")
+#         return f"{sql_query} sfTimed out\n"
 
 
 def get_api_name(sql_data):
@@ -165,3 +249,7 @@ def get_api_name(sql_data):
     else:
         raise NotImplementedError("Invalid file name.")
 
+def calculate_md5(input_string):
+    md5_obj = hashlib.md5()
+    md5_obj.update(input_string.encode('utf-8'))
+    return md5_obj.hexdigest()

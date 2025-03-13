@@ -182,6 +182,86 @@ def execute_sql_with_timeout(sql_query, save_path=None, api="snowflake", max_len
     except TimeoutError:
         print(f"{sql_query} Timed out\n")
         return f"{sql_query} Timed out\n"
+import threading
+class SqlEnv:
+    def __init__(self):
+        self.conns = {}
+        self.db_lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=2048)
+
+    def start_db(self, sqlite_path):
+        with self.db_lock:
+            if sqlite_path not in self.conns:
+                uri = f"file:{sqlite_path}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                # TODO: locking protocol in backup for multi nodes
+                try:
+                    memory_conn = sqlite3.connect(f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared", uri=True, check_same_thread=False)
+                    conn.backup(memory_conn)
+                    conn.close()
+                    # memory_conn = conn
+                    self.conns[sqlite_path] = memory_conn
+                except Exception as e:
+                    print(f"self.conns.keys(): {self.conns.keys()}, {str(e)}, {sqlite_path}")
+
+    def close_db(self):
+        for conn in self.conns.values():
+            conn.close()
+        self.conns = {}
+
+    def exec_sql(self, sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
+        cursor = self.conns[sqlite_path].cursor()
+        try:
+            cursor.execute(sql_query)
+        except Exception as e:
+            # in sqlite, syntax errors, wrong table, column come here in exception
+            return "Incorrect SQL Syntax:\n" + str(e)
+        def get_rows(cursor):
+            rows = []
+            current_len = 0
+            for row in cursor:
+                rows.append(row)
+                row_str = str(row)
+                if current_len + len(row_str) > max_len:
+                    break
+                current_len += len(row_str)
+            return rows
+        try:
+            rows = get_rows(cursor)
+            columns = [desc[0] for desc in cursor.description]
+            df = pd.DataFrame(rows, columns=columns)
+        except Exception as e:
+            print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}")
+            return str(e)
+
+        # Check if the result is empty
+        if df.empty:
+            return "No data found for the specified query.\n"
+        else:
+            # Save or print the results based on the is_save flag
+            if save_path:
+                try:
+                    df.to_csv(f"{save_path}", index=False)
+                    return 0
+                except Exception as e:
+                    print(e)
+            else:
+                return hard_cut(df.to_csv(index=False), max_len)
+        cursor.close()
+            
+    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=300):
+        if save_path not in self.conns.keys():
+            self.start_db(sqlite_path)
+        future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
+        try:
+            result = future.result(timeout=timeout)
+            return result
+        except TimeoutError:
+            print(f"{sql_query} Timed out\n")
+            return f"{sql_query} Timed out\n"
+
+    def __del__(self):
+        self.close_db()
 
 def split_cte(with_block):
     i = 0

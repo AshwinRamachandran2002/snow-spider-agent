@@ -273,6 +273,7 @@ class RayPPOTrainer(object):
         reward_tensor_lst = []
         test_batch_lst = []
         print("self.val_dataloader")
+        val_dataloader_idex = 0
         for test_data in tqdm(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
             # test_batch = test_batch.to('cuda')
@@ -314,7 +315,8 @@ class RayPPOTrainer(object):
             print(f"reward_tensor.shape: {reward_tensor.shape}")
             metric_dict = {}
             metric_dict = self.compute_per_api_metrics(test_batch, reward_tensor, metric_dict, prefix=f'val_{len(reward_tensor_lst)}/')
-            metric_dict[f'val_{len(reward_tensor_lst)}/mean_rewards'] = np.mean(reward_tensor.cpu().numpy())
+            metric_dict[f'val_index{val_dataloader_idex}/mean_rewards'] = np.mean(reward_tensor.cpu().numpy())
+            val_dataloader_idex += 1
 
         return metric_dict
 

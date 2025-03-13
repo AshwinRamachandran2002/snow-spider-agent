@@ -54,7 +54,8 @@ from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
-from verl.workers.reward_model.reward_utils import execute_sql_with_timeout, get_api_name, execute_sql_with_timeout_sf
+from verl.workers.reward_model.reward_utils import get_api_name, SqlEnv, calculate_md5
+from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql
 import uuid
 import datetime
 
@@ -71,18 +72,20 @@ class SQLExecutor():
         self.calls_per_parent_seq_id = {}
         self.time_per_parent_seq_id = {}
 
-        self.monitor_token_id = [522, 11748, 18063, 397]
+        self.monitor_token_id = [522, 11748, 18063, 397] # </exec_sql>
         self.start_token_id_1 = [366, 11748, 18063, 397]
         self.start_token_id_2 = [27, 11748, 18063, 397]
         self.tokenizer = tokenizer_group.tokenizer
 
-        self.exec_func_sql = execute_sql_with_timeout
-        self.exec_func_sf = execute_sql_with_timeout_sf
+        sql_env = SqlEnv()
+        self.ground_truths = "deepscaler/rewards/gold/gold_answer"
+        self.exec_func_sql = sql_env.execute_sql_with_timeout
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
         self.max_calls = sql_executor_config.max_calls
+        self.max_time = sql_executor_config.max_time
         
-        print(f"SQLExecutor initialized with sqlite_source_path {self.sqlite_source_path} and max_calls {self.max_calls}")
+        print(f"SQLExecutor initialized with sqlite_source_path {self.sqlite_source_path} and max_calls {self.max_calls} and max_time {self.max_time}")
 
         self.logging = False
         self.log_path = f"log/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
@@ -93,10 +96,12 @@ class SQLExecutor():
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
-                if kwargs['api'] == "snowflake":
-                    exec_result = self.exec_func_sf(sql_string, max_len=200, LIMIT=100, **kwargs)
-                else:
-                    exec_result = self.exec_func_sql(sql_string, max_len=200, LIMIT=100, **kwargs)
+                # if kwargs['api'] == "snowflake":
+                #     exec_result = self.exec_func_sf(sql_string, max_len=200, LIMIT=100, **kwargs)
+                # else:
+                exec_result = self.exec_func_sql(sql_string, max_len=200, LIMIT=100, **kwargs)
+                if "Timed out" in exec_result:
+                    return "Timed out"
                 
                 exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
                 if self.logging:
@@ -108,6 +113,23 @@ class SQLExecutor():
                 if kwargs['api'] == "snowflake":
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result)
+            elif completion[-1] == 151645:
+                if completion[index] == 151644:
+                    sql_string = self.tokenizer.decode(completion[index+2:-1])
+                    # print(f"sql_string: {sql_string}, {self.initial_prompts}")
+                    kwargs = self.initial_prompts[str(request_id)]
+                    example_id = kwargs["example_id"]
+                    start = time.time()
+                    exec_result = self.exec_func_sql(sql_string, timeout=300, **kwargs)
+                    log = self.tokenizer.decode(completion)
+                    file_name = f"{example_id}_{calculate_md5(log)}"
+                    with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), "w") as f:
+                        f.write(exec_result) 
+                    with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
+                        f.write(log)
+                    with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
+                        f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
+                    
         return []
 
     def remove(self, request_id):
@@ -173,6 +195,7 @@ class SQLExecutor():
                         with open(self.log_path, "a") as f:
                             f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
                     self.initial_prompts[str(seq_id)] = {
+                        "example_id": example_id,
                         "api": get_api_name(example_id),
                         "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
                     }
@@ -185,25 +208,29 @@ class SQLExecutor():
                             f.write(f"Monitoring seq_id {seq_id}\n")
 
                     monitor_info = self.monitor_parent_seq_ids[seq_id]
-
-                    actual_output_token = seq_output.output_token
-                    replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
-                    monitor_info["curr_pointer"] += 1
-
-                    # replace output token
-                    seq_output.output_token = replacement_token
-                    
-                    # replace the logprobs also
-                    seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
-                    if replacement_token != actual_output_token:
-                        del seq_output.logprobs[actual_output_token]
-
-                    # Remove from monitoring if all tokens have been processed
+                    # TODO: index error
                     if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                        if self.logging:
-                            with open(self.log_path, "a") as f:
-                                f.write(f"Removing seq_id {seq_id} from monitoring\n")
+                        print(monitor_info["curr_pointer"], monitor_info["exec_result"], f"Removing seq_id {seq_id} from monitoring\n")
                         del self.monitor_parent_seq_ids[seq_id]
+                    else:
+                        actual_output_token = seq_output.output_token
+                        replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
+                        monitor_info["curr_pointer"] += 1
+
+                        # replace output token
+                        seq_output.output_token = replacement_token
+                        
+                        # replace the logprobs also
+                        seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
+                        if replacement_token != actual_output_token:
+                            del seq_output.logprobs[actual_output_token]
+
+                        # Remove from monitoring if all tokens have been processed
+                        if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
+                            if self.logging:
+                                with open(self.log_path, "a") as f:
+                                    f.write(f"Removing seq_id {seq_id} from monitoring\n")
+                            del self.monitor_parent_seq_ids[seq_id]
 
                 output_token = seq_output.output_token
 
@@ -227,7 +254,7 @@ class SQLExecutor():
                     self.calls_per_parent_seq_id[seq_id] += 1
                     self.time_per_parent_seq_id[seq_id] += [time.time()]
                     used_time = self.time_per_parent_seq_id[seq_id][-1] - self.time_per_parent_seq_id[seq_id][0]
-                    if used_time > self.max_calls:
+                    if used_time > self.max_time:
                         if self.logging:
                             with open(self.log_path, "a") as f:
                                 f.write(f"Exceeded max calls for seq_id {seq_id}\n")
@@ -237,7 +264,7 @@ class SQLExecutor():
                             "exec_result": [self.tokenizer.eos_token_id],
                             "curr_pointer": 0
                         }
-                    elif self.calls_per_parent_seq_id[seq_id] > 30:
+                    elif self.calls_per_parent_seq_id[seq_id] > self.max_calls:
 
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": [self.tokenizer.eos_token_id],
@@ -248,11 +275,24 @@ class SQLExecutor():
                         if self.logging:
                             with open(self.log_path, "a") as f:
                                 f.write(f"Making API call for seq_id {seq_id}\n")
-                        self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": self.fetch_execution_result(completions, seq_id),
-                            "curr_pointer": 0
-                        }
-
+                        exec_res = self.fetch_execution_result(completions, seq_id)
+                        if exec_res == "Timed out":
+                            print(f"Timeout for one execution, return")
+                            self.monitor_parent_seq_ids[seq_id] = {
+                                "exec_result": [self.tokenizer.eos_token_id],
+                                "curr_pointer": 0
+                            }
+                        else:
+                            self.monitor_parent_seq_ids[seq_id] = {
+                                "exec_result": exec_res,
+                                "curr_pointer": 0
+                            }
+                elif completions[-1] == 151645:
+                    exec_res = self.fetch_execution_result(completions, seq_id)
+                    self.monitor_parent_seq_ids[seq_id] = {
+                                "exec_result": exec_res,
+                                "curr_pointer": 0
+                    }
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
             if index not in seq_id_analyzed:
