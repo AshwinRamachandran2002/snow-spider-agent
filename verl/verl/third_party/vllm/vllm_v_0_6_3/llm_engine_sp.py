@@ -91,7 +91,7 @@ class SQLExecutor():
         self.logging = False
         self.log_path = f"log/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
 
-    def fetch_execution_result(self, completion, request_id, failed=False):
+    def fetch_execution_result(self, completion, request_id, failed=False, final=False):
         if failed:
             kwargs = self.initial_prompts[str(request_id)]
             example_id = kwargs["example_id"]
@@ -105,6 +105,8 @@ class SQLExecutor():
         for index in range(len(completion)-4, 0, -1):
             if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
+                if completion[-5] == 522:
+                    print(f"</</{self.tokenizer.decode(completion)}")
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
                 # if kwargs['api'] == "snowflake":
@@ -124,14 +126,14 @@ class SQLExecutor():
                 if kwargs['api'] == "snowflake":
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result)
-            elif completion[-1] == 151645:
+            elif completion[-1] == 151645 and final == True:
                 if completion[index] == 151644:
                     sql_string = self.tokenizer.decode(completion[index+2:-1])
                     # print(f"sql_string: {sql_string}, {self.initial_prompts}")
                     kwargs = self.initial_prompts[str(request_id)]
                     example_id = kwargs["example_id"]
                     start = time.time()
-                    exec_result = self.exec_func_sql(sql_string, timeout=300, **kwargs)
+                    exec_result = self.exec_func_sql(sql_string, timeout=10, **kwargs)
                     log = self.tokenizer.decode(completion).strip('\n')
                     file_name = f"{example_id}_{calculate_md5(log)}"
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
@@ -222,7 +224,7 @@ class SQLExecutor():
                     monitor_info = self.monitor_parent_seq_ids[seq_id]
                     # TODO: index error
                     if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                        print(monitor_info["curr_pointer"], monitor_info["exec_result"], f"Removing seq_id {seq_id} from monitoring\n")
+                        print(monitor_info["curr_pointer"], monitor_info["exec_result"], f"Removing seq_id {seq_id} from monitoring, outputs: {outputs}, scheduler_outputs: {scheduler_outputs}\n")
                         del self.monitor_parent_seq_ids[seq_id]
                     else:
                         actual_output_token = seq_output.output_token
@@ -308,7 +310,7 @@ class SQLExecutor():
                                 "curr_pointer": 0
                             }
                 elif completions[-1] == 151645:
-                    exec_res = self.fetch_execution_result(completions, seq_id)
+                    exec_res = self.fetch_execution_result(completions, seq_id, final=True)
                     self.monitor_parent_seq_ids[seq_id] = {
                                 "exec_result": exec_res,
                                 "curr_pointer": 0

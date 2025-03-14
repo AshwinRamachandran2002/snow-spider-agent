@@ -451,8 +451,7 @@ class RayPPOTrainer(object):
             metrics[f"{prefix}reward/absent_final_sql_reward/{api}/mean"] = np.mean(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
             metrics[f"{prefix}reward/absent_final_sql_reward/{api}/min"] = np.min(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
             metrics[f"{prefix}reward/absent_final_sql_reward/{api}/max"] = np.max(absent_final_sql_rewards[api]) if len(absent_final_sql_rewards[api]) > 0 else 0
-        metrics[f'{prefix}batch/acc'] = rewards_sum / rewards_num if rewards_num != 0 else 0
-        print(f"acc: {rewards_sum}/{rewards_num}={rewards_sum / rewards_num}")
+        metrics[f'{prefix}batch/acc'] = solve_all / (solve_none+solve_all) if solve_none+solve_all != 0 else 0
         return metrics
 
     def fit(self):
