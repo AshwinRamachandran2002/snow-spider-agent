@@ -249,12 +249,12 @@ class SQLExecutor():
 
                 output_token = seq_output.output_token
                 start_time_path = os.path.join(os.getenv("EXEC_FOLDER"), "start_time.log")
-                if not os.path.exists(start_time_path) or os.path.getsize(start_time_path) < 100:
-                    with open(start_time_path, "a") as f:
-                        f.write(str(time.time()) + "\n")
-                    with open(start_time_path, "r") as f:
-                        start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
-                        print(f"Mean start time: {start_time}")
+                # if not os.path.exists(start_time_path) or os.path.getsize(start_time_path) < 100:
+                #     with open(start_time_path, "a") as f:
+                #         f.write(str(time.time()) + "\n")
+                #     with open(start_time_path, "r") as f:
+                #         start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
+                #         print(f"Mean start time: {start_time}")
                 # Store the output token for the sequence ID
                 if seq_id not in self.parent_seq_ids_completions:
                     self.parent_seq_ids_completions[seq_id] = []
@@ -270,24 +270,24 @@ class SQLExecutor():
                     # Check if a lot of calls have been made for this seq_id
                     if seq_id not in self.calls_per_parent_seq_id:
                         self.calls_per_parent_seq_id[seq_id] = 0
-                    if seq_id not in self.time_per_parent_seq_id:
-                        self.time_per_parent_seq_id[seq_id] = [time.time()]
+                    # if seq_id not in self.time_per_parent_seq_id:
+                    #     self.time_per_parent_seq_id[seq_id] = [time.time()]
                     self.calls_per_parent_seq_id[seq_id] += 1
-                    self.time_per_parent_seq_id[seq_id] += [time.time()]
-                    with open(start_time_path, "r") as f:
-                        start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
-                    used_time = self.time_per_parent_seq_id[seq_id][-1] - start_time
-                    if used_time > self.max_time:
-                        if self.logging:
-                            with open(self.log_path, "a") as f:
-                                f.write(f"Exceeded max calls for seq_id {seq_id}\n")
-                        print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
+                    # self.time_per_parent_seq_id[seq_id] += [time.time()]
+                    # with open(start_time_path, "r") as f:
+                    #     start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
+                    # used_time = self.time_per_parent_seq_id[seq_id][-1] - start_time
+                    # if used_time > self.max_time:
+                    #     if self.logging:
+                    #         with open(self.log_path, "a") as f:
+                    #             f.write(f"Exceeded max calls for seq_id {seq_id}\n")
+                    #     print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
 
-                        self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
-                            "curr_pointer": 0
-                        }
-                    elif self.calls_per_parent_seq_id[seq_id] > self.max_calls:
+                    #     self.monitor_parent_seq_ids[seq_id] = {
+                    #         "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
+                    #         "curr_pointer": 0
+                    #     }
+                    if self.calls_per_parent_seq_id[seq_id] > self.max_calls:
 
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
@@ -312,10 +312,11 @@ class SQLExecutor():
                             }
                 elif completions[-1] == 151645:
                     exec_res = self.fetch_execution_result(completions, seq_id, final=True)
-                    self.monitor_parent_seq_ids[seq_id] = {
-                                "exec_result": exec_res,
-                                "curr_pointer": 0
-                    }
+                    if exec_res != []:
+                        self.monitor_parent_seq_ids[seq_id] = {
+                                    "exec_result": exec_res,
+                                    "curr_pointer": 0
+                        }
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
             if index not in seq_id_analyzed:

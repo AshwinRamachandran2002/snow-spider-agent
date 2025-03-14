@@ -10,6 +10,7 @@ import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
 import hashlib
+import time
 
 def hard_cut(str_e, length=0):
     if length:
@@ -154,21 +155,52 @@ class SqlEnv:
         self.executor = ThreadPoolExecutor()
 
     def start_db(self, sqlite_path):
-        with self.db_lock:
-            if sqlite_path not in self.conns:
-                uri = f"file:{sqlite_path}?mode=ro"
-                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        if sqlite_path not in self.conns:
+            uri = f"file:{sqlite_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
                 # TODO: locking protocol in backup for multi nodes
-                try:
-                    memory_conn = sqlite3.connect(f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared", uri=True, check_same_thread=False)
-                    conn.backup(memory_conn)
-                    
+            def backup_with_retry(conn, sqlite_path, meta_time_out):
+                """
+                Attempts to backup the database to memory within a given total timeout (meta_time_out seconds).
+                If a "database is locked" error occurs, it will retry until the timeout is exceeded or maximum attempts are reached.
+                """
+                start_time = time.time()
+                max_attempts = 3  # Adjust this value as needed
+                attempts = 0
+
+                while time.time() - start_time < meta_time_out and attempts < max_attempts:
+                    try:
+                        # Create a memory connection with a timeout to wait for the lock to be released.
+                        memory_conn = sqlite3.connect(
+                            f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared",
+                            uri=True, 
+                            check_same_thread=False,
+                            timeout=5.0  # Wait up to 5 seconds for a lock release
+                        )
+                        conn.backup(memory_conn)
+                        return memory_conn  # Return the memory connection if backup succeeds
+                    except sqlite3.OperationalError as e:
+                        attempts += 1
+                        elapsed = time.time() - start_time
+                        remaining = meta_time_out - elapsed
+                        print(f"Attempt {attempts}. Remaining time: {remaining:.2f} seconds. Error: {str(e)}")
+                        # If there's still time remaining, wait a short while before retrying.
+                        if remaining > 0.5:
+                            time.sleep(0.5)
+                # If the backup wasn't successful within the timeout or max attempts, return None.
+                return None
+            try:
+                memory_conn = backup_with_retry(conn, sqlite_path, 5)
+                if memory_conn:
                     self.conns[sqlite_path] = memory_conn
                     conn.close()
-                    print(f"self.conns.keys(): {self.conns.keys()}")
-                except Exception as e:
-                    print(f"self.conns.keys(): {self.conns.keys()}, {str(e)}, {sqlite_path}")
+                    print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
+                else:
+                    print("Backup failed after multiple attempts, using the original connection.")
                     self.conns[sqlite_path] = conn
+            except Exception as e:
+                print(f"Exception during backup: {str(e)}. Using the original connection.")
+                self.conns[sqlite_path] = conn
 
     def close_db(self):
         for conn in self.conns.values():
