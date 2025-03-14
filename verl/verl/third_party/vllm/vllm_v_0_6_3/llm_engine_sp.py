@@ -103,10 +103,10 @@ class SQLExecutor():
                 f.write('0')
             return [self.tokenizer.eos_token_id]
         for index in range(len(completion)-4, 0, -1):
-            if completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2:
+            if completion[-4:] == self.monitor_token_id and (completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2):
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
-                if completion[-5] == 522:
-                    print(f"</</{self.tokenizer.decode(completion)}")
+                # if completion[-5] == 522:
+                #     print(f"</</{self.tokenizer.decode(completion)}")
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
                 # if kwargs['api'] == "snowflake":
@@ -127,7 +127,8 @@ class SQLExecutor():
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result)
             elif completion[-1] == 151645 and final == True:
-                if completion[index] == 151644:
+                # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
+                if completion[index] == 151644 and completion[index+1] == 6688:
                     sql_string = self.tokenizer.decode(completion[index+2:-1])
                     # print(f"sql_string: {sql_string}, {self.initial_prompts}")
                     kwargs = self.initial_prompts[str(request_id)]
