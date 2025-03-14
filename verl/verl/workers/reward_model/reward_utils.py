@@ -7,7 +7,7 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import sqlite3
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
 import hashlib
 
@@ -151,7 +151,7 @@ class SqlEnv:
     def __init__(self):
         self.conns = {}
         self.db_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=20480)
+        self.executor = ThreadPoolExecutor()
 
     def start_db(self, sqlite_path):
         with self.db_lock:
@@ -165,6 +165,7 @@ class SqlEnv:
                     
                     self.conns[sqlite_path] = memory_conn
                     conn.close()
+                    print(f"self.conns.keys(): {self.conns.keys()}")
                 except Exception as e:
                     print(f"self.conns.keys(): {self.conns.keys()}, {str(e)}, {sqlite_path}")
                     self.conns[sqlite_path] = conn
@@ -215,7 +216,7 @@ class SqlEnv:
                 return hard_cut(df.to_csv(index=False), max_len)
         cursor.close()
             
-    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=40, example_id=None):
+    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=5, example_id=None):
         if save_path not in self.conns.keys():
             self.start_db(sqlite_path)
         future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
