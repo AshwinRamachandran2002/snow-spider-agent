@@ -201,19 +201,17 @@ class SqlEnv:
             # except Exception as e:
                 # print(f"Exception during backup: {str(e)}. Using the original connection.")
             self.conns[sqlite_path] = conn
+            print(f"sqlite_path: {sqlite_path}, (self.conns): {self.conns.keys()}")
 
     def close_db(self):
         print("Close DB")
         for conn in self.conns.values():
             try:
-                conn.close()
-                print("Conn clossed")
+                if conn:
+                    conn.close()
+                    print("Conn clossed")
             except Exception as e:
                 print(f"When closing DB: {e}")
-        try:
-            self.conns = {}
-        except:
-            print("Failed to init conns")
 
     def exec_sql(self, sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
         cursor = self.conns[sqlite_path].cursor()
@@ -222,26 +220,26 @@ class SqlEnv:
         except Exception as e:
             # in sqlite, syntax errors, wrong table, column come here in exception
             return "Incorrect SQL Syntax:\n" + str(e)
-        def get_rows(cursor):
-            rows = []
-            current_len = 0
-            for row in cursor:
-                rows.append(row)
-                row_str = str(row)
-                if current_len + len(row_str) > max_len:
-                    break
-                current_len += len(row_str)
-            return rows
+        # def get_rows(cursor):
+        #     rows = []
+        #     current_len = 0
+        #     for row in cursor:
+        #         rows.append(row)
+        #         row_str = str(row)
+        #         if current_len + len(row_str) > max_len:
+        #             break
+        #         current_len += len(row_str)
+        #     return rows
         try:
-            rows = get_rows(cursor)
+            # rows = get_rows(cursor)
+            rows = cursor.fetchall()
+            if cursor.description is None:
+                print("cursor.description is None")
             columns = [desc[0] for desc in cursor.description]
             df = pd.DataFrame(rows, columns=columns)
         except Exception as e:
             # TODO: bugs here
             print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}. Using the original connection.")
-            uri = f"file:{sqlite_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-            self.conns[sqlite_path] = conn
             return str(e)
 
         # Check if the result is empty
@@ -260,7 +258,7 @@ class SqlEnv:
         cursor.close()
             
     def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
-        if save_path not in self.conns.keys():
+        if sqlite_path not in self.conns.keys():
             self.start_db(sqlite_path)
         future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
         try:

@@ -304,8 +304,9 @@ class SQLExecutor():
                                 "curr_pointer": 0
                             }
                         elif exec_res == [self.tokenizer.eos_token_id]:
-                            print(f"ERROR: Remove from monitor, {self.tokenizer.decode(completions)}")
-                            del self.monitor_parent_seq_ids[seq_id]
+                            print(f"FATALERROR: Remove from monitor, {self.tokenizer.decode(completions)}, {completions}")
+                            if seq_id in self.monitor_parent_seq_ids:
+                                del self.monitor_parent_seq_ids[seq_id]
                         else:
                             self.monitor_parent_seq_ids[seq_id] = {
                                 "exec_result": exec_res,
