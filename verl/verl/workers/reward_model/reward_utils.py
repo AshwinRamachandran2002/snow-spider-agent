@@ -152,7 +152,7 @@ class SqlEnv:
     def __init__(self):
         self.conns = {}
         self.db_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=8)
+        self.executor = ThreadPoolExecutor()
 
     def start_db(self, sqlite_path):
         if sqlite_path not in self.conns:
@@ -205,13 +205,15 @@ class SqlEnv:
 
     def close_db(self):
         print("Close DB")
-        for conn in self.conns.values():
-            try:
-                if conn:
-                    conn.close()
-                    print("Conn clossed")
-            except Exception as e:
-                print(f"When closing DB: {e}")
+        with self.db_lock:
+            for key, conn in list(self.conns.items()):
+                try:
+                    if conn:
+                        conn.close()
+                        print(f"Connection {key} closed.")
+                        del self.conns[key]
+                except Exception as e:
+                    print(f"When closing DB for {key}: {e}")
 
     def exec_sql(self, sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
         cursor = self.conns[sqlite_path].cursor()

@@ -59,6 +59,7 @@ from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql
 import uuid
 import datetime
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -106,6 +107,7 @@ class SQLExecutor():
                 # else:
                 exec_result = self.exec_func_sql(sql_string, max_len=200, LIMIT=100, **kwargs)
                 if "Timed out" in exec_result:
+                    print(f"timed out time: {time.time() - start}")
                     return "Timed out"
                 
                 exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
@@ -159,7 +161,12 @@ class SQLExecutor():
         self.monitor_parent_seq_ids = {}
         self.calls_per_parent_seq_id = {}
         self.initial_prompts = {}
-        # self.sql_env.close_db()
+        print(f"Wait for releasing DB")
+        self.sql_env.executor.shutdown(wait=True)
+        print(f"Start releasing DB")
+        self.sql_env.close_db()
+        print(f"Released DB")
+        self.sql_env.executor = ThreadPoolExecutor()
 
     def process(self, outputs, scheduler_outputs):
         """
