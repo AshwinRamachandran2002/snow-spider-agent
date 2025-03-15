@@ -161,12 +161,12 @@ class SQLExecutor():
         self.monitor_parent_seq_ids = {}
         self.calls_per_parent_seq_id = {}
         self.initial_prompts = {}
-        print(f"Wait for releasing DB")
-        self.sql_env.executor.shutdown(wait=False)
-        print(f"Start releasing DB")
-        self.sql_env.close_db()
-        print(f"Released DB")
-        self.sql_env.executor = ThreadPoolExecutor()
+        # print(f"Wait for releasing DB")
+        # self.sql_env.executor.shutdown(wait=True)
+        # print(f"Start releasing DB")
+        # self.sql_env.close_db()
+        # print(f"Released DB")
+        self.sql_env.executor = ThreadPoolExecutor(max_workers=1)
 
     def process(self, outputs, scheduler_outputs):
         """

@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
 import hashlib
 import time
+from concurrent.futures import TimeoutError
 
 def hard_cut(str_e, length=0):
     if length:
@@ -152,7 +153,7 @@ class SqlEnv:
     def __init__(self):
         self.conns = {}
         self.db_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor()
+        self.executor = ThreadPoolExecutor(max_workers=1)
 
     def start_db(self, sqlite_path):
         if sqlite_path not in self.conns:
@@ -205,59 +206,62 @@ class SqlEnv:
 
     def close_db(self):
         print("Close DB")
-        with self.db_lock:
-            for key, conn in list(self.conns.items()):
-                try:
-                    if conn:
-                        conn.close()
-                        print(f"Connection {key} closed.")
-                        del self.conns[key]
-                except Exception as e:
-                    print(f"When closing DB for {key}: {e}")
+        for key, conn in list(self.conns.items()):
+            try:
+                if conn:
+                    conn.close()
+                    print(f"Connection {key} closed.")
+                    del self.conns[key]
+            except Exception as e:
+                print(f"When closing DB for {key}: {e}")
 
     def exec_sql(self, sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
         cursor = self.conns[sqlite_path].cursor()
+        # Don't add LIMIT
         try:
             cursor.execute(sql_query)
         except Exception as e:
-            # in sqlite, syntax errors, wrong table, column come here in exception
             return "Incorrect SQL Syntax:\n" + str(e)
-        # def get_rows(cursor):
-        #     rows = []
-        #     current_len = 0
-        #     for row in cursor:
-        #         rows.append(row)
-        #         row_str = str(row)
-        #         if current_len + len(row_str) > max_len:
-        #             break
-        #         current_len += len(row_str)
-        #     return rows
+        
+        def get_rows(cursor):
+            rows = []
+            current_len = 0
+            for row in cursor:
+                row_str = str(row)
+                if current_len + len(row_str) > max_len:
+                    break
+                rows.append(row)
+                current_len += len(row_str)
+            return rows
+        
         try:
-            # rows = get_rows(cursor)
-            rows = cursor.fetchall()
+            rows = get_rows(cursor)
             if cursor.description is None:
-                print("cursor.description is None")
+                print("cursor.description is None, no column metadata available.")
+                return "No column information available."
             columns = [desc[0] for desc in cursor.description]
             df = pd.DataFrame(rows, columns=columns)
         except Exception as e:
-            # TODO: bugs here
-            print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}. Using the original connection.")
+            print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
             return str(e)
+        finally:
+            try:
+                cursor.close()
+            except Exception as e:
+                print("Failed to close cursor:", e)
 
-        # Check if the result is empty
         if df.empty:
             return "No data found for the specified query.\n"
         else:
-            # Save or print the results based on the is_save flag
             if save_path:
                 try:
                     df.to_csv(f"{save_path}", index=False)
                     return 0
                 except Exception as e:
                     print(e)
+                    return str(e)
             else:
                 return hard_cut(df.to_csv(index=False), max_len)
-        cursor.close()
             
     def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
         if sqlite_path not in self.conns.keys():
