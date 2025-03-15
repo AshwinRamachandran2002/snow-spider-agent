@@ -122,7 +122,7 @@ if __name__ == '__main__':
     score = 0
     log_folder = "exec"
     for folder_name in tqdm(os.listdir(log_folder)):
-        example_id = '_'.join(folder_name.split('_')[:-3])
+        example_id = '_'.join(folder_name.split('_')[:-1])
         if folder_name.endswith(".log"):
             count += 1
         if folder_name.endswith(".csv"):
