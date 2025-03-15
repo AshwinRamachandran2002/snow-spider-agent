@@ -78,9 +78,9 @@ class SQLExecutor():
         self.start_token_id_2 = [27, 11748, 18063, 397]
         self.tokenizer = tokenizer_group.tokenizer
 
-        sql_env = SqlEnv()
+        self.sql_env = SqlEnv()
         self.ground_truths = "deepscaler/rewards/gold/gold_answer"
-        self.exec_func_sql = sql_env.execute_sql_with_timeout
+        self.exec_func_sql = self.sql_env.execute_sql_with_timeout
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
         self.max_calls = sql_executor_config.max_calls
@@ -93,14 +93,6 @@ class SQLExecutor():
 
     def fetch_execution_result(self, completion, request_id, failed=False, final=False):
         if failed:
-            kwargs = self.initial_prompts[str(request_id)]
-            example_id = kwargs["example_id"]
-            log = self.tokenizer.decode(completion).strip('\n')
-            file_name = f"{example_id}_{calculate_md5(log)}"
-            with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
-                f.write(log)
-            with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
-                f.write('0')
             return [self.tokenizer.eos_token_id]
         for index in range(len(completion)-4, 0, -1):
             if completion[-4:] == self.monitor_token_id and (completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2):
@@ -126,7 +118,7 @@ class SQLExecutor():
                 if kwargs['api'] == "snowflake":
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result)
-            elif completion[-1] == 151645 and final == True:
+            elif completion[-1] == self.tokenizer.eos_token_id and final == True:
                 # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
                 if completion[index] == 151644 and completion[index+1] == 6688:
                     sql_string = self.tokenizer.decode(completion[index+2:-1])
@@ -134,7 +126,7 @@ class SQLExecutor():
                     kwargs = self.initial_prompts[str(request_id)]
                     example_id = kwargs["example_id"]
                     start = time.time()
-                    exec_result = self.exec_func_sql(sql_string, timeout=10, **kwargs)
+                    exec_result = self.exec_func_sql(sql_string, timeout=5, **kwargs)
                     log = self.tokenizer.decode(completion).strip('\n')
                     file_name = f"{example_id}_{calculate_md5(log)}"
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
@@ -144,8 +136,10 @@ class SQLExecutor():
                         f.write(log)
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
                         f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
-                    
-        return []
+                    return []
+        if completion[-1] != self.tokenizer.eos_token_id:
+            print(f"No match: {self.tokenizer.decode(completion)}")
+        return [self.tokenizer.eos_token_id]
 
     def remove(self, request_id):
         if request_id in self.parent_seq_ids_completions:
@@ -165,6 +159,7 @@ class SQLExecutor():
         self.monitor_parent_seq_ids = {}
         self.calls_per_parent_seq_id = {}
         self.initial_prompts = {}
+        # self.sql_env.close_db()
 
     def process(self, outputs, scheduler_outputs):
         """
@@ -249,12 +244,9 @@ class SQLExecutor():
 
                 output_token = seq_output.output_token
                 start_time_path = os.path.join(os.getenv("EXEC_FOLDER"), "start_time.log")
-                # if not os.path.exists(start_time_path) or os.path.getsize(start_time_path) < 100:
-                #     with open(start_time_path, "a") as f:
-                #         f.write(str(time.time()) + "\n")
-                #     with open(start_time_path, "r") as f:
-                #         start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
-                #         print(f"Mean start time: {start_time}")
+                if not os.path.exists(start_time_path) or os.path.getsize(start_time_path) < 100:
+                    with open(start_time_path, "a") as f:
+                        f.write(str(time.time()) + "\n")
                 # Store the output token for the sequence ID
                 if seq_id not in self.parent_seq_ids_completions:
                     self.parent_seq_ids_completions[seq_id] = []
@@ -265,29 +257,35 @@ class SQLExecutor():
                 if completions[-4:] == self.monitor_token_id:
                     if self.logging:
                         with open(self.log_path, "a") as f:
-                            f.write(f"Detected monitor token for seq_id {seq_id}\n")
+                            f.write(f"Detected monitor token for seq_id: {seq_id}: {self.tokenizer.decode(completions)}, ids: {completions}")
 
                     # Check if a lot of calls have been made for this seq_id
                     if seq_id not in self.calls_per_parent_seq_id:
                         self.calls_per_parent_seq_id[seq_id] = 0
-                    # if seq_id not in self.time_per_parent_seq_id:
-                    #     self.time_per_parent_seq_id[seq_id] = [time.time()]
+                    if seq_id not in self.time_per_parent_seq_id:
+                        self.time_per_parent_seq_id[seq_id] = []
                     self.calls_per_parent_seq_id[seq_id] += 1
-                    # self.time_per_parent_seq_id[seq_id] += [time.time()]
-                    # with open(start_time_path, "r") as f:
-                    #     start_time = np.mean([float(i) for i in f.read().split('\n') if i != ''])
-                    # used_time = self.time_per_parent_seq_id[seq_id][-1] - start_time
-                    # if used_time > self.max_time:
-                    #     if self.logging:
-                    #         with open(self.log_path, "a") as f:
-                    #             f.write(f"Exceeded max calls for seq_id {seq_id}\n")
-                    #     print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
+                    self.time_per_parent_seq_id[seq_id] += [time.time()]
+                    with open(start_time_path, "r") as f:
+                        time_list = []
+                        for i in f.read().split('\n'):
+                            try:
+                                time_list.append(float(i))
+                            except:
+                                pass
+                        start_time = np.mean(time_list)
+                    used_time = self.time_per_parent_seq_id[seq_id][-1] - start_time
+                    if used_time > self.max_time:
+                        if self.logging:
+                            with open(self.log_path, "a") as f:
+                                f.write(f"Exceeded max calls for seq_id {seq_id}\n")
+                        print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
 
-                    #     self.monitor_parent_seq_ids[seq_id] = {
-                    #         "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
-                    #         "curr_pointer": 0
-                    #     }
-                    if self.calls_per_parent_seq_id[seq_id] > self.max_calls:
+                        self.monitor_parent_seq_ids[seq_id] = {
+                            "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
+                            "curr_pointer": 0
+                        }
+                    elif self.calls_per_parent_seq_id[seq_id] > self.max_calls:
 
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
@@ -305,18 +303,16 @@ class SQLExecutor():
                                 "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
                                 "curr_pointer": 0
                             }
+                        elif exec_res == [self.tokenizer.eos_token_id]:
+                            print(f"ERROR: Remove from monitor, {self.tokenizer.decode(completions)}")
+                            del self.monitor_parent_seq_ids[seq_id]
                         else:
                             self.monitor_parent_seq_ids[seq_id] = {
                                 "exec_result": exec_res,
                                 "curr_pointer": 0
                             }
-                elif completions[-1] == 151645:
-                    exec_res = self.fetch_execution_result(completions, seq_id, final=True)
-                    if exec_res != []:
-                        self.monitor_parent_seq_ids[seq_id] = {
-                                    "exec_result": exec_res,
-                                    "curr_pointer": 0
-                        }
+                elif completions[-1] == self.tokenizer.eos_token_id:
+                    self.fetch_execution_result(completions, seq_id, final=True)
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
             if index not in seq_id_analyzed:
