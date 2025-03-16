@@ -40,7 +40,7 @@ from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
-
+import time
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -225,6 +225,8 @@ class vLLMRollout(BaseRollout):
                     ):
                         # Inside the context, perform the operations to generate the sequence
                         batch_sampling_params.append(self.sampling_params.clone())
+
+                self.inference_engine.llm_engine.sql_executor_context.start_time = time.time()
 
                 output = self.inference_engine.generate(
                     prompts=None,

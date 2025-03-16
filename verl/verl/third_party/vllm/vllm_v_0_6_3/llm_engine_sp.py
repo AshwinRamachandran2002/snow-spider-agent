@@ -75,8 +75,7 @@ class SQLExecutor():
         self.time_per_parent_seq_id = {}
 
         self.monitor_token_id = [522, 11748, 18063, 397] # </exec_sql>
-        self.start_token_id_1 = [366, 11748, 18063, 397]
-        self.start_token_id_2 = [27, 11748, 18063, 397]
+        self.start_token_ids = [[366, 11748, 18063, 397], [27, 11748, 18063, 397], [366, 11748, 18063, 29]]
         self.tokenizer = tokenizer_group.tokenizer
 
         self.sql_env = SqlEnv()
@@ -86,6 +85,8 @@ class SQLExecutor():
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
         self.max_calls = sql_executor_config.max_calls
         self.max_time = sql_executor_config.max_time
+
+        self.start_time = 0
         
         print(f"SQLExecutor initialized with sqlite_source_path {self.sqlite_source_path} and max_calls {self.max_calls} and max_time {self.max_time}")
 
@@ -96,7 +97,7 @@ class SQLExecutor():
         if failed:
             return [self.tokenizer.eos_token_id]
         for index in range(len(completion)-4, 0, -1):
-            if completion[-4:] == self.monitor_token_id and (completion[index:index+4] == self.start_token_id_1 or completion[index:index+4] == self.start_token_id_2):
+            if completion[-4:] == self.monitor_token_id and completion[index:index+4] in self.start_token_ids:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
                 # if completion[-5] == 522:
                 #     print(f"</</{self.tokenizer.decode(completion)}")
@@ -248,10 +249,6 @@ class SQLExecutor():
                             del self.monitor_parent_seq_ids[seq_id]
 
                 output_token = seq_output.output_token
-                start_time_path = os.path.join(os.getenv("EXEC_FOLDER"), "start_time.log")
-                if not os.path.exists(start_time_path) or os.path.getsize(start_time_path) < 100:
-                    with open(start_time_path, "a") as f:
-                        f.write(str(time.time()) + "\n")
                 # Store the output token for the sequence ID
                 if seq_id not in self.parent_seq_ids_completions:
                     self.parent_seq_ids_completions[seq_id] = []
@@ -271,16 +268,9 @@ class SQLExecutor():
                         self.time_per_parent_seq_id[seq_id] = []
                     self.calls_per_parent_seq_id[seq_id] += 1
                     self.time_per_parent_seq_id[seq_id] += [time.time()]
-                    with open(start_time_path, "r") as f:
-                        time_list = []
-                        for i in f.read().split('\n'):
-                            try:
-                                if float(i) > 1e10:
-                                    time_list.append(float(i))
-                            except:
-                                pass
-                        start_time = np.mean(time_list)
-                    used_time = self.time_per_parent_seq_id[seq_id][-1] - start_time
+                    
+                    used_time = self.time_per_parent_seq_id[seq_id][-1] - self.start_time
+                    assert used_time < 1e4
                     if used_time > self.max_time:
                         if self.logging:
                             with open(self.log_path, "a") as f:

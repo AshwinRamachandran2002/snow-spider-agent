@@ -259,7 +259,7 @@ class SqlEnv:
                     df.to_csv(f"{save_path}", index=False)
                     return 0
                 except Exception as e:
-                    print(e)
+                    print(str(e))
                     return str(e)
             else:
                 return hard_cut(df.to_csv(index=False), max_len)
@@ -283,7 +283,8 @@ class SqlEnv:
                 result = self.exec_sql(sql_query, save_path, api, max_len, LIMIT, sqlite_path)
                 q.put(result)
             except Exception as e:
-                q.put(e)
+                print("Exception in process", str(e))
+                q.put(str(e))
         q = Queue()
         p = Process(target=target, args=(q,))
         p.start()
