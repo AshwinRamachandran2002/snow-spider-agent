@@ -12,6 +12,7 @@ import threading
 import hashlib
 import time
 from concurrent.futures import TimeoutError
+from multiprocessing import Process, Queue
 
 def hard_cut(str_e, length=0):
     if length:
@@ -153,7 +154,7 @@ class SqlEnv:
     def __init__(self):
         self.conns = {}
         self.db_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=1)
+        # self.executor = ThreadPoolExecutor(max_workers=1)
 
     def start_db(self, sqlite_path):
         if sqlite_path not in self.conns:
@@ -263,16 +264,42 @@ class SqlEnv:
             else:
                 return hard_cut(df.to_csv(index=False), max_len)
             
+    # def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
+    #     if sqlite_path not in self.conns.keys():
+    #         self.start_db(sqlite_path)
+    #     future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
+    #     try:
+    #         result = future.result(timeout=timeout)
+    #         return result
+    #     except TimeoutError:
+    #         print(f"{sql_query} Timed out\n")
+    #         return f"{sql_query} Timed out\n"
     def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
         if sqlite_path not in self.conns.keys():
             self.start_db(sqlite_path)
-        future = self.executor.submit(self.exec_sql, sql_query, save_path, api, max_len, LIMIT, sqlite_path)
-        try:
-            result = future.result(timeout=timeout)
-            return result
-        except TimeoutError:
-            print(f"{sql_query} Timed out\n")
+
+        def target(q):
+            try:
+                result = self.exec_sql(sql_query, save_path, api, max_len, LIMIT, sqlite_path)
+                q.put(result)
+            except Exception as e:
+                q.put(e)
+        q = Queue()
+        p = Process(target=target, args=(q,))
+        p.start()
+
+        p.join(timeout)
+        if p.is_alive():
+            p.kill()
+            p.join()
+            print(f"{sql_query} Timed out, p.exitcode: {p.exitcode}\n")
             return f"{sql_query} Timed out\n"
+        else:
+            if not q.empty():
+                result = q.get()
+                return result
+            else:
+                return None
 
     def __del__(self):
         self.close_db()

@@ -161,12 +161,10 @@ class SQLExecutor():
         self.monitor_parent_seq_ids = {}
         self.calls_per_parent_seq_id = {}
         self.initial_prompts = {}
-        # print(f"Wait for releasing DB")
-        # self.sql_env.executor.shutdown(wait=True)
-        # print(f"Start releasing DB")
-        # self.sql_env.close_db()
-        # print(f"Released DB")
-        self.sql_env.executor = ThreadPoolExecutor(max_workers=1)
+        print(f"Start releasing DB")
+        self.sql_env.close_db()
+        print(f"End releasing  DB")
+        # self.sql_env.executor = ThreadPoolExecutor(max_workers=1)
 
     def process(self, outputs, scheduler_outputs):
         """
@@ -277,7 +275,8 @@ class SQLExecutor():
                         time_list = []
                         for i in f.read().split('\n'):
                             try:
-                                time_list.append(float(i))
+                                if float(i) > 1e10:
+                                    time_list.append(float(i))
                             except:
                                 pass
                         start_time = np.mean(time_list)
