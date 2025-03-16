@@ -109,6 +109,7 @@ class vLLMRollout(BaseRollout):
                                     max_num_batched_tokens=max_num_batched_tokens,
                                     enable_chunked_prefill=config.enable_chunked_prefill,
                                     load_format=config.load_format,
+                                    is_val=is_val
                                     )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.offload_model_weights()
@@ -150,7 +151,7 @@ class vLLMRollout(BaseRollout):
             setattr(self.sampling_params, key, value)
 
     @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto, max_retries: int = 1e9, **kwargs) -> DataProto:
+    def generate_sequences(self, prompts: DataProto, max_retries: int = 1e9, is_val=False, **kwargs) -> DataProto:
         """Generate sequences using vLLM engine with retry logic for failures.
 
         Args:
@@ -232,7 +233,8 @@ class vLLMRollout(BaseRollout):
                     prompts=None,
                     sampling_params=batch_sampling_params,
                     prompt_token_ids=idx_list,
-                    use_tqdm=False)
+                    use_tqdm=False,
+                    is_val=False)
                 
                 self.inference_engine.llm_engine.sql_executor_context.remove_all_ids()
 
@@ -331,7 +333,8 @@ class vLLMRollout(BaseRollout):
                     skip_tokenizer_init=False,
                     max_model_len=self.config.prompt_length +
                     self.config.response_length,
-                    load_format=self.config.load_format)
+                    load_format=self.config.load_format,
+                    is_val=is_val)
                 print("vLLM is ready to roll!")
 
                 if attempt < max_retries - 1:

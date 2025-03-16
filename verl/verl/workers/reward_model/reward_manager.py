@@ -11,6 +11,7 @@ from verl.workers.reward_model.reward_utils import get_api_name, SqlEnv, calcula
 from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql
 from tqdm import tqdm
 import shutil
+import sys
 class RewardManager():
     """
     The reward manager.
@@ -34,6 +35,7 @@ class RewardManager():
         self.ground_truths = "deepscaler/rewards/gold/gold_answer"
         
         self.max_workers = rewards_config.max_workers
+        self.val_only = rewards_config.val_only
 
     def enum_unsuccessful_intermediate_sql(self, response_str, log_path):
         num_total = 0
@@ -196,6 +198,8 @@ class RewardManager():
             if i.endswith("log"):
                 log_gen += 1
         print(f"Gen results: {num_gen}/{log_gen}, reward_tensor: {reward_tensor.shape}")
+        if self.val_only:
+            sys.exit(0)
         shutil.rmtree(os.getenv("EXEC_FOLDER"))
         os.mkdir(os.getenv("EXEC_FOLDER"))
         return reward_tensor

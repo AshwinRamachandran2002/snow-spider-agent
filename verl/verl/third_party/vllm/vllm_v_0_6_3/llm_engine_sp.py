@@ -67,7 +67,7 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 class SQLExecutor():
 
-    def __init__(self, tokenizer_group, sql_executor_config):
+    def __init__(self, tokenizer_group, sql_executor_config, is_val=False):
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
         self.initial_prompts = {}
@@ -83,8 +83,16 @@ class SQLExecutor():
         self.exec_func_sql = self.sql_env.execute_sql_with_timeout
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
-        self.max_calls = sql_executor_config.max_calls
-        self.max_time = sql_executor_config.max_time
+        if is_val:
+            self.max_calls = sql_executor_config.max_calls_val
+            self.max_time = sql_executor_config.max_time_val
+            self.timeout_for_exploration = sql_executor_config.timeout_for_exploration_val
+            self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer_val            
+        else:
+            self.max_calls = sql_executor_config.max_calls
+            self.max_time = sql_executor_config.max_time
+            self.timeout_for_exploration = sql_executor_config.timeout_for_exploration
+            self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer
 
         self.start_time = 0
         
@@ -106,7 +114,7 @@ class SQLExecutor():
                 # if kwargs['api'] == "snowflake":
                 #     exec_result = self.exec_func_sf(sql_string, max_len=200, LIMIT=100, **kwargs)
                 # else:
-                exec_result = self.exec_func_sql(sql_string, max_len=200, LIMIT=100, **kwargs)
+                exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_exploration, max_len=200, LIMIT=100, **kwargs)
                 if "Timed out" in exec_result:
                     print(f"timed out time: {time.time() - start}")
                     return "Timed out"
@@ -129,7 +137,7 @@ class SQLExecutor():
                     kwargs = self.initial_prompts[str(request_id)]
                     example_id = kwargs["example_id"]
                     start = time.time()
-                    exec_result = self.exec_func_sql(sql_string, timeout=5, **kwargs)
+                    exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_final_answer, **kwargs)
                     log = self.tokenizer.decode(completion).strip('\n')
                     file_name = f"{example_id}_{calculate_md5(log)}"
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
@@ -390,6 +398,7 @@ class LLMEngine(LLMEngine):
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
         use_cached_outputs: bool = False,
+        is_val=False
     ) -> None:
         logger.info(
             "Initializing an LLM engine (v%s) with config: "
@@ -608,7 +617,7 @@ class LLMEngine(LLMEngine):
             ),
         )
 
-        self.sql_executor_context = SQLExecutor(self.tokenizer, sql_executor_config)
+        self.sql_executor_context = SQLExecutor(self.tokenizer, sql_executor_config, is_val=is_val)
 
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
@@ -654,6 +663,7 @@ class LLMEngine(LLMEngine):
         engine_args: EngineArgs,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
+        is_val=False
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
@@ -677,6 +687,7 @@ class LLMEngine(LLMEngine):
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
             stat_loggers=stat_loggers,
+            is_val=is_val
         )
         return engine
 

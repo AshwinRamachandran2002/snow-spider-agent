@@ -3,7 +3,7 @@ import os
 import json
 import math
 import pandas as pd
-
+import argparse
 
 def load_jsonl_to_dict(jsonl_file):
     data_dict = {}
@@ -117,10 +117,15 @@ def evaluate_spider2sql(gold_result_dir, csv_str, example_id):
     return score
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Setup for Spider 2.0")
+    parser.add_argument("--log_folder", default="exec", type=str)
+
+    args = parser.parse_args()
+
     from tqdm import tqdm
     count = 0
     score = 0
-    log_folder = "exec"
+    log_folder = args.log_folder
     for folder_name in tqdm(os.listdir(log_folder)):
         example_id = '_'.join(folder_name.split('_')[:-1])
         if folder_name.endswith(".log"):
