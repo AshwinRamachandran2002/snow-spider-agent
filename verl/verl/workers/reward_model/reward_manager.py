@@ -93,7 +93,7 @@ class RewardManager():
         return ((num_total - num_distinct) / num_total) * self.undiverse_intermediate_sql_reward if num_total > 0 else 0
 
     def compute_reward_tensor(self, prompt_str, response_str, response_ids, sqlite_path, example_id):
-        print(f"Start Reward {example_id}")
+        # print(f"Start Reward {example_id}")
 
         # reward_tensor = torch.zeros_like(response_ids, dtype=torch.float32)
         # csv_save_path = os.path.join(self.exec_folder, example_id+f"_{threading.get_ident()}.csv")
@@ -148,7 +148,7 @@ class RewardManager():
                 #     f.write(f"Reward: successful_final_sql\n")
                 return self.successful_final_sql_reward
 
-        print(f"End Reward {example_id}")
+        # print(f"End Reward {example_id}")
         return 0
 
     def process_item(self, args):

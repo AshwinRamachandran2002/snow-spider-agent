@@ -67,14 +67,14 @@ _LOCAL_LOGGING_INTERVAL_SEC = 5
 
 class SQLExecutor():
 
-    def __init__(self, tokenizer_group, sql_executor_config, is_val=False):
+    def __init__(self, tokenizer_group, sql_executor_config):
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
         self.initial_prompts = {}
         self.calls_per_parent_seq_id = {}
         self.time_per_parent_seq_id = {}
 
-        self.monitor_token_id = [522, 11748, 18063, 397] # </exec_sql>
+        self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]] # </exec_sql>
         self.start_token_ids = [[366, 11748, 18063, 397], [27, 11748, 18063, 397], [366, 11748, 18063, 29]]
         self.tokenizer = tokenizer_group.tokenizer
 
@@ -83,16 +83,16 @@ class SQLExecutor():
         self.exec_func_sql = self.sql_env.execute_sql_with_timeout
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
-        if is_val:
-            self.max_calls = sql_executor_config.max_calls_val
-            self.max_time = sql_executor_config.max_time_val
-            self.timeout_for_exploration = sql_executor_config.timeout_for_exploration_val
-            self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer_val            
-        else:
-            self.max_calls = sql_executor_config.max_calls
-            self.max_time = sql_executor_config.max_time
-            self.timeout_for_exploration = sql_executor_config.timeout_for_exploration
-            self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer
+        # if is_val:
+        #     self.max_calls = sql_executor_config.max_calls_val
+        #     self.max_time = sql_executor_config.max_time_val
+        #     self.timeout_for_exploration = sql_executor_config.timeout_for_exploration_val
+        #     self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer_val            
+        # else:
+        self.max_calls = sql_executor_config.max_calls
+        self.max_time = sql_executor_config.max_time
+        self.timeout_for_exploration = sql_executor_config.timeout_for_exploration
+        self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer
 
         self.start_time = 0
         
@@ -105,7 +105,7 @@ class SQLExecutor():
         if failed:
             return [self.tokenizer.eos_token_id]
         for index in range(len(completion)-4, 0, -1):
-            if completion[-4:] == self.monitor_token_id and completion[index:index+4] in self.start_token_ids:
+            if completion[-4:] in self.monitor_token_ids and completion[index:index+4] in self.start_token_ids:
                 sql_string = self.tokenizer.decode(completion[index+4:-4])
                 # if completion[-5] == 522:
                 #     print(f"</</{self.tokenizer.decode(completion)}")
@@ -264,7 +264,10 @@ class SQLExecutor():
 
                 # Check for the monitor token sequence in completions
                 completions = self.parent_seq_ids_completions[seq_id]
-                if completions[-4:] == self.monitor_token_id:
+                # if "I find there's something wrong." in self.tokenizer.decode(completions):
+                #     if "</exec_sql>" in self.tokenizer.decode(completions)[self.tokenizer.decode(completions).find("I find there's something wrong."):]:
+                #         print(f"I find there's something wrong. completions: {self.tokenizer.decode(completions)}, completions: {completions}")
+                if completions[-4:] in self.monitor_token_ids:
                     if self.logging:
                         with open(self.log_path, "a") as f:
                             f.write(f"Detected monitor token for seq_id: {seq_id}: {self.tokenizer.decode(completions)}, ids: {completions}")
@@ -318,6 +321,8 @@ class SQLExecutor():
                             }
                 elif completions[-1] == self.tokenizer.eos_token_id:
                     self.fetch_execution_result(completions, seq_id, final=True)
+                elif self.tokenizer.decode(completions[-4:]) == "</exec_sql>":
+                    print(f"Fatal err: {completions[-4:]} not in monitor")
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
             if index not in seq_id_analyzed:
@@ -397,8 +402,7 @@ class LLMEngine(LLMEngine):
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
-        use_cached_outputs: bool = False,
-        is_val=False
+        use_cached_outputs: bool = False
     ) -> None:
         logger.info(
             "Initializing an LLM engine (v%s) with config: "
@@ -617,7 +621,7 @@ class LLMEngine(LLMEngine):
             ),
         )
 
-        self.sql_executor_context = SQLExecutor(self.tokenizer, sql_executor_config, is_val=is_val)
+        self.sql_executor_context = SQLExecutor(self.tokenizer, sql_executor_config)
 
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
@@ -662,8 +666,7 @@ class LLMEngine(LLMEngine):
         sql_executor_config: DictConfig,
         engine_args: EngineArgs,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
-        is_val=False
+        stat_loggers: Optional[Dict[str, StatLoggerBase]] = None
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
@@ -686,8 +689,7 @@ class LLMEngine(LLMEngine):
             executor_class=executor_class,
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
-            stat_loggers=stat_loggers,
-            is_val=is_val
+            stat_loggers=stat_loggers
         )
         return engine
 

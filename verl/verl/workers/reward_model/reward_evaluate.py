@@ -93,24 +93,24 @@ def evaluate_spider2sql(gold_result_dir, csv_str, example_id):
     eval_ids = sorted(eval_ids)  # sorted, for reproduce result
     
     try:
-        if "BIRD" in example_id or "Spider" in example_id:
-            pred_pd = pd.read_csv(csv_str, header=None, skiprows=1)
-            gold_pd = pd.read_csv(os.path.join(gold_result_dir, example_id + ".csv"), header=None, skiprows=1)
-            pred_set = set(map(tuple, pred_pd.values))
-            gold_set = set(map(tuple, gold_pd.values))
-            score = int(pred_set == gold_set)
-        else:
-            pred_pd = pd.read_csv(csv_str)
-            pattern = re.compile(rf'^{re.escape(example_id)}(_[a-z])?\.csv$')
-            all_files = os.listdir(gold_result_dir)
-            csv_files = [file for file in all_files if pattern.match(file)]
-            csv_files = sorted(csv_files)
-            if len(csv_files) == 1:
-                gold_pd = pd.read_csv(os.path.join(gold_result_dir, example_id+".csv"))
-                score = compare_pandas_table(pred_pd, gold_pd, eval_standard_dict.get(example_id)['condition_cols'], eval_standard_dict.get(example_id)['ignore_order'])
-            elif len(csv_files) > 1:
-                gold_pds = [pd.read_csv(os.path.join(gold_result_dir, file)) for file in csv_files]
-                score = compare_multi_pandas_table(pred_pd, gold_pds, eval_standard_dict.get(example_id)['condition_cols'], eval_standard_dict.get(example_id)['ignore_order'])
+        # if "BIRD" in example_id or "Spider" in example_id:
+        #     pred_pd = pd.read_csv(csv_str, header=None, skiprows=1)
+        #     gold_pd = pd.read_csv(os.path.join(gold_result_dir, example_id + ".csv"), header=None, skiprows=1)
+        #     pred_set = set(map(tuple, pred_pd.values))
+        #     gold_set = set(map(tuple, gold_pd.values))
+        #     score = int(pred_set == gold_set)
+        # else:
+        pred_pd = pd.read_csv(csv_str)
+        pattern = re.compile(rf'^{re.escape(example_id)}(_[a-z])?\.csv$')
+        all_files = os.listdir(gold_result_dir)
+        csv_files = [file for file in all_files if pattern.match(file)]
+        csv_files = sorted(csv_files)
+        if len(csv_files) == 1:
+            gold_pd = pd.read_csv(os.path.join(gold_result_dir, example_id+".csv"))
+            score = compare_pandas_table(pred_pd, gold_pd, eval_standard_dict.get(example_id)['condition_cols'], eval_standard_dict.get(example_id)['ignore_order'])
+        elif len(csv_files) > 1:
+            gold_pds = [pd.read_csv(os.path.join(gold_result_dir, file)) for file in csv_files]
+            score = compare_multi_pandas_table(pred_pd, gold_pds, eval_standard_dict.get(example_id)['condition_cols'], eval_standard_dict.get(example_id)['ignore_order'])
     except Exception as e:
         print(f"{example_id} ERROR: {e}")
         score = 0
