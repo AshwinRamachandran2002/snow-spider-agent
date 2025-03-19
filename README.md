@@ -1,72 +1,65 @@
-# snow-spider-agent
-Snowflake Internal agent framework and evaluation toolkit for Spider 2.0-Snow.
+## Setup
 
-This repo is heavily refactored from [the official repo](https://github.com/snowflakedb/snow-spider-agent) for improved engineering practices and allows multiple teams to simultaneously experiment with their own ideas and develop their own agents without causing conflicts. The design document can be found [here](https://docs.google.com/document/d/1RS6YPSkuuZfSQbdt00sMe7D3KLWpOSg_JpUdoDJLCQ4/edit?usp=sharing).
+1. **Create a Conda Environment**
+   Use the following command to create and activate a new environment for the SFT training:
+   
+   ```bash
+   conda create -n sft_env python=3.9
+   conda activate sft_env
+   ```
+2. **Install Dependencies**
+   After activating the environment, install all required dependencies by running:
+   
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. **Binarize Data**
+   Provide the raw data as follows:
+   the raw JSONLINE file contains a JSON object (each line). Each sample should follow the following format:
+   ```json
+   {
+        "messages":[
+            {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
+            {"role": "user", "content": "Write a regex expression to match any letter of the alphabet"},
+            {"role": "assistant", "content": "The regex expression to match any letter of the alphabet (either in uppercase or lowercase) is: \n\n```regex\n[a-zA-Z]\n```"},
+            {"role": "user", "content": "How about if I only want to match uppercase letters? Can you modify the regex expression for that?"},
+            {"role": "assistant", "content": "Sure, the regex expression to match any uppercase letter of the alphabet is:\n\n```regex\n[A-Z]\n```"}
+       ],
+       "format": "chatml"
+   }
+   ```
+   For the SFT datasets, the raw JSONLINE file follows the following format:
+   ```
+   {"messages": [sample1...], "format": "chatml"}
+   {"messages": [sample2...], "format": "chatml"}
+   {"messages": [sample3...], "format": "chatml"}
+   ```
+   Binarize the raw data:
+   
+   ```bash
+   INPUT_PATH="/path/to/raw/sft.jsonl"
+   OUTPUT_PATH="/path/to/processed/sft.jsonl"
+   TOKENIZER_PATH="/path/to/pretrained_models/Qwen/Qwen2___5-Coder-1___5B/"
+   bash ./scripts/binarize_data.sh ${INPUT_PATH} ${OUTPUT_PATH} ${TOKENIZER_PATH}
+   ```
+5. **Training**
+   Once the environment is ready and the model paths are configured, run the evaluation suite by executing the following script:
+   
+   ```bash
+   DATA_PATH="/path/to/processed/sft.jsonl"
+   PRETRAINED_MODEL="/path/to/pretrained_models/Qwen/Qwen2___5-Coder-1___5B/"
+   OUTPUT_DIR="/path/to/checkpoints/sft_model/"
+   bash ./scripts/sft_qwencoder.sh ${DATA_PATH} ${PRETRAINED_MODEL} ${OUTPUT_DIR}
+   ```
 
-## 🚀 Quickstart
+6. **Merge Adapter**
+   When running sft with lora, merge the base model and the adapters by executing the following script:
 
-1. **Snowflake Account**: ~~Follow this [guideline](https://github.com/xlang-ai/Spider2/blob/main/assets/Snowflake_Guideline.md) to get your own Snowflake username and password in our snowflake database. You must update `bigquery_credential.json` and `snowflake_credential.json`.~~ If you're a Snowflake employee, intern or collaborator, please use [this form](https://forms.gle/nDo6ovuQhavkpYit5) to submit an account request.
+   ```bash
+   BASE_MODEL_PATH=${1}
+   TRAIN_ADAPTERS_PATH=${2}
+   OUTPUT_PATH=${3}
+   bash ./scripts/merge_adapter.sh ${BASE_MODEL_PATH} ${TRAIN_ADAPTERS_PATH} ${OUTPUT_PATH}
+   ```
 
-2. Create `snowflake_credential.json`. You can find the template in `spider-agent-snow/snowflake_credential.json.example`.
 
-
-### Run Spider-Agent(Snow)
-
-1. **Install Docker**. Follow the instructions in the [Docker setup guide](https://docs.docker.com/engine/install/) to install Docker on your machine.
-2. **Install conda environment**.
-```
-git clone https://github.com/snowflakedb/snow-spider-agent.git
-
-# Optional: Create a Conda environment for Spider 2.0
-# conda create -n spider2 python=3.11
-# conda activate spider2
-
-# Install required dependencies
-pip install -r requirements.txt
-```
-3. **Configure credential**: Create `snowflake_credential.json` in `./spider-agent-snow/` and `./spider2-snow-bench`. You can find the template in `spider-agent-snow/snowflake_credential.json.example`.
-
-4. **Spider 2.0-Snow Setup**
-```
-cd ./spider-agent-snow
-python spider_agent_setup_snow.py
-```
-
-5. **Run agent**
-```
-cd ./spider-agent-snow
-export OPENAI_API_KEY=<your-openai-key>
-python run.py --agent default-agent --model gpt4o -s 241117
-```
-
-For Azure OpenAI, do this (remember to add `azure/` before the deployment name):
-```
-export AZURE_API_KEY=<azure-api-key>
-export AZURE_ENDPOINT=<azure-endpoint>
-python run.py --agent default-agent --model azure/gpt4o -s 241117
-```
-
-### Evaluation
-
-```
-python get_spider2snow_submission_data.py --experiment_id default-agent-gpt4o-241117 --results_folder_name ../spider2-snow-bench/evaluation_suite/experiments/default-agent-gpt4o-241117
-
-cd ../spider2-snow-bench/evaluation_suite
-python evaluate.py --mode exec_result --result_dir ./experiments/default-agent-gpt4o-241117
-```
-
-## 🔧 Develop your own agent
-
-You can follow these steps to develop your own agents:
-1. Define the actions. The new action should be a separate file in `./snow-spider-agent/spider-agent-snow/spider_agent/agent/actions`. Use existing actions for reference.
-2. Define your agents. Create a separate file in `spider-agent-snow/spider_agent/agent/agents`. Use the [official Spider Agent](spider-agent-snow/spider_agent/agent/agents/prompt_agent.py) for reference. Don't forget to register your agents in [`__init__.py`](spider-agent-snow/spider_agent/agent/agents/__init__.py).
-3. Run your own agent by `python run.py --agent <your_agent_name> ...`.
-
-## 🏆 Internal Leaderboard
-
-| Name          | Correct/Total | Score | Description                                                                                                                                                                       |
-|---------------|---------------|-------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Spider-Agent (gpt4o-240513)  | 40/260        | 15.4  | Reproduced number of [the official repo](https://github.com/snowflakedb/snow-spider-agent) by @canwen.xu                                                                          |
-| Spider-Agent (gpt4o-240806)  | 36/260        | 13.8  | Reproduced number of [the official repo](https://github.com/snowflakedb/snow-spider-agent) by @hao.zhang's lab                                                                    |
-| default-agent (gpt4o-240806) | 35/260        | 13.5  | [Default agent](/spider-agent-snow/spider_agent/agent/agents/__init__.py) in this repo (added `tree` in initial prompt to save a few steps; minor action name change)             |
-| snowpark-agent (gpt4o-240806) | 25/260        | 9.62  | [Snowpark agent](/spider-agent-snow/spider_agent/agent/agents/snowpark_agent.py) |
