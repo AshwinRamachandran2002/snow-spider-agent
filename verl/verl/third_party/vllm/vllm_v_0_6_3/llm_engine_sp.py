@@ -74,7 +74,7 @@ class SQLExecutor():
         self.calls_per_parent_seq_id = {}
         self.time_per_parent_seq_id = {}
 
-        self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]] # </exec_sql>
+        self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370], [522, 11748, 18063, 29]] # </exec_sql>
         self.start_token_ids = [[366, 11748, 18063, 397], [27, 11748, 18063, 397], [366, 11748, 18063, 29]]
         self.tokenizer = tokenizer_group.tokenizer
 
@@ -119,7 +119,7 @@ class SQLExecutor():
                     print(f"timed out time: {time.time() - start}")
                     return "Timed out"
                 
-                exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>\n"
+                exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>\n"
                 if self.logging:
                     with open(self.log_path, "a") as f:
                         f.write(f"executed below SQL with kwargs {kwargs}\n")
@@ -137,16 +137,19 @@ class SQLExecutor():
                     kwargs = self.initial_prompts[str(request_id)]
                     example_id = kwargs["example_id"]
                     start = time.time()
-                    exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_final_answer, **kwargs)
+
                     log = self.tokenizer.decode(completion).strip('\n')
                     file_name = f"{example_id}_{calculate_md5(log)}"
+                    exec_result = self.exec_func_sql(sql_string, save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
+                    
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
-                    with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), "w") as f:
-                        f.write(exec_result) 
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
                         f.write(log)
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
-                        f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
+                        if not os.path.exists(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv")):
+                            f.write('0')
+                        else:
+                            f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
                     return []
         if completion[-1] != self.tokenizer.eos_token_id:
             print(f"No match: {self.tokenizer.decode(completion)}")
@@ -321,8 +324,8 @@ class SQLExecutor():
                             }
                 elif completions[-1] == self.tokenizer.eos_token_id:
                     self.fetch_execution_result(completions, seq_id, final=True)
-                elif self.tokenizer.decode(completions[-4:]) == "</exec_sql>":
-                    print(f"Fatal err: {completions[-4:]} not in monitor")
+                elif self.tokenizer.decode(completions[-4:]).strip() == "</exec_sql>":
+                    print(f"Fatal err: {completions[-4:]} not in monitor, {self.tokenizer.decode(completions)}, ids: {completions}")
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
             if index not in seq_id_analyzed:

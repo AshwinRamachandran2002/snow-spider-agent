@@ -11,7 +11,8 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import threading
 import hashlib
 import time
-from concurrent.futures import TimeoutError
+import io
+import csv
 from multiprocessing import Process, Queue
 
 def hard_cut(str_e, length=0):
@@ -241,7 +242,6 @@ class SqlEnv:
                 print("cursor.description is None, no column metadata available.")
                 return "No column information available."
             columns = [desc[0] for desc in cursor.description]
-            df = pd.DataFrame(rows, columns=columns)
         except Exception as e:
             print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
             return str(e)
@@ -251,18 +251,25 @@ class SqlEnv:
             except Exception as e:
                 print("Failed to close cursor:", e)
 
-        if df.empty:
+        if not rows:
             return "No data found for the specified query.\n"
         else:
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            writer.writerows(rows)
+            csv_content = output.getvalue()
+            output.close()
             if save_path:
                 try:
-                    df.to_csv(f"{save_path}", index=False)
+                    with open(save_path, 'w', newline='') as f:
+                        f.write(csv_content)
                     return 0
                 except Exception as e:
                     print(str(e))
                     return str(e)
             else:
-                return hard_cut(df.to_csv(index=False), max_len)
+                return hard_cut(csv_content, max_len)
             
     # def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
     #     if sqlite_path not in self.conns.keys():
@@ -300,7 +307,7 @@ class SqlEnv:
                 result = q.get()
                 return result
             else:
-                return None
+                return "Error p dead"
 
     def __del__(self):
         self.close_db()
