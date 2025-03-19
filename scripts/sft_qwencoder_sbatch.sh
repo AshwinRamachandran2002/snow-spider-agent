@@ -23,7 +23,7 @@
 
 DATA_PATH="processed/bird_sft.jsonl.npy"
 PRETRAINED_MODEL="../../end2end/snow-spider-agent/models/Qwen2.5-Coder-7B-Instruct/"
-OUTPUT_DIR="../../func/models/Qwen2.5-Coder-7B-Instruct-bird-nomask"
+OUTPUT_DIR="../../func/models/Qwen2.5-Coder-7B-Instruct-bird-spec"
 
 GPUS_PER_NODE=$(python -c "import torch; print(torch.cuda.device_count());")
 MASTER_ADDR=${MASTER_ADDR:-localhost}
