@@ -1,11 +1,10 @@
 import os
 import pandas as pd
-import re
 from tqdm import tqdm
 import argparse
 import shutil
 import sqlite3
-from utils import remove_digits, is_file, matching_at_same_position
+from utils import remove_digits, is_file
 pd.set_option('display.max_colwidth', None)
 
 def process_ddl(ddl_file):
@@ -137,7 +136,7 @@ def get_sqlite_data(path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--example_folder', type=str, default="output/test")
+    parser.add_argument('--example_folder', type=str, default="examples")
     args = parser.parse_args()
     make_folder(args)
     compress_ddl(args.example_folder)

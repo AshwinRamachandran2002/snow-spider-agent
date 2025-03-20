@@ -33,8 +33,8 @@ def extract_all_blocks(main_content, code_format):
 
 def hard_cut(str_e, length=0):
     if length:
-        if len(str_e) > length and not str_e.startswith("Too long, hard cut"):
-            str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
+        if len(str_e) > length:
+            str_e = str_e[:int(length)]+"\n"
     return str_e
 
 def get_values_from_table(csv_data_str):
@@ -47,7 +47,7 @@ def search_file(directory, target_file):
             result.append(os.path.join(root, target_file))
     return result
 
-def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=1000000, sqlite_path=None):
+def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
     if api == "snowflake":
         # Load Snowflake credentials
         snowflake_credential = json.load(open("./snowflake_credential.json"))
@@ -144,68 +144,7 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=1000000,
             cursor.close()  # Close the cursor manually
             conn.close()    # Close the connection manually
     else:
-        raise NotImplementedError("Unsupported API\n")
-
-def split_cte(with_block):
-    i = 0
-    length = len(with_block)
-    cte_list = []
-
-    while i < length:
-        as_pos = with_block.find(" AS ", i)
-        if as_pos == -1:
-            break
-
-        j = as_pos + 3 
-        while j < length and with_block[j].isspace():
-            j += 1
-        
-        if j >= length or with_block[j] != '(':
-            i = j
-            continue
-        
-        cte_name_part = with_block[:as_pos].rstrip() 
-        comma_pos = cte_name_part.rfind(',')
-        if comma_pos != -1:
-            cte_name_part = cte_name_part[comma_pos+1:]
-        cte_name = cte_name_part.strip()
-
-        stack = []
-        stack.append('(')
-        start_sql_body = j + 1 
-        j += 1
-
-        while j < length and stack:
-            if with_block[j] == '(':
-                stack.append('(')
-            elif with_block[j] == ')':
-                stack.pop()
-            j += 1
-
-        cte_sql_body = with_block[start_sql_body : j-1].strip()
-
-        cte_list.append((cte_name, cte_sql_body))
-        i = j
-
-    cte_lists = []
-    for i in range(len(cte_list)):
-        concat = ' AS (\n'.join(cte_list[i])
-        cte_lists.append(concat)
-
-    step_queries = []
-    for i in range(1, len(cte_lists) + 1):
-        current_with = "), ".join(cte_lists[:i]) + ")"
-        cte_name = cte_list[i-1][0].strip("WITH ")
-        step_queries.append(f"{current_with}\nSELECT * FROM {cte_name};")
-        step_queries.append(f"{current_with}\nSELECT COUNT(*) AS total_rows FROM {cte_name};")
-
-    return step_queries
-
-def get_cte_info(ctes):
-    cte_info = "Here are results for each step of the query:\n"
-    for query in split_cte(ctes):
-        cte_info += "Query:\n" + query + "Results:\n" + hard_cut(execute_sql_api(query), 1000)
-    return cte_info
+        raise NotImplementedError("Unsupported API")
 
 def get_longest(sql_list):
     sql_list_len = [len(i) for i in sql_list]
@@ -335,3 +274,25 @@ def matching_at_same_position(s1, s2):
     min_length = min(len(s1), len(s2))
     matches = [s1[i] for i in range(min_length) if s1[i] == s2[i]]
     return "".join(matches)
+
+def get_dictionary(args):
+    json_path = os.path.join(args.test_path, f"spider2-{args.task}.jsonl")
+    task_dict = {}
+    with open(json_path) as f:
+        for line in f:
+            line_js = json.loads(line)
+            if args.task == "snow":
+                task_dict[line_js['instance_id']] = line_js['instruction']
+            elif args.task == "lite":
+                task_dict[line_js['instance_id']] = line_js['question']
+
+    dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
+    return dictionaries, task_dict
+
+def get_sqlite_path(args, sql_data):
+    sql_data_path = os.path.join(args.test_path, sql_data)
+    sqlite_path = None
+    for sqlite in os.listdir(sql_data_path):
+        if sqlite.endswith(".sqlite"):
+            sqlite_path = os.path.join(sql_data_path, sqlite)
+    return sqlite_path

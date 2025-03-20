@@ -1,12 +1,15 @@
 # ReFoRCE: A Text-to-SQL Agent with Self-Refinement, Format Restriction, and Column Exploration
 
-## Dependencies
+## Setup
 
+### Dependencies
 ```
 conda create -n sql python=3.10 -y
 conda activate sql
 pip install -r requirements.txt
 ```
+
+For folder `spider2-lite` and `spider2-snow`, get the latest version from [Spider2 repo](https://github.com/xlang-ai/Spider2).
 
 ## Spider2.0-snow
 
