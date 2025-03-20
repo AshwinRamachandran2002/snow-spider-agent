@@ -1,4 +1,4 @@
-from utils import execute_sql_api, hard_cut, get_values_from_table, search_file, get_api_name, get_table_info
+from utils import execute_sql_api, hard_cut, get_values_from_table, search_file, get_api_name, get_table_info, extract_all_marks, extract_numbered_sentences
 from reconstruct_data import remove_digits, compress_ddl
 import numpy as np
 import pandas as pd
@@ -8,91 +8,122 @@ import ast
 import re
 import csv
 from tqdm import tqdm
-
+import sys
 '''
 input: sqls
 output: results for each sql
 '''
-def execute_sql(sqls, chat_session, logger, api="snowflake", max_len=0, save_path=None, get_max=False, sqlite_path=None):
+def execute_sql(response_pre, chat_session, logger, ex_id, search_directory, api="snowflake", max_len=500, save_path=None, get_max=False, sqlite_path=None):
     result_dic = {}
     error_rec = []
-    while sqls:
-        sql = sqls[0]
-        sqls = sqls[1:]
+    aug_index = 0
+    while response_pre:
+        sql = response_pre[0]['sql']
+        task = response_pre[0]['task']
+        response_pre = response_pre[1:]
         check_again_flag = False
-        results = execute_sql_api(sql, save_path, api=api, max_len=max_len, sqlite_path=sqlite_path)
-        try:
-            if not results.startswith("Too long") and results != "No data found for the specified query.\n":
-                df_csv = StringIO(results)
-                df_csv = pd.read_csv(df_csv).fillna(0)
-                if ((df_csv == 0) | (df_csv == "")).all().any():
-                    check_again_flag = True
-        except:
-            pass
+        logger.info("[Try to run SQL]\n"+sql+"\n[Try to run SQL]")
+        results = execute_sql_api(sql, save_path, api=api, max_len=1000, sqlite_path=sqlite_path)
+        # try:
+        #     if not results.startswith("Too long") and results != "No data found for the specified query.\n":
+        #         df_csv = StringIO(results)
+        #         df_csv = pd.read_csv(df_csv).fillna(0)
+        #         if ((df_csv == 0) | (df_csv == "")).all().any():
+        #             check_again_flag = True
+        # except:
+        #     pass
         if isinstance(results, str) and results != "No data found for the specified query.\n" and not check_again_flag:
             # results = hard_cut(results, max_len)
             result_dic[sql] = results
-            chat_session.messages.append({"role": "user", "content": f"SQL:\n{sql}\nResults:\n{results}"})
-            logger.info(chat_session.messages[-1]['content'])
+            chat_session.messages.append({"role": "user", "content": results})
+            logger.info("[Successfully Generated]\n"+hard_cut(chat_session.messages[-1]['content'], max_len)+"\n[Successfully Generated]")
+            if "Too long" not in results:
+                with open(os.path.join(search_directory, ex_id + f"_aug{aug_index}.txt"), "w") as f:
+                    f.write(task)
+                with open(os.path.join(search_directory, ex_id + f"_aug{aug_index}.sql"), "w") as f:
+                    f.write(sql)
+                with open(os.path.join(search_directory, ex_id + f"_aug{aug_index}.csv"), "w") as f:
+                    f.write(results)
+                aug_index += 1
         else:
-            # print(f"Solving err: {results}")
+            logger.info("[Issue occurred]\n"+str(results)+"\n[Issue occurred]")
+            print(f"{ex_id}: Solving err: {results}")
             max_iter = 3
             simplify = False
             corrected_sql = None
-            while not isinstance(results, str) or results == "No data found for the specified query.\n" or check_again_flag:
-                if max_iter == 0:
-                    break
+            while max_iter > 0 and (not isinstance(results, str) or results == "No data found for the specified query.\n"):
                 if results == "No data found for the specified query.\n":
                     simplify = True
-                corrected_sql, chat_session = self_correct(sql, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
+                corrected_sql, response_tasks, chat_session = self_correct(sql, task, results, chat_session, logger, max_len=max_len, simplify=simplify, check_again_flag=check_again_flag)
                 check_again_flag = False
-                if not isinstance(corrected_sql, list) or corrected_sql == []:
-                    results = "Empty. No data found for the specified query.\n"
-                    break
+                if not isinstance(corrected_sql, list) or corrected_sql == [] or len(corrected_sql) > 1 or len(response_tasks) != len(corrected_sql):
+                    max_iter -= 1 
+                    continue
                 corrected_sql = corrected_sql[0]
-                results = execute_sql_api(corrected_sql, api=api, max_len=max_len, sqlite_path=sqlite_path)
+                results = execute_sql_api(corrected_sql, api=api, max_len=5000, sqlite_path=sqlite_path)
+                logger.info("[Results for corrected]\n"+str(results)+"\n[Results for corrected]")
+
                 max_iter -= 1
                 simplify = False
-            if isinstance(results, str) and results != "No data found for the specified query.\n":
-                # print("Corrected.\n")
-                error_rec.append(1)
-                response = chat_session.get_model_response(f"Please correct other sqls if they have similar errors: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
-                if isinstance(corrected_sql, list) and corrected_sql != []:
-                    response_sql = []
-                    for s in response:
-                        try:
-                            queries = [query.strip() for query in s.strip().split(';') if query.strip()]
-                            response_sql += queries
-                        except:
-                            pass
-                    if len(response_sql) >= len(sqls):
-                        sqls = response_sql
-            else:
-                # print("Max iter, failed to correct.\n")
-                error_rec.append(0)
-                results = str(results) if not isinstance(results, str) else results
-            if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
-                return result_dic, chat_session
-            if not corrected_sql:
-                # print(f"Results: {results}")
-                # print("No corrected_sql, skip")
+            if max_iter == 0:
                 continue
+            if "Too long" not in results:
+                with open(os.path.join(search_directory, ex_id + f"_aug{aug_index}.txt"), "w") as f:
+                    f.write(response_tasks[0])
+                with open(os.path.join(search_directory, ex_id + f"_aug{aug_index}.sql"), "w") as f:
+                    f.write(corrected_sql)
+                with open(os.path.join(search_directory, ex_id + f"_aug{aug_index}.csv"), "w") as f:
+                    f.write(results)
+                aug_index += 1
+            cause = chat_session.get_model_response_txt("The error is corrected. Please conclude all possible causes to this error in only one sentence. Don't output any SQL query.")
+            logger.info("[Cause]\n"+str(cause)+"\n[Cause]")
+            if isinstance(results, str) and results != "No data found for the specified query.\n":
+                error_rec.append(1)
+                response_sql = chat_session.get_model_response(f"Now we corrected the SQL. The reason for the error is stated in the thinking process above. Here are sqls having similar errors. Please correct them one by one by checking: {cause}. Other sqls and their description: {response_pre}. For each SQL, answer in Format like: 1. (description...in one sentence)\n```sql\n```\n2. (description...in one sentence)\n```sql\n```.\n Don't output other things.", "sql")
+                logger.info("[Generated Corrected SQLs]\n"+chat_session.messages[-1]['content']+"\n[Generated Corrected SQLs]")
+                response_pre_txt = chat_session.messages[-1]['content']
+                response_tasks = extract_numbered_sentences(response_pre_txt)
+                if len(response_sql) != len(response_tasks):
+                    response_sql = chat_session.get_model_response("Task and SQL should be matched in Format like: 1. (description...in one sentence)\n```sql\n```\n2. (description...in one sentence)\n```sql\n```.\n Don't output other things.", "sql")
+                    logger.info("[Generated Corrected SQLs Again]\n"+chat_session.messages[-1]['content']+"\n[Generated Corrected SQLs Again]")
+                    response_pre_txt = chat_session.messages[-1]['content']
+                    response_tasks = extract_numbered_sentences(response_pre_txt)
+                assert len(response_sql) == len(response_tasks), f"{ex_id} length not matched"
+                response_cor = []
+                for i in range(len(response_sql)):
+                    response_dic = {}
+                    response_dic['sql'] = response_sql[i]
+                    response_dic['task'] = response_tasks[i]
+                    response_cor.append(response_dic)
+                if isinstance(corrected_sql, str):
+                    if len(response_cor) == len(response_pre):
+                        response_pre = response_cor
+                    else:
+                        break
             result_dic[corrected_sql] = results
             chat_session.messages.append({"role": "user", "content": f"SQL:\n{corrected_sql}\nResults:\n{results}"})
-            logger.info(chat_session.messages[-1]['content'])
+            
+            # logger.info(chat_session.messages[-1]['content'])
     if get_max:
         return max(result_dic.keys(), key=len)
     return result_dic, chat_session
 
-def self_correct(sql, error, chat_session, logger, max_len=0, simplify=False, check_again_flag=False):
-    prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease correct it based on previous context and output only one sql query in ```sql``` format. Don't just analyze without SQL or output several SQLs.\n"
+def self_correct(sql, task, error, chat_session, logger, max_len=500, simplify=False, check_again_flag=False):
+    prompt = f"Input sql:\n{sql}\nDescription: {task}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease think and correct it based on previous context and output in the Format like: (description...in one sentence)\n```sql\n```. Shoule match the index number in the original description. Don't just analyze without SQL or output SQLs more than 1.\n"
     if simplify:
-        prompt += "Since the output is empty, please simplify some conditions of the past sql.\n"
+        prompt += "Since the output is empty, please adjuest some conditions of the past sql also also modify the description.\n"
     if check_again_flag:
         prompt += "Some columns are empty values. Please check it again.\n"
     response = chat_session.get_model_response(prompt, "sql")
-    logger.info(chat_session.messages[-1]['content'])
-    return response, chat_session
+    response_pre_txt = '0'+chat_session.messages[-1]['content']
+    response_tasks = extract_numbered_sentences(response_pre_txt)
+    if not isinstance(response, str) or len(response) > 1:
+        response = chat_session.get_model_response("Please generate only one SQL with description.", "sql")
+        response_pre_txt = chat_session.messages[-1]['content']
+        response_pre_txt = '0'+chat_session.messages[-1]['content']
+        response_tasks = extract_numbered_sentences(response_pre_txt)
+    logger.info("[Corrected SQL]\n"+chat_session.messages[-1]['content']+"\n[Corrected SQL]")
+    return response, response_tasks, chat_session
 
 def format_answer(prompt_class, table_info, task, chat_session):
     format_prompt = "This is an SQL task. Please provide the simplest possible answer format in ```csv``` format like a table and include a brief explanation.\n"
@@ -131,41 +162,58 @@ def format_answer(prompt_class, table_info, task, chat_session):
     response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
     return response_csv, chat_session
 
-def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, api="snowflake", sqlite_path=None):
+def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o, ex_id, search_directory, api="snowflake", sqlite_path=None, answer=None):
     pre_info = ''
     ans_pre = prompt
     while LIMIT > 0:
 
-        ans_pre += f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 {api} SQL queries for simple to complex ones like {prompt_all.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
-        ans_pre += "Each query should be different. Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. Try to use DISTINCT. For each SQL LIMIT 100 rows.\n"
-
-        ans_pre += prompt_all.get_prompt_dialect_nested(api)
+        ans_pre += f"The answer to the task is: {answer}. Based on this, Write at least 10 {api} more complex SQL queries like {prompt_all.get_prompt_dialect_basic(api)} in ```sql``` format. You can use any information in the database provided.\n"
+        ans_pre += "Each query should be different. You can write SELECT query only. \n"
+        ans_pre += "For each query, just write one sentence to describe the task. Format like: 1. (description...in one sentence)\n```sql\n```\n2. (description...in one sentence)\n```sql\n```.\n Don't output other things.\n" 
+        # ans_pre += prompt_all.get_prompt_dialect_nested(api)
                 
-        ans_pre += prompt_all.get_prompt_convert_symbols()
+        # ans_pre += prompt_all.get_prompt_convert_symbols()
         
-        ans_pre += prompt_all.get_prompt_dialect_string_matching(api)
+        # ans_pre += prompt_all.get_prompt_dialect_string_matching(api)
         
-        ans_pre += "For time-related queries, given the variety of formats, avoid using time converting functions unless you are certain of the specific format being used.\n"
+        # ans_pre += "For time-related queries, given the variety of formats, avoid using time converting functions unless you are certain of the specific format being used.\n"
         
-        ans_pre += "When generating SQLs, be aware of quotation matching: 'Vegetarian\"; You sometimes match \' with \" which may cause an error.\n"
+        # ans_pre += "When generating SQLs, be aware of quotation matching: 'Vegetarian\"; You sometimes match \' with \" which may cause an error.\n"
 
-        ans_pre += f"You can only use tables in {table_struct}"
+        # ans_pre += f"You can only use tables in {table_struct}"
         
-        ans_pre += prompt_all.get_prompt_knowledge()
+        # ans_pre += prompt_all.get_prompt_knowledge()
 
-        response_pre = chat_session4o.get_model_response(ans_pre, "sql")
+        response_sql = chat_session4o.get_model_response(ans_pre, "sql")
+        logger.info("[Generated SQLs]\n"+chat_session4o.messages[-1]['content']+"\n[Generated SQLs]")
         response_pre_txt = chat_session4o.messages[-1]['content']
+        response_tasks = extract_numbered_sentences(response_pre_txt)
+        if len(response_sql) != len(response_tasks):
+            response_sql = chat_session4o.get_model_response("Task and SQL should be matched in Format like: 1. (description...in one sentence)\n```sql\n```\n2. (description...in one sentence)\n```sql\n```.\n Don't output other things.", "sql")
+            logger.info("[Generated SQLs Again]\n"+chat_session4o.messages[-1]['content']+"\n[Generated SQLs Again]")
+            response_pre_txt = chat_session4o.messages[-1]['content']
+            response_tasks = extract_numbered_sentences(response_pre_txt)
+        if len(response_sql) != len(response_tasks):
+            break
+        response_pre = []
+        for i in range(len(response_sql)):
+            response_dic = {}
+            response_dic['sql'] = response_sql[i]
+            response_dic['task'] = response_tasks[i]
+            response_pre.append(response_dic)
         if not isinstance(response_pre, list):
             LIMIT -= 5
             continue
-        if len(response_pre) == 1:
-            response_pre = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
-        if len(response_pre) < 10:
+
+        if len(response_pre) < 5:
             ans_pre = prompt
             LIMIT -= 5
-            print("Few sqls, retry preparation.")
+            print(f"{ex_id}: Few sqls, retry preparation.")
             continue
-        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, api=api, max_len=5000, sqlite_path=sqlite_path)
+
+        results_pre_dic, chat_session4o = execute_sql(response_pre, chat_session4o, logger, ex_id, search_directory, api=api, max_len=500, sqlite_path=sqlite_path)
+        if results_pre_dic == "err during correction":
+            return "err during correction", response_pre_txt, LIMIT, chat_session4o
         sql_count = 0
         for key, value in results_pre_dic.items():
             pre_info += "Query:\n" + key + "\nAnswer:\n" + str(value)
@@ -173,14 +221,14 @@ def preparation(prompt, LIMIT, prompt_all, table_struct, logger, chat_session4o,
                 sql_count += 1
 
         if sql_count < len(response_pre) // 2:
-            print(f"sql_count: {sql_count}, len(response_pre): {len(response_pre)}. Inadequate preparation, retry preparation.\n")
+            print(f"{ex_id}: sql_count: {sql_count}, len(response_pre): {len(response_pre)}. Inadequate preparation, retry preparation.\n")
             pre_info = ''
             LIMIT -= 10
             continue
 
         if len(pre_info) < 1e5:
             break
-        print("Too long, retry preparation.")
+        print(f"{ex_id}: Too long, retry preparation.")
         pre_info = ''
         LIMIT -= 5
     return pre_info, response_pre_txt, LIMIT, chat_session4o
@@ -226,34 +274,34 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
     results_tables = []
     complete_save_path = search_directory + "/" + save_path
     complete_save_path_sql = search_directory + "/" + sql_save_path
-    e += "Task: " + task + "\n"+f'\nPlease answer only one complete SQL in {api} dialect in ```sql``` format.\n'
+    e += "Task: " + task + "\n"+f'\nPlease think based on the information provided and answer thinking process first and then with only one complete SQL in {api} dialect in ```sql``` format. Don\'t output SQLs more than one. Format like: 1. (description...in one sentence)\n```sql\n```\n2. (description...in one sentence)\n```sql\n```.\n Don\'t output other things.\n'
     e += f'Usage example: {prompt_all.get_prompt_dialect_basic(api)}\n'
-    e += f"Follow the answer format like: {response_csv}.\n"
-    e += "Here are some useful tips for answering:\n"
+    # e += f"Follow the answer format like: {response_csv}.\n"
+    # e += "Here are some useful tips for answering:\n"
     
-    e += prompt_all.get_prompt_dialect_list_all_tables(table_struct, api)
-    e += prompt_all.get_prompt_fuzzy_query()
+    # e += prompt_all.get_prompt_dialect_list_all_tables(table_struct, api)
+    # e += prompt_all.get_prompt_fuzzy_query()
 
-    if api == "snowflake":
-        e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
-    e += "When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion."
+    # if api == "snowflake":
+    #     e += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
+    # e += "When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion."
 
-    e += prompt_all.get_prompt_decimal_places()
+    # e += prompt_all.get_prompt_decimal_places()
 
-    if "> 0" in response_csv:
-        e += "You need to follow the format's positive signs.\n"
+    # if "> 0" in response_csv:
+    #     e += "You need to follow the format's positive signs.\n"
 
-    # Specific prompts
-    e += "Be careful of information in nested columns. e.g. When it comes to completed purchase, `hits.eCommerceAction.action_type` Indicates the type of ecommerce action and '6' represents completed purchases.\n"
-    e += "Be careful one country may have different country_name and country_region in different columns in a database.\n"
-    e += "Don't be misled by examples. For instance, a question related to Android development on StackOverflow might include tags like 'android-layout,' 'android-activity,' or 'android-intent.' However, you should not limit your analysis to just these three tags; instead, consider all tags related to Android: \"tags\" LIKE '%android%'.\n"
+    # # Specific prompts
+    # e += "Be careful of information in nested columns. e.g. When it comes to completed purchase, `hits.eCommerceAction.action_type` Indicates the type of ecommerce action and '6' represents completed purchases.\n"
+    # e += "Be careful one country may have different country_name and country_region in different columns in a database.\n"
+    # e += "Don't be misled by examples. For instance, a question related to Android development on StackOverflow might include tags like 'android-layout,' 'android-activity,' or 'android-intent.' However, you should not limit your analysis to just these three tags; instead, consider all tags related to Android: \"tags\" LIKE '%android%'.\n"
     # self-refine
     error_rec = []
     while itercount < args.max_iter:
         logger.info(f"itercount: {itercount}")
-        logger.info(e)
+        # logger.info(e)
         if e == 0:
-            e = f"Please check the answer again by reviewing {task}, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.\n" 
+            e = f"Please check the answer again by reviewing {task}, reviewing Relevant Tables and Columns and Possible Conditions and then write the thinking process and output the final SQL.\n" 
             e += prompt_all.get_prompt_decimal_places()
             e += f"The answer format should be like: {response_csv} The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!\n"
             e += "Current snswer: \n"
@@ -276,21 +324,22 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 df_csv_copy[col] = df_csv[col].round(2)
             df_csv_copy_sorted = df_csv_copy.sort_values(by=df_csv_copy.columns[0])
             csv_data_str_round2 = df_csv_copy_sorted.to_string()
-            if get_values_from_table(csv_data_str_round2) not in results_values:
-                if nested_val:
-                    e += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\nA,\n B\n]' to 'A, B'.\n"
-                elif not ((df_csv == 0) | (df_csv == "")).all().any():
-                    # if len(format_csv.split('\n')) == len(csv_data_str.split('\n')):
-                        results_values.append(get_values_from_table(csv_data_str_round2))
-                        results_tables.append(csv_data_str)
-                else:
-                    empty_columns = df_csv.columns[((df_csv == 0) | (df_csv == "")).all()].to_list()
-                    e += f"Empty results in Column {empty_columns}. Please correct them.\n"
-            else:
-                with open(complete_save_path_sql, "w") as f:
-                    f.write(response)
-                break
-            logger.info(f"results: \n{csv_data_str}\n")
+            # if get_values_from_table(csv_data_str_round2) not in results_values:
+            #     if nested_val:
+            #         e += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\nA,\n B\n]' to 'A, B'.\n"
+            #     elif not ((df_csv == 0) | (df_csv == "")).all().any():
+            #         # if len(format_csv.split('\n')) == len(csv_data_str.split('\n')):
+            #             results_values.append(get_values_from_table(csv_data_str_round2))
+            #             results_tables.append(csv_data_str)
+            #     else:
+            #         empty_columns = df_csv.columns[((df_csv == 0) | (df_csv == "")).all()].to_list()
+            #         e += f"Empty results in Column {empty_columns}. Please correct them.\n"
+            # else:
+            #     with open(complete_save_path_sql, "w") as f:
+            #         f.write(response)
+            #     break
+
+            logger.info(f"[Executed csv]\n{csv_data_str}\n[Executed csv]")
             if args.save_all_results:
                 save_path = save_path[:-4] + str(itercount) + save_path[-4:]
         if not isinstance(e, str):
@@ -314,23 +363,28 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 e += prompt_all.get_prompt_percentage_shown()
             if "GENERATOR" in response and api == "snowflake":
                 e += prompt_all.get_prompt_generator()
-            if "> 0" in response_csv:
-                e += "You need to follow the format's positive signs.\n"
-            logger.info(e)
+            # if "> 0" in (response_csv):
+            #     e += "You need to follow the format's positive signs.\n"
+            # logger.info(e)
         response = chat_session.get_model_response(e, "sql")
-        logger.info(chat_session.messages[-1]['content'])
+        if itercount == 0:
+            logger.info("[Try to run SQL]\n"+chat_session.messages[-1]['content']+"\n[Try to run SQL]")
+        else:
+            logger.info("[Final answer]\n"+chat_session.messages[-1]['content']+"\n[Final answer]")
         if not isinstance(response, list) or response == []:
-            logger.info(response)
-            logger.info(chat_session.messages[-1]['content'])
+            # logger.info(response)
+            
             if os.path.exists(complete_save_path):
                 os.remove(complete_save_path)
             break
         
         elif len(response) > 0:
-            response_len = [len(i) for i in response]
-            response_index = response_len.index(max(response_len))
-            response = response[response_index]
-            e = execute_sql_api(response, complete_save_path, api=api, max_len=1000000, sqlite_path=sqlite_path)
+            if len(response) > 1:
+                break
+            response = response[0]
+            e = execute_sql_api(response, complete_save_path, api=api, max_len=500, sqlite_path=sqlite_path)
+            if e != 0 and itercount == 1:
+                logger.info(f"[Executed csv]\n{e}\n[Executed csv]")
         itercount += 1
         error_rec.append(e)
         if len(error_rec) > 3:
@@ -341,7 +395,10 @@ def self_refine(args, logger, task, prompt_all, response_csv, search_directory, 
                 break
 
     logger.info(f"Total iteration counts: {itercount}")
-    if itercount == args.max_iter and not args.save_all_results:
-        if os.path.exists(complete_save_path):
-            os.remove(complete_save_path)
-        print("Max Iter, remove file")
+    if isinstance(response, str):
+        with open(complete_save_path_sql, "w") as f:
+            f.write(response)
+    # if itercount == args.max_iter and not args.save_all_results:
+    #     if os.path.exists(complete_save_path):
+    #         os.remove(complete_save_path)
+    #     print("Max Iter, remove file")

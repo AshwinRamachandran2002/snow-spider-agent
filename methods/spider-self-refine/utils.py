@@ -218,12 +218,11 @@ def get_shortest(sql_list):
     return sql_list[sql_list_len_index]
 
 def initialize_logger(log_path):
-    logger = logging.getLogger()
+    logger = logging.Logger(log_path)
     logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(log_path, mode='w')
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     file_handler.setFormatter(formatter)
-    logger.handlers.clear()
     logger.addHandler(file_handler)
     return logger
 
@@ -335,3 +334,41 @@ def matching_at_same_position(s1, s2):
     min_length = min(len(s1), len(s2))
     matches = [s1[i] for i in range(min_length) if s1[i] == s2[i]]
     return "".join(matches)
+    
+def extract_all_marks(text, marker):
+    results = []
+    marker_len = len(marker)
+    start_index = 0
+
+    while True:
+        start = text.find(marker, start_index)
+        if start == -1:
+            break
+        end = text.find(marker, start + marker_len)
+        if end == -1:
+            break
+        content = text[start:end]
+        results.append({start: content})
+        start_index = end + marker_len
+
+    return results
+
+def trim_non_letters(s):
+    """
+    去除字符串首尾非字母字符
+    """
+    return re.sub(r'^[^A-Za-z]+|[^A-Za-z]+$', '', s)
+
+def extract_numbered_sentences(text):
+    """
+    提取形如 "数字. 内容\n" 的句子
+    """
+    # 这里使用正则表达式：
+    # \d+ 匹配一个或多个数字
+    # \. 匹配点号
+    # \s* 匹配任意空白字符（包括空格、制表符等）
+    # (.*?) 非贪婪方式匹配句子内容，直到遇到换行符
+    # \n 匹配换行符
+    pattern = r'\d+\.\s*(.*?)\n'
+    # findall 返回所有匹配的分组内容
+    return re.findall(pattern, text)
