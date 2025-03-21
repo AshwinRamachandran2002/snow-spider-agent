@@ -10,9 +10,10 @@ from prompt import Prompts
 from typing import Type
 from tqdm import tqdm
 from chat import GPTChat
+csv.field_size_limit(500000)
 
 class REFORCE:
-    def __init__(self, args, sql_data, search_directory, prompt_class: Type[Prompts]):
+    def __init__(self, args, sql_data, search_directory, prompt_class: Type[Prompts], sql_env: Type[SqlEnv]=None, chat_session_pre: Type[GPTChat]=None, chat_session: Type[GPTChat]=None, log_save_path=None):
         self.csv_save_name = "result.csv"
         self.sql_save_name = "result.sql"
         self.log_save_name = "log.log"
@@ -22,17 +23,23 @@ class REFORCE:
         self.api = get_api_name(sql_data)
         self.sqlite_path = get_sqlite_path(args, sql_data)
 
-        self.sql_id = sql_data
+        self.sql_id = log_save_path
 
         self.complete_csv_save_path = os.path.join(search_directory, self.csv_save_name)
         self.complete_sql_save_path = os.path.join(search_directory, self.sql_save_name)
+        self.complete_log_save_path = os.path.join(search_directory, self.log_save_name)
         self.complete_vote_log_path = os.path.join(search_directory, self.log_vote_name)
 
         self.prompt_class = prompt_class
         self.max_try = 3
         self.csv_max_len = 500
 
-    def execute_sqls(self, sqls, chat_session: Type[GPTChat], logger, sql_env: Type[SqlEnv]):
+        self.sql_env = sql_env
+        self.chat_session_pre = chat_session_pre
+        self.chat_session = chat_session
+
+
+    def execute_sqls(self, sqls, logger):
         result_dic_list = []
         error_rec = []
         causes = ''
@@ -42,7 +49,7 @@ class REFORCE:
             sqls = sqls[1:]
             check_again_flag = False
             logger.info("[Try to execute]\n" + sql + "\n[Try to execute]")
-            results = sql_env.execute_sql_api(sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
+            results = self.sql_env.execute_sql_api(sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
             try:
                 # Check null values
                 if results != self.empty_result:
@@ -55,8 +62,8 @@ class REFORCE:
             if isinstance(results, str) and results != self.empty_result and not check_again_flag:
                 result_dic['sql'] = sql
                 result_dic['res'] = results
-                chat_session.messages.append({"role": "user", "content": f"Successfully executed. SQL:\n{sql}\nResults:\n{results}"})
-                logger.info("[Successfully executed]\n" + chat_session.messages[-1]['content'] + "\n[Successfully executed]")
+                self.chat_session_pre.messages.append({"role": "user", "content": f"Successfully executed. SQL:\n{sql}\nResults:\n{results}"})
+                logger.info("[Successfully executed]\n" + self.chat_session_pre.messages[-1]['content'] + "\n[Successfully executed]")
                 result_dic_list.append(result_dic)
             else:
                 logger.info("[Error occurred]\n" + str(results) + "\n[Error occurred]")
@@ -68,23 +75,23 @@ class REFORCE:
                         break
                     if results == self.empty_result:
                         simplify = True
-                    corrected_sql, chat_session = self.self_correct(sql, results, chat_session, logger, simplify=simplify, check_again_flag=check_again_flag)
+                    corrected_sql = self.self_correct(sql, results, logger, simplify=simplify, check_again_flag=check_again_flag)
                     check_again_flag = False
-                    if not isinstance(corrected_sql, list) or len(corrected_sql) != 1:
-                        print(f"{self.sql_id}: Not a valid SQL.\n")
+                    if not isinstance(corrected_sql, list) or len(corrected_sql) < 1:
+                        print(f"{self.sql_id}: Not a valid SQL: {corrected_sql}")
                         continue
-                    corrected_sql = corrected_sql[0]
-                    results = sql_env.execute_sql_api(corrected_sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
+                    corrected_sql = max(corrected_sql, key=len)
+                    results = self.sql_env.execute_sql_api(corrected_sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
                     logger.info("[Results for corrected sql]\n"+str(results)+"\n[Results for corrected sql]")
                     max_try -= 1
                     simplify = False
 
-                # cause = chat_session.get_model_response_txt("The error is corrected. Please conclude all possible causes to this error in only one sentence. Don't output any SQL query.")
+                # cause = self.chat_session_pre.get_model_response_txt("The error is corrected. Please conclude all possible causes to this error in only one sentence. Don't output any SQL query.")
                 # causes += cause
                 # logger.info("[Cause]\n"+str(cause)+"\n[Cause]")
                 if isinstance(results, str) and results != self.empty_result:
                     error_rec.append(1)
-                    response = chat_session.get_model_response(f"SQL {corrected_sql} is correct now. Please correct other sqls if they have similar errors. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
+                    response = self.chat_session_pre.get_model_response(f"SQL {corrected_sql} is correct now. Please correct other sqls if they have similar errors. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
                     if isinstance(corrected_sql, list) and corrected_sql != []:
                         response_sqls = []
                         for s in response:
@@ -95,51 +102,52 @@ class REFORCE:
                                 pass
                         if len(response_sqls) >= len(sqls):
                             sqls = response_sqls
-                            logger.info("[Corrected other sqls]\n"+chat_session.messages[-1]['content']+"\n[Corrected other sqls]")
+                            logger.info("[Corrected other sqls]\n"+self.chat_session_pre.messages[-1]['content']+"\n[Corrected other sqls]")
                 else:
                     error_rec.append(0)
                     results = str(results)
+                    continue
                 # Many times error, return
                 if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
-                    return result_dic_list, chat_session
+                    return result_dic_list
                 if not corrected_sql:
                     continue
                 result_dic['sql'] = corrected_sql
                 result_dic['res'] = results
-                chat_session.messages.append({"role": "user", "content": f"Successfully corrected. SQL:\n{corrected_sql}\nResults:\n{results}"})
-                logger.info("[Successfully corrected]\n" + chat_session.messages[-1]['content'] + "\n[Successfully corrected]")
-        return result_dic_list, chat_session, causes, sql_env
+                self.chat_session_pre.messages.append({"role": "user", "content": f"Successfully corrected. SQL:\n{corrected_sql}\nResults:\n{results}"})
+                logger.info("[Successfully corrected]\n" + self.chat_session_pre.messages[-1]['content'] + "\n[Successfully corrected]")
+        return result_dic_list
 
-    def self_correct(self, sql, error, chat_session: Type[GPTChat], logger, simplify=False, check_again_flag=False):
-        prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease correct it based on previous context and output the thinking process with only one sql query in ```sql``` format. Don't just analyze without SQL or output several SQLs.\n"
+    def self_correct(self, sql, error, logger, simplify=False, check_again_flag=False):
+        prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) + "\nPlease correct it based on previous context and output the thinking process with only one sql query in ```sql``` format. Don't just analyze without SQL or output several SQLs.\n"
         if simplify:
             prompt += "Since the output is empty, please simplify some conditions of the past sql.\n"
         if check_again_flag:
             prompt += "Some columns are empty values. Please check it again.\n"
-        response = chat_session.get_model_response(prompt, "sql")
+        response = self.chat_session_pre.get_model_response(prompt, "sql")
 
         max_try = self.max_try
         while max_try > 0 and (not isinstance(response, str) or len(response) > 1):
-            response = chat_session.get_model_response("Please generate only one SQL with thinking process.", "sql")
+            response = self.chat_session_pre.get_model_response("Please generate only one SQL with thinking process.", "sql")
             max_try -= 1
-        logger.info("[Corrected SQL]\n" + chat_session.messages[-1]['content'] + "\n[Corrected SQL]")
-        return response, chat_session
+        logger.info("[Corrected SQL]\n" + self.chat_session_pre.messages[-1]['content'] + "\n[Corrected SQL]")
+        return response
 
-    def format_answer(self, table_info, task, chat_session: Type[GPTChat]):
+    def format_answer(self, task, chat_session: Type[GPTChat]):
         format_prompt = self.prompt_class.get_format_prompt()
-        response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
+        response_csv = chat_session.get_model_response_txt("Task: " + task + format_prompt)
         return response_csv, chat_session
 
-    def exploration(self, task, table_struct, logger, chat_session: Type[GPTChat], sql_env: Type[SqlEnv]):
+    def exploration(self, task, table_struct, table_info, logger):
         pre_info = ''
-        task = "Task: " + task + "\n"
+        task = table_info + "\nTask: " + task + "\n"
         max_try = self.max_try
         causes = None
         while max_try > 0:
             exploration_prompt = task + self.prompt_class.get_exploration_prompt(self.api, table_struct)
 
-            response_pre = chat_session.get_model_response(exploration_prompt, "sql")
-            response_pre_txt = chat_session.messages[-1]['content']
+            response_pre = self.chat_session_pre.get_model_response(exploration_prompt, "sql")
+            response_pre_txt = self.chat_session_pre.messages[-1]['content']
             logger.info("[Exploration]\n" + response_pre_txt + "\n[Exploration]")
             if not isinstance(response_pre, list):
                 max_try -= 1
@@ -151,7 +159,7 @@ class REFORCE:
                 max_try -= 1
                 print(f"{self.sql_id}: Few sqls, retry preparation.")
                 continue
-            results_pre_dic_list, chat_session, causes, sql_env = self.execute_sqls(response_pre, chat_session, logger, sql_env)
+            results_pre_dic_list = self.execute_sqls(response_pre, logger)
             sql_count = 0
             for dic in results_pre_dic_list:
                 pre_info += "Query:\n" + dic['sql'] + "\nAnswer:\n" + str(dic['res'])
@@ -159,10 +167,10 @@ class REFORCE:
                     sql_count += 1
 
             if sql_count < len(response_pre) // 2:
-                print(f"{self.sql_id}: sql_count: {sql_count}, len(response_pre): {len(response_pre)}. Inadequate preparation, retry preparation.")
+                print(f"{self.sql_id}: sql_count: {sql_count}, len(response_pre): {len(response_pre)}. Inadequate preparation, break.")
                 pre_info = ''
                 max_try -= 1
-                continue
+                break
 
             if len(pre_info) < 1e5:
                 break
@@ -171,9 +179,9 @@ class REFORCE:
             max_try -= 1
         # if causes:
         #     pre_info += f"Pay attention to:\n{causes}"
-        return pre_info, response_pre_txt, max_try, chat_session, sql_env
+        return pre_info, response_pre_txt, max_try
 
-    def self_refine(self, args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, chat_session: Type[GPTChat], csv_save_path, sql_save_path, sql_env: Type[SqlEnv]):
+    def self_refine(self, args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, csv_save_path, sql_save_path):
         itercount = 0
         results_values = []
         results_tables = []
@@ -187,7 +195,7 @@ class REFORCE:
             
             max_try = self.max_try
             while max_try > 0:
-                response = chat_session.get_model_response(self_refine_prompt, "sql")
+                response = self.chat_session.get_model_response(self_refine_prompt, "sql")
                 if not isinstance(response, list) or len(response) != 1:
                     self_refine_prompt = "Please output one SQL only."
                 else:
@@ -198,9 +206,9 @@ class REFORCE:
                     os.remove(csv_save_path)
                 print(f"{self.sql_id}: Error when generating final SQL.")
                 break
-            logger.info("[Try to run SQL in self-refine]\n" + chat_session.messages[-1]['content'] + "\n[Try to run SQL in self-refine]")
+            logger.info("[Try to run SQL in self-refine]\n" +self. chat_session.messages[-1]['content'] + "\n[Try to run SQL in self-refine]")
             response = response[0]
-            executed_result = sql_env.execute_sql_api(response, self.sql_id, csv_save_path, api=self.api, sqlite_path=self.sqlite_path)
+            executed_result = self.sql_env.execute_sql_api(response, self.sql_id, csv_save_path, api=self.api, sqlite_path=self.sqlite_path)
             error_rec.append(executed_result)
             if len(error_rec) > 3:
                 # Eraly stop for repeatitive empty results
@@ -265,12 +273,13 @@ class REFORCE:
             if os.path.exists(csv_save_path):
                 os.remove(csv_save_path)
             logger.info("Max Iter, remove file")
-        return chat_session, sql_env
+        print(f"{self.sql_id}: chat_session len: {self.chat_session.get_message_len()}")
 
-    def vote_result(self, search_directory, task, chat_session: Type[GPTChat]):
+    
+    def vote_result(self, search_directory, task, chat_session: Type[GPTChat], sql_paths, table_info):
         
 
-        pre_info = 'Based on some observations on the database:\n'
+        pre_info = f'Based on database info:\n{table_info}'
         prompt = f"The task is: {task}. Here are some candidate sqls and answers: \n"
         count = 0
 
@@ -310,7 +319,7 @@ class REFORCE:
                     prompt += hard_cut(f.read(), 5000)
 
         if count == 0:
-            print("Empty\n")
+            print(f"{logfile_path} Empty")
             return
         elif count == 1:
             os.rename(sql_path_exist, self.complete_sql_save_path)
@@ -321,12 +330,12 @@ class REFORCE:
             response = chat_session.get_model_response(hard_cut(pre_info, 150000) + prompt, "plaintext")
             while max_try > 0:
                 if not response or not isinstance(response, list):
-                    print(response)
+                    print(logfile_path, response)
                     chat_session.get_model_response("Please output the name of sql in ```plaintext\nxxx.sql``` format. You should not ingnore 'plaintext'.", "plaintext")
                 else:
                     break
                 max_try -= 1
-            with open(os.path.join(search_directory, response[0])) as f:
+            with open(os.path.join(search_directory, response[0].strip())) as f:
                 selected_sql = f.read()
             sql_env = SqlEnv()
             if sql_env.execute_sql_api(selected_sql, self.sql_id, self.complete_csv_save_path, api=self.api, sqlite_path=self.sqlite_path) == 0:
@@ -336,18 +345,23 @@ class REFORCE:
                     f.write(chat_session.messages[-1]['content'])
             sql_env.close_db()
 
-def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[GPTChat], txt_len_threshold=50000):
+def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[GPTChat], txt_len_threshold=100000):
     print("Doing schema linking")
+    # skip_flag = True
+    skip_flag = False
     for eg_id in tqdm(dictionaries):
-        skip_flag = False
+        if eg_id not in ["bq287"]:
+            continue
+        #     skip_flag = False
         chat_session_sl.init_messages()
-        print(eg_id)
         api = get_api_name(eg_id)
         task = task_dict[eg_id]
-        table_info = get_table_info(example_path, eg_id, api)
-        if len(table_info) < txt_len_threshold or skip_flag:
+        table_info = get_table_info(example_path, eg_id, api, clear_des=True)
+        print(f"Doing schema linking for {eg_id}, table len: {len(table_info)}")
+        if len(table_info) < txt_len_threshold or skip_flag or len(table_info) > 400000:
+            print(f"Skip, len: {len(table_info)}")
             continue
-        print("Doing schema linking")
+        
         table_struct = table_info[table_info.find("The table structure information is "):]
 
         prompt = f"Table information: {table_info}\nTask: {task}\nConsider which tables are related to the task. Remove unnecessary tables in {table_struct} and answer table names in ```python``` format in a list.\n"
@@ -372,7 +386,7 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
         ddl_paths = search_file(os.path.join(example_path, eg_id), "DDL.csv")
         
         for ddl_path in ddl_paths:
-            temp_file = ddl_path.replace("DDL.csv", "DDL_tmp.csv")
+            temp_file = ddl_path.replace("DDL.csv", "DDL_sl.csv")
             with open(ddl_path, "r", newline="", encoding="utf-8", errors="ignore") as infile, \
                 open(temp_file, "w", newline="", encoding="utf-8", errors="ignore") as outfile:
                 
@@ -382,20 +396,29 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
                 header = next(reader)
                 writer.writerow(header)
                 row_count = 0
+                row_count_rm = 0
                 row_list_all = []
                 row_list = []
                 for row in reader:
                     if any(remove_digits(row[0]) in item for item in table_names_no_digit):
-                        row_count += 1
+                        row_count_rm += 1
                         row_list_all.append(row)
                     if any(row[0] in item for item in table_names):
+                        row_count += 1
                         row_list.append(row)
-
-                if row_count > 100:
+                print(f"{eg_id}: tables after linking: {row_count}, tables rm digits after linking: {row_count_rm}")
+                if row_count_rm > 500:
+                    print(f"row_count_rm > 500: {eg_id}, row_count: {row_count}")
+                    writer.writerows(row_list)
+                elif row_count < 10:
+                    print(f"row_count < 10: {eg_id}")
                     writer.writerows(row_list)
                 else:
                     writer.writerows(row_list_all)
+                if row_list_all == []:
+                    print(f"{eg_id} Empty: {table_names_no_digit}")
+                    os.remove(temp_file)
 
-            os.replace(temp_file, ddl_path)
+            # os.replace(temp_file, ddl_path)
 
-    compress_ddl(example_path, add_description=True)
+    compress_ddl(example_path, add_description=True, add_sample_rows=True, rm_digits=True, schema_linked=True)

@@ -37,48 +37,48 @@ class SqlEnv:
         if sqlite_path not in self.conns:
             uri = f"file:{sqlite_path}?mode=ro"
             conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-                # TODO: locking protocol in backup for multi nodes
-            def backup_with_retry(conn, sqlite_path, meta_time_out):
-                """
-                Attempts to backup the database to memory within a given total timeout (meta_time_out seconds).
-                If a "database is locked" error occurs, it will retry until the timeout is exceeded or maximum attempts are reached.
-                """
-                start_time = time.time()
-                max_attempts = 3  # Adjust this value as needed
-                attempts = 0
+            #     # TODO: locking protocol in backup for multi nodes
+            # def backup_with_retry(conn, sqlite_path, meta_time_out):
+            #     """
+            #     Attempts to backup the database to memory within a given total timeout (meta_time_out seconds).
+            #     If a "database is locked" error occurs, it will retry until the timeout is exceeded or maximum attempts are reached.
+            #     """
+            #     start_time = time.time()
+            #     max_attempts = 3  # Adjust this value as needed
+            #     attempts = 0
 
-                while time.time() - start_time < meta_time_out and attempts < max_attempts:
-                    try:
-                        # Create a memory connection with a timeout to wait for the lock to be released.
-                        memory_conn = sqlite3.connect(
-                            f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared",
-                            uri=True, 
-                            check_same_thread=False,
-                            timeout=5.0  # Wait up to 5 seconds for a lock release
-                        )
-                        conn.backup(memory_conn)
-                        return memory_conn  # Return the memory connection if backup succeeds
-                    except sqlite3.OperationalError as e:
-                        attempts += 1
-                        elapsed = time.time() - start_time
-                        remaining = meta_time_out - elapsed
-                        print(f"Attempt {attempts}. Remaining time: {remaining:.2f} seconds. Error: {str(e)}")
-                        # If there's still time remaining, wait a short while before retrying.
-                        if remaining > 0.5:
-                            time.sleep(0.5)
-                # If the backup wasn't successful within the timeout or max attempts, return None.
-                return None
-            try:
-                memory_conn = backup_with_retry(conn, sqlite_path, 5)
-                if memory_conn:
-                    self.conns[sqlite_path] = memory_conn
-                    conn.close()
-                    print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
-                else:
-                    print("Backup failed after multiple attempts, using the original connection.")
-                    self.conns[sqlite_path] = conn
-            except Exception as e:
-                print(f"Exception during backup: {str(e)}. Using the original connection.")
+            #     while time.time() - start_time < meta_time_out and attempts < max_attempts:
+            #         try:
+            #             # Create a memory connection with a timeout to wait for the lock to be released.
+            #             memory_conn = sqlite3.connect(
+            #                 f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared",
+            #                 uri=True, 
+            #                 check_same_thread=False,
+            #                 timeout=5.0  # Wait up to 5 seconds for a lock release
+            #             )
+            #             conn.backup(memory_conn)
+            #             return memory_conn  # Return the memory connection if backup succeeds
+            #         except sqlite3.OperationalError as e:
+            #             attempts += 1
+            #             elapsed = time.time() - start_time
+            #             remaining = meta_time_out - elapsed
+            #             print(f"Attempt {attempts}. Remaining time: {remaining:.2f} seconds. Error: {str(e)}")
+            #             # If there's still time remaining, wait a short while before retrying.
+            #             if remaining > 0.5:
+            #                 time.sleep(0.5)
+            #     # If the backup wasn't successful within the timeout or max attempts, return None.
+            #     return None
+            # try:
+            #     memory_conn = backup_with_retry(conn, sqlite_path, 5)
+            #     if memory_conn:
+            #         self.conns[sqlite_path] = memory_conn
+            #         conn.close()
+            #         print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
+            #     else:
+            #         print("Backup failed after multiple attempts, using the original connection.")
+            #         self.conns[sqlite_path] = conn
+            # except Exception as e:
+            # print(f"Exception during backup: {str(e)}. Using the original connection.")
             self.conns[sqlite_path] = conn
             # print(f"sqlite_path: {sqlite_path}, (self.conns): {self.conns.keys()}")
 
@@ -102,19 +102,11 @@ class SqlEnv:
         cursor = self.conns[sqlite_path].cursor()
         try:
             cursor.execute(sql_query)
-        except Exception as e:
-            return "Incorrect SQL Syntax:\n" + str(e)
-        
-        try:
             column_info = cursor.description
             rows = self.get_rows(cursor, max_len)
-            if column_info is None:
-                print("cursor.description is None, no column metadata available.")
-                return "No column information available."
             columns = [desc[0] for desc in column_info]
         except Exception as e:
-            print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
-            return str(e)
+            return e
         finally:
             try:
                 cursor.close()
@@ -126,40 +118,30 @@ class SqlEnv:
         else:
             csv_content = self.get_csv(columns, rows)
             if save_path:
-                try:
-                    with open(save_path, 'w', newline='') as f:
-                        f.write(csv_content)
-                    return 0
-                except Exception as e:
-                    print(str(e))
-                    return str(e)
+                with open(save_path, 'w', newline='') as f:
+                    f.write(csv_content)
+                return 0
             else:
                 return hard_cut(csv_content, max_len)
             
     def exec_sql_sf(self, sql_query, save_path, max_len, ex_id):
         with self.conns[ex_id].cursor() as cursor:
-            cursor.execute(sql_query)
-            column_info = cursor.description
-        if column_info is None:
-            print("cursor.description is None, no column metadata available.")
-            return "No column information available."
-        # Fetch the results
-        rows = self.get_rows(cursor, max_len)
-        results = results[:max_len] if len(results) > max_len else results
-        columns = [desc[0] for desc in column_info]
+            try:
+                cursor.execute(sql_query)
+                column_info = cursor.description
+                rows = self.get_rows(cursor, max_len)
+                columns = [desc[0] for desc in column_info]
+            except Exception as e:
+                return e
 
         if not rows:
             return "No data found for the specified query.\n"
         else:
             csv_content = self.get_csv(columns, rows)
             if save_path:
-                try:
-                    with open(save_path, 'w', newline='') as f:
-                        f.write(csv_content)
-                    return 0
-                except Exception as e:
-                    print(str(e))
-                    return str(e)
+                with open(save_path, 'w', newline='') as f:
+                    f.write(csv_content)
+                return 0
             else:
                 return hard_cut(csv_content, max_len)
 
@@ -167,7 +149,10 @@ class SqlEnv:
         bigquery_credential = service_account.Credentials.from_service_account_file("./bigquery_credential.json")
         client = bigquery.Client(credentials=bigquery_credential, project=bigquery_credential.project_id)
         query_job = client.query(sql_query)
-        result_iterator = query_job.result()
+        try:
+            result_iterator = query_job.result()
+        except Exception as e:
+            return e
         rows = []
         current_len = 0
         for row in result_iterator:
@@ -178,13 +163,11 @@ class SqlEnv:
         df = pd.DataFrame(rows)
         # Check if the result is empty
         if df.empty:
-            # print("No data found for the specified query.")
             return "No data found for the specified query.\n"
         else:
             # Save or print the results based on the is_save flag
             if save_path:
                 df.to_csv(f"{save_path}", index=False)
-                # print(f"Results saved to {save_path}")
                 return 0
             else:
                 return hard_cut(df.to_csv(index=False), max_len)
@@ -199,4 +182,4 @@ class SqlEnv:
         elif api == "sqlite":
             if sqlite_path not in self.conns.keys():
                 self.start_db_sqlite(sqlite_path)
-            return self.exec_sql_bq(sql_query, save_path, max_len, ex_id)
+            return self.exec_sql_sqlite(sql_query, save_path, max_len, sqlite_path)

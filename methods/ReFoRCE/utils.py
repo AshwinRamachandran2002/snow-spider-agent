@@ -53,12 +53,19 @@ def get_shortest(sql_list):
     sql_list_len_index = sql_list_len.index(min(sql_list_len))
     return sql_list[sql_list_len_index]
 
-def initialize_logger(log_path):
-    logger = logging.getLogger()
+import threading
+def initialize_logger(log_path, logger_name=None):
+    if logger_name is None:
+        logger_name = threading.current_thread().name
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     file_handler = logging.FileHandler(log_path, mode='w')
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
     file_handler.setFormatter(formatter)
+
     logger.handlers.clear()
     logger.addHandler(file_handler)
     return logger
@@ -136,7 +143,7 @@ def compare_pandas_table(pred, gold, condition_cols=[], ignore_order=False):
     return score
 
 def clear_description(table_info):
-    return re.sub(r'OPTIONS\(description=.*?\)', '', table_info, flags=re.DOTALL)
+    return re.sub(r"(Description:)[^\n]*", r"\1", table_info)
 
 def get_table_info(test_path, sql_data, api, clear_des=False):
     table_info_txt = ["prompts.txt"]      
@@ -147,9 +154,8 @@ def get_table_info(test_path, sql_data, api, clear_des=False):
             with open(path) as f:
                 table_info += f.read()
     if clear_des:
-        if api == "bigquery":
-            if len(table_info) > 200000:
-                table_info = clear_description(table_info)
+        if len(table_info) > 200000:
+            table_info = clear_description(table_info)
     return table_info
 
 def get_api_name(sql_data):

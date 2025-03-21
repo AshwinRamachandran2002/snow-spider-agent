@@ -4,7 +4,7 @@ from tqdm import tqdm
 import argparse
 import shutil
 import sqlite3
-from utils import remove_digits, is_file, hard_cut
+from utils import remove_digits, is_file, hard_cut, clear_description
 import json
 pd.set_option('display.max_colwidth', None)
 
@@ -47,8 +47,9 @@ def make_folder(args):
                             if not os.path.exists(folder_path):
                                 os.mkdir(folder_path)
                             if entry.startswith("bq") or entry.startswith("ga"):
-                                shutil.copytree(db_name_path, os.path.join(folder_path, file_name))
-                                shutil.rmtree(db_name_path)
+                                # shutil.copytree(db_name_path, os.path.join(folder_path, file_name))
+                                # shutil.rmtree(db_name_path)
+                                shutil.move(db_name_path, os.path.join(folder_path, file_name))
                             elif entry.startswith("sf"):
                                 shutil.copy(db_name_path, os.path.join(folder_path, file_name))
                                 os.remove(db_name_path)                                
@@ -57,10 +58,11 @@ def make_folder(args):
                         shutil.copy(ddl_path, os.path.join(folder_path, "DDL.csv"))
                         os.remove(ddl_path)
                     if entry.startswith("bq") or entry.startswith("ga"):
-                        shutil.copytree(folder_path, os.path.join(entry1_path, folder_name))
+                        # shutil.copytree(folder_path, os.path.join(entry1_path, folder_name))
+                        shutil.move(folder_path, os.path.join(entry1_path, folder_name))
                         shutil.rmtree(project_name_path)
 
-def compress_ddl(example_folder, add_description=False, add_sample_rows=False):
+def compress_ddl(example_folder, add_description=False, add_sample_rows=False, rm_digits=False, schema_linked=False):
     print("Compress DDL files.")
     for entry in tqdm(os.listdir(example_folder)):
         external_knowledge = None
@@ -85,38 +87,50 @@ def compress_ddl(example_folder, add_description=False, add_sample_rows=False):
                             for schema_name in os.listdir(db_name_path):
                                 schema_name_path = os.path.join(db_name_path, schema_name)
                                 if schema_name == "DDL.csv":
+                                    representatives = None
                                     if entry.startswith("sf0"):
                                         check_table_names(schema_name_path)
-                                    df = pd.read_csv(schema_name_path)
-                                    ddl_file, representatives = process_ddl(df)
+                                    if schema_linked and os.path.exists(schema_name_path.replace("DDL.csv", "DDL_sl.csv")):
+                                        schema_name_path = schema_name_path.replace("DDL.csv", "DDL_sl.csv")
+                                    ddl_file = pd.read_csv(schema_name_path)
+                                    if schema_linked and len(ddl_file['table_name'].to_list()) < 10:
+                                        pass
+                                    elif rm_digits:
+                                        ddl_file, representatives = process_ddl(ddl_file)
                                     table_name_list = ddl_file['table_name'].to_list()
                                     ddl_file.reset_index(drop=True, inplace=True)
                                     for i in range(len(table_name_list)):
-                                        try:                                         
+                                        if os.path.exists(os.path.join(db_name_path, table_name_list[i]+".json")):                               
                                             with open(os.path.join(db_name_path, table_name_list[i]+".json")) as f:
                                                 table_json = json.load(f)
-                                        except Exception as e:
-                                            print(entry, e)
+                                        elif os.path.exists(os.path.join(db_name_path, db_name+'.'+table_name_list[i]+".json")):
+                                                with open(os.path.join(db_name_path, db_name+'.'+table_name_list[i]+".json")) as f:
+                                                    table_json = json.load(f)
+                                        else:
+                                            # print(entry, f"No table: {os.path.join(db_name_path, table_name_list[i])}")
                                             continue
                                         
                                         prompts += "Table full name: " + table_json["table_fullname"] + "\n"
-                                        if entry.startswith("bq") or entry.startswith("ga"):
-                                            column_prefix = "nested_column_"
-                                        else:
-                                            column_prefix = "column_"
+                                        # if entry.startswith("bq") or entry.startswith("ga"):
+                                        #     if schema_linked:
+                                        #         column_prefix = "nested_column_"
+                                        # else:
+                                        column_prefix = "column_"
                                         for j in range(len(table_json[f"{column_prefix}names"])):
                                             table_des = ''
-                                            if add_description:
-                                                if j == len(table_json["description"]):
-                                                    print(j, len(table_json["description"]), table_name_list[i])
+                                            if add_description and j < len(table_json["description"]):
                                                 table_des = " Description: " + str(table_json["description"][j])
+                                            else:
+                                                if table_json[f"column_names"][j] != "_PARTITIONTIME":
+                                                    print(f"{entry} description unmatch {table_name_list[i]}")
                                             prompts += "Column name: " + table_json[f"{column_prefix}names"][j] + " Type: " + table_json[f"{column_prefix}types"][j] + table_des +"\n"
                                         if add_sample_rows:
                                             prompts += "Sample rows:\n" + hard_cut(str(table_json["sample_rows"]), length=1000) + "\n"
                                         table_dict[project_name][db_name] += [table_name_list[i]]
-                                        if len(representatives[remove_digits(table_name_list[i])]) > 1:
-                                            prompts += f"Some other tables have the similar structure: {representatives[remove_digits(table_name_list[i])]}\n"
-                                            table_dict[project_name][db_name] += representatives[remove_digits(table_name_list[i])]
+                                        if representatives is not None:
+                                            if len(representatives[remove_digits(table_name_list[i])]) > 1:
+                                                prompts += f"Some other tables have the similar structure: {representatives[remove_digits(table_name_list[i])]}\n"
+                                                table_dict[project_name][db_name] += representatives[remove_digits(table_name_list[i])]
                                         prompts += "\n" + "-" * 50 + "\n"
                                 elif schema_name == "json":
                                     with open(schema_name_path) as f:
@@ -132,6 +146,10 @@ def compress_ddl(example_folder, add_description=False, add_sample_rows=False):
                         sqlite_path = os.path.join(entry1_path, sqlite)
                 table_names, prompts = get_sqlite_data(sqlite_path, add_description=add_description, add_sample_rows=add_sample_rows)
             with open(os.path.join(entry1_path, "prompts.txt"), "w") as f:
+                if len(prompts) > 200000:
+                    print(f"{entry} len: {len(prompts)}")
+                    prompts = clear_description(prompts)
+                    print(f"cleared len: {len(prompts)}")
                 prompts += f"External knowledge that might be helpful: \n{external_knowledge}\n"
                 if not entry.startswith("local"):
                     prompts += "The table structure information is ({database name: {schema name: [table name]}}): \n" + str(table_dict) + "\n"
@@ -194,6 +212,10 @@ if __name__ == '__main__':
     parser.add_argument('--example_folder', type=str, default="examples")
     parser.add_argument('--add_description', action="store_true")
     parser.add_argument('--add_sample_rows', action="store_true")
+    parser.add_argument('--make_folder', action="store_true")
+    parser.add_argument('--rm_digits', action="store_true")
+    parser.add_argument('--schema_linked', action="store_true")
     args = parser.parse_args()
-    # make_folder(args)
-    compress_ddl(args.example_folder, args.add_description, args.add_sample_rows)
+    if args.make_folder:
+        make_folder(args)
+    compress_ddl(args.example_folder, args.add_description, args.add_sample_rows, args.rm_digits, args.schema_linked)

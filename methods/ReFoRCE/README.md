@@ -22,8 +22,9 @@ python spider_agent_setup_snow.py
 ```
 
 ### Reconstruct data
+First, roughly compress.
 ```
-python reconstruct_data.py --example_folder examples_snow
+python reconstruct_data.py --example_folder examples_snow --add_description --make_folder --rm_digits
 ```
 
 ### Run
@@ -36,7 +37,7 @@ export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 
 Run voting:
 ```
-python run_vote.py --test_path examples_snow --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --num_processes 3 --task snow
+python run.py --db_path examples_snow --model o1-preview --pre_model o1-preview --output_path output/o1-preview-snow-log --azure --num_threads 3 --task snow
 ```
 ### Evaluation
 Preparation for evaluation files:
@@ -65,8 +66,9 @@ python spider_agent_setup_lite.py
 ```
 
 ### Reconstruct data
+First, roughly compress.
 ```
-python reconstruct_data.py --example_folder examples_lite
+python reconstruct_data.py --example_folder examples_lite --add_description --make_folder --rm_digits
 ```
 
 ### Run
@@ -79,7 +81,15 @@ export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 
 Run voting:
 ```
-python run_vote.py --test_path examples_lite --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-lite-log --azure --num_processes 3 --task lite
+python run.py \
+--task lite \
+--db_path examples_lite \
+--output_path output/o1-preview-lite-log \
+--model o1-preview \
+--pre_model o1-preview \
+--azure \
+--schema_linking_model o1-preview \
+--model_vote
 ```
 ### Evaluation
 Preparation for evaluation files:

@@ -87,7 +87,7 @@ class Prompts:
         return format_prompt
 
     def get_exploration_prompt(self, api, table_struct):
-        exploration_prompt = f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write 10 {api} SQL queries for simple to complex ones like {self.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
+        exploration_prompt = f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write 10 {api} SQL queries for simple to complex ones to final answer like {self.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
         exploration_prompt += "Each query should be different. Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. Try to use DISTINCT. For each SQL LIMIT 100 rows.\n"
 
         exploration_prompt += self.get_prompt_dialect_nested(api)

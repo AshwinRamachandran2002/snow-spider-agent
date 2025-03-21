@@ -7,12 +7,13 @@ from agent import REFORCE, schema_linking
 from typing import Type
 from chat import GPTChat
 from prompt import Prompts
-import multiprocessing
+import threading, concurrent
 from sql import SqlEnv
+import time
 
-def execute(agent: Type[REFORCE], task, table_info, args, csv_save_path, log_save_path, sql_save_path, search_directory, chat_session, chat_session_pre, format_csv):
+def execute(task, table_info, args, csv_save_path, log_save_path, sql_save_path, search_directory, format_csv, sql_data):
     if args.rerun:
-        if os.path.exists(os.path.join(search_directory, csv_save_path)):
+        if os.path.exists(os.path.join(search_directory, sql_save_path)):
             return
         else:
             print(f"Rerun: {search_directory}")
@@ -20,8 +21,8 @@ def execute(agent: Type[REFORCE], task, table_info, args, csv_save_path, log_sav
     elif not args.overwrite_results and os.path.exists(os.path.join(search_directory, log_save_path)):
         return
 
-    # remove csv
-    self_files = glob.glob(os.path.join(search_directory, f'*{csv_save_path}*'))
+    # remove files
+    self_files = glob.glob(os.path.join(search_directory, f'*{log_save_path}*'))
     for self_file in self_files:
         os.remove(self_file)
 
@@ -31,88 +32,121 @@ def execute(agent: Type[REFORCE], task, table_info, args, csv_save_path, log_sav
     logger.info("[Answer format]\n" + format_csv + "\n[Answer format]")
     table_struct = table_info[table_info.find("The table structure information is "):]
 
+    # sql
     sql_env = SqlEnv()
 
+    # chat
+    if args.model:
+        chat_session_pre = GPTChat(args.azure, args.pre_model, temperature=args.temperature)
+        chat_session = GPTChat(args.azure, args.pre_model, temperature=args.temperature)
+
+    # agent
+    agent = REFORCE(args, sql_data, search_directory, prompt_all, sql_env, chat_session_pre, chat_session, sql_data+'/'+log_save_path)
+
     # preparation
-    pre_info, response_pre_txt, max_try, chat_session_pre, sql_env = agent.exploration(task, table_struct, logger, chat_session_pre, sql_env)
+    pre_info, response_pre_txt, max_try = agent.exploration(task, table_struct, table_info, logger)
     if max_try <= 0:
-        print("Inadequate preparation, skip")
+        print(f"{sql_data+'/'+log_save_path} Inadequate preparation, skip")
         return
-    print(f"{search_directory}: chat_session_pre len: {chat_session_pre.get_message_len()}")
+    print(f"{sql_data+'/'+log_save_path}: chat_session_pre len: {chat_session_pre.get_message_len()}")
     csv_save_path = os.path.join(search_directory, csv_save_path)
     sql_save_path = os.path.join(search_directory, sql_save_path)
 
     # answer
-    chat_session, sql_env = agent.self_refine(args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, chat_session, csv_save_path, sql_save_path, sql_env)
-    print(f"{search_directory}: chat_session len: {chat_session.get_message_len()}")
-
-    sql_env.close_db()
+    agent.self_refine(args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, csv_save_path, sql_save_path)
+    agent.sql_env.close_db()
+    
 
 def main(args):
-    prompt_all = Prompts()
-
-    dictionaries, task_dict = get_dictionary(args)
-
-    if args.model:
-        chat_session = GPTChat(args.azure, args.model, temperature=args.temperature)
-        chat_session_pre = GPTChat(args.azure, args.pre_model, temperature=args.temperature)
 
     if args.schema_linking_model:
         chat_session_sl = GPTChat(args.azure, args.schema_linking_model, temperature=args.temperature) 
         schema_linking(dictionaries, task_dict, args.db_path, chat_session_sl)
+        import sys
+        sys.exit(0)
+    # Use ThreadPoolExecutor to process each sql_data in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+        list(executor.map(process_sql_data, dictionaries))
 
-    for sql_data in tqdm(dictionaries):
-        chat_session.init_messages()
-        chat_session_pre.init_messages()
-        print(sql_data)
+    # for sql_data in dictionaries:
+    #     process_sql_data(sql_data)
 
-        task = task_dict[sql_data]
-        search_directory = os.path.join(args.output_path, sql_data)
+def process_sql_data(sql_data):
+    start_time = time.time()
+    # Initialize sessions at the beginning of each thread
+    if args.model:
+        chat_session_format = GPTChat(args.azure, args.pre_model, temperature=args.temperature)
+    print(sql_data)
 
-        agent = REFORCE(args, sql_data, search_directory, prompt_all)
-        if not os.path.exists(search_directory):
-            os.makedirs(search_directory)
+    task = task_dict[sql_data]
+    search_directory = os.path.join(args.output_path, sql_data)
 
+    # Create agent object
+    agent_format = REFORCE(args, sql_data, search_directory, prompt_all)
+    
+    # Create the directory if it does not exist
+    if not os.path.exists(search_directory):
+        os.makedirs(search_directory)
+
+    # Skip processing if results already exist and overwrite is not allowed
+    if not args.overwrite_results and os.path.exists(agent_format.complete_log_save_path):
+        return
+
+    # Ensure the search directory exists (in case it was removed)
+    if not os.path.exists(search_directory):
+        os.makedirs(search_directory)
+
+    # Get table information
+    table_info = get_table_info(args.db_path, sql_data, agent_format.api, clear_des=True)
+
+    # Format answer and update the pre-chat session
+    format_csv, chat_session_format = agent_format.format_answer(task, chat_session_format)
+
+    # Skip task if the context is too long
+    if chat_session_format.get_message_len() > 200000:
+        print(f"{sql_data} Too long context, skip")
+        return
+
+    if args.model_vote:
+        num_votes = args.num_votes
         sql_paths = {}
-        processes = []
+        threads = []
 
-        if not args.overwrite_results and os.path.exists(agent.complete_csv_save_path):
-            continue
-        if not os.path.exists(search_directory):
-            os.makedirs(search_directory)
+        for i in range(num_votes):
+            csv_save_pathi = str(i) + agent_format.csv_save_name
+            log_pathi = str(i) + agent_format.log_save_name
+            sql_save_pathi = str(i) + agent_format.sql_save_name
+            sql_paths[sql_save_pathi] = csv_save_pathi
 
-        table_info = get_table_info(args.db_path, sql_data, agent.api)
+            thread = threading.Thread(
+                target=execute,
+                args=(
+                    task, table_info, args,
+                    csv_save_pathi, log_pathi, sql_save_pathi,
+                    search_directory, format_csv, sql_data
+                )
+            )
+            threads.append(thread)
+            thread.start()
 
-        format_csv, chat_session_pre = agent.format_answer(table_info, task, chat_session_pre)
-
-        if chat_session_pre.get_message_len() > 300000:
-            print(f"{sql_data} Too long context, skip")
-            continue
-
-        if args.model_vote:
-            num_processes = args.num_processes
-
-            sql_paths = {}
-            processes = []
-
-            for i in range(num_processes):
-
-                csv_save_pathi = str(i) + agent.csv_save_name
-                log_pathi = str(i) + agent.log_save_name
-                sql_save_pathi = str(i) + agent.sql_save_name
-                sql_paths[sql_save_pathi] = csv_save_pathi
-                process = multiprocessing.Process(target=execute, args=(agent, task, table_info, args, csv_save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session_pre, format_csv))
-                processes.append(process)
-                process.start()
-
-            for process in processes:
-                process.join()
-
-            agent.vote_result(search_directory, task)
+        # wait
+        for thread in threads:
+            thread.join()
         
+        if any(file.endswith('.sql') for file in os.listdir(search_directory) if os.path.isfile(os.path.join(search_directory, file))):
+            # After all processes have completed, perform the vote result
+            agent_format.vote_result(search_directory, task, chat_session_format, sql_paths, table_info)
         else:
-            execute(agent, task, table_info, args, agent.csv_save_name, agent.log_save_name, agent.sql_save_name, search_directory, chat_session, chat_session_pre, format_csv)
+            print(f"{sql_data}: Empty")
+    else:
+        # Directly execute the task
+        execute(
+            task, table_info, args,
+            agent_format.csv_save_name, agent_format.log_save_name, agent_format.sql_save_name,
+            search_directory, format_csv, sql_data
+        )
 
+    print(f"Time for {sql_data}: {int((time.time() - start_time) // 60)} min")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -125,10 +159,13 @@ if __name__ == '__main__':
     parser.add_argument('--azure', action="store_true")
     parser.add_argument('--max_iter', type=int, default=10)
     parser.add_argument('--temperature', type=float, default=1)
-    parser.add_argument('--num_processes', type=int, default=3)
+    parser.add_argument('--num_votes', type=int, default=3)
     parser.add_argument('--save_all_results', action="store_true")
     parser.add_argument('--schema_linking_model', type=str, default=None)
     parser.add_argument('--rerun', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
+    parser.add_argument('--num_workers', type=int, default=3)
     args = parser.parse_args()
+    prompt_all = Prompts()
+    dictionaries, task_dict = get_dictionary(args)
     main(args)
