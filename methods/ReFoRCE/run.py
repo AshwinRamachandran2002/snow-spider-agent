@@ -3,20 +3,21 @@ from tqdm import tqdm
 import argparse
 import glob
 from utils import get_table_info, initialize_logger, get_dictionary
-from agent import REFORCE
+from agent import REFORCE, schema_linking
 from typing import Type
 from chat import GPTChat
 from prompt import Prompts
 import multiprocessing
+from sql import SqlEnv
 
-def execute(agent: Type[REFORCE], task, table_info, args, csv_save_path, log_path, sql_save_path, search_directory, prompt_all, chat_session, chat_session_pre, format_csv):
+def execute(agent: Type[REFORCE], task, table_info, args, csv_save_path, log_save_path, sql_save_path, search_directory, chat_session, chat_session_pre, format_csv):
     if args.rerun:
         if os.path.exists(os.path.join(search_directory, csv_save_path)):
             return
         else:
             print(f"Rerun: {search_directory}")
     # if log.log exists, pass
-    elif not args.overwrite_results and os.path.exists(os.path.join(search_directory, log_path)):
+    elif not args.overwrite_results and os.path.exists(os.path.join(search_directory, log_save_path)):
         return
 
     # remove csv
@@ -25,19 +26,27 @@ def execute(agent: Type[REFORCE], task, table_info, args, csv_save_path, log_pat
         os.remove(self_file)
 
     # log
-    log_file_path = os.path.join(search_directory, log_path)
+    log_file_path = os.path.join(search_directory, log_save_path)
     logger = initialize_logger(log_file_path)
-
+    logger.info("[Answer format]\n" + format_csv + "\n[Answer format]")
     table_struct = table_info[table_info.find("The table structure information is "):]
 
+    sql_env = SqlEnv()
+
     # preparation
-    pre_info, response_pre_txt, max_try, chat_session_pre = agent.exploration(task, max_try, prompt_all, table_struct, logger, chat_session_pre)
+    pre_info, response_pre_txt, max_try, chat_session_pre, sql_env = agent.exploration(task, table_struct, logger, chat_session_pre, sql_env)
     if max_try <= 0:
         print("Inadequate preparation, skip")
         return
-    
+    print(f"{search_directory}: chat_session_pre len: {chat_session_pre.get_message_len()}")
+    csv_save_path = os.path.join(search_directory, csv_save_path)
+    sql_save_path = os.path.join(search_directory, sql_save_path)
+
     # answer
-    agent.self_refine(args, logger, task, prompt_all, format_csv, search_directory, csv_save_path, sql_save_path, table_struct, table_info, response_pre_txt, pre_info, chat_session)
+    chat_session, sql_env = agent.self_refine(args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, chat_session, csv_save_path, sql_save_path, sql_env)
+    print(f"{search_directory}: chat_session len: {chat_session.get_message_len()}")
+
+    sql_env.close_db()
 
 def main(args):
     prompt_all = Prompts()
@@ -46,11 +55,11 @@ def main(args):
 
     if args.model:
         chat_session = GPTChat(args.azure, args.model, temperature=args.temperature)
-        chat_session_pre = GPTChat(args.azure, args.understanding_model, temperature=args.temperature)
+        chat_session_pre = GPTChat(args.azure, args.pre_model, temperature=args.temperature)
 
-    if args.schema_linking_api:
-        chat_session_sl = GPTChat(args.azure, args.schema_linking_api, temperature=args.temperature) 
-        agent.schema_linking(dictionaries, task_dict, args.test_path, chat_session_sl)
+    if args.schema_linking_model:
+        chat_session_sl = GPTChat(args.azure, args.schema_linking_model, temperature=args.temperature) 
+        schema_linking(dictionaries, task_dict, args.db_path, chat_session_sl)
 
     for sql_data in tqdm(dictionaries):
         chat_session.init_messages()
@@ -72,9 +81,9 @@ def main(args):
         if not os.path.exists(search_directory):
             os.makedirs(search_directory)
 
-        table_info = get_table_info(args.test_path, sql_data, agent.api)
+        table_info = get_table_info(args.db_path, sql_data, agent.api)
 
-        format_csv, chat_session_pre = agent.format_answer(prompt_all, table_info, task, chat_session_pre)
+        format_csv, chat_session_pre = agent.format_answer(table_info, task, chat_session_pre)
 
         if chat_session_pre.get_message_len() > 300000:
             print(f"{sql_data} Too long context, skip")
@@ -102,7 +111,7 @@ def main(args):
             agent.vote_result(search_directory, task)
         
         else:
-            execute(agent, task, table_info, args, csv_save_pathi, log_pathi, sql_save_pathi, search_directory, prompt_all, chat_session, chat_session_pre, format_csv)
+            execute(agent, task, table_info, args, agent.csv_save_name, agent.log_save_name, agent.sql_save_name, search_directory, chat_session, chat_session_pre, format_csv)
 
 
 if __name__ == '__main__':
@@ -118,7 +127,7 @@ if __name__ == '__main__':
     parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--num_processes', type=int, default=3)
     parser.add_argument('--save_all_results', action="store_true")
-    parser.add_argument('--schema_linking_api', type=str, default=None)
+    parser.add_argument('--schema_linking_model', type=str, default=None)
     parser.add_argument('--rerun', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
     args = parser.parse_args()

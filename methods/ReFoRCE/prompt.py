@@ -87,7 +87,7 @@ class Prompts:
         return format_prompt
 
     def get_exploration_prompt(self, api, table_struct):
-        exploration_prompt = f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write at least 10 {api} SQL queries for simple to complex ones like {self.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
+        exploration_prompt = f"Consider which tables and columns are relevant to the task. Answer like: `column name`: `potential usage`. And also conditions that may be used. Then write 10 {api} SQL queries for simple to complex ones like {self.get_prompt_dialect_basic(api)} in ```sql``` format to have an understanding of values in related columns.\n"
         exploration_prompt += "Each query should be different. Don't use CTEs and don't query about any SCHEMA or checking data types. You can write SELECT query only. Try to use DISTINCT. For each SQL LIMIT 100 rows.\n"
 
         exploration_prompt += self.get_prompt_dialect_nested(api)
@@ -107,19 +107,19 @@ class Prompts:
         return exploration_prompt
 
     def get_self_refine_prompt(self, table_info, response_pre_txt, pre_info, task, api, format_csv, table_struct):
-        refine_prompt = table_info + "Begin Exploring Related Columns\n" + response_pre_txt + "\nFor SQLs there may be some errors and they are corrected. Here is refined SQLs with causes to the error:\n" + pre_info + "End Exploring Related Columns\n"
+        refine_prompt = table_info + "Begin Exploring Related Columns\n" + response_pre_txt + "\nRefined SQLs and results:\n" + pre_info + "End Exploring Related Columns\n"
 
         refine_prompt += "Task: " + task + "\n"+f'\nPlease answer only one complete SQL in {api} dialect in ```sql``` format.\n'
-        refine_prompte += f'Usage example: {self.get_prompt_dialect_basic(api)}\n'
+        refine_prompt += f'Usage example: {self.get_prompt_dialect_basic(api)}\n'
         refine_prompt += f"Follow the answer format like: {format_csv}.\n"
         refine_prompt += "Here are some useful tips for answering:\n"
         
         refine_prompt += self.get_prompt_dialect_list_all_tables(table_struct, api)
         refine_prompt += self.get_prompt_fuzzy_query()
 
-        if self.api == "snowflake":
+        if api == "snowflake":
             refine_prompt += "When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.\n"
-        refine_prompt += "When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion."
+        refine_prompt += "When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.\n"
 
         refine_prompt += self.get_prompt_decimal_places()
 
@@ -132,6 +132,5 @@ class Prompts:
         self_consistency_prompt = f"Please check the answer again by reviewing {task}, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.\n" 
         self_consistency_prompt += self.get_prompt_decimal_places()
         self_consistency_prompt += f"The answer format should be like: {format_csv} The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!\n"
-        self_consistency_prompt += "Current snswer: \n"
 
         return self_consistency_prompt

@@ -1,12 +1,8 @@
 import os
 import pandas as pd
-import snowflake.connector
 import json
 import logging
 import math
-from google.cloud import bigquery
-from google.oauth2 import service_account
-import sqlite3
 import re
 
 def extract_all_blocks(main_content, code_format):
@@ -24,7 +20,7 @@ def extract_all_blocks(main_content, code_format):
         if sql_query_end == -1:
             break 
 
-        sql_block = main_content[sql_query_start + len(f"```{code_format}"):sql_query_end].strip()
+        sql_block = main_content[sql_query_start + len(f"```{code_format}"):sql_query_end]
         sql_blocks.append(sql_block)
 
         start = sql_query_end + len("```")
@@ -46,105 +42,6 @@ def search_file(directory, target_file):
         if target_file in files:
             result.append(os.path.join(root, target_file))
     return result
-
-def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, sqlite_path=None):
-    if api == "snowflake":
-        # Load Snowflake credentials
-        snowflake_credential = json.load(open("./snowflake_credential.json"))
-        # Define the SQL query
-        # Execute the SQL query
-        with snowflake.connector.connect(**snowflake_credential) as conn:
-            with conn.cursor() as cursor:
-                try:
-                    cursor.execute(sql_query)
-                    # Fetch the results
-                    results = cursor.fetchall()
-                    results = results[:max_len] if len(results) > max_len else results
-                    columns = [desc[0] for desc in cursor.description]
-                    df = pd.DataFrame(results, columns=columns)
-
-                    # Check if the result is empty
-                    if df.empty:
-                        # print("No data found for the specified query.")
-                        return "No data found for the specified query.\n"
-                    else:
-                        # Save or print the results based on the is_save flag
-                        if save_path:
-                            try:
-                                df.to_csv(f"{save_path}", index=False)
-                                # print(f"Results saved to {save_path}")
-                                return 0
-                            except Exception as e:
-                                print(e)
-                        else:
-                            return hard_cut(df.to_csv(index=False), max_len)
-                except Exception as e:
-                    # print("Error occurred: ", str(e))
-                    return e
-    elif api == "bigquery":
-        bigquery_credential = service_account.Credentials.from_service_account_file("./bigquery_credential.json")
-        client = bigquery.Client(credentials=bigquery_credential, project=bigquery_credential.project_id)
-        try:
-            query_job = client.query(sql_query)
-            result_iterator = query_job.result()
-            rows = []
-            current_len = 0
-            for row in result_iterator:
-                if current_len > max_len:
-                    break
-                current_len += len(str(dict(row)))
-                rows.append(dict(row))
-            df = pd.DataFrame(rows)
-            # Check if the result is empty
-            if df.empty:
-                # print("No data found for the specified query.")
-                return "No data found for the specified query.\n"
-            else:
-                # Save or print the results based on the is_save flag
-                if save_path:
-                    df.to_csv(f"{save_path}", index=False)
-                    # print(f"Results saved to {save_path}")
-                    return 0
-                else:
-                    return hard_cut(df.to_csv(index=False), max_len)
-        except Exception as e:
-            # print("Error occurred: ", str(e))
-            return e
-    elif api == "sqlite":
-        conn = sqlite3.connect(sqlite_path)
-        try:
-            cursor = conn.cursor()
-                        
-            cursor.execute(sql_query)
-            # Fetch the results
-            results = cursor.fetchall()
-            results = results[:max_len] if len(results) > max_len else results
-            columns = [desc[0] for desc in cursor.description]
-            df = pd.DataFrame(results, columns=columns)
-
-            # Check if the result is empty
-            if df.empty:
-                # print("No data found for the specified query.")
-                return "No data found for the specified query.\n"
-            else:
-                # Save or print the results based on the is_save flag
-                if save_path:
-                    try:
-                        df.to_csv(f"{save_path}", index=False)
-                        # print(f"Results saved to {save_path}")
-                        return 0
-                    except Exception as e:
-                        print(e)
-                else:
-                    return hard_cut(df.to_csv(index=False), max_len)
-        except Exception as e:
-            # print("Error occurred: ", str(e))
-            return e
-        finally:
-            cursor.close()  # Close the cursor manually
-            conn.close()    # Close the connection manually
-    else:
-        raise NotImplementedError("Unsupported API")
 
 def get_longest(sql_list):
     sql_list_len = [len(i) for i in sql_list]
@@ -183,7 +80,7 @@ def extract_between(file_path, start_str, end_str):
         end_index = content.find(end_str, start_index)
         if end_index == -1:
             break
-        results.append(content[start_index:end_index].strip())
+        results.append(content[start_index:end_index])
         start_index = end_index + len(end_str)
     
     return results
@@ -241,7 +138,7 @@ def compare_pandas_table(pred, gold, condition_cols=[], ignore_order=False):
 def clear_description(table_info):
     return re.sub(r'OPTIONS\(description=.*?\)', '', table_info, flags=re.DOTALL)
 
-def get_table_info(test_path, sql_data, api):
+def get_table_info(test_path, sql_data, api, clear_des=False):
     table_info_txt = ["prompts.txt"]      
     table_info = ''
     for txt in table_info_txt:
@@ -249,9 +146,10 @@ def get_table_info(test_path, sql_data, api):
         for path in txt_path:
             with open(path) as f:
                 table_info += f.read()
-    if api == "bigquery":
-        if len(table_info) > 200000:
-            table_info = clear_description(table_info)
+    if clear_des:
+        if api == "bigquery":
+            if len(table_info) > 200000:
+                table_info = clear_description(table_info)
     return table_info
 
 def get_api_name(sql_data):
@@ -276,7 +174,7 @@ def matching_at_same_position(s1, s2):
     return "".join(matches)
 
 def get_dictionary(args):
-    json_path = os.path.join(args.test_path, f"spider2-{args.task}.jsonl")
+    json_path = os.path.join(args.db_path, f"spider2-{args.task}.jsonl")
     task_dict = {}
     with open(json_path) as f:
         for line in f:
@@ -286,11 +184,11 @@ def get_dictionary(args):
             elif args.task == "lite":
                 task_dict[line_js['instance_id']] = line_js['question']
 
-    dictionaries = [entry for entry in os.listdir(args.test_path) if os.path.isdir(os.path.join(args.test_path, entry))]
+    dictionaries = [entry for entry in os.listdir(args.db_path) if os.path.isdir(os.path.join(args.db_path, entry))]
     return dictionaries, task_dict
 
 def get_sqlite_path(args, sql_data):
-    sql_data_path = os.path.join(args.test_path, sql_data)
+    sql_data_path = os.path.join(args.db_path, sql_data)
     sqlite_path = None
     for sqlite in os.listdir(sql_data_path):
         if sqlite.endswith(".sqlite"):

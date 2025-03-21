@@ -23,7 +23,7 @@ python spider_agent_setup_snow.py
 
 ### Reconstruct data
 ```
-python reconstruct_data.py --example_folder examples
+python reconstruct_data.py --example_folder examples_snow
 ```
 
 ### Run
@@ -36,7 +36,7 @@ export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 
 Run voting:
 ```
-python run_vote.py --test_path examples --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --num_processes 3 --task snow
+python run_vote.py --test_path examples_snow --model o1-preview --understanding_model o1-preview --output_path output/o1-preview-snow-log --azure --num_processes 3 --task snow
 ```
 ### Evaluation
 Preparation for evaluation files:

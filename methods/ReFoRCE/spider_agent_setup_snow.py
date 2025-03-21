@@ -24,7 +24,7 @@ def setup_snowflake():
         examples = [json.loads(line) for line in f]
     for example in examples:
         instance_id = example['instance_id']
-        folder_path = f'examples/{instance_id}'
+        folder_path = f'examples_snow/{instance_id}'
         target_credential_path = os.path.join(folder_path, 'snowflake_credential.json')
 
         if os.path.exists(target_credential_path):
@@ -47,7 +47,7 @@ def setup_add_schema(args):
     for example in examples:
         instance_id = example['instance_id']
         db_id = example['db_id']
-        example_folder = f'examples/{instance_id}'
+        example_folder = f'examples_snow/{instance_id}'
         assert os.path.exists(example_folder)
         dest_folder = os.path.join(example_folder, db_id)  # Use db_id as the folder name
         if os.path.exists(dest_folder):
@@ -68,7 +68,7 @@ def add_snowflake_agent_setting():
     with open(JSONL_PATH, "r") as f:
         examples = [json.loads(line) for line in f]
 
-    snowflake_agent_dir_path = os.path.join('./','examples')
+    snowflake_agent_dir_path = os.path.join('./','examples_snow')
     
     clear_folder(snowflake_agent_dir_path)
 

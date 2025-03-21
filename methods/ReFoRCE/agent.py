@@ -1,4 +1,5 @@
-from utils import execute_sql_api, hard_cut, get_values_from_table, search_file, get_api_name, get_table_info, compare_pandas_table, extract_between, get_sqlite_path
+from utils import hard_cut, get_values_from_table, search_file, get_api_name, get_table_info, compare_pandas_table, extract_between, get_sqlite_path
+from sql import SqlEnv
 from reconstruct_data import remove_digits, compress_ddl
 import pandas as pd
 from io import StringIO
@@ -10,8 +11,8 @@ from typing import Type
 from tqdm import tqdm
 from chat import GPTChat
 
-class REFORCE():
-    def __init__(self, sql_data, search_directory, prompt_class: Type[Prompts]):
+class REFORCE:
+    def __init__(self, args, sql_data, search_directory, prompt_class: Type[Prompts]):
         self.csv_save_name = "result.csv"
         self.sql_save_name = "result.sql"
         self.log_save_name = "log.log"
@@ -19,7 +20,7 @@ class REFORCE():
         self.empty_result = "No data found for the specified query.\n"
 
         self.api = get_api_name(sql_data)
-        self.sqlite_path = get_sqlite_path(sql_data)
+        self.sqlite_path = get_sqlite_path(args, sql_data)
 
         self.sql_id = sql_data
 
@@ -29,8 +30,9 @@ class REFORCE():
 
         self.prompt_class = prompt_class
         self.max_try = 3
+        self.csv_max_len = 500
 
-    def execute_sqls(self, sqls, chat_session: Type[GPTChat], logger, max_len=500):
+    def execute_sqls(self, sqls, chat_session: Type[GPTChat], logger, sql_env: Type[SqlEnv]):
         result_dic_list = []
         error_rec = []
         causes = ''
@@ -40,7 +42,7 @@ class REFORCE():
             sqls = sqls[1:]
             check_again_flag = False
             logger.info("[Try to execute]\n" + sql + "\n[Try to execute]")
-            results = execute_sql_api(sql, api=self.api, max_len=max_len, sqlite_path=self.sqlite_path)
+            results = sql_env.execute_sql_api(sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
             try:
                 # Check null values
                 if results != self.empty_result:
@@ -58,11 +60,11 @@ class REFORCE():
                 result_dic_list.append(result_dic)
             else:
                 logger.info("[Error occurred]\n" + str(results) + "\n[Error occurred]")
-                max_iter = 3
+                max_try = self.max_try
                 simplify = False
                 corrected_sql = None
                 while not isinstance(results, str) or results == self.empty_result or check_again_flag:
-                    if max_iter == 0:
+                    if max_try == 0:
                         break
                     if results == self.empty_result:
                         simplify = True
@@ -72,17 +74,17 @@ class REFORCE():
                         print(f"{self.sql_id}: Not a valid SQL.\n")
                         continue
                     corrected_sql = corrected_sql[0]
-                    results = execute_sql_api(corrected_sql, api=self.api, max_len=max_len, sqlite_path=self.sqlite_path)
+                    results = sql_env.execute_sql_api(corrected_sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
                     logger.info("[Results for corrected sql]\n"+str(results)+"\n[Results for corrected sql]")
-                    max_iter -= 1
+                    max_try -= 1
                     simplify = False
 
-                cause = chat_session.get_model_response_txt("The error is corrected. Please conclude all possible causes to this error in only one sentence. Don't output any SQL query.")
-                causes += cause
-                logger.info("[Cause]\n"+str(cause)+"\n[Cause]")
+                # cause = chat_session.get_model_response_txt("The error is corrected. Please conclude all possible causes to this error in only one sentence. Don't output any SQL query.")
+                # causes += cause
+                # logger.info("[Cause]\n"+str(cause)+"\n[Cause]")
                 if isinstance(results, str) and results != self.empty_result:
                     error_rec.append(1)
-                    response = chat_session.get_model_response(f"Please correct other sqls if they have similar errors: {cause}. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
+                    response = chat_session.get_model_response(f"SQL {corrected_sql} is correct now. Please correct other sqls if they have similar errors. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
                     if isinstance(corrected_sql, list) and corrected_sql != []:
                         response_sqls = []
                         for s in response:
@@ -106,9 +108,9 @@ class REFORCE():
                 result_dic['res'] = results
                 chat_session.messages.append({"role": "user", "content": f"Successfully corrected. SQL:\n{corrected_sql}\nResults:\n{results}"})
                 logger.info("[Successfully corrected]\n" + chat_session.messages[-1]['content'] + "\n[Successfully corrected]")
-        return result_dic_list, chat_session, causes
+        return result_dic_list, chat_session, causes, sql_env
 
-    def self_correct(self, sql, error, chat_session, logger, simplify=False, check_again_flag=False):
+    def self_correct(self, sql, error, chat_session: Type[GPTChat], logger, simplify=False, check_again_flag=False):
         prompt = f"Input sql:\n{sql}\nThe error information is:\n" + str(error) if not isinstance(error, str) else error + "\nPlease correct it based on previous context and output the thinking process with only one sql query in ```sql``` format. Don't just analyze without SQL or output several SQLs.\n"
         if simplify:
             prompt += "Since the output is empty, please simplify some conditions of the past sql.\n"
@@ -128,25 +130,28 @@ class REFORCE():
         response_csv = chat_session.get_model_response_txt(table_info + "Task: " + task + format_prompt)
         return response_csv, chat_session
 
-    def exploration(self, task, max_try, table_struct, logger, chat_session: Type[GPTChat]):
+    def exploration(self, task, table_struct, logger, chat_session: Type[GPTChat], sql_env: Type[SqlEnv]):
         pre_info = ''
         task = "Task: " + task + "\n"
-        max_try = 3
+        max_try = self.max_try
+        causes = None
         while max_try > 0:
             exploration_prompt = task + self.prompt_class.get_exploration_prompt(self.api, table_struct)
 
             response_pre = chat_session.get_model_response(exploration_prompt, "sql")
             response_pre_txt = chat_session.messages[-1]['content']
+            logger.info("[Exploration]\n" + response_pre_txt + "\n[Exploration]")
             if not isinstance(response_pre, list):
                 max_try -= 1
                 continue
+            
             if len(response_pre) == 1:
-                sql_list = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
-            if len(sql_list) < 10:
+                response_pre = [query.strip() for query in response_pre[0].strip().split(';') if query.strip()]
+            if len(response_pre) < 10:
                 max_try -= 1
                 print(f"{self.sql_id}: Few sqls, retry preparation.")
                 continue
-            results_pre_dic_list, chat_session, causes = self.execute_sqls(sql_list, chat_session, logger, max_len=500)
+            results_pre_dic_list, chat_session, causes, sql_env = self.execute_sqls(response_pre, chat_session, logger, sql_env)
             sql_count = 0
             for dic in results_pre_dic_list:
                 pre_info += "Query:\n" + dic['sql'] + "\nAnswer:\n" + str(dic['res'])
@@ -164,112 +169,54 @@ class REFORCE():
             print(f"{self.sql_id}: Too long, retry preparation.")
             pre_info = ''
             max_try -= 1
-        pre_info += f"Please note that this may cause errors:\n{causes}"
-        return pre_info, response_pre_txt, max_try, chat_session
+        # if causes:
+        #     pre_info += f"Pay attention to:\n{causes}"
+        return pre_info, response_pre_txt, max_try, chat_session, sql_env
 
-    def schema_linking(dictionaries, task_dict, example_path, chat_session_sl, txt_len_threshold):
-        for eg_id in tqdm(dictionaries):
-            skip_flag = False
-            chat_session_sl.init_messages()
-            print(eg_id)
-            api = get_api_name(eg_id)
-            task = task_dict[eg_id]
-            table_info = get_table_info(example_path, eg_id, api)
-            if len(table_info) < txt_len_threshold or skip_flag:
-                continue
-            print("Doing schema linking")
-            table_struct = table_info[table_info.find("The table structure information is "):]
-
-            prompt = f"Table information: {table_info}\nTask: {task}\nConsider which tables are related to the task. Remove unnecessary tables in {table_struct} and answer table names in ```python``` format in a list.\n"
-            
-            max_iter = 3
-            while max_iter > 0:
-                chat_session_sl.init_messages()
-                e = None
-                table_struct_response = chat_session_sl.get_model_response(prompt, "python")
-                try:
-                    table_names = ast.literal_eval(table_struct_response[0])
-                    table_names_no_digit = [remove_digits(s) for s in table_names]
-                except Exception as e:
-                    print(str(table_struct_response))
-                    continue
-                if table_names_no_digit != []:
-                    break
-                max_iter -= 1
-            if e is not None or max_iter <= 0:
-                print([max_iter, e])
-                continue
-            ddl_paths = search_file(os.path.join(example_path, eg_id), "DDL.csv")
-            
-            for ddl_path in ddl_paths:
-                temp_file = ddl_path.replace("DDL.csv", "DDL_tmp.csv")
-                with open(ddl_path, "r", newline="", encoding="utf-8", errors="ignore") as infile, \
-                    open(temp_file, "w", newline="", encoding="utf-8", errors="ignore") as outfile:
-                    
-                    reader = csv.reader(infile)
-                    writer = csv.writer(outfile)
-
-                    header = next(reader)
-                    writer.writerow(header)
-                    row_count = 0
-                    row_list_all = []
-                    row_list = []
-                    for row in reader:
-                        if any(remove_digits(row[0]) in item for item in table_names_no_digit):
-                            row_count += 1
-                            row_list_all.append(row)
-                        if any(row[0] in item for item in table_names):
-                            row_list.append(row)
-
-                    if row_count > 100:
-                        writer.writerows(row_list)
-                    else:
-                        writer.writerows(row_list_all)
-
-                os.replace(temp_file, ddl_path)
-
-        compress_ddl(example_path)
-
-    def self_refine(self, args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, chat_session):
+    def self_refine(self, args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, chat_session: Type[GPTChat], csv_save_path, sql_save_path, sql_env: Type[SqlEnv]):
         itercount = 0
         results_values = []
         results_tables = []
 
-        self_refine_prompt = self.prompt_class.get_self_refine_prompt(self, table_info, response_pre_txt, pre_info, task, self.api, format_csv, table_struct)
+        self_refine_prompt = self.prompt_class.get_self_refine_prompt(table_info, response_pre_txt, pre_info, task, self.api, format_csv, table_struct)
         # self-refine
         error_rec = []
         while itercount < args.max_iter:
             logger.info(f"itercount: {itercount}")
-            logger.info(self_refine_prompt)
+            logger.info("[Self-refine]\n" + self_refine_prompt + "\n[Self-refine]")
             
             max_try = self.max_try
             while max_try > 0:
                 response = chat_session.get_model_response(self_refine_prompt, "sql")
                 if not isinstance(response, list) or len(response) != 1:
                     self_refine_prompt = "Please output one SQL only."
+                else:
+                    break
+                max_try -= 1
             if not isinstance(response, list) or response == []:
-                if os.path.exists(self.complete_csv_save_path):
-                    os.remove(self.complete_csv_save_path)
+                if os.path.exists(csv_save_path):
+                    os.remove(csv_save_path)
                 print(f"{self.sql_id}: Error when generating final SQL.")
                 break
-            logger.info("[Try to run SQL]\n" + chat_session.messages[-1]['content'] + "\n[Try to run SQL]")
- 
-            executed_result = execute_sql_api(response, self.complete_csv_save_path, api=self.api, sqlite_path=self.sqlite_path)
+            logger.info("[Try to run SQL in self-refine]\n" + chat_session.messages[-1]['content'] + "\n[Try to run SQL in self-refine]")
+            response = response[0]
+            executed_result = sql_env.execute_sql_api(response, self.sql_id, csv_save_path, api=self.api, sqlite_path=self.sqlite_path)
             error_rec.append(executed_result)
             if len(error_rec) > 3:
                 # Eraly stop for repeatitive empty results
                 if len(set(error_rec[-4:])) == 1 and error_rec[-1] == self.empty_result:
                     logger.info("No data found for the specified query, remove file.")                    
-                    if os.path.exists(self.complete_csv_save_path):
-                        os.remove(self.complete_csv_save_path)
+                    if os.path.exists(csv_save_path):
+                        os.remove(csv_save_path)
                     break
             
             if executed_result == 0:
-                self_consistency_prompt = self.prompt_class.get_self_consistency_prompt(self, task, format_csv)
-                with open(self.complete_csv_save_path) as f:
+                self_consistency_prompt = self.prompt_class.get_self_consistency_prompt(task, format_csv)
+                with open(csv_save_path) as f:
                     csv_data = f.readlines()
                     csv_data_str = ''.join(csv_data)
-                self_consistency_prompt += csv_data_str if len(csv_data_str) < 1e4 else hard_cut(csv_data_str, 10000)
+                logger.info(f"[Executed results in self-refine]\n{csv_data_str}\n[Executed results in self-refine]")
+                self_consistency_prompt += "Current snswer: \n" + hard_cut(csv_data_str, self.csv_max_len)
                 self_consistency_prompt += f"Current sql:\n{response}"
                 if '"""' in csv_data_str:
                     self_consistency_prompt += 'Please remove """ in results. Use CAST: CAST(column_name AS STRING).\n'
@@ -295,7 +242,7 @@ class REFORCE():
                 else:
                     # self-consistency
                     logger.info(f"[Consistent results]\n{hard_cut(csv_data_str, 500)}\n[Consistent results]")
-                    with open(self.complete_sql_save_path, "w") as f:
+                    with open(sql_save_path, "w") as f:
                         f.write(response)
                     break
                 
@@ -305,21 +252,22 @@ class REFORCE():
                     save_path = save_path[:-4] + str(itercount) + save_path[-4:]
                 self_refine_prompt = self_consistency_prompt
             
-            elif not isinstance(executed_result, str):
+            elif not isinstance(executed_result, str) or executed_result == self.empty_result:
                 self_refine_prompt = f"Input sql:\n{response}\nThe error information is:\n" + str(executed_result) + "\nPlease correct it and output only 1 complete SQL query."
-            
-            elif executed_result == self.empty_result:
-                self_refine_prompt = f"Input sql:\n{response}\nThe error information is: {self.empty_result}"
 
+            else:
+                print(str(executed_result))
+                break
             itercount += 1
 
         logger.info(f"Total iteration counts: {itercount}")
         if itercount == args.max_iter and not args.save_all_results:
-            if os.path.exists(self.complete_csv_save_path):
-                os.remove(self.complete_csv_save_path)
+            if os.path.exists(csv_save_path):
+                os.remove(csv_save_path)
             logger.info("Max Iter, remove file")
+        return chat_session, sql_env
 
-    def vote_result(self, search_directory, task, chat_session):
+    def vote_result(self, search_directory, task, chat_session: Type[GPTChat]):
         
 
         pre_info = 'Based on some observations on the database:\n'
@@ -380,8 +328,74 @@ class REFORCE():
                 max_try -= 1
             with open(os.path.join(search_directory, response[0])) as f:
                 selected_sql = f.read()
-            if execute_sql_api(selected_sql, self.complete_csv_save_path, api=self.api, sqlite_path=self.sqlite_path) == 0:
+            sql_env = SqlEnv()
+            if sql_env.execute_sql_api(selected_sql, self.sql_id, self.complete_csv_save_path, api=self.api, sqlite_path=self.sqlite_path) == 0:
                 with open(self.complete_sql_save_path, "w") as f:
                     f.write(selected_sql)
                 with open(self.complete_vote_log_path, "w") as f:
                     f.write(chat_session.messages[-1]['content'])
+            sql_env.close_db()
+
+def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[GPTChat], txt_len_threshold=50000):
+    print("Doing schema linking")
+    for eg_id in tqdm(dictionaries):
+        skip_flag = False
+        chat_session_sl.init_messages()
+        print(eg_id)
+        api = get_api_name(eg_id)
+        task = task_dict[eg_id]
+        table_info = get_table_info(example_path, eg_id, api)
+        if len(table_info) < txt_len_threshold or skip_flag:
+            continue
+        print("Doing schema linking")
+        table_struct = table_info[table_info.find("The table structure information is "):]
+
+        prompt = f"Table information: {table_info}\nTask: {task}\nConsider which tables are related to the task. Remove unnecessary tables in {table_struct} and answer table names in ```python``` format in a list.\n"
+        
+        max_iter = 3
+        while max_iter > 0:
+            chat_session_sl.init_messages()
+            e = None
+            table_struct_response = chat_session_sl.get_model_response(prompt, "python")
+            try:
+                table_names = ast.literal_eval(table_struct_response[0])
+                table_names_no_digit = [remove_digits(s) for s in table_names]
+            except Exception as e:
+                print(str(table_struct_response))
+                continue
+            if table_names_no_digit != []:
+                break
+            max_iter -= 1
+        if e is not None or max_iter <= 0:
+            print([max_iter, e])
+            continue
+        ddl_paths = search_file(os.path.join(example_path, eg_id), "DDL.csv")
+        
+        for ddl_path in ddl_paths:
+            temp_file = ddl_path.replace("DDL.csv", "DDL_tmp.csv")
+            with open(ddl_path, "r", newline="", encoding="utf-8", errors="ignore") as infile, \
+                open(temp_file, "w", newline="", encoding="utf-8", errors="ignore") as outfile:
+                
+                reader = csv.reader(infile)
+                writer = csv.writer(outfile)
+
+                header = next(reader)
+                writer.writerow(header)
+                row_count = 0
+                row_list_all = []
+                row_list = []
+                for row in reader:
+                    if any(remove_digits(row[0]) in item for item in table_names_no_digit):
+                        row_count += 1
+                        row_list_all.append(row)
+                    if any(row[0] in item for item in table_names):
+                        row_list.append(row)
+
+                if row_count > 100:
+                    writer.writerows(row_list)
+                else:
+                    writer.writerows(row_list_all)
+
+            os.replace(temp_file, ddl_path)
+
+    compress_ddl(example_path, add_description=True)
