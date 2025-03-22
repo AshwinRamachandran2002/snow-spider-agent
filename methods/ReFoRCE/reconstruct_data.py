@@ -47,8 +47,6 @@ def make_folder(args):
                             if not os.path.exists(folder_path):
                                 os.mkdir(folder_path)
                             if entry.startswith("bq") or entry.startswith("ga"):
-                                # shutil.copytree(db_name_path, os.path.join(folder_path, file_name))
-                                # shutil.rmtree(db_name_path)
                                 shutil.move(db_name_path, os.path.join(folder_path, file_name))
                             elif entry.startswith("sf"):
                                 shutil.copy(db_name_path, os.path.join(folder_path, file_name))
@@ -58,7 +56,6 @@ def make_folder(args):
                         shutil.copy(ddl_path, os.path.join(folder_path, "DDL.csv"))
                         os.remove(ddl_path)
                     if entry.startswith("bq") or entry.startswith("ga"):
-                        # shutil.copytree(folder_path, os.path.join(entry1_path, folder_name))
                         shutil.move(folder_path, os.path.join(entry1_path, folder_name))
                         shutil.rmtree(project_name_path)
 
@@ -111,10 +108,7 @@ def compress_ddl(example_folder, add_description=False, add_sample_rows=False, r
                                             continue
                                         
                                         prompts += "Table full name: " + table_json["table_fullname"] + "\n"
-                                        # if entry.startswith("bq") or entry.startswith("ga"):
-                                        #     if schema_linked:
-                                        #         column_prefix = "nested_column_"
-                                        # else:
+
                                         column_prefix = "column_"
                                         for j in range(len(table_json[f"{column_prefix}names"])):
                                             table_des = ''

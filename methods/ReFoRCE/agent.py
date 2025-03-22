@@ -50,15 +50,7 @@ class REFORCE:
             check_again_flag = False
             logger.info("[Try to execute]\n" + sql + "\n[Try to execute]")
             results = self.sql_env.execute_sql_api(sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
-            # try:
-            #     # Check null values
-            #     if results != self.empty_result:
-            #         df_csv = StringIO(results)
-            #         df_csv = pd.read_csv(df_csv).fillna(0)
-            #         if ((df_csv == 0) | (df_csv == "")).all().any():
-            #             check_again_flag = True
-            # except:
-            #     pass
+
             if isinstance(results, str) and results != self.empty_result and not check_again_flag:
                 result_dic['sql'] = sql
                 result_dic['res'] = results
@@ -87,14 +79,11 @@ class REFORCE:
                     max_try -= 1
                     simplify = False
 
-                # cause = self.chat_session_pre.get_model_response_txt("The error is corrected. Please conclude all possible causes to this error in only one sentence. Don't output any SQL query.")
-                # causes += cause
-                # logger.info("[Cause]\n"+str(cause)+"\n[Cause]")
                 if isinstance(results, str) and results != self.empty_result:
                     error_rec.append(1)
                     if sqls != []:
                         response = self.chat_session_pre.get_model_response(f"```sql\n{sql}``` is corrected to ```sql\n{corrected_sql}```. Please correct other sqls if they have similar errors. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
-                        # logger.info("[Debug]\n"+response+"\n[Debug]")
+
                         if isinstance(response, list) and response != []:
                             response_sqls = []
                             for s in response:
@@ -144,7 +133,6 @@ class REFORCE:
         pre_info = ''
         task = table_info + "\nTask: " + task + "\n"
         max_try = self.max_try
-        causes = None
         while max_try > 0:
             exploration_prompt = task + self.prompt_class.get_exploration_prompt(self.api, table_struct)
 
@@ -178,8 +166,7 @@ class REFORCE:
             print(f"{self.sql_id}: Too long, retry preparation.")
             pre_info = ''
             max_try -= 1
-        # if causes:
-        #     pre_info += f"Pay attention to:\n{causes}"
+
         return pre_info, response_pre_txt, max_try
 
     def self_refine(self, args, logger, task, format_csv, table_struct, table_info, response_pre_txt, pre_info, csv_save_path, sql_save_path):
@@ -188,7 +175,7 @@ class REFORCE:
         results_tables = []
 
         self_refine_prompt = self.prompt_class.get_self_refine_prompt(table_info, response_pre_txt, pre_info, task, self.api, format_csv, table_struct)
-        # self-refine
+
         error_rec = []
         while itercount < args.max_iter:
             logger.info(f"itercount: {itercount}")
@@ -230,6 +217,7 @@ class REFORCE:
                 if '"""' in csv_data_str:
                     self_consistency_prompt += 'Please remove """ in results. Use CAST: CAST(column_name AS STRING).\n'
 
+                # Filter results with null columns
                 csv_buffer = StringIO(csv_data_str)
                 df_csv = pd.read_csv(csv_buffer).fillna("")
 
@@ -240,14 +228,15 @@ class REFORCE:
                 sort_col = df_csv_copy.columns[0]
                 df_csv_copy_sorted = df_csv_copy[sort_col].astype(str)
                 csv_data_str_round2 = df_csv_copy_sorted.to_string()
+                df_csv_str = df_csv.astype(str)
                 if get_values_from_table(csv_data_str_round2) not in results_values:
                     if nested_val:
                         self_consistency_prompt += f"Values {nested_val} are nested. Please correct them. e.g. Transfer '[\nA,\n B\n]' to 'A, B'.\n"
-                    elif not ((df_csv == 0) | (df_csv == "")).all().any():
+                    elif not ((df_csv_str == "0") | (df_csv_str == "")).all().any():
                             results_values.append(get_values_from_table(csv_data_str_round2))
                             results_tables.append(csv_data_str)
                     else:
-                        empty_columns = df_csv.columns[((df_csv == 0) | (df_csv == "")).all()].to_list()
+                        empty_columns = df_csv_str.columns[((df_csv_str == "0") | (df_csv_str == "")).all()].to_list()
                         self_consistency_prompt += f"Empty results in Column {empty_columns}. Please correct them.\n"
                 else:
                     # self-consistency
@@ -421,8 +410,5 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
                     writer.writerows(row_list)
                 else:
                     writer.writerows(row_list_all)
-        # if row_list == []:
-        #     print(f"{eg_id} Empty: {table_names}, {row_list}")
-        #     os.remove(temp_file)
 
     compress_ddl(example_path, add_description=True, add_sample_rows=True, rm_digits=True, schema_linked=True)

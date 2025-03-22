@@ -33,8 +33,8 @@ class GPTChat:
                     temperature=self.temperature
                 )
             except Exception as e:
-                if "Error code: 400" in str(e):
-                    print("Error code: 400, exit")
+                if "Error code" in str(e):
+                    print("Error code: 400, exit: "+str(e))
                     sys.exit(0)
                 print(e)
                 return e

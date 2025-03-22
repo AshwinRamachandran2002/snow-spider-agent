@@ -1,44 +1,33 @@
-# ReFoRCE: A Text-to-SQL Agent with Self-Refinement, Format Restriction, and Column Exploration
-
-## Setup
-
-### Dependencies
+# Run Step by Step
+Navigate to the ReFoRCE method folder:  
+```bash
+cd methods/ReFoRCE
 ```
-conda create -n sql python=3.10 -y
-conda activate sql
-pip install -r requirements.txt
-```
-
-For folder `spider2-lite` and `spider2-snow`, get the latest version from [Spider2 repo](https://github.com/xlang-ai/Spider2).
-
-## Scripts
-
 ## Spider2.0-snow
-
-### Set up
-Put `snowflake_credential.json` in this folder (`snow-spider-agent/methods/ReFoRCE`).
+### Setup
+Put `snowflake_credential.json` in this folder (`methods/ReFoRCE`).
 
 Set up folders: 
-```
+```bash
 python spider_agent_setup_snow.py
 ```
 
-### Reconstruct data
 First, roughly compress.
-```
+```bash
 python reconstruct_data.py --example_folder examples_snow --add_description --make_folder --rm_digits
 ```
 
 ### Run
-Export keys: OPENAI or AZURE (optional)
-```
+
+Export keys: OPENAI or AZURE (optional):
+```bash
 export OPENAI_API_KEY=YOUR_API_KEY
 export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 
-Do Schema Linking First
-```
+Do Schema Linking:
+```bash
 python run.py \
 --task snow \
 --db_path examples_snow \
@@ -47,8 +36,8 @@ python run.py \
 --schema_linking_only
 ```
 
-Run voting:
-```
+Run Voting:
+```bash
 python run.py \
 --task snow \
 --db_path examples_snow \
@@ -59,27 +48,27 @@ python run.py \
 --model_vote
 ```
 
-To run for the empty results without overwriting, add `--rerun`.
+To rerun for the empty examples without overwriting, add `--rerun`.
 
 ### Evaluation
-Preparation for evaluation files:
-```
+Preparing for evaluation files:
+```bash
 python get_metadata.py --result_path output/o1-preview-snow-log --output_path output/o1-preview-snow
 ```
 
 Run evaluation:
-```
+```bash
 cd ../../spider2-snow/evaluation_suite
 python evaluate.py --mode exec_result --result_dir ../../methods/ReFoRCE/output/o1-preview-snow
 ```
 
-## Spider2.0-lite
+## Spider2.0-snow
 
-### Set up
+### Setup
 Put `snowflake_credential.json` and `bigquery_credential.json` in this folder (`snow-spider-agent/methods/ReFoRCE`).
 
 Set up folders: 
-```
+```bash
 gdown 'https://drive.google.com/uc?id=1coEVsCZq-Xvj9p2TnhBFoFTsY-UoYGmG' -O ../../spider2-lite/resource/
 rm -rf ../../spider2-lite/resource/databases/spider2-localdb
 mkdir -p ../../spider2-lite/resource/databases/spider2-localdb
@@ -87,52 +76,54 @@ unzip ../../spider2-lite/resource/local_sqlite.zip -d ../../spider2-lite/resourc
 python spider_agent_setup_lite.py
 ```
 
-### Reconstruct data
-First, roughly compress.
-```
+First, roughly compress:
+```bash
 python reconstruct_data.py --example_folder examples_lite --add_description --make_folder --rm_digits
 ```
 
 ### Run
-Export keys: OPENAI or AZURE (optional)
-```
+Export API keys: OPENAI or AZURE (optional):
+```bash
 export OPENAI_API_KEY=YOUR_API_KEY
 export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 
-Do Schema Linking First
-```
+Do Schema Linking:
+```bash
 python run.py \
---task snow \
---db_path examples_snow \
+--task lite \
+--db_path examples_lite \
 --schema_linking_model o1-preview \
 --azure \
 --schema_linking_only
 ```
 
-Run voting:
-```
+Run Voting:
+```bash
 python run.py \
---task lite \
---db_path examples_lite \
---output_path output/o1-preview-lite-log \
---model o1-preview \
---pre_model o1-preview \
---azure \
---model_vote
+    --task lite \
+    --db_path examples_lite \
+    --output_path output/o1-preview-lite-log \
+    --model o1-preview \
+    --pre_model o1-preview \
+    --azure \
+    --max_iter 5 \
+    --model_vote \
+    --num_votes 3 \
+    --num_workers 16
 ```
 
-To run for the empty results without overwriting, add `--rerun`.
+To rerun for the empty examples without overwriting, add `--rerun`.
 
 ### Evaluation
 Preparation for evaluation files:
-```
+```bash
 python get_metadata.py --result_path output/o1-preview-lite-log --output_path output/o1-preview-lite
 ```
 
 Run evaluation:
-```
+```bash
 cd ../../spider2-lite/evaluation_suite
 python evaluate.py --mode exec_result --result_dir ../../methods/ReFoRCE/output/o1-preview-lite
 ```
