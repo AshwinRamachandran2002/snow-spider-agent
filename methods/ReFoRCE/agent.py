@@ -50,15 +50,15 @@ class REFORCE:
             check_again_flag = False
             logger.info("[Try to execute]\n" + sql + "\n[Try to execute]")
             results = self.sql_env.execute_sql_api(sql, self.sql_id, api=self.api, max_len=self.csv_max_len, sqlite_path=self.sqlite_path)
-            try:
-                # Check null values
-                if results != self.empty_result:
-                    df_csv = StringIO(results)
-                    df_csv = pd.read_csv(df_csv).fillna(0)
-                    if ((df_csv == 0) | (df_csv == "")).all().any():
-                        check_again_flag = True
-            except:
-                pass
+            # try:
+            #     # Check null values
+            #     if results != self.empty_result:
+            #         df_csv = StringIO(results)
+            #         df_csv = pd.read_csv(df_csv).fillna(0)
+            #         if ((df_csv == 0) | (df_csv == "")).all().any():
+            #             check_again_flag = True
+            # except:
+            #     pass
             if isinstance(results, str) and results != self.empty_result and not check_again_flag:
                 result_dic['sql'] = sql
                 result_dic['res'] = results
@@ -71,6 +71,7 @@ class REFORCE:
                 simplify = False
                 corrected_sql = None
                 while not isinstance(results, str) or results == self.empty_result or check_again_flag:
+                    error_rec.append(0)
                     if max_try == 0:
                         break
                     if results == self.empty_result:
@@ -91,25 +92,26 @@ class REFORCE:
                 # logger.info("[Cause]\n"+str(cause)+"\n[Cause]")
                 if isinstance(results, str) and results != self.empty_result:
                     error_rec.append(1)
-                    response = self.chat_session_pre.get_model_response(f"SQL {corrected_sql} is correct now. Please correct other sqls if they have similar errors. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
-                    if isinstance(corrected_sql, list) and corrected_sql != []:
-                        response_sqls = []
-                        for s in response:
-                            try:
-                                queries = [query.strip() for query in s.strip().split(';') if query.strip()]
-                                response_sqls += queries
-                            except:
-                                pass
-                        if len(response_sqls) >= len(sqls):
-                            sqls = response_sqls
-                            logger.info("[Corrected other sqls]\n"+self.chat_session_pre.messages[-1]['content']+"\n[Corrected other sqls]")
+                    if sqls != []:
+                        response = self.chat_session_pre.get_model_response(f"```sql\n{sql}``` is corrected to ```sql\n{corrected_sql}```. Please correct other sqls if they have similar errors. SQLs: {sqls}. For each SQL, answer in ```sql``` format.\n", "sql")
+                        # logger.info("[Debug]\n"+response+"\n[Debug]")
+                        if isinstance(response, list) and response != []:
+                            response_sqls = []
+                            for s in response:
+                                try:
+                                    queries = [query.strip() for query in s.strip().split(';') if query.strip()]
+                                    response_sqls += queries
+                                except:
+                                    pass
+                            if len(response_sqls) >= len(sqls) // 2:
+                                sqls = response_sqls
+                                logger.info("[Corrected other sqls]\n"+self.chat_session_pre.messages[-1]['content']+"\n[Corrected other sqls]")
                 else:
                     error_rec.append(0)
-                    results = str(results)
+                    # Many times error, return
+                    if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
+                        return result_dic_list
                     continue
-                # Many times error, return
-                if len(error_rec) > 5 and sum(error_rec[-5:]) == 0:
-                    return result_dic_list
                 if not corrected_sql:
                     continue
                 result_dic['sql'] = corrected_sql
@@ -168,8 +170,7 @@ class REFORCE:
 
             if sql_count < len(response_pre) // 2:
                 print(f"{self.sql_id}: sql_count: {sql_count}, len(response_pre): {len(response_pre)}. Inadequate preparation, break.")
-                pre_info = ''
-                max_try -= 1
+                max_try = 0
                 break
 
             if len(pre_info) < 1e5:
@@ -223,7 +224,7 @@ class REFORCE:
                 with open(csv_save_path) as f:
                     csv_data = f.readlines()
                     csv_data_str = ''.join(csv_data)
-                logger.info(f"[Executed results in self-refine]\n{csv_data_str}\n[Executed results in self-refine]")
+                logger.info(f"[Executed results in self-refine]\n{hard_cut(csv_data_str, self.csv_max_len)}\n[Executed results in self-refine]")
                 self_consistency_prompt += "Current snswer: \n" + hard_cut(csv_data_str, self.csv_max_len)
                 self_consistency_prompt += f"Current sql:\n{response}"
                 if '"""' in csv_data_str:
@@ -236,7 +237,8 @@ class REFORCE:
                 df_csv_copy = df_csv.copy()
                 for col in df_csv.select_dtypes(include=['float']):
                     df_csv_copy[col] = df_csv[col].round(2)
-                df_csv_copy_sorted = df_csv_copy.sort_values(by=df_csv_copy.columns[0])
+                sort_col = df_csv_copy.columns[0]
+                df_csv_copy_sorted = df_csv_copy[sort_col].astype(str)
                 csv_data_str_round2 = df_csv_copy_sorted.to_string()
                 if get_values_from_table(csv_data_str_round2) not in results_values:
                     if nested_val:
@@ -307,7 +309,7 @@ class REFORCE:
                 pre_info += extract_between(logfile_path, "Begin Exploring Related Columns\n", "End Exploring Related Columns\n")[0]
             except Exception as e:
                 print([logfile_path, e])
-            if os.path.exists(sql_path):
+            if os.path.exists(sql_path) and os.path.exists(csv_path):
                 sql_path_exist = sql_path
                 csv_path_exist = csv_path
                 count += 1
@@ -329,12 +331,15 @@ class REFORCE:
             prompt += "Compare the SQL and results of each answer and choose one SQL as the correct answer and tell me the reason. Output the name of sql in ```plaintext\nxxx.sql``` format. You should not ingnore 'plaintext'.\n"
             response = chat_session.get_model_response(hard_cut(pre_info, 150000) + prompt, "plaintext")
             while max_try > 0:
-                if not response or not isinstance(response, list):
+                if not response or not isinstance(response, list) or ".sql" not in response[0]:
                     print(logfile_path, response)
                     chat_session.get_model_response("Please output the name of sql in ```plaintext\nxxx.sql``` format. You should not ingnore 'plaintext'.", "plaintext")
                 else:
                     break
                 max_try -= 1
+            if max_try == 0:
+                print(f"{logfile_path} Empty")
+                return
             with open(os.path.join(search_directory, response[0].strip())) as f:
                 selected_sql = f.read()
             sql_env = SqlEnv()
@@ -347,11 +352,9 @@ class REFORCE:
 
 def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[GPTChat], txt_len_threshold=100000):
     print("Doing schema linking")
-    # skip_flag = True
     skip_flag = False
     for eg_id in tqdm(dictionaries):
-        if eg_id not in ["bq287"]:
-            continue
+        # if eg_id in ["sf_bq287"]:
         #     skip_flag = False
         chat_session_sl.init_messages()
         api = get_api_name(eg_id)
@@ -373,6 +376,7 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
             table_struct_response = chat_session_sl.get_model_response(prompt, "python")
             try:
                 table_names = ast.literal_eval(table_struct_response[0])
+                table_names = [name.split('.')[-1] for name in table_names]
                 table_names_no_digit = [remove_digits(s) for s in table_names]
             except Exception as e:
                 print(str(table_struct_response))
@@ -397,6 +401,7 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
                 writer.writerow(header)
                 row_count = 0
                 row_count_rm = 0
+                total_count = 0
                 row_list_all = []
                 row_list = []
                 for row in reader:
@@ -406,7 +411,8 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
                     if any(row[0] in item for item in table_names):
                         row_count += 1
                         row_list.append(row)
-                print(f"{eg_id}: tables after linking: {row_count}, tables rm digits after linking: {row_count_rm}")
+                    total_count += 1
+                print(f"{eg_id}: tables before linking: {total_count}, tables after linking: {row_count}, tables rm digits after linking: {row_count_rm}")
                 if row_count_rm > 500:
                     print(f"row_count_rm > 500: {eg_id}, row_count: {row_count}")
                     writer.writerows(row_list)
@@ -415,10 +421,8 @@ def schema_linking(dictionaries, task_dict, example_path, chat_session_sl: Type[
                     writer.writerows(row_list)
                 else:
                     writer.writerows(row_list_all)
-                if row_list_all == []:
-                    print(f"{eg_id} Empty: {table_names_no_digit}")
-                    os.remove(temp_file)
-
-            # os.replace(temp_file, ddl_path)
+        # if row_list == []:
+        #     print(f"{eg_id} Empty: {table_names}, {row_list}")
+        #     os.remove(temp_file)
 
     compress_ddl(example_path, add_description=True, add_sample_rows=True, rm_digits=True, schema_linked=True)

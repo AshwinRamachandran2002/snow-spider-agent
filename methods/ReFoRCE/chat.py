@@ -1,6 +1,7 @@
 from openai import OpenAI, AzureOpenAI
 from utils import extract_all_blocks
 import os
+import sys
 
 class GPTChat:
     def __init__(self, azure=False, model="gpt-4o", temperature=1) -> None:
@@ -32,6 +33,9 @@ class GPTChat:
                     temperature=self.temperature
                 )
             except Exception as e:
+                if "Error code: 400" in str(e):
+                    print("Error code: 400, exit")
+                    sys.exit(0)
                 print(e)
                 return e
             choices = response.choices

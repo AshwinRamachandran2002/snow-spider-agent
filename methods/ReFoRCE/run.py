@@ -1,10 +1,8 @@
 import os
-from tqdm import tqdm
 import argparse
 import glob
 from utils import get_table_info, initialize_logger, get_dictionary
 from agent import REFORCE, schema_linking
-from typing import Type
 from chat import GPTChat
 from prompt import Prompts
 import threading, concurrent
@@ -18,7 +16,7 @@ def execute(task, table_info, args, csv_save_path, log_save_path, sql_save_path,
         else:
             print(f"Rerun: {search_directory}")
     # if log.log exists, pass
-    elif not args.overwrite_results and os.path.exists(os.path.join(search_directory, log_save_path)):
+    elif os.path.exists(os.path.join(search_directory, sql_save_path)):
         return
 
     # remove files
@@ -62,14 +60,13 @@ def main(args):
     if args.schema_linking_model:
         chat_session_sl = GPTChat(args.azure, args.schema_linking_model, temperature=args.temperature) 
         schema_linking(dictionaries, task_dict, args.db_path, chat_session_sl)
-        import sys
-        sys.exit(0)
+        if args.schema_linking_only:
+            return
     # Use ThreadPoolExecutor to process each sql_data in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         list(executor.map(process_sql_data, dictionaries))
 
-    # for sql_data in dictionaries:
-    #     process_sql_data(sql_data)
+    print("Finished")
 
 def process_sql_data(sql_data):
     start_time = time.time()
@@ -89,7 +86,7 @@ def process_sql_data(sql_data):
         os.makedirs(search_directory)
 
     # Skip processing if results already exist and overwrite is not allowed
-    if not args.overwrite_results and os.path.exists(agent_format.complete_log_save_path):
+    if os.path.exists(agent_format.complete_sql_save_path):
         return
 
     # Ensure the search directory exists (in case it was removed)
@@ -133,11 +130,12 @@ def process_sql_data(sql_data):
         for thread in threads:
             thread.join()
         
-        if any(file.endswith('.sql') for file in os.listdir(search_directory) if os.path.isfile(os.path.join(search_directory, file))):
-            # After all processes have completed, perform the vote result
-            agent_format.vote_result(search_directory, task, chat_session_format, sql_paths, table_info)
-        else:
-            print(f"{sql_data}: Empty")
+        if "result.sql" not in os.listdir(search_directory):
+            if any(file.endswith('.sql') for file in os.listdir(search_directory) if os.path.isfile(os.path.join(search_directory, file))):
+                # After all processes have completed, perform the vote result
+                agent_format.vote_result(search_directory, task, chat_session_format, sql_paths, table_info)
+            else:
+                print(f"{sql_data}: Empty")
     else:
         # Directly execute the task
         execute(
@@ -155,16 +153,16 @@ if __name__ == '__main__':
     parser.add_argument('--output_path', type=str, default="output/o1-preview-snow-log")
     parser.add_argument('--model', type=str, default="o1-preview")
     parser.add_argument('--pre_model', type=str, default="o1-preview")
-    parser.add_argument('--overwrite_results', action="store_true")
     parser.add_argument('--azure', action="store_true")
-    parser.add_argument('--max_iter', type=int, default=10)
+    parser.add_argument('--schema_linking_model', type=str, default=None)
+    parser.add_argument('--schema_linking_only', action="store_true")
+    parser.add_argument('--max_iter', type=int, default=5)
     parser.add_argument('--temperature', type=float, default=1)
     parser.add_argument('--num_votes', type=int, default=3)
     parser.add_argument('--save_all_results', action="store_true")
-    parser.add_argument('--schema_linking_model', type=str, default=None)
     parser.add_argument('--rerun', action="store_true")
     parser.add_argument('--model_vote', action="store_true")
-    parser.add_argument('--num_workers', type=int, default=3)
+    parser.add_argument('--num_workers', type=int, default=10)
     args = parser.parse_args()
     prompt_all = Prompts()
     dictionaries, task_dict = get_dictionary(args)

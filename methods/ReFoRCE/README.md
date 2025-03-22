@@ -11,6 +11,8 @@ pip install -r requirements.txt
 
 For folder `spider2-lite` and `spider2-snow`, get the latest version from [Spider2 repo](https://github.com/xlang-ai/Spider2).
 
+## Scripts
+
 ## Spider2.0-snow
 
 ### Set up
@@ -35,10 +37,30 @@ export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 
+Do Schema Linking First
+```
+python run.py \
+--task snow \
+--db_path examples_snow \
+--schema_linking_model o1-preview \
+--azure \
+--schema_linking_only
+```
+
 Run voting:
 ```
-python run.py --db_path examples_snow --model o1-preview --pre_model o1-preview --output_path output/o1-preview-snow-log --azure --num_threads 3 --task snow
+python run.py \
+--task snow \
+--db_path examples_snow \
+--output_path output/o1-preview-snow-log \
+--model o1-preview \
+--pre_model o1-preview \
+--azure \
+--model_vote
 ```
+
+To run for the empty results without overwriting, add `--rerun`.
+
 ### Evaluation
 Preparation for evaluation files:
 ```
@@ -48,7 +70,7 @@ python get_metadata.py --result_path output/o1-preview-snow-log --output_path ou
 Run evaluation:
 ```
 cd ../../spider2-snow/evaluation_suite
-python evaluate.py --mode exec_result --result_dir ../../methods/spider-self-refine/output/o1-preview-snow
+python evaluate.py --mode exec_result --result_dir ../../methods/ReFoRCE/output/o1-preview-snow
 ```
 
 ## Spider2.0-lite
@@ -79,6 +101,16 @@ export AZURE_ENDPOIONT=YOUR_AZURE_ENDPOIONT
 export AZURE_OPENAI_KEY=YOUR_AZURE_API_KEY
 ```
 
+Do Schema Linking First
+```
+python run.py \
+--task snow \
+--db_path examples_snow \
+--schema_linking_model o1-preview \
+--azure \
+--schema_linking_only
+```
+
 Run voting:
 ```
 python run.py \
@@ -88,9 +120,11 @@ python run.py \
 --model o1-preview \
 --pre_model o1-preview \
 --azure \
---schema_linking_model o1-preview \
 --model_vote
 ```
+
+To run for the empty results without overwriting, add `--rerun`.
+
 ### Evaluation
 Preparation for evaluation files:
 ```
@@ -100,5 +134,5 @@ python get_metadata.py --result_path output/o1-preview-lite-log --output_path ou
 Run evaluation:
 ```
 cd ../../spider2-lite/evaluation_suite
-python evaluate.py --mode exec_result --result_dir ../../methods/spider-self-refine/output/o1-preview-lite
+python evaluate.py --mode exec_result --result_dir ../../methods/ReFoRCE/output/o1-preview-lite
 ```

@@ -364,7 +364,7 @@ def evaluate_spider2sql(args):
                     gold_pds = [pd.read_csv(os.path.join(gold_result_dir, file)) for file in csv_files]
                     score = compare_multi_pandas_table(pred_pd, gold_pds, eval_standard_dict.get(id)['condition_cols'], eval_standard_dict.get(id)['ignore_order'])
             except:
-                print("{id} ERROR!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+                print(f"{id} ERROR!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
         output_results.append(
             {
@@ -376,7 +376,7 @@ def evaluate_spider2sql(args):
         )
 
         
-    # print({item['instance_id']: item['score'] for item in output_results if item['score']==1})  
+    print({item['instance_id']: item['score'] for item in output_results})  
     correct_examples = sum([item['score'] for item in output_results]) 
 
     print(f"Final score: {correct_examples / len(output_results)}, Correct examples: {correct_examples}, Total examples: {len(output_results)}")
