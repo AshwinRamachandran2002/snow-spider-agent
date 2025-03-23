@@ -277,51 +277,47 @@ class vLLMRollout(BaseRollout):
                     dtype=attention_mask.dtype)
                 
                 ignore_now = False
-                if self.start_tensor is None:
-                    self.start_tensor = torch.tensor([27, 11748, 5287, 397], dtype=response.dtype, device=response.device)
-                    # self.start_tensor = torch.tensor([151669], dtype=response.dtype, device=response.device)
-                if self.end_tensor is None:
-                    self.end_tensor = torch.tensor([522, 11748, 5287, 397], dtype=response.dtype, device=response.device)
-                    # self.end_tensor = torch.tensor([151670], dtype=response.dtype, device=response.device)
+                # if self.start_tensor is None:
+                #     self.start_tensor = torch.tensor([27, 11748, 5287, 397], dtype=response.dtype, device=response.device)
+                #     # self.start_tensor = torch.tensor([151669], dtype=response.dtype, device=response.device)
+                # if self.end_tensor is None:
+                #     self.end_tensor = torch.tensor([522, 11748, 5287, 397], dtype=response.dtype, device=response.device)
+                #     # self.end_tensor = torch.tensor([151670], dtype=response.dtype, device=response.device)
+                # for batch in range(len(response)):
+                #     for index in range(4, len(response[batch])-4):
+                        
+                #         if torch.equal(response[batch][index-4:index], self.start_tensor):
+                #             ignore_now = True
+                #             continue
+
+                #         if torch.equal(response[batch][index:index+4], self.end_tensor):
+                #             ignore_now = False
+                            
+                #         if ignore_now:
+                #             response_attention_mask[batch][index] = 0
+
+                start_tensor = torch.tensor([[27, 11748, 5287, 397],
+                                             [27, 11748, 5287, 29]
+                                             ], dtype=response.dtype, device=response.device)
+                end_tensor   = torch.tensor([[522, 11748, 5287, 397],
+                                             [522, 11748, 5287, 29]
+                                             ], dtype=response.dtype, device=response.device)
                 for batch in range(len(response)):
                     for index in range(4, len(response[batch])-4):
                         
-                        if torch.equal(response[batch][index-4:index], self.start_tensor):
+                        if any(torch.equal(response[batch][index-4:index], st) for st in start_tensor):
+                            response_attention_mask[batch][index] = 0
                             ignore_now = True
                             continue
+                        elif self.tokenizer.decode(response[batch][index-4:index]).strip() == "<exec_result>":
+                            print("FATAL: <exec_result> not matched: "+str(response[batch][:].cpu().tolist()))
 
-                        if torch.equal(response[batch][index:index+4], self.end_tensor):
+                        if any(torch.equal(response[batch][index:index+4], st) for st in end_tensor):
                             ignore_now = False
-                            
+                        elif self.tokenizer.decode(response[batch][index:index+4]).strip() == "</exec_result>":
+                            print("FATAL: </exec_result> not matched: "+str(response[batch][:].cpu().tolist()))
                         if ignore_now:
                             response_attention_mask[batch][index] = 0
-                # start_patterns = [
-                #     torch.tensor([27, 11748, 5287, 397], dtype=response.dtype, device=response.device),
-                #     torch.tensor([27, 11748, 5287, 29], dtype=response.dtype, device=response.device),
-                # ]
-
-                # end_patterns = [
-                #     torch.tensor([3918, 11748, 5287, 397], dtype=response.dtype, device=response.device),
-                #     torch.tensor([522, 11748, 5287, 29], dtype=response.dtype, device=response.device),
-                # ]
-
-                # ignore_now = False
-                # for batch in range(len(response)):
-                #     for index in range(4, len(response[batch]) - 4):
-                #         for start_seq in start_patterns:
-                #             if torch.equal(response[batch][index - 4:index], start_seq):
-                #                 ignore_now = True
-                #                 break
-                #         if ignore_now:
-                #             continue
-                #         for end_seq in end_patterns:
-                #             if torch.equal(response[batch][index:index + 4], end_seq):
-                #                 ignore_now = False
-                #                 break
-                #         if ignore_now:
-                #             response_attention_mask[batch][index] = 0
-                # attention_mask = torch.cat(
-                #     (attention_mask, response_attention_mask), dim=-1)
                 attention_mask = torch.cat(
                     (attention_mask, response_attention_mask), dim=-1)
 

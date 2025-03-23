@@ -107,13 +107,17 @@ class RewardManager():
         #     f.write(f"sqlite_path:\n{sqlite_path}\n")
         #     f.write(f"api:\n{get_api_name(example_id)}\n")
         #     f.write(f"csv_save_path:\n{csv_save_path}\n")
-        log_folder = os.getenv("EXEC_FOLDER")
+
+        
         # Negative rewards for incorrect intermediate SQLs.
         # Note: Since the token level rewards are any way summed up in the end,
         # we attach negative rewards to positin just before end
         # this is to enable latr metrics calculation
         # hacky method
-
+        # prin = True
+        # if prin:
+        #     print(f"log_path: {log_path}, response_str: {response_str}, MD5: {calculate_md5(response_str.strip())}")
+        # prin = False
 
         # Extract solution.
         if "<|im_start|>SQL" in response_str:
@@ -128,10 +132,11 @@ class RewardManager():
         #         with open(log_path, "a") as f:
         #             f.write(f"Reward: successful_final_sql\n")
         #         reward_tensor[-1] = self.successful_final_sql_reward
-        response_str = response_str.strip('\n')
+        response_str = response_str.strip()
+        log_folder = os.getenv("EXEC_FOLDER")
         log_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".log")
         # print(f"log_path: {log_path}")
-        # print(f"response_str: {response_str}, MD5: {calculate_md5(response_str)}")
+        
         if not os.path.exists(log_path):
             return 0
   
@@ -160,7 +165,7 @@ class RewardManager():
         valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
         valid_prompt_ids = prompt_ids[-valid_prompt_length:]
         prompt_str = self.tokenizer.decode(valid_prompt_ids)
-        valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
+
         # recover the response
         response_ids = data_item.batch['responses']
         end_index = len(data_item.batch['attention_mask'][prompt_length:]) - 1
@@ -168,6 +173,8 @@ class RewardManager():
             end_index -= 1
         response_str = self.tokenizer.decode(response_ids[:end_index + 1])
 
+        # print(f"Attention Mask: {data_item.batch['attention_mask'][prompt_length:].cpu().tolist()}, response_ids: {response_ids.cpu().tolist()}")
+        valid_response_length = end_index + 1
         sqlite_path = data_item.non_tensor_batch['reward_model']['sqlite_path']
         example_id = data_item.non_tensor_batch['reward_model']['example_id']
 

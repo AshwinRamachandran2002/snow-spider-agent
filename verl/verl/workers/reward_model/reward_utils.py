@@ -197,7 +197,7 @@ class SqlEnv:
                 if memory_conn:
                     self.conns[sqlite_path] = memory_conn
                     conn.close()
-                    print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
+                    # print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
                 else:
                     print("Backup failed after multiple attempts, using the original connection.")
                     self.conns[sqlite_path] = conn
@@ -207,12 +207,12 @@ class SqlEnv:
             # print(f"sqlite_path: {sqlite_path}, (self.conns): {self.conns.keys()}")
 
     def close_db(self):
-        print("Close DB")
+        # print("Close DB")
         for key, conn in list(self.conns.items()):
             try:
                 if conn:
                     conn.close()
-                    print(f"Connection {key} closed.")
+                    # print(f"Connection {key} closed.")
                     del self.conns[key]
             except Exception as e:
                 print(f"When closing DB for {key}: {e}")
@@ -239,8 +239,8 @@ class SqlEnv:
         try:
             rows = get_rows(cursor)
             if cursor.description is None:
-                print("cursor.description is None, no column metadata available.")
-                return "No column information available."
+                print(f"Cursor.description is None SQL: {sql_query}")
+                return f"No a valid SQL: {sql_query}"
             columns = [desc[0] for desc in cursor.description]
         except Exception as e:
             print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
@@ -288,7 +288,7 @@ class SqlEnv:
         def target(q):
             try:
                 result = self.exec_sql(sql_query, save_path, api, max_len, LIMIT, sqlite_path)
-                q.put(result)
+                q.put(str(result))
             except Exception as e:
                 print("Exception in process", str(e))
                 q.put(str(e))

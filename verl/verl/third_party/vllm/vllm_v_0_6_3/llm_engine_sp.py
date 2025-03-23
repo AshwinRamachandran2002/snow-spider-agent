@@ -74,8 +74,12 @@ class SQLExecutor():
         self.calls_per_parent_seq_id = {}
         self.time_per_parent_seq_id = {}
 
-        self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370], [522, 11748, 18063, 29]] # </exec_sql>
-        self.start_token_ids = [[366, 11748, 18063, 397], [27, 11748, 18063, 397], [366, 11748, 18063, 29]]
+        # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]] # </exec_sql>
+        # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
+
+        # For v1:
+        self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339]]
+        self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
         self.tokenizer = tokenizer_group.tokenizer
 
         self.sql_env = SqlEnv()
@@ -138,7 +142,7 @@ class SQLExecutor():
                     example_id = kwargs["example_id"]
                     start = time.time()
 
-                    log = self.tokenizer.decode(completion).strip('\n')
+                    log = self.tokenizer.decode(completion).strip()
                     file_name = f"{example_id}_{calculate_md5(log)}"
                     exec_result = self.exec_func_sql(sql_string, save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
                     
@@ -152,7 +156,7 @@ class SQLExecutor():
                             f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
                     return []
         if completion[-1] != self.tokenizer.eos_token_id:
-            print(f"No match: {self.tokenizer.decode(completion)}")
+            print(f"No match: {completion}")
         return [self.tokenizer.eos_token_id]
 
     def remove(self, request_id):
@@ -173,9 +177,9 @@ class SQLExecutor():
         self.monitor_parent_seq_ids = {}
         self.calls_per_parent_seq_id = {}
         self.initial_prompts = {}
-        print(f"Start releasing DB")
+        # print(f"Start releasing DB")
         self.sql_env.close_db()
-        print(f"End releasing  DB")
+        # print(f"End releasing  DB")
         # self.sql_env.executor = ThreadPoolExecutor(max_workers=1)
 
     def process(self, outputs, scheduler_outputs):
@@ -204,8 +208,8 @@ class SQLExecutor():
             for seq_output in completion_seq_output.samples:
                 seq_id = seq_output.parent_seq_id
 
-                if seq_id in seq_id_analyzed:
-                    print("WARNING", outputs)
+                # if seq_id in seq_id_analyzed:
+                #     print("WARNING", outputs)
                 seq_id_analyzed.append(seq_id)
 
                 if self.logging:
@@ -313,10 +317,10 @@ class SQLExecutor():
                                 "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
                                 "curr_pointer": 0
                             }
-                        elif exec_res == [self.tokenizer.eos_token_id]:
-                            print(f"FATALERROR: Remove from monitor, {self.tokenizer.decode(completions)}, {completions}")
-                            if seq_id in self.monitor_parent_seq_ids:
-                                del self.monitor_parent_seq_ids[seq_id]
+                        # elif exec_res == [self.tokenizer.eos_token_id]:
+                        #     print(f"FATALERROR: Remove from monitor: {completions}")
+                        #     if seq_id in self.monitor_parent_seq_ids:
+                        #         del self.monitor_parent_seq_ids[seq_id]
                         else:
                             self.monitor_parent_seq_ids[seq_id] = {
                                 "exec_result": exec_res,
@@ -325,7 +329,11 @@ class SQLExecutor():
                 elif completions[-1] == self.tokenizer.eos_token_id:
                     self.fetch_execution_result(completions, seq_id, final=True)
                 elif self.tokenizer.decode(completions[-4:]).strip() == "</exec_sql>":
-                    print(f"Fatal err: {completions[-4:]} not in monitor, {self.tokenizer.decode(completions)}, ids: {completions}")
+                    print(f"Fatal err: {completions[-4:]} not in monitor, ids: {completions}")
+                    self.monitor_parent_seq_ids[seq_id] = {
+                        "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
+                        "curr_pointer": 0
+                    }
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
             if index not in seq_id_analyzed:
