@@ -74,12 +74,11 @@ class SQLExecutor():
         self.calls_per_parent_seq_id = {}
         self.time_per_parent_seq_id = {}
 
-        # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]] # </exec_sql>
-        # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
-
         # For v1:
-        self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339]]
-        self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
+        # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]]
+        # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
+        self.monitor_token_id = 151668 # </exec_sql>
+        self.start_token_id = 151667 # <exec_sql>
         self.tokenizer = tokenizer_group.tokenizer
 
         self.sql_env = SqlEnv()
@@ -87,12 +86,7 @@ class SQLExecutor():
         self.exec_func_sql = self.sql_env.execute_sql_with_timeout
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path
-        # if is_val:
-        #     self.max_calls = sql_executor_config.max_calls_val
-        #     self.max_time = sql_executor_config.max_time_val
-        #     self.timeout_for_exploration = sql_executor_config.timeout_for_exploration_val
-        #     self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer_val            
-        # else:
+
         self.max_calls = sql_executor_config.max_calls
         self.max_time = sql_executor_config.max_time
         self.timeout_for_exploration = sql_executor_config.timeout_for_exploration
@@ -108,16 +102,13 @@ class SQLExecutor():
     def fetch_execution_result(self, completion, request_id, failed=False, final=False):
         if failed:
             return [self.tokenizer.eos_token_id]
-        for index in range(len(completion)-4, 0, -1):
-            if completion[-4:] in self.monitor_token_ids and completion[index:index+4] in self.start_token_ids:
-                sql_string = self.tokenizer.decode(completion[index+4:-4])
-                # if completion[-5] == 522:
-                #     print(f"</</{self.tokenizer.decode(completion)}")
+        for index in range(len(completion)-1, 0, -1):
+            if completion[-1] == self.monitor_token_id and completion[index] == self.start_token_id:
+                sql_string = self.tokenizer.decode(completion[index+1:-1])
+ 
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
-                # if kwargs['api'] == "snowflake":
-                #     exec_result = self.exec_func_sf(sql_string, max_len=200, LIMIT=100, **kwargs)
-                # else:
+
                 exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_exploration, max_len=200, LIMIT=100, **kwargs)
                 if "Timed out" in exec_result:
                     print(f"timed out time: {time.time() - start}")
@@ -271,10 +262,8 @@ class SQLExecutor():
 
                 # Check for the monitor token sequence in completions
                 completions = self.parent_seq_ids_completions[seq_id]
-                # if "I find there's something wrong." in self.tokenizer.decode(completions):
-                #     if "</exec_sql>" in self.tokenizer.decode(completions)[self.tokenizer.decode(completions).find("I find there's something wrong."):]:
-                #         print(f"I find there's something wrong. completions: {self.tokenizer.decode(completions)}, completions: {completions}")
-                if completions[-4:] in self.monitor_token_ids:
+
+                if completions[-1] == self.monitor_token_id:
                     if self.logging:
                         with open(self.log_path, "a") as f:
                             f.write(f"Detected monitor token for seq_id: {seq_id}: {self.tokenizer.decode(completions)}, ids: {completions}")

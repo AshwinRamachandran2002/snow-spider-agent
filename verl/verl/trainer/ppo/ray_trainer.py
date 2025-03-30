@@ -403,9 +403,9 @@ class RayPPOTrainer(object):
             uid_mask = uids == uid
             # uid_rewards = reward_tensor[uid_mask][:, -1].sum(-1)  # Sum rewards for each sequence
             uid_rewards = reward_tensor[uid_mask].sum(-1)
-            count_correct += torch.sum(uid_rewards)
+            count_correct += torch.sum(uid_rewards == 1)
             # Check if all rewards are 0 or all are 1 for this uid
-            if (uid_rewards == 0).all():
+            if (uid_rewards < 1).all():
                 solve_none += 1
             elif (uid_rewards == 1).all():
                 solve_all += 1

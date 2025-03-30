@@ -180,15 +180,12 @@ class DataParallelPPOActor(BasePPOActor):
 
         if use_dynamic_bsz:
             # split using dynamic bsz
-            print("split using dynamic bsz")
             max_token_len = data.meta_info['max_token_len'] * self.ulysses_sequence_parallel_size
             micro_batches, indices = rearrange_micro_batches(batch=batch, max_token_len=max_token_len)
         else:
-            print("no dynamic bsz")
             micro_batches = batch.split(micro_batch_size)
 
         log_probs_lst = []
-        print("micro_batches")
         for micro_batch in micro_batches:
             with torch.no_grad():
                 _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
@@ -196,7 +193,6 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs = torch.concat(log_probs_lst, dim=0)
 
         if use_dynamic_bsz:
-            print("use_dynamic_bsz")
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)

@@ -26,6 +26,7 @@ class RewardManager():
         self.absent_intermediate_thought_reward = rewards_config.absent_intermediate_thought_reward
         self.undiverse_intermediate_sql_reward = rewards_config.undiverse_intermediate_sql_reward
         self.absent_final_sql_reward = rewards_config.absent_final_sql_reward
+        self.format_reward = rewards_config.format_reward
 
         time_now_formatted = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         # self.exec_folder = f"exec_3B_{mode}_{time_now_formatted}"
@@ -119,11 +120,7 @@ class RewardManager():
         #     print(f"log_path: {log_path}, response_str: {response_str}, MD5: {calculate_md5(response_str.strip())}")
         # prin = False
 
-        # Extract solution.
-        if "<|im_start|>SQL" in response_str:
-            final_sql = response_str.split("<|im_start|>SQL")[1].split("<|im_end|>")[0]
-        else:
-            return 0
+
 
         # if self.execute_sql_with_timeout(final_sql, csv_save_path, api=get_api_name(example_id), sqlite_path=sqlite_path) == 0:
         #     is_correct = evaluate_spider2sql(self.ground_truths, csv_save_path, example_id)
@@ -135,11 +132,14 @@ class RewardManager():
         response_str = response_str.strip()
         log_folder = os.getenv("EXEC_FOLDER")
         log_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".log")
+        csv_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".csv")
         # print(f"log_path: {log_path}")
         
         if not os.path.exists(log_path):
+            # print(f"{log_path} doesn't exist, response_str: {response_str}")
             return 0
-  
+        if not os.path.exists(csv_path):
+            return 0
         # if reward_tensor.shape[0] > 4:
         #     reward_tensor[-2] = self.enum_unsuccessful_intermediate_sql(response_str, log_path)
         #     reward_tensor[-3] = self.enum_absent_intermediate_thought(response_str, log_path)
@@ -152,9 +152,13 @@ class RewardManager():
                 # with open(log_path, "a") as f:
                 #     f.write(f"Reward: successful_final_sql\n")
                 return self.successful_final_sql_reward
-
-        # print(f"End Reward {example_id}")
-        return 0
+        # Format
+        start_count = response_str.count("<exec_sql>")
+        end_count = response_str.count("</exec_sql>")
+        if "<|im_start|>SQL" in response_str and "<|im_end|>" in response_str and start_count > 1 and end_count > 1 and start_count == end_count:
+            return self.format_reward
+        else:
+            return 0       
 
     def process_item(self, args):
         i, data_item = args

@@ -276,7 +276,7 @@ class vLLMRollout(BaseRollout):
                     eos_token=eos_token_id,
                     dtype=attention_mask.dtype)
                 
-                ignore_now = False
+                # ignore_now = False
                 # if self.start_tensor is None:
                 #     self.start_tensor = torch.tensor([27, 11748, 5287, 397], dtype=response.dtype, device=response.device)
                 #     # self.start_tensor = torch.tensor([151669], dtype=response.dtype, device=response.device)
@@ -296,28 +296,28 @@ class vLLMRollout(BaseRollout):
                 #         if ignore_now:
                 #             response_attention_mask[batch][index] = 0
 
-                start_tensor = torch.tensor([[27, 11748, 5287, 397],
-                                             [27, 11748, 5287, 29]
-                                             ], dtype=response.dtype, device=response.device)
-                end_tensor   = torch.tensor([[522, 11748, 5287, 397],
-                                             [522, 11748, 5287, 29]
-                                             ], dtype=response.dtype, device=response.device)
-                for batch in range(len(response)):
-                    for index in range(4, len(response[batch])-4):
+                # start_tensor = torch.tensor([[27, 11748, 5287, 397],
+                #                              [27, 11748, 5287, 29]
+                #                              ], dtype=response.dtype, device=response.device)
+                # end_tensor   = torch.tensor([[522, 11748, 5287, 397],
+                #                              [522, 11748, 5287, 29]
+                #                              ], dtype=response.dtype, device=response.device)
+                # for batch in range(len(response)):
+                #     for index in range(4, len(response[batch])-4):
                         
-                        if any(torch.equal(response[batch][index-4:index], st) for st in start_tensor):
-                            response_attention_mask[batch][index] = 0
-                            ignore_now = True
-                            continue
-                        elif self.tokenizer.decode(response[batch][index-4:index]).strip() == "<exec_result>":
-                            print("FATAL: <exec_result> not matched: "+str(response[batch][:].cpu().tolist()))
+                #         if any(torch.equal(response[batch][index:index+4], st) for st in start_tensor):
+                #             response_attention_mask[batch][index] = 0
+                #             ignore_now = True
+                #             continue
+                #         elif self.tokenizer.decode(response[batch][index:index+4]).strip() == "<exec_result>":
+                #             print("FATAL: <exec_result> not matched: "+str(response[batch][:].cpu().tolist()))
 
-                        if any(torch.equal(response[batch][index:index+4], st) for st in end_tensor):
-                            ignore_now = False
-                        elif self.tokenizer.decode(response[batch][index:index+4]).strip() == "</exec_result>":
-                            print("FATAL: </exec_result> not matched: "+str(response[batch][:].cpu().tolist()))
-                        if ignore_now:
-                            response_attention_mask[batch][index] = 0
+                #         if any(torch.equal(response[batch][index-4:index], st) for st in end_tensor):
+                #             ignore_now = False
+                #         elif self.tokenizer.decode(response[batch][index-4:index]).strip() == "</exec_result>":
+                #             print("FATAL: </exec_result> not matched: "+str(response[batch][:].cpu().tolist()))
+                #         if ignore_now:
+                #             response_attention_mask[batch][index] = 0
                 attention_mask = torch.cat(
                     (attention_mask, response_attention_mask), dim=-1)
 
