@@ -11,10 +11,15 @@ from utils import utils
 IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 # Set special tokens globally to avoid adding them multiple times.
 def setup_tokenizer(tokenizer):
-    tokenizer.add_special_tokens({
-        "additional_special_tokens": [
+    special_tokens = [
+            "<exec_result>", "</exec_result>", "<exec_sql>", "</exec_sql>", "<formatting>", "</formatting>"
         ]
+    tokenizer.add_special_tokens({
+        "additional_special_tokens": special_tokens
     })
+    for token in special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"Token: {token}\tID: {token_id}")
     return tokenizer
 
 

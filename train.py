@@ -106,7 +106,7 @@ class CustomTrainer(Trainer):
         self.state.log_history.append(output)
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 
 class LoggingCallback(transformers.TrainerCallback):
     def __init__(self):
@@ -137,30 +137,30 @@ class LoggingCallback(transformers.TrainerCallback):
                 "steps": self.steps
             }, f)
 
-        plt.figure(figsize=(10, 5))
-        plt.subplot(1, 3, 1)
-        plt.plot(self.steps, self.losses, label="Loss")
-        plt.xlabel("Training Steps")
-        plt.ylabel("Loss")
-        plt.title("Loss vs Training Step")
+        # plt.figure(figsize=(10, 5))
+        # plt.subplot(1, 3, 1)
+        # plt.plot(self.steps, self.losses, label="Loss")
+        # plt.xlabel("Training Steps")
+        # plt.ylabel("Loss")
+        # plt.title("Loss vs Training Step")
 
-        # Plot the learning rate schedule vs training step
-        plt.subplot(1, 3, 2)
-        plt.plot(self.steps, self.lr_schedules, label="Learning Rate")
-        plt.xlabel("Training Steps")
-        plt.ylabel("Learning Rate")
-        plt.title("LR Schedule vs Training Step")
+        # # Plot the learning rate schedule vs training step
+        # plt.subplot(1, 3, 2)
+        # plt.plot(self.steps, self.lr_schedules, label="Learning Rate")
+        # plt.xlabel("Training Steps")
+        # plt.ylabel("Learning Rate")
+        # plt.title("LR Schedule vs Training Step")
 
-        # Plot the gradient norm vs training step
-        plt.subplot(1, 3, 3)
-        plt.plot(self.steps, self.grad_norms, label="Gradient Norm")
-        plt.xlabel("Training Steps")
-        plt.ylabel("Gradient Norm")
-        plt.title("Gradient Norm vs Training Step")
+        # # Plot the gradient norm vs training step
+        # plt.subplot(1, 3, 3)
+        # plt.plot(self.steps, self.grad_norms, label="Gradient Norm")
+        # plt.xlabel("Training Steps")
+        # plt.ylabel("Gradient Norm")
+        # plt.title("Gradient Norm vs Training Step")
 
-        plt.tight_layout()
-        plt.savefig("syn_gen_func_call.png")
-        plt.close()
+        # plt.tight_layout()
+        # plt.savefig("syn_gen_func_call.png")
+        # plt.close()
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -206,25 +206,29 @@ def train():
     )
 
     # Add new special tokens
-    # num_new_tokens = tokenizer.add_special_tokens({
-    #     "additional_special_tokens": [
-    #     ]
-    # })
-    
-    # model.resize_token_embeddings(len(tokenizer))
+    special_tokens = [
+            "<exec_result>", "</exec_result>", "<exec_sql>", "</exec_sql>", "<formatting>", "</formatting>"
+        ]
+    num_new_tokens = tokenizer.add_special_tokens({
+        "additional_special_tokens": special_tokens
+    })
+    for token in special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"Token: {token}\tID: {token_id}")
+    model.resize_token_embeddings(len(tokenizer))
 
-    # input_embeddings = model.get_input_embeddings().weight.data
-    # output_embeddings = model.get_output_embeddings().weight.data
+    input_embeddings = model.get_input_embeddings().weight.data
+    output_embeddings = model.get_output_embeddings().weight.data
 
-    # input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
-    # output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+    input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+    output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
 
-    # input_embeddings[-num_new_tokens:] = input_embeddings_avg
-    # output_embeddings[-num_new_tokens:] = output_embeddings_avg
+    input_embeddings[-num_new_tokens:] = input_embeddings_avg
+    output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
-    # with torch.no_grad():
-    #     mean_embedding = model.model.embed_tokens.weight[:-11].mean(0)
-    #     model.model.embed_tokens.weight[-11:] = mean_embedding.unsqueeze(0).expand(11, -1)
+    with torch.no_grad():
+        mean_embedding = model.model.embed_tokens.weight[:-num_new_tokens].mean(0)
+        model.model.embed_tokens.weight[-num_new_tokens:] = mean_embedding.unsqueeze(0).expand(num_new_tokens, -1)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer, args=args)
     trainer = CustomTrainer(
