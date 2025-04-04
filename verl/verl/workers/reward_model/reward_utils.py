@@ -194,6 +194,7 @@ class SqlEnv:
                 return None
             try:
                 memory_conn = backup_with_retry(conn, sqlite_path, 5)
+                memory_conn.execute("PRAGMA shared_cache = ON;")
                 if memory_conn:
                     self.conns[sqlite_path] = memory_conn
                     conn.close()
@@ -203,8 +204,8 @@ class SqlEnv:
                     self.conns[sqlite_path] = conn
             except Exception as e:
                 print(f"Exception during backup: {str(e)}. Using the original connection.")
-            # self.conns[sqlite_path] = conn
-            # print(f"sqlite_path: {sqlite_path}, (self.conns): {self.conns.keys()}")
+                conn.execute("PRAGMA shared_cache = ON;")
+                self.conns[sqlite_path] = conn
 
     def close_db(self):
         # print("Close DB")

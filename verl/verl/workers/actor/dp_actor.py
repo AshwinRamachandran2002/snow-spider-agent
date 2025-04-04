@@ -256,7 +256,62 @@ class DataParallelPPOActor(BasePPOActor):
                     # compute kl loss
                     kld = log_prob - ref_log_prob
                     kl_loss = masked_mean(kld, response_mask)
+                    # min_kld_threshold = -1.0
+                    # value_mask = kld > min_kld_threshold
+                    # kl_loss = masked_mean(kld, response_mask & value_mask)
 
+                    if kld.mean().item() < 0:
+                        log = ''
+                        import datetime
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H")
+                        log += timestamp
+                        from transformers import AutoTokenizer
+                        tokenizer = AutoTokenizer.from_pretrained("models/Qwen2.5-Coder-14B-bird-sft-spec-inst")
+
+                        mask = response_mask.bool()
+
+                        masked_kld = kld[mask]                         # [N_masked]
+                        masked_log_prob = log_prob[mask]
+                        masked_ref_log_prob = ref_log_prob[mask]
+                        masked_input_ids = data["input_ids"][:, -response_length:][mask]
+
+                        num_top = 5
+                        if masked_kld.numel() >= num_top:
+                            lowest_kld_idx = torch.topk(masked_kld, k=num_top, largest=False).indices
+                        else:
+                            lowest_kld_idx = torch.arange(masked_kld.numel())
+
+                        log += (f"🔍 Top {num_top} most negative kld tokens:\n")
+                        for i, idx in enumerate(lowest_kld_idx):
+                            token_id = masked_input_ids[idx].item()
+                            token_str = tokenizer.decode([token_id])
+                            lp = masked_log_prob[idx].item()
+                            rlp = masked_ref_log_prob[idx].item()
+                            diff = masked_kld[idx].item()
+
+                            context_str = ''
+                            if idx - 1 >= 0:
+                                token_id_before = masked_input_ids[idx-1].item()
+                                context_str += tokenizer.decode([token_id_before])
+                            context_str += f"|{token_str}|"
+                            if idx + 1 < len(masked_input_ids):
+                                token_id_before = masked_input_ids[idx+1].item()
+                                context_str += tokenizer.decode([token_id_before])
+
+                            log += (
+                                f"#{i+1}: Token='{token_str}' (id={token_id}), "
+                                f"log_prob={lp:.4f}, ref_log_prob={rlp:.4f}, kld={diff:.4f}\n"
+                                f"     Context: ...{context_str}...\n"
+                            )
+                    
+                        import hashlib
+                        def calculate_md5(input_string):
+                            md5_obj = hashlib.md5()
+                            md5_obj.update(input_string.encode('utf-8'))
+                            return md5_obj.hexdigest()
+                        
+                        with open(f"log/{timestamp}_{calculate_md5(timestamp)}.log", "a") as f:
+                            f.write(log)
                     policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef

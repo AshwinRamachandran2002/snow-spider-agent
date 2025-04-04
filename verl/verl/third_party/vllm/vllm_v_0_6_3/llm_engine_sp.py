@@ -114,7 +114,7 @@ class SQLExecutor():
                     print(f"timed out time: {time.time() - start}")
                     return "Timed out"
                 
-                exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>\n"
+                exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>"
                 if self.logging:
                     with open(self.log_path, "a") as f:
                         f.write(f"executed below SQL with kwargs {kwargs}\n")

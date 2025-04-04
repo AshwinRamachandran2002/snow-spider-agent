@@ -12,6 +12,8 @@ from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql
 from tqdm import tqdm
 import shutil
 import sys
+import re
+
 class RewardManager():
     """
     The reward manager.
@@ -93,6 +95,35 @@ class RewardManager():
         #     f.write(f"distinct ratio: {num_distinct / num_total}\n")
         return ((num_total - num_distinct) / num_total) * self.undiverse_intermediate_sql_reward if num_total > 0 else 0
 
+    def is_valid_exec_sequence(self, text):
+        tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
+        tags = tag_pattern.findall(text)
+
+        all_tag_counts = {
+            'exec_sql_open': len(re.findall(r'<exec_sql>', text)),
+            'exec_sql_close': len(re.findall(r'</exec_sql>', text)),
+            'exec_result_open': len(re.findall(r'<exec_result>', text)),
+            'exec_result_close': len(re.findall(r'</exec_result>', text)),
+        }
+
+        if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
+                all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close']):
+            return False
+
+        if not tags:
+            return False
+
+        if len(tags) % 2 != 0:
+            return False
+
+        for i, tag in enumerate(tags):
+            if i % 2 == 0 and not tag.startswith('<exec_sql>'):
+                return False
+            if i % 2 == 1 and not tag.startswith('<exec_result>'):
+                return False
+
+        return True
+
     def compute_reward_tensor(self, prompt_str, response_str, response_ids, sqlite_path, example_id):
         # print(f"Start Reward {example_id}")
 
@@ -153,9 +184,7 @@ class RewardManager():
                 #     f.write(f"Reward: successful_final_sql\n")
                 return self.successful_final_sql_reward
         # Format
-        start_count = response_str.count("<exec_sql>")
-        end_count = response_str.count("</exec_sql>")
-        if "<|im_start|>SQL" in response_str and "<|im_end|>" in response_str and start_count > 1 and end_count > 1 and start_count == end_count:
+        if self.is_valid_exec_sequence(response_str):
             return self.format_reward
         else:
             return 0       
@@ -173,7 +202,7 @@ class RewardManager():
         # recover the response
         response_ids = data_item.batch['responses']
         end_index = len(data_item.batch['attention_mask'][prompt_length:]) - 1
-        while data_item.batch['attention_mask'][prompt_length:][end_index] == 0:
+        while data_item.batch['attention_mask'][prompt_length:][end_index] == 0 and -end_index < len(response_ids): 
             end_index -= 1
         response_str = self.tokenizer.decode(response_ids[:end_index + 1])
 

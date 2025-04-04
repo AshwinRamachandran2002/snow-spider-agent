@@ -276,25 +276,19 @@ class vLLMRollout(BaseRollout):
                     eos_token=eos_token_id,
                     dtype=attention_mask.dtype)
                 
-                # ignore_now = False
-                # if self.start_tensor is None:
-                #     self.start_tensor = torch.tensor([27, 11748, 5287, 397], dtype=response.dtype, device=response.device)
-                #     # self.start_tensor = torch.tensor([151669], dtype=response.dtype, device=response.device)
-                # if self.end_tensor is None:
-                #     self.end_tensor = torch.tensor([522, 11748, 5287, 397], dtype=response.dtype, device=response.device)
-                #     # self.end_tensor = torch.tensor([151670], dtype=response.dtype, device=response.device)
-                # for batch in range(len(response)):
-                #     for index in range(4, len(response[batch])-4):
+                ignore_now = False
+                for batch in range(len(response)):
+                    for index in range(len(response[batch])):
                         
-                #         if torch.equal(response[batch][index-4:index], self.start_tensor):
-                #             ignore_now = True
-                #             continue
+                        if response[batch][index] == 151665:
+                            ignore_now = True
+                            continue
 
-                #         if torch.equal(response[batch][index:index+4], self.end_tensor):
-                #             ignore_now = False
+                        if response[batch][index] == 151666:
+                            ignore_now = False
                             
-                #         if ignore_now:
-                #             response_attention_mask[batch][index] = 0
+                        if ignore_now:
+                            response_attention_mask[batch][index] = 0
 
                 # start_tensor = torch.tensor([[27, 11748, 5287, 397],
                 #                              [27, 11748, 5287, 29]

@@ -37,7 +37,7 @@ def make_map_fn(split: str):
 
         user_prompt += "\nTask: " + example["question"]
 
-        sys_prompt = f"You are a data scientist proficient in databases, SQL, and DBT projects. Given a task, you should determine the answer format, generate at most 10 SQL queries from simple to complex, execute them step by step, and provide a final answer after reviewing the results. You may use the \n<exec_sql>\n and \n</exec_sql>\n tags to execute SQL functions and you will get result feedback. Use this tool to investigate the schema before writing the final SQL. The SQL dialect must be {api}.\n"
+        sys_prompt = f"You are a data scientist proficient in databases, SQL, and DBT projects. Given a task, you should determine the answer format, generate multiple SQL queries from simple to complex, execute them step by step, and provide a final answer after reviewing the results. You may use the <exec_sql> and </exec_sql> tags to execute SQL functions and you will get result feedback. If there is syntax error or empty results, you should fix it. The SQL dialect must be {api}.\n"
 
         data = {
             "data_source": "",
