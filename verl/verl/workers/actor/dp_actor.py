@@ -256,9 +256,6 @@ class DataParallelPPOActor(BasePPOActor):
                     # compute kl loss
                     kld = log_prob - ref_log_prob
                     kl_loss = masked_mean(kld, response_mask)
-                    # min_kld_threshold = -1.0
-                    # value_mask = kld > min_kld_threshold
-                    # kl_loss = masked_mean(kld, response_mask & value_mask)
 
                     if kld.mean().item() < 0:
                         log = ''
@@ -312,7 +309,7 @@ class DataParallelPPOActor(BasePPOActor):
                         
                         with open(f"log/{timestamp}_{calculate_md5(timestamp)}.log", "a") as f:
                             f.write(log)
-                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                    # policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 

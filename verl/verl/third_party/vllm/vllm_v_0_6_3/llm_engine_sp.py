@@ -109,12 +109,12 @@ class SQLExecutor():
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
 
-                exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_exploration, max_len=200, LIMIT=100, **kwargs)
+                exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_exploration, max_len=1000, LIMIT=100, **kwargs)
                 if "Timed out" in exec_result:
                     print(f"timed out time: {time.time() - start}")
                     return "Timed out"
                 
-                exec_result = "<exec_result>\n" + exec_result + "\n</exec_result>"
+                exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>"
                 if self.logging:
                     with open(self.log_path, "a") as f:
                         f.write(f"executed below SQL with kwargs {kwargs}\n")

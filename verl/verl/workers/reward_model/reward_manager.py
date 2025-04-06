@@ -108,21 +108,25 @@ class RewardManager():
 
         if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
                 all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close']):
-            return False
+            return 0
 
         if not tags:
-            return False
+            return 0
 
         if len(tags) % 2 != 0:
-            return False
+            return 0
 
         for i, tag in enumerate(tags):
             if i % 2 == 0 and not tag.startswith('<exec_sql>'):
-                return False
+                return 0
             if i % 2 == 1 and not tag.startswith('<exec_result>'):
-                return False
+                return 0
+            if i % 2 == 1 and i > 2 and tag.startswith('<exec_result>'):
+                if "No data found for the specified query." in tags[i-2] or "Incorrect SQL Syntax" in tags[i-2]:
+                    if "No data found for the specified query." in tags[i] or "Incorrect SQL Syntax" in tags[i]:
+                        return self.unsuccessful_intermediate_sql_reward
 
-        return True
+        return self.format_reward
 
     def compute_reward_tensor(self, prompt_str, response_str, response_ids, sqlite_path, example_id):
         # print(f"Start Reward {example_id}")
@@ -184,10 +188,7 @@ class RewardManager():
                 #     f.write(f"Reward: successful_final_sql\n")
                 return self.successful_final_sql_reward
         # Format
-        if self.is_valid_exec_sequence(response_str):
-            return self.format_reward
-        else:
-            return 0       
+        return self.is_valid_exec_sequence(response_str)
 
     def process_item(self, args):
         i, data_item = args
