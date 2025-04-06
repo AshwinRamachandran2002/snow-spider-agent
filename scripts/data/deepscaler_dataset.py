@@ -77,7 +77,7 @@ if __name__ == '__main__':
         # "spider2_train_data",
         # "spider1_bird_train_data",
         # "bird_train_data_add_ev",
-        "bird_train_data_add_ev_change_pth"
+        "bird_train_data_change_pth"
     ]
     def load_dataset_train(file_path):
         file_path = f"deepscaler/data/train/{file_path}.json"
@@ -107,7 +107,7 @@ if __name__ == '__main__':
         # "spider1_dev_data",
         # "spider1_test_data",
         # "bird_dev_data_add_ev",
-        "bird_dev_data_add_ev_change_pth"
+        "bird_dev_data_change_pth"
     ]    
     def load_dataset(file_path):
         file_path = f"deepscaler/data/test/{file_path}.json"

@@ -82,7 +82,7 @@ class SQLExecutor():
         self.tokenizer = tokenizer_group.tokenizer
 
         self.sql_env = SqlEnv()
-        self.ground_truths = "deepscaler/rewards/gold/gold_answer"
+        self.ground_truths = "data_preprocess/BIRD/gold_results"
         self.exec_func_sql = self.sql_env.execute_sql_with_timeout
         self.beginning = True
         self.sqlite_source_path = sql_executor_config.sqlite_source_path

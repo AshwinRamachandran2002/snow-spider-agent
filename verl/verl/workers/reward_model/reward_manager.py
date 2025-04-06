@@ -35,7 +35,7 @@ class RewardManager():
         # if not os.path.exists(self.exec_folder):
         #     os.mkdir(self.exec_folder)
 
-        self.ground_truths = "deepscaler/rewards/gold/gold_answer"
+        self.ground_truths = "data_preprocess/BIRD/gold_results"
         
         self.max_workers = rewards_config.max_workers
         self.val_only = rewards_config.val_only

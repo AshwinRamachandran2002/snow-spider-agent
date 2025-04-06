@@ -132,5 +132,5 @@ if __name__ == '__main__':
             count += 1
         if folder_name.endswith(".csv"):
             folder_path = os.path.join(log_folder, folder_name)
-            score += evaluate_spider2sql("deepscaler/rewards/gold/gold_answer", folder_path, example_id)
+            score += evaluate_spider2sql("data_preprocess/BIRD/gold_results", folder_path, example_id)
     print(f"acc: {score}/{count}")
