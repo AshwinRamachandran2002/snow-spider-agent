@@ -276,19 +276,19 @@ class vLLMRollout(BaseRollout):
                     eos_token=eos_token_id,
                     dtype=attention_mask.dtype)
                 
-                ignore_now = False
-                for batch in range(len(response)):
-                    for index in range(len(response[batch])):
+                # ignore_now = False
+                # for batch in range(len(response)):
+                #     for index in range(len(response[batch])):
                         
-                        if response[batch][index] == 151665:
-                            ignore_now = True
-                            continue
+                #         if response[batch][index] == 151665:
+                #             ignore_now = True
+                #             continue
 
-                        if response[batch][index] == 151666:
-                            ignore_now = False
+                #         if response[batch][index] == 151666:
+                #             ignore_now = False
                             
-                        if ignore_now:
-                            response_attention_mask[batch][index] = 0
+                #         if ignore_now:
+                #             response_attention_mask[batch][index] = 0
 
                 # start_tensor = torch.tensor([[27, 11748, 5287, 397],
                 #                              [27, 11748, 5287, 29]

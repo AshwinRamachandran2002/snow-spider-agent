@@ -241,6 +241,24 @@ class DataParallelPPOActor(BasePPOActor):
 
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
+                    ignore_now = False
+                    for batch in range(len(responses)):
+                        for index in range(len(responses[batch])):
+                            
+                            if responses[batch][index] == 151665:
+                                if index - 1 >= 0:
+                                    response_mask[batch][index-1] = 0
+                                response_mask[batch][index] = 0
+                                ignore_now = True
+                                continue
+
+                            if responses[batch][index] == 151666:
+                                response_mask[batch][index] = 0
+                                ignore_now = False
+                                
+                            if ignore_now or responses[batch][index] == 151645:
+                                response_mask[batch][index] = 0
+
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                                 log_prob=log_prob,
                                                                                 advantages=advantages,
@@ -309,7 +327,7 @@ class DataParallelPPOActor(BasePPOActor):
                         
                         with open(f"log/{timestamp}_{calculate_md5(timestamp)}.log", "a") as f:
                             f.write(log)
-                    # policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                    policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                     metrics['actor/kl_loss'] = kl_loss.detach().item()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
