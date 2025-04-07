@@ -128,8 +128,6 @@ if __name__ == "__main__":
             if len(out) > 1 or not empty_flag:
                 exec_time = time_end - time_start
             else:
-                if len(out) == 1:
-                    print(out)
                 empty_result = True
                 exec_time = 1000000
             data = {
@@ -153,11 +151,12 @@ if __name__ == "__main__":
                     "empty_result": empty_result,
                 }
             }
-            if split == "dev" or (not empty_result and exec_time < 5):
+            if split == "dev" or (not empty_result and exec_time < 5 and "##SQLERROR##" not in str(out)):
                 df = pd.DataFrame(out)
                 df.to_csv(f"BIRD/gold_results/local_BIRD_{split}_{idx:04d}.csv", index=False)
                 folder_name = f"BIRD/examples_{split}/local_BIRD_{split}_{idx:04d}"
-            # print(f"{data=}")
+            else:
+                print(f"{idx}: {out}")
             return data
 
         return process_fn

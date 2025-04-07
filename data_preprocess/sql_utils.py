@@ -143,7 +143,7 @@ def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
     output = []
 
     for table_idx, table_name in enumerate(table_names):
-        output.append(f"{table_name} :")
+        output.append(f"Table Name: {table_name} :")
         columns = table_columns[table_idx]
 
         for col_idx, col_name in columns:
@@ -174,7 +174,7 @@ def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
                 )
 
             # Append formatted column description
-            column_desc = f"{col_name} [ {col_type.upper()} ] ( {sample_str} ) {primary_key_text} {ref_text}"
+            column_desc = f"Column Name: {col_name} [ {col_type.upper()} ] ( {sample_str} ) {primary_key_text} {ref_text}"
             output.append(column_desc.strip())
 
         output.append("")  # Add a blank line between tables
