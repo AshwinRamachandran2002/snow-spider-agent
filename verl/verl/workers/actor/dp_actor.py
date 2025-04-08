@@ -247,6 +247,7 @@ class DataParallelPPOActor(BasePPOActor):
                             
                             if responses[batch][index] == 151665:
                                 if index - 1 >= 0:
+                                    # mask \n before <exec_res>
                                     response_mask[batch][index-1] = 0
                                 response_mask[batch][index] = 0
                                 ignore_now = True
@@ -256,7 +257,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 response_mask[batch][index] = 0
                                 ignore_now = False
                                 
-                            if ignore_now or responses[batch][index] == 151645:
+                            if ignore_now or responses[batch][index] == 151645 or responses[batch][index] == 151643: # mask <|endoftext|>, <|im_end|>
                                 response_mask[batch][index] = 0
 
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,

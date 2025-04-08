@@ -141,14 +141,14 @@ def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
     cursor = conn.cursor()
 
     output = []
-
+    tb_struct = {}
     for table_idx, table_name in enumerate(table_names):
         output.append(f"Table Name: {table_name} :")
         columns = table_columns[table_idx]
-
+        tb_struct[table_name] = []
         for col_idx, col_name in columns:
             col_type = column_types[col_idx]
-
+            tb_struct[table_name] += [col_name]
             # Fetch sample data
             cursor.execute(_gen_data_fetch(col_name, table_name))
             sample_data = [str(row[0]) for row in cursor.fetchall()]
@@ -178,7 +178,7 @@ def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
             output.append(column_desc.strip())
 
         output.append("")  # Add a blank line between tables
-
+    output.append("Table structure: " + str(tb_struct))
     conn.close()
     return "\n".join(output).strip()
 
