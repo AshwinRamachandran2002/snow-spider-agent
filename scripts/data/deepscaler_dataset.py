@@ -24,12 +24,13 @@ def make_map_fn(split: str):
         ex_id = example["example_id"]
         
         sql_input = example["input"]
-        user_prompt = ""
+        sys_prompt = f"You are a data scientist proficient in Text-to-SQL tasks. Given a task, you should determine the answer format first, then reason step by step to generate at least 5 SQL queries from simple to complex to undersatnd DB schema, execute them step by step, and provide a final answer after reviewing the results. You should use the <formatting></formatting> tags for formatting in ``csv\n``` code block, <exec_sql></exec_sql> tags to execute SQLs and you will get result feedback. If there is any syntax error or empty result, you should fix it. There's no gold answer with empty results. Write final answer in <|im_start|>SQL\n<|im_end|> tags. The SQL dialect must be {api}. Basic usage: SELECT \"column_name\" FROM \"table_name\" WHERE ... (Replace \"table_name\" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)\n"
+        user_prompt = sys_prompt
         if isinstance(sql_input, list):
             user_prompt += sql_input[0]
             table_structure = sql_input[1]
             if api == "sqlite":
-                user_prompt += "The table structure information is [table name]: \n" + table_structure + "\n"
+                user_prompt += "The table structure information is [table name: {column name}]: \n" + table_structure + "\n"
             else:
                 user_prompt += "The table structure information is ({database name: {schema name: {table name}}}): \n" + table_structure + "\n"
         else:
@@ -37,14 +38,9 @@ def make_map_fn(split: str):
 
         user_prompt += "\nTask: " + example["question"]
 
-        sys_prompt = f"You are a data scientist proficient in databases, SQL, and DBT projects. Given a task, you should determine the answer format, generate multiple SQL queries from simple to complex, execute them step by step, and provide a final answer after reviewing the results. You may use the <exec_sql> and </exec_sql> tags to execute SQL functions and you will get result feedback. If there is syntax error or empty results, you should fix it. The SQL dialect must be {api}.\n"
-
         data = {
             "data_source": "",
             "prompt": [{
-                "role": "system",
-                "content": sys_prompt
-            }, {
                 "role": "user",
                 "content": user_prompt
             }],

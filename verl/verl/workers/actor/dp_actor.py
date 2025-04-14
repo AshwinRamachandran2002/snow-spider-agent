@@ -32,7 +32,9 @@ from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
-
+from transformers import AutoTokenizer
+import os
+import datetime
 __all__ = ['DataParallelPPOActor']
 
 
@@ -214,7 +216,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
-
+        tokenizer = AutoTokenizer.from_pretrained(os.getenv("MODEL_PATH"))
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -244,20 +246,22 @@ class DataParallelPPOActor(BasePPOActor):
                     ignore_now = False
                     for batch in range(len(responses)):
                         for index in range(len(responses[batch])):
+                            assert len(tokenizer.encode("<exec_result>")) == 2, tokenizer.encode("<exec_result>")
+                            if responses[batch][index] == tokenizer.encode("<exec_result>")[1]:
+                                if index - 3 >= 0 and (responses[batch][index-3] == tokenizer.encode("</exec_sql>")[1] or responses[batch][index-2] == tokenizer.encode("</exec_sql>")[1]):
+                                    response_mask[batch][index-1] = 0 # mask \n before <exec_res>
+                                    response_mask[batch][index] = 0
+                                    ignore_now = True
+                                    continue
                             
-                            if responses[batch][index] == 151665:
-                                if index - 1 >= 0:
-                                    # mask \n before <exec_res>
-                                    response_mask[batch][index-1] = 0
-                                response_mask[batch][index] = 0
-                                ignore_now = True
-                                continue
-
-                            if responses[batch][index] == 151666:
+                            assert len(tokenizer.encode("</exec_result>")) == 2, tokenizer.encode("</exec_result>")
+                            if responses[batch][index] == tokenizer.encode("</exec_result>")[1]:
                                 response_mask[batch][index] = 0
                                 ignore_now = False
                                 
-                            if ignore_now or responses[batch][index] == 151645 or responses[batch][index] == 151643: # mask <|endoftext|>, <|im_end|>
+                            if ignore_now or responses[batch][index] == tokenizer.pad_token_id \
+                                or responses[batch][index] == tokenizer.eos_token_id \
+                                or responses[batch][index] == tokenizer.bos_token_id: # mask pad, eos, bos
                                 response_mask[batch][index] = 0
 
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
@@ -278,11 +282,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if kld.mean().item() < 0:
                         log = ''
-                        import datetime
+                        
                         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H")
                         log += timestamp
-                        from transformers import AutoTokenizer
-                        tokenizer = AutoTokenizer.from_pretrained("models/Qwen2.5-Coder-14B-bird-sft-spec-inst")
 
                         mask = response_mask.bool()
 

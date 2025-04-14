@@ -96,6 +96,20 @@ class RewardManager():
         return ((num_total - num_distinct) / num_total) * self.undiverse_intermediate_sql_reward if num_total > 0 else 0
 
     def is_valid_exec_sequence(self, text):
+        def check_once(start, end, text):
+            start_count = text.count(start)
+            end_count = text.count(end)
+            if start_count == 1 and end_count == 1:
+                return True
+            return False
+    
+        # if not check_once("<think>", "</think>", text):
+        #     return 0
+        if text.count("</think>") != 1:
+            return 0
+        if not check_once("<|im_start|>SQL", "<|im_end|>", text):
+            return 0
+        
         tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
         tags = tag_pattern.findall(text)
 
@@ -113,7 +127,7 @@ class RewardManager():
         if not tags:
             return 0
 
-        if len(tags) % 2 != 0:
+        if len(tags) % 2 != 0 or len(tags) < 10:
             return 0
 
         for i, tag in enumerate(tags):
@@ -165,6 +179,10 @@ class RewardManager():
         #             f.write(f"Reward: successful_final_sql\n")
         #         reward_tensor[-1] = self.successful_final_sql_reward
         response_str = response_str.strip()
+        if response_str.count("<|im_end|>") != 1:
+            return 0
+        # response_str = response_str[:response_str.find("<|im_end|>")+len("<|im_end|>")]
+        response_str = response_str[response_str.find("<exec_sql>"):response_str.find("<|im_end|>")+len("<|im_end|>")]
         log_folder = os.getenv("EXEC_FOLDER")
         log_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".log")
         csv_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".csv")
@@ -186,7 +204,7 @@ class RewardManager():
                 print(f"Correct: {example_id}")
                 # with open(log_path, "a") as f:
                 #     f.write(f"Reward: successful_final_sql\n")
-                return self.successful_final_sql_reward
+                return self.successful_final_sql_reward + self.is_valid_exec_sequence(response_str)
         # Format
         return self.is_valid_exec_sequence(response_str)
 

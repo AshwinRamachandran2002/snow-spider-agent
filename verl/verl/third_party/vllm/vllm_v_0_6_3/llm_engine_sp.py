@@ -77,9 +77,19 @@ class SQLExecutor():
         # For v1:
         # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]]
         # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
-        self.monitor_token_id = 151668 # </exec_sql>
-        self.start_token_id = 151667 # <exec_sql>
         self.tokenizer = tokenizer_group.tokenizer
+        exec_sql_start = self.tokenizer.encode("<exec_sql>")
+        exec_sql_end = self.tokenizer.encode("</exec_sql>")
+        im_start = self.tokenizer.encode("<|im_start|>")
+        im_end = self.tokenizer.encode("<|im_end|>")
+        assert len(exec_sql_start) == 2, exec_sql_start
+        assert len(exec_sql_end) == 2, exec_sql_end
+        assert len(im_start) == 2, im_start
+        assert len(im_end) == 2, im_end
+        self.monitor_token_id = exec_sql_end[1] # </exec_sql>
+        self.start_token_id = exec_sql_start[1] # <exec_sql>
+        self.im_start_id = im_start[1]
+        self.im_end_id = im_end[1]
 
         self.sql_env = SqlEnv()
         self.ground_truths = "data_preprocess/BIRD/gold_results"
@@ -124,28 +134,30 @@ class SQLExecutor():
                 if kwargs['api'] == "snowflake":
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result)
-            elif completion[-1] == self.tokenizer.eos_token_id and final == True:
+            elif completion[-1] == self.im_end_id and final == True:
                 # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
-                if completion[index] == 151644 and completion[index+1] == 6688:
+                if completion[index] == self.im_start_id and completion[index+1] == self.tokenizer.encode("SQL")[1]:
                     sql_string = self.tokenizer.decode(completion[index+2:-1])
                     # print(f"sql_string: {sql_string}, {self.initial_prompts}")
                     kwargs = self.initial_prompts[str(request_id)]
                     example_id = kwargs["example_id"]
                     start = time.time()
 
-                    log = self.tokenizer.decode(completion).strip()
-                    file_name = f"{example_id}_{calculate_md5(log)}"
+                    log_ = self.tokenizer.decode(completion).strip()
+                    log_gen = log_
+                    log_gen = log_[log_.find("<exec_sql>"):]
+                    file_name = f"{example_id}_{calculate_md5(log_gen)}"
                     exec_result = self.exec_func_sql(sql_string, save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
                     
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
-                        f.write(log)
+                        f.write(log_)
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
                         if not os.path.exists(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv")):
                             f.write('0')
                         else:
                             f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
-                    return []
+                    return [self.tokenizer.eos_token_id]
         if completion[-1] != self.tokenizer.eos_token_id:
             print(f"No match: {completion}")
         return [self.tokenizer.eos_token_id]
@@ -277,7 +289,6 @@ class SQLExecutor():
                     self.time_per_parent_seq_id[seq_id] += [time.time()]
                     
                     used_time = self.time_per_parent_seq_id[seq_id][-1] - self.start_time
-                    assert used_time < 1e4
                     if used_time > self.max_time:
                         if self.logging:
                             with open(self.log_path, "a") as f:
@@ -315,7 +326,7 @@ class SQLExecutor():
                                 "exec_result": exec_res,
                                 "curr_pointer": 0
                             }
-                elif completions[-1] == self.tokenizer.eos_token_id:
+                elif completions[-1] == self.im_end_id:
                     self.fetch_execution_result(completions, seq_id, final=True)
                 elif self.tokenizer.decode(completions[-4:]).strip() == "</exec_sql>":
                     print(f"Fatal err: {completions[-4:]} not in monitor, ids: {completions}")

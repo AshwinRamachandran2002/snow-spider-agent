@@ -398,16 +398,30 @@ class RayPPOTrainer(object):
         solve_none = 0
         solve_all = 0
         count_correct = 0
-        count_all = 0
+        
+        all_wrong = 0
+        wrong_ans_and_solve_format_half = 0
+        wrong_ans_and_solve_format_all = 0
+        right_ans_and_wrong_format = 0
+        right_ans_and_solve_format_half = 0
+        all_correct = 0
         for uid in unique_uids:
             uid_mask = uids == uid
             # uid_rewards = reward_tensor[uid_mask][:, -1].sum(-1)  # Sum rewards for each sequence
             uid_rewards = reward_tensor[uid_mask].sum(-1)
-            count_correct += torch.sum(uid_rewards == 1)
+            count_correct += torch.sum(uid_rewards >= 0.9)
+
+            
+            all_wrong += torch.sum(uid_rewards == 0)
+            wrong_ans_and_solve_format_half += torch.sum(uid_rewards == 0.05)
+            wrong_ans_and_solve_format_all += torch.sum(uid_rewards == 0.1)
+            right_ans_and_wrong_format += torch.sum(uid_rewards == 0.9)
+            right_ans_and_solve_format_half += torch.sum(uid_rewards == 0.95)
+            all_correct += torch.sum(uid_rewards == 1)
             # Check if all rewards are 0 or all are 1 for this uid
-            if (uid_rewards < 1).all():
+            if (uid_rewards < 0.9).all():
                 solve_none += 1
-            elif (uid_rewards == 1).all():
+            elif (uid_rewards >= 0.9).all():
                 solve_all += 1
 
             # example_id = batch.non_tensor_batch['reward_model'][uid_mask][0]['example_id']
@@ -426,6 +440,13 @@ class RayPPOTrainer(object):
         # Log to metrics
         metrics[f'{prefix}batch/solve_none'] = solve_none
         metrics[f'{prefix}batch/solve_all'] = solve_all
+        
+        metrics[f'{prefix}batch/all_wrong'] = all_wrong
+        metrics[f'{prefix}batch/wrong_ans_and_solve_format_half'] = wrong_ans_and_solve_format_half
+        metrics[f'{prefix}batch/wrong_ans_and_solve_format_all'] = wrong_ans_and_solve_format_all
+        metrics[f'{prefix}batch/right_ans_and_wrong_format'] = right_ans_and_wrong_format
+        metrics[f'{prefix}batch/right_ans_and_solve_format_half'] = right_ans_and_solve_format_half
+        metrics[f'{prefix}batch/all_correct'] = all_correct
         # for api in ['sqlite', 'bigquery', 'snowflake']:
         #     rewards_sum += np.sum(successful_final_sql_rewards[api])
         #     rewards_num += len(successful_final_sql_rewards[api])
