@@ -45,7 +45,7 @@ Basic usage: SELECT \"column_name\" FROM \"table_name\" WHERE ... (Replace \"tab
 """
 
 gen_prompt = """
-Now given a task, you should simulate execution feedback reasoning process in reasoning_content and put final answer in main_content. 
+Now given a task, you should simulate execution feedback reasoning process in reasoning_content and put final answer in main_content. <exec_result> should be after </exec_sql> like <exec_sql>\n...\n</exec_sql>\n<exec_result>\n...\n</exec_result>.
 e.g.
 
 Okay, so the schema makes sense. Now, to calculate total sales per category in 2023, need to join orders, products, and categories. Sales would be sum(quantity * price) grouped by category. Also, filter orders where order_date is in 2023.
@@ -128,7 +128,10 @@ def is_valid_exec_sequence(text):
         return False
 
     if not check_once("<|im_start|>SQL", "<|im_end|>", text):
-        return 0
+        return "<|im_start|>SQL and <|im_end|> should appear once. "
+
+    if len(re.findall(r'<exec_sql>\nSELECT', text)) != len(re.findall(r'\nSELECT', text)) - 1:
+        return "SELECT should be in <exec_sql></exec_sql> block"
     
     tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
     tags = tag_pattern.findall(text)
@@ -142,21 +145,18 @@ def is_valid_exec_sequence(text):
 
     if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
             all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close']):
-        return 0
+        return "Number of <exec_sql></exec_sql> tags should match <exec_result></exec_result> tags. "
 
     if not tags:
-        return 0
-
-    if len(tags) % 2 != 0:
-        return 0
+        return "You should use <exec_sql></exec_sql> tags and <exec_result></exec_result> tags. "
 
     for i, tag in enumerate(tags):
         if i % 2 == 0 and not tag.startswith('<exec_sql>'):
-            return 0
+            return "<exec_result> should be after </exec_sql> like <exec_sql>\n...\n</exec_sql>\n<exec_result>\n...\n</exec_result>. "
         if i % 2 == 1 and not tag.startswith('<exec_result>'):
-            return 0
+            return "<exec_result> should be after </exec_sql> like <exec_sql>\n...\n</exec_sql>\n<exec_result>\n...\n</exec_result>. "
 
-    return 1
+    return "Successfully Generated. "
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -166,48 +166,40 @@ if __name__ == "__main__":
     with open(args.bird_train_pth) as f:
         data = json.load(f)
 
-    
-
-    # gen_data = []
-    # for ex in data:
-    #     if len(gen_data) > 10:
-    #         break
-    #     gen_dict = {"messages": [{"role": "user", "content": ex["input"]}, {"role": "assistant", "content": ""}], "format": "chatml"}
-        
-    #     db_info = "DB Info: " + ex["input"] + "\n" + "Task: "+ex["question"]
-    #     response = chat.get_model_response_txt(original_prompt+gen_prompt+db_info)
-    #     if is_valid_exec_sequence(response):
-    #         print(response)
-    #         gen_dict["messages"][-1]["content"] = response
-    #         gen_data.append(gen_dict)
     gen_data = []
     lock = threading.Lock()
 
     def process_example(ex):
         chat = DSChat()
-        gen_dict = {
-            "messages": [
-                {"role": "user", "content": ex["input"]},
-                {"role": "assistant", "content": ""}
-            ],
-            "format": "chatml"
-        }
+
 
         db_info = "DB Info: " + ex["input"] + "\n" + "Task: " + ex["question"]
-        response = chat.get_model_response_txt(original_prompt + gen_prompt + db_info)
+        prompt = original_prompt + gen_prompt + db_info
+        
+        max_try = 3
 
-        if is_valid_exec_sequence(response):
-            # print(response)
-            gen_dict["messages"][-1]["content"] = response
-            with lock:
-                if len(gen_data) < 300:
+        while max_try:
+            gen_dict = {
+                "messages": [
+                    {"role": "user", "content": ex["input"]},
+                    {"role": "assistant", "content": ""}
+                ],
+                "format": "chatml"
+            }
+            response = chat.get_model_response_txt(prompt)
+            if is_valid_exec_sequence(response) == "Successfully Generated. ":
+                # print(response)
+                gen_dict["messages"][-1]["content"] = response
+                with lock:
                     gen_data.append(gen_dict)
 
-                print(f"len(gen_data): {len(gen_data)}")
+                    print(f"len(gen_data): {len(gen_data)}, ex_id: ", ex["example_id"])
+                    with open("raw/ds_bird.jsonl", "a", encoding="utf-8") as f:
+                        f.write(json.dumps(gen_dict, ensure_ascii=False) + "\n")
+                break
+            
+            prompt = is_valid_exec_sequence(response) + "Please generate again. "
+            max_try -= 1
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as executor:
-        futures = [executor.submit(process_example, ex) for ex in data]
-
-    with open("raw/ds_bird.jsonl", "a") as f:
-        for row in gen_data:
-            f.write(json.dumps(row)+"\n")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(process_example, ex) for ex in data[400:600]]

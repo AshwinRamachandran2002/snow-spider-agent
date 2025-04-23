@@ -12,11 +12,15 @@ from utils import utils
 IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 # Set special tokens globally to avoid adding them multiple times.
 def setup_tokenizer(tokenizer):
+    special_tokens = [
+        "<|im_start|>", "<|im_end|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"
+    ]
     tokenizer.add_special_tokens({
-        "additional_special_tokens": [
-            "<|im_start|>", "<|im_end|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"
-        ]
+        "additional_special_tokens": special_tokens
     })
+    for token in special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"Token: {token}\tID: {token_id}")
     return tokenizer
 
 
@@ -66,11 +70,12 @@ response
             raise ValueError(f"Unknown role '{sentence['role']}' encountered.")
         
         _input_id = tokenizer(role).input_ids + nl_tokens + tokenizer(sentence["content"], add_special_tokens=False).input_ids + [im_end] + nl_tokens
-        input_id += _input_id
 
         if role == '<|im_start|>user' or (only_last_turn_loss and j < len(sources[1:]) - 1):
             _target = [im_start] + [IGNORE_INDEX] * (len(_input_id) - 3) + [im_end] + nl_tokens
+            input_id += _input_id
         elif role == '<|im_start|>assistant':
+            # _target = [im_start] + [IGNORE_INDEX] * len(tokenizer(role).input_ids) + _input_id[len(tokenizer(role).input_ids) + 1: -2] + [im_end] + nl_tokens
             word_exec_result = "<exec_result>"
             end_exec_result = "</exec_result>"
 
@@ -88,9 +93,10 @@ response
             input_id += _input_id
         elif role == "<|im_start|>system": # if has more system prompt in the conversion
             _target = [im_start] + [IGNORE_INDEX] * (len(_input_id) - 3) + [im_end] + nl_tokens
+            input_id += _input_id
         else:
             raise NotImplementedError(f"Role '{role}' is not implemented.")
-        
+
         target += _target
 
         if j == len(sources[1:]) - 1:

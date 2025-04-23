@@ -230,11 +230,12 @@ def train():
     )
     special_tokens = ["<|im_end|>", "<|im_start|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"]
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
-
+    for token in special_tokens:
+        token_id = tokenizer.convert_tokens_to_ids(token)
+        print(f"Token: {token}\tID: {token_id}")
     model.resize_token_embeddings(len(tokenizer))
     # Set new word embedding to average of existing word embeddings. For why,
     # see https://nlp.stanford.edu/~johnhew/vocab-expansion.html
-    print(dir(model))
 
     with torch.no_grad():
         model.model.embed_tokens.weight[
