@@ -14,8 +14,7 @@ IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 def setup_tokenizer(tokenizer):
     tokenizer.add_special_tokens({
         "additional_special_tokens": [
-            "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|repo_name|>",
-            "<|file_sep|>", "<|im_start|>", "<|im_end|>", "<formatting>", "</formatting>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"
+            "<|im_start|>", "<|im_end|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"
         ]
     })
     return tokenizer
@@ -217,10 +216,11 @@ if __name__ == "__main__":
     print(args)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.tokenizer_path,
-        add_eos_token=False,
-        add_bos_token=False,
+        add_eos_token=True,
+        add_bos_token=True,
         pad_token='<|endoftext|>',
         eos_token='<|im_end|>', 
+        bos_token='<|im_start|>', 
         cache_dir=None,
         model_max_length=8192 * 5,
         truncation=True,

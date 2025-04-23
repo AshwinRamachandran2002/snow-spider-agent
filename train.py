@@ -220,14 +220,15 @@ def train():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         pad_token = '<|endoftext|>',
-        eos_token = '<|im_end|>', #<|endoftext|>
+        eos_token = '<|im_end|>',
+        bos_token = '<|im_start|>',
         cache_dir = None,
         model_max_length = training_args.model_max_length,
         truncation = True,
         padding_side = "right",
         trust_remote_code = True
     )
-    special_tokens = ["<|im_end|>", "<|im_start|>", "<formatting>", "</formatting>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"]
+    special_tokens = ["<|im_end|>", "<|im_start|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"]
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
     model.resize_token_embeddings(len(tokenizer))
