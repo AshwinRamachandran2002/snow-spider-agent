@@ -537,13 +537,11 @@ class RayPPOTrainer(object):
 
                         # recompute old_log_probs
                         with _timer('old_log_prob', timing_raw):
-                            print("Compute old_log_prob")
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             batch = batch.union(old_log_prob)
 
                         # compute reference log_prob
                         with _timer('ref', timing_raw):
-                            print("Compute ref old_log_prob")
                             ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
@@ -560,7 +558,6 @@ class RayPPOTrainer(object):
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # update actor
-                    print("update_actor")
                     with _timer('update_actor', timing_raw):
                         actor_output = self.actor_rollout_wg.update_actor(batch)
                     actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])

@@ -13,6 +13,7 @@ import sqlglot
 from datasets import load_dataset, Dataset
 import multiprocessing
 from functools import partial
+import pandas as pd
 
 class SqlEnv:
     def __init__(self, db_path: str):
@@ -109,18 +110,34 @@ def _gen_data_fetch(col_name: str, table_name: str):
     return query
 
 
+def get_row_info_filtered(df, original_col_name, table_name):
+    df['original_column_name'] = df['original_column_name'].str.strip()
+
+    row = df[df['original_column_name'] == original_col_name]
+    assert not row.empty, table_name
+    row_data = row.iloc[0]
+    return ', '.join([
+        f"{col}: {row_data[col]}"
+        for col in df.columns
+        if pd.notna(row_data[col]) and str(row_data[col]).strip() != ''
+    ]).replace("column_name", "full_column_name")
+
 def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
     table_names = db_metadata["table_names_original"]
     column_names = db_metadata["column_names_original"]
+    full_table_names = db_metadata["table_names"]
+    full_column_names = db_metadata["column_names"]
     column_types = db_metadata["column_types"]
     primary_keys = db_metadata["primary_keys"]
     foreign_keys = db_metadata["foreign_keys"]
 
     # Create table columns and primary key set
     table_columns = [[] for _ in range(len(table_names))]
+    full_table_columns = [[] for _ in range(len(full_table_names))]
     for idx, (table_idx, col_name) in enumerate(column_names):
         if table_idx != -1:  # Ignore the '*' wildcard
             table_columns[table_idx].append((idx, col_name))
+            full_table_columns[table_idx].append((idx, full_column_names[idx][-1]))
 
     flattened_pks = []
     for pk in primary_keys:
@@ -143,9 +160,24 @@ def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
     output = []
     tb_struct = {}
     for table_idx, table_name in enumerate(table_names):
-        output.append(f"Table Name: {table_name} :")
+        output.append(f"Table Name: {table_name} (Full Table Name: {full_table_names[table_idx]}):")
         columns = table_columns[table_idx]
+        full_columns = full_table_columns[table_idx]
         tb_struct[table_name] = []
+
+        database_description_path = os.path.join("/".join(db_path.split("/")[:-1]), "database_description")
+        for csv_file in os.listdir(database_description_path):
+            if db_metadata["db_id"] == "app_store":
+                if table_name == "playstore":
+                    csv_file_path = os.path.join(database_description_path, "googleplaystore.csv")
+                elif table_name == "user_reviews":
+                    csv_file_path = os.path.join(database_description_path, "googleplaystore_user_reviews.csv")
+            if csv_file.replace(".csv", "").upper() == table_name.upper():
+                csv_file_path = os.path.join(database_description_path, csv_file)
+        try:
+            df = pd.read_csv(csv_file_path, encoding_errors='ignore')
+        except Exception as e:
+            print(e, database_description_path)
         for col_idx, col_name in columns:
             col_type = column_types[col_idx]
             tb_struct[table_name] += [col_name]
@@ -173,8 +205,11 @@ def create_db_schema(db_metadata: Dict[str, Any], db_path: str) -> str:
                     f"{table_name}.{col_name}={ref_table_name}.{ref_col_name}"
                 )
 
+            
             # Append formatted column description
-            column_desc = f"Column Name: {col_name} [ {col_type.upper()} ] ( {sample_str} ) {primary_key_text} {ref_text}"
+            column_desc = get_row_info_filtered(df, col_name, table_name)
+            if primary_key_text or ref_text:
+                column_desc += f", primary_key or foreign_key info: {primary_key_text} {ref_text}"
             output.append(column_desc.strip())
 
         output.append("")  # Add a blank line between tables
@@ -290,7 +325,7 @@ def prepare_fn_func(sample, db_desc_str, dataset_type, tokenizer, template_type=
         ]
         sample["question"] = question
         # GS: test qwen-instruct and deepseek-distilled-qwen
-        sample["prompt"] = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        # sample["prompt"] = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     return sample
 
 def load_bird_dataset_util(data_path: str, mode: str, cache_dir: str, tokenizer):

@@ -4,6 +4,8 @@ import json
 import math
 import pandas as pd
 import argparse
+from io import StringIO
+import csv
 
 def load_jsonl_to_dict(jsonl_file):
     data_dict = {}
@@ -115,6 +117,21 @@ def evaluate_spider2sql(gold_result_dir, csv_str, example_id):
         print(f"{example_id} ERROR: {e}")
         score = 0
     return score
+
+def get_tuple(csv_str):
+    f = StringIO(csv_str)
+    reader = csv.reader(f)
+    next(reader)
+    return [tuple(row) for row in reader]
+
+def evaluate_bird(gold_result_dir, exec_result, example_id):
+    try:
+        with open(os.path.join(gold_result_dir, example_id+".csv")) as f:
+            gold_csv = f.read()
+        return set(get_tuple(exec_result)) == set(get_tuple(gold_csv))
+    except Exception as e:
+        print(f"{example_id} ERROR: {e}")
+    return 0
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Setup for Spider 2.0")

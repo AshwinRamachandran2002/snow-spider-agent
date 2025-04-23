@@ -18,7 +18,7 @@ from multiprocessing import Process, Queue
 def hard_cut(str_e, length=0):
     if length:
         if len(str_e) > length and not str_e.startswith("Too long, hard cut"):
-            str_e = "Too long, hard cut:\n" + str_e[:int(length)]+"\n"
+            str_e = f"Too long, show first {length} chars:\n" + str_e[:int(length)]+"\n"
     return str_e
 
 def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
@@ -28,9 +28,9 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, L
         for row in cursor:
             rows.append(row)
             row_str = str(row)
+            current_len += len(row_str)
             if current_len + len(row_str) > max_len:
                 break
-            current_len += len(row_str)
         return rows
     if LIMIT is not None and "LIMIT" not in sql_query.upper():
         sql_query = sql_query.rstrip('\n;') + " LIMIT 100;\n"
@@ -154,39 +154,41 @@ def execute_sql_api(sql_query, save_path=None, api="snowflake", max_len=30000, L
 class SqlEnv:
     def __init__(self):
         self.conns = {}
-        self.db_lock = threading.Lock()
-        # self.executor = ThreadPoolExecutor(max_workers=1)
 
-    def start_db(self, sqlite_path):
-        if sqlite_path not in self.conns:
-            uri = f"file:{sqlite_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
-            try:
-                # Create a memory connection with a timeout to wait for the lock to be released.
-                memory_conn = sqlite3.connect(
-                    f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared",
-                    uri=True, 
-                    check_same_thread=False,
-                    timeout=5.0  # Wait up to 5 seconds for a lock release
-                )
-                conn.backup(memory_conn)
-                memory_conn.execute("PRAGMA shared_cache = ON;")
-                if memory_conn:
-                    self.conns[sqlite_path] = memory_conn
-                    conn.close()
-                    # print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
-                else:
-                    print("Backup failed after multiple attempts, using the original connection.")
-                    self.conns[sqlite_path] = conn
-            except Exception as e:
-                print(f"Exception during backup: {str(e)}. sqlite_path: {sqlite_path}. Using the original connection.")
-                if memory_conn:
-                    memory_conn.close()
-                if conn:
-                    conn.close()
+
+    def start_db(self, sqlite_path, exe_id):
+        try:
+            if exe_id not in self.conns:
+                uri = f"file:{sqlite_path}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+                # try:
+                #     # Create a memory connection with a timeout to wait for the lock to be released.
+                #     memory_conn = sqlite3.connect(
+                #         f"file:{sqlite_path.split('/')[-1]}?mode=memory&cache=shared",
+                #         uri=True, 
+                #         check_same_thread=False,
+                #         timeout=5.0  # Wait up to 5 seconds for a lock release
+                #     )
+                #     conn.backup(memory_conn)
+                #     memory_conn.execute("PRAGMA shared_cache = ON;")
+                #     if memory_conn:
+                #         self.conns[sqlite_path] = memory_conn
+                #         conn.close()
+                #         # print(f"Backup succeeded, self.conns.keys(): {self.conns.keys()}")
+                #     else:
+                #         print("Backup failed after multiple attempts, using the original connection.")
+                #         self.conns[sqlite_path] = conn
+                # except Exception as e:
+                #     print(f"Exception during backup: {str(e)}. sqlite_path: {sqlite_path}. Using the original connection.")
+                #     if memory_conn:
+                #         memory_conn.close()
+                #     if conn:
+                #         conn.close()
                 conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
                 conn.execute("PRAGMA shared_cache = ON;")
-                self.conns[sqlite_path] = conn
+                self.conns[exe_id] = conn
+        except Exception as e:
+            print("##ERROR## Failed to start DB", e)
 
     def close_db(self):
         # print("Close DB")
@@ -197,7 +199,18 @@ class SqlEnv:
                     # print(f"Connection {key} closed.")
                     del self.conns[key]
             except Exception as e:
-                print(f"When closing DB for {key}: {e}")
+                print(f"##ERROR## When closing DB for {key}: {e}")
+
+    def close_conn(self, exe_id):
+        # print("Close DB")
+        for key, conn in list(self.conns.items()):
+            try:
+                if key == exe_id and conn:
+                    conn.close()
+                    # print(f"Connection {key} closed.")
+                    del self.conns[key]
+            except Exception as e:
+                print(f"##ERROR## When closing DB for {key}: {e}")
 
     def exec_sql(self, sql_query, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None):
         cursor = self.conns[sqlite_path].cursor()
@@ -205,33 +218,34 @@ class SqlEnv:
         try:
             cursor.execute(sql_query)
         except Exception as e:
-            return "Incorrect SQL Syntax:\n" + str(e)
+            return "##ERROR## Incorrect SQL Syntax: " + str(e)
         
         def get_rows(cursor):
             rows = []
             current_len = 0
             for row in cursor:
                 row_str = str(row)
-                if current_len + len(row_str) > max_len:
-                    break
                 rows.append(row)
                 current_len += len(row_str)
+                if current_len + len(row_str) > max_len:
+                    break
             return rows
         
         try:
             rows = get_rows(cursor)
             if cursor.description is None:
-                print(f"Cursor.description is None SQL: {sql_query}")
-                return f"No a valid SQL: {sql_query}"
+                err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
+                print(err)
+                return err
             columns = [desc[0] for desc in cursor.description]
         except Exception as e:
-            print(f"sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
-            return str(e)
+            print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
+            return "##ERROR## " + str(e)
         finally:
             try:
                 cursor.close()
             except Exception as e:
-                print("Failed to close cursor:", e)
+                print("##ERROR## Failed to close cursor:", e)
 
         if not rows:
             return "No data found for the specified query.\n"
@@ -248,7 +262,7 @@ class SqlEnv:
                         f.write(csv_content)
                     return 0
                 except Exception as e:
-                    print(str(e))
+                    print("##ERROR## ", str(e))
                     return str(e)
             else:
                 return hard_cut(csv_content, max_len)
@@ -263,9 +277,9 @@ class SqlEnv:
     #     except TimeoutError:
     #         print(f"{sql_query} Timed out\n")
     #         return f"{sql_query} Timed out\n"
-    def execute_sql_with_timeout(self, sql_query, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
+    def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3):
         if sqlite_path not in self.conns.keys():
-            self.start_db(sqlite_path)
+            self.start_db(sqlite_path, exe_id)
 
         def target(q):
             try:
@@ -282,14 +296,14 @@ class SqlEnv:
         if p.is_alive():
             p.kill()
             p.join()
-            print(f"{sql_query} Timed out, p.exitcode: {p.exitcode}\n")
-            return f"{sql_query} Timed out\n"
+            print(f"##ERROR## {sql_query} Timed out, p.exitcode: {p.exitcode}\n")
+            return f"##ERROR## {sql_query} Timed out\n"
         else:
             if not q.empty():
                 result = q.get()
                 return result
             else:
-                return "Error p dead"
+                return "##ERROR## Process p dead"
 
     def __del__(self):
         self.close_db()

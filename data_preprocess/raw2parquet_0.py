@@ -70,3 +70,4 @@ if __name__ == "__main__":
 
     print(dataset)
     dataset.to_parquet(os.path.join(args.local_dir, f"{args.save_prefix}_{args.dataset_mode}.parquet"))
+    dataset.to_json("output.jsonl", orient="records", lines=True, force_ascii=False)

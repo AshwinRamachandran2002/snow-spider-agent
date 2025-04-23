@@ -107,6 +107,8 @@ class RewardManager():
         #     return 0
         if text.count("</think>") != 1:
             return 0
+
+        text = text[:text.find("</think>")]
         if not check_once("<|im_start|>SQL", "<|im_end|>", text):
             return 0
         

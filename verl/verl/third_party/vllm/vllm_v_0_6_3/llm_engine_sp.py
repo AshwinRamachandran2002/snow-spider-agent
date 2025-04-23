@@ -55,7 +55,7 @@ from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
 from verl.workers.reward_model.reward_utils import get_api_name, SqlEnv, calculate_md5
-from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql
+from verl.workers.reward_model.reward_evaluate import evaluate_spider2sql, evaluate_bird
 import uuid
 import datetime
 import numpy as np
@@ -119,10 +119,12 @@ class SQLExecutor():
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
 
-                exec_result = self.exec_func_sql(sql_string, timeout=self.timeout_for_exploration, max_len=1000, LIMIT=100, **kwargs)
+                log_ = self.tokenizer.decode(completion).strip()
+                log_gen = log_[:log_.find("<exec_sql>")]
+                exec_result = self.exec_func_sql(sql_string, calculate_md5(log_gen), timeout=self.timeout_for_exploration, max_len=500, LIMIT=100, **kwargs)
                 if "Timed out" in exec_result:
-                    print(f"timed out time: {time.time() - start}")
-                    return "Timed out"
+                    print(f"Timed out time: {time.time() - start}")
+                    return [self.tokenizer.eos_token_id]
                 
                 exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>"
                 if self.logging:
@@ -147,7 +149,7 @@ class SQLExecutor():
                     log_gen = log_
                     log_gen = log_[log_.find("<exec_sql>"):]
                     file_name = f"{example_id}_{calculate_md5(log_gen)}"
-                    exec_result = self.exec_func_sql(sql_string, save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
+                    exec_result = self.exec_func_sql(sql_string, calculate_md5(log_gen), save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
                     
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
@@ -159,7 +161,7 @@ class SQLExecutor():
                             f.write(str(evaluate_spider2sql(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
                     return [self.tokenizer.eos_token_id]
         if completion[-1] != self.tokenizer.eos_token_id:
-            print(f"No match: {completion}")
+            print(f"Fatal err: No match: {completion}")
         return [self.tokenizer.eos_token_id]
 
     def remove(self, request_id):
@@ -243,28 +245,28 @@ class SQLExecutor():
 
                     monitor_info = self.monitor_parent_seq_ids[seq_id]
                     # TODO: index error
+                    # if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
+                    #     print(monitor_info["curr_pointer"], monitor_info["exec_result"], f"Removing seq_id {seq_id} from monitoring, outputs: {outputs}, scheduler_outputs: {scheduler_outputs}\n")
+                    #     del self.monitor_parent_seq_ids[seq_id]
+                    # else:
+                    actual_output_token = seq_output.output_token
+                    replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
+                    monitor_info["curr_pointer"] += 1
+
+                    # replace output token
+                    seq_output.output_token = replacement_token
+                    
+                    # replace the logprobs also
+                    seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
+                    if replacement_token != actual_output_token:
+                        del seq_output.logprobs[actual_output_token]
+
+                    # Remove from monitoring if all tokens have been processed
                     if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                        print(monitor_info["curr_pointer"], monitor_info["exec_result"], f"Removing seq_id {seq_id} from monitoring, outputs: {outputs}, scheduler_outputs: {scheduler_outputs}\n")
+                        if self.logging:
+                            with open(self.log_path, "a") as f:
+                                f.write(f"Removing seq_id {seq_id} from monitoring\n")
                         del self.monitor_parent_seq_ids[seq_id]
-                    else:
-                        actual_output_token = seq_output.output_token
-                        replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
-                        monitor_info["curr_pointer"] += 1
-
-                        # replace output token
-                        seq_output.output_token = replacement_token
-                        
-                        # replace the logprobs also
-                        seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
-                        if replacement_token != actual_output_token:
-                            del seq_output.logprobs[actual_output_token]
-
-                        # Remove from monitoring if all tokens have been processed
-                        if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                            if self.logging:
-                                with open(self.log_path, "a") as f:
-                                    f.write(f"Removing seq_id {seq_id} from monitoring\n")
-                            del self.monitor_parent_seq_ids[seq_id]
 
                 output_token = seq_output.output_token
                 # Store the output token for the sequence ID
@@ -293,7 +295,7 @@ class SQLExecutor():
                         if self.logging:
                             with open(self.log_path, "a") as f:
                                 f.write(f"Exceeded max calls for seq_id {seq_id}\n")
-                        print(f"Timeout for seq_id {seq_id}, time: {used_time}, Current GPU Index: {torch.cuda.current_device()}\n")
+                        print(f"Timeout for seq_id {seq_id}, time: {used_time}")
 
                         self.monitor_parent_seq_ids[seq_id] = {
                             "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
@@ -305,27 +307,16 @@ class SQLExecutor():
                             "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
                             "curr_pointer": 0
                         }
-                        print(f"Max calls for seq_id {seq_id}, Current GPU Index: {torch.cuda.current_device()}\n")
+                        print(f"Max calls for seq_id {seq_id}")
                     else:
                         if self.logging:
                             with open(self.log_path, "a") as f:
                                 f.write(f"Making API call for seq_id {seq_id}\n")
                         exec_res = self.fetch_execution_result(completions, seq_id)
-                        if exec_res == "Timed out":
-                            print(f"Timeout for one execution, return")
-                            self.monitor_parent_seq_ids[seq_id] = {
-                                "exec_result": self.fetch_execution_result(completions, seq_id, failed=True),
-                                "curr_pointer": 0
-                            }
-                        # elif exec_res == [self.tokenizer.eos_token_id]:
-                        #     print(f"FATALERROR: Remove from monitor: {completions}")
-                        #     if seq_id in self.monitor_parent_seq_ids:
-                        #         del self.monitor_parent_seq_ids[seq_id]
-                        else:
-                            self.monitor_parent_seq_ids[seq_id] = {
-                                "exec_result": exec_res,
-                                "curr_pointer": 0
-                            }
+                        self.monitor_parent_seq_ids[seq_id] = {
+                            "exec_result": exec_res,
+                            "curr_pointer": 0
+                        }
                 elif completions[-1] == self.im_end_id:
                     self.fetch_execution_result(completions, seq_id, final=True)
                 elif self.tokenizer.decode(completions[-4:]).strip() == "</exec_sql>":
