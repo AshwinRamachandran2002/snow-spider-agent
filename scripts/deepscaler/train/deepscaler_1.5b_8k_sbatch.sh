@@ -1,4 +1,10 @@
 #!/bin/bash
+#SBATCH --job-name=bash
+#SBATCH --output=logs/test-%j.out
+#SBATCH --error=logs/test-%j.err
+#SBATCH --nodes=8
+#SBATCH --tasks-per-node=1
+#SBATCH --gpus-per-task=1
 set -x
 
 # Warning: Export VLLM_ATTENTION_BACKEND on every machine before starting Ray cluster.
@@ -26,11 +32,11 @@ fi
 # Train over a single node, 8 A100-80GB GPUs.
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=$HOME/rllm/data/deepscaler_train.parquet \
-    data.val_files=$HOME/rllm/data/aime.parquet \
+    data.train_files=/mnt/weka/home/hao.zhang/bruce/ag/data_preprocess/data/processed/bird_train_data.parquet \
+    data.val_files=/mnt/weka/home/hao.zhang/bruce/ag/data_preprocess/data/processed/bird_dev_data.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=512 \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=8192 \
     data.max_response_length=8192 \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=1e-6 \

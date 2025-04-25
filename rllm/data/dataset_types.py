@@ -28,6 +28,7 @@ class TrainDataset:
         LEETCODE = "LEETCODE"
         PRIMEINTELLECT = "PRIMEINTELLECT"
         KODCODE = "KODCODE"
+        BIRD_TRAIN = "BIRD_TRAIN"
 
 class TestDataset:
 
@@ -46,6 +47,7 @@ class TestDataset:
         LIVECODEBENCH = "LIVECODEBENCH"
         LEETCODE = "LEETCODE"
         HUMANEVALPLUS = "HUMANEVALPLUS"
+        BIRD_DEV = "BIRD_DEV"
 
 
 Dataset = Union[TrainDataset, TestDataset]

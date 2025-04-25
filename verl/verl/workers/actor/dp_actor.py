@@ -32,9 +32,65 @@ from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
-
+from transformers import AutoTokenizer
+import os
+import datetime
 __all__ = ['DataParallelPPOActor']
 
+def log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length):
+    # compute kl loss
+    kld = log_prob - ref_log_prob
+
+    if kld.mean().item() < 0:
+        log = ''
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H")
+        log += timestamp
+
+        mask = response_mask.bool()
+
+        masked_kld = kld[mask]                         # [N_masked]
+        masked_log_prob = log_prob[mask]
+        masked_ref_log_prob = ref_log_prob[mask]
+        masked_input_ids = data["input_ids"][:, -response_length:][mask]
+
+        num_top = 5
+        if masked_kld.numel() >= num_top:
+            lowest_kld_idx = torch.topk(masked_kld, k=num_top, largest=False).indices
+        else:
+            lowest_kld_idx = torch.arange(masked_kld.numel())
+
+        log += (f"🔍 Top {num_top} most negative kld tokens:\n")
+        for i, idx in enumerate(lowest_kld_idx):
+            token_id = masked_input_ids[idx].item()
+            token_str = tokenizer.decode([token_id])
+            lp = masked_log_prob[idx].item()
+            rlp = masked_ref_log_prob[idx].item()
+            diff = masked_kld[idx].item()
+
+            context_str = ''
+            if idx - 1 >= 0:
+                token_id_before = masked_input_ids[idx-1].item()
+                context_str += tokenizer.decode([token_id_before])
+            context_str += f"|{token_str}|"
+            if idx + 1 < len(masked_input_ids):
+                token_id_before = masked_input_ids[idx+1].item()
+                context_str += tokenizer.decode([token_id_before])
+
+            log += (
+                f"#{i+1}: Token='{token_str}' (id={token_id}), "
+                f"log_prob={lp:.4f}, ref_log_prob={rlp:.4f}, kld={diff:.4f}\n"
+                f"     Context: ...{context_str}...\n"
+            )
+    
+        import hashlib
+        def calculate_md5(input_string):
+            md5_obj = hashlib.md5()
+            md5_obj.update(input_string.encode('utf-8'))
+            return md5_obj.hexdigest()
+        
+        with open(f"log/{timestamp}_{calculate_md5(timestamp)}.log", "a") as f:
+            f.write(log)
 
 class DataParallelPPOActor(BasePPOActor):
 
@@ -216,7 +272,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
-
+        tokenizer = AutoTokenizer.from_pretrained(os.getenv("MODEL_PATH"))
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -246,6 +302,34 @@ class DataParallelPPOActor(BasePPOActor):
 
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
+                    ignore_now = False
+                    for batch in range(len(responses)):
+                        for index in range(len(responses[batch])):
+                            assert len(tokenizer.encode("<exec_result>")) == 2, tokenizer.encode("<exec_result>")
+                            if responses[batch][index] == tokenizer.encode("<exec_result>")[1]:
+                                if index - 3 >= 0 and responses[batch][index-3] == tokenizer.encode("</exec_sql>")[1]:
+                                    response_mask[batch][index-2] = 0
+                                    response_mask[batch][index-1] = 0 # mask \n before <exec_res>
+                                    response_mask[batch][index] = 0
+                                    ignore_now = True
+                                    continue
+                                elif index - 2 >= 0 and responses[batch][index-2] == tokenizer.encode("</exec_sql>")[1]:
+                                    response_mask[batch][index-1] = 0 # mask \n before <exec_res>
+                                    response_mask[batch][index] = 0
+                                    ignore_now = True
+                                    continue                                    
+                            
+                            assert len(tokenizer.encode("</exec_result>")) == 2, tokenizer.encode("</exec_result>")
+                            if responses[batch][index] == tokenizer.encode("</exec_result>")[1]:
+                                response_mask[batch][index] = 0
+                                ignore_now = False
+                                
+                            if ignore_now or responses[batch][index] == tokenizer.pad_token_id \
+                                or responses[batch][index] == tokenizer.eos_token_id \
+                                or responses[batch][index] == tokenizer.bos_token_id: # mask pad, eos, bos
+                                response_mask[batch][index] = 0
+
+
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                                 log_prob=log_prob,
                                                                                 advantages=advantages,
@@ -262,6 +346,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
+                        log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length)
                         # compute kl loss
                         kld = core_algos.kl_penalty(logprob=log_prob,
                                                     ref_logprob=ref_log_prob,

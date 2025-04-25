@@ -27,6 +27,8 @@ class RewardConfig:
     # Bonus reward for calling tools.
     toolcall_bonus: float = 0.5
 
+    half_correct_reward: float = 0.9
+    format_reward: float = 0.1
 
 class RewardType(Enum):
     """

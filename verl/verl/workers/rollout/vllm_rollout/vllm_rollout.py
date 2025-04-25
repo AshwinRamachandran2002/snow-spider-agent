@@ -41,7 +41,7 @@ from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
-
+import time
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -101,6 +101,7 @@ class vLLMRollout(BaseRollout):
             "model context length should be greater than total sequence length"
         self.inference_engine = LLM(actor_module,
                                     tokenizer=tokenizer,
+                                    sql_executor_config=config.sql_executor,
                                     model_hf_config=model_hf_config,
                                     tensor_parallel_size=tensor_parallel_size,
                                     dtype=config.dtype,
@@ -181,6 +182,7 @@ class vLLMRollout(BaseRollout):
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
         eos_token_id = prompts.meta_info['eos_token_id']
+        reward_model = prompts.non_tensor_batch['reward_model']
         batch_size = idx.size(0)
 
         # Pre-process input token ids
@@ -207,17 +209,44 @@ class vLLMRollout(BaseRollout):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
             is_validation = True
 
+        # add
+        example_id_list = [
+            reward_model[i]["ground_truth"]['example_id']
+            for i in range(batch_size)
+        ]
+        sqlite_path_list = [
+            reward_model[i]["ground_truth"]['sqlite_path']
+            for i in range(batch_size)
+        ]
+
+        # Generating sequences
+        batch_sampling_params = []
+        for _idx in range(batch_size):
+            with self.update_sampling_params(
+                    example_id=example_id_list[_idx],
+                    sqlite_path=sqlite_path_list[_idx],
+                    **kwargs
+            ):
+                # Inside the context, perform the operations to generate the sequence
+                batch_sampling_params.append(self.sampling_params.clone())
+
         kwargs['n'] = 1
         if do_sample:
             idx_list = [deepcopy(item) for item in idx_list for _ in range(self.config.n)]
+            batch_sampling_params = [deepcopy(p) for p in batch_sampling_params for _ in range(self.config.n)]
+        assert len(idx_list) == len(batch_sampling_params), \
+                f"Mismatch: idx_list={len(idx_list)}, sampling_params={len(batch_sampling_params)}"
 
+        self.inference_engine.llm_engine.sql_executor_context.start_time = time.time()
         # Generate sequences
         with self.update_sampling_params(**kwargs):
             output = self.inference_engine.generate(
                 prompts=None,
-                sampling_params=self.sampling_params,
+                sampling_params=batch_sampling_params,
                 prompt_token_ids=idx_list,
                 use_tqdm=False)
+
+        self.inference_engine.llm_engine.sql_executor_context.remove_all_ids()
 
         # Process outputs
         response = output[0].to(idx.device)
