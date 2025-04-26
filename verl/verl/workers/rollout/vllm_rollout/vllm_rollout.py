@@ -219,6 +219,8 @@ class vLLMRollout(BaseRollout):
             for i in range(batch_size)
         ]
 
+
+        kwargs['n'] = 1
         # Generating sequences
         batch_sampling_params = []
         for _idx in range(batch_size):
@@ -230,7 +232,6 @@ class vLLMRollout(BaseRollout):
                 # Inside the context, perform the operations to generate the sequence
                 batch_sampling_params.append(self.sampling_params.clone())
 
-        kwargs['n'] = 1
         if do_sample:
             idx_list = [deepcopy(item) for item in idx_list for _ in range(self.config.n)]
             batch_sampling_params = [deepcopy(p) for p in batch_sampling_params for _ in range(self.config.n)]
@@ -261,6 +262,7 @@ class vLLMRollout(BaseRollout):
 
         # Handle multiple samples per prompt
         non_tensor_batch = deepcopy(prompts.non_tensor_batch)
+        # print(f"idx.shape before: {idx.shape}")
         if self.config.n > 1 and do_sample:
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(
@@ -276,6 +278,7 @@ class vLLMRollout(BaseRollout):
                 non_tensor_batch[key] = repeated_val
 
         # Concatenate prompt and response
+        # print(f"idx.shape: {idx.shape}, response.shape: {response.shape}, self.config.n: {self.config.n}")
         seq = torch.cat([idx, response], dim=-1)
 
         # Create position IDs and attention mask for full sequence

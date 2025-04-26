@@ -16,79 +16,79 @@ def hard_cut(str_e, length=0):
             str_e = f"Too long, show first {length} chars:\n" + str_e[:int(length)]+"\n"
     return str_e
 
-def exec_sql_(con, sql_query, exe_id, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, example_id=None):
-    cursor = con.cursor()
-    # Don't add LIMIT
-    try:
-        cursor.execute(sql_query)
-    except Exception as e:
-        cursor.close()
-        return "##ERROR## Incorrect SQL Syntax: " + str(e)
+# def exec_sql_(con, sql_query, exe_id, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, example_id=None):
+#     cursor = con.cursor()
+#     # Don't add LIMIT
+#     try:
+#         cursor.execute(sql_query)
+#     except Exception as e:
+#         cursor.close()
+#         return "##ERROR## Incorrect SQL Syntax: " + str(e)
     
-    def get_rows(cursor):
-        rows = []
-        current_len = 0
-        for row in cursor:
-            row_str = str(row)
-            rows.append(row)
-            current_len += len(row_str)
-            if current_len + len(row_str) > max_len:
-                break
-        return rows
+#     def get_rows(cursor):
+#         rows = []
+#         current_len = 0
+#         for row in cursor:
+#             row_str = str(row)
+#             rows.append(row)
+#             current_len += len(row_str)
+#             if current_len + len(row_str) > max_len:
+#                 break
+#         return rows
     
-    try:
-        rows = get_rows(cursor)
-        if cursor.description is None:
-            err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
-            print(err)
-            return err
-        columns = [desc[0] for desc in cursor.description]
-    except Exception as e:
-        print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
-        return "##ERROR## " + str(e)
-    finally:
-        try:
-            cursor.close()
-        except Exception as e:
-            print("##ERROR## Failed to close cursor:", e)
+#     try:
+#         rows = get_rows(cursor)
+#         if cursor.description is None:
+#             err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
+#             print(err)
+#             return err
+#         columns = [desc[0] for desc in cursor.description]
+#     except Exception as e:
+#         print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
+#         return "##ERROR## " + str(e)
+#     finally:
+#         try:
+#             cursor.close()
+#         except Exception as e:
+#             print("##ERROR## Failed to close cursor:", e)
 
-    if not rows:
-        return "No data found for the specified query.\n"
-    else:
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(columns)
-        writer.writerows(rows)
-        csv_content = output.getvalue()
-        output.close()
-        if save_path:
-            try:
-                with open(save_path, 'w', newline='') as f:
-                    f.write(csv_content)
-                return 0
-            except Exception as e:
-                print("##ERROR## ", str(e))
-                return str(e)
-        else:
-            return hard_cut(csv_content, max_len)
+#     if not rows:
+#         return "No data found for the specified query.\n"
+#     else:
+#         output = io.StringIO()
+#         writer = csv.writer(output)
+#         writer.writerow(columns)
+#         writer.writerows(rows)
+#         csv_content = output.getvalue()
+#         output.close()
+#         if save_path:
+#             try:
+#                 with open(save_path, 'w', newline='') as f:
+#                     f.write(csv_content)
+#                 return 0
+#             except Exception as e:
+#                 print("##ERROR## ", str(e))
+#                 return str(e)
+#         else:
+#             return hard_cut(csv_content, max_len)
 
-def _sql_worker_wrapper(args):
-    sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id = args
-    try:
-        con = sqlite3.connect(
-            f"file:{sqlite_path}?mode=memory&cache=shared",
-            uri=True, 
-            check_same_thread=False
-        )
-        result = exec_sql_(con, sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
-        return str(result)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        print("Exception in worker", str(e))
-        return f"##ERROR## {str(e)}"
-    finally:
-        con.close()
+# def _sql_worker_wrapper(args):
+#     sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id = args
+#     try:
+#         con = sqlite3.connect(
+#             f"file:{sqlite_path}?mode=memory&cache=shared",
+#             uri=True, 
+#             check_same_thread=False
+#         )
+#         result = exec_sql_(con, sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
+#         return str(result)
+#     except Exception as e:
+#         import traceback
+#         traceback.print_exc()
+#         print("Exception in worker", str(e))
+#         return f"##ERROR## {str(e)}"
+#     finally:
+#         con.close()
 
 class SqlEnv:
     def __init__(self):
@@ -146,154 +146,158 @@ class SqlEnv:
             except Exception as e:
                 print(f"##ERROR## When closing DB for {key}: {e}")
 
-    # def new_con(self, example_id, exe_id):
-    #     self.conns[example_id+exe_id] = sqlite3.connect(
-    #         f"file:{example_id}?mode=memory&cache=shared",
-    #         uri=True, 
-    #         check_same_thread=False
-    #     )
-    #     # print("Start conn", example_id+exe_id)
+    def new_con(self, example_id, exe_id, sqlite_path):
+        self.conns[example_id+exe_id] = sqlite3.connect(
+            f"file:{sqlite_path}?mode=memory&cache=shared",
+            uri=True, 
+            check_same_thread=False
+        )
+        # print("Start conn", example_id+exe_id)
 
-    # def exec_sql(self, sql_query, exe_id, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, example_id=None):
-    #     cursor = self.conns[example_id+exe_id].cursor()
-    #     # Don't add LIMIT
-    #     try:
-    #         cursor.execute(sql_query)
-    #     except Exception as e:
-    #         cursor.close()
-    #         return "##ERROR## Incorrect SQL Syntax: " + str(e)
+    def exec_sql(self, sql_query, exe_id, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, example_id=None):
+        cursor = self.conns[example_id+exe_id].cursor()
+        # Don't add LIMIT
+        try:
+            cursor.execute(sql_query)
+        except Exception as e:
+            cursor.close()
+            return "##ERROR## Incorrect SQL Syntax: " + str(e)
         
-    #     def get_rows(cursor):
-    #         rows = []
-    #         current_len = 0
-    #         for row in cursor:
-    #             row_str = str(row)
-    #             rows.append(row)
-    #             current_len += len(row_str)
-    #             if current_len + len(row_str) > max_len:
-    #                 break
-    #         return rows
+        def get_rows(cursor):
+            rows = []
+            current_len = 0
+            for row in cursor:
+                row_str = str(row)
+                rows.append(row)
+                current_len += len(row_str)
+                if current_len + len(row_str) > max_len:
+                    break
+            return rows
         
-    #     try:
-    #         rows = get_rows(cursor)
-    #         if cursor.description is None:
-    #             err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
-    #             print(err)
-    #             return err
-    #         columns = [desc[0] for desc in cursor.description]
-    #     except Exception as e:
-    #         print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
-    #         return "##ERROR## " + str(e)
-    #     finally:
-    #         try:
-    #             cursor.close()
-    #         except Exception as e:
-    #             print("##ERROR## Failed to close cursor:", e)
+        try:
+            rows = get_rows(cursor)
+            if cursor.description is None:
+                err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
+                print(err)
+                return err
+            columns = [desc[0] for desc in cursor.description]
+        except Exception as e:
+            print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
+            return "##ERROR## " + str(e)
+        finally:
+            try:
+                cursor.close()
+            except Exception as e:
+                print("##ERROR## Failed to close cursor:", e)
 
-    #     if not rows:
-    #         return "No data found for the specified query.\n"
-    #     else:
-    #         output = io.StringIO()
-    #         writer = csv.writer(output)
-    #         writer.writerow(columns)
-    #         writer.writerows(rows)
-    #         csv_content = output.getvalue()
-    #         output.close()
-    #         if save_path:
-    #             try:
-    #                 with open(save_path, 'w', newline='') as f:
-    #                     f.write(csv_content)
-    #                 return 0
-    #             except Exception as e:
-    #                 print("##ERROR## ", str(e))
-    #                 return str(e)
-    #         else:
-    #             return hard_cut(csv_content, max_len)
+        if not rows:
+            return "No data found for the specified query.\n"
+        else:
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(columns)
+            writer.writerows(rows)
+            csv_content = output.getvalue()
+            output.close()
+            if save_path:
+                try:
+                    with open(save_path, 'w', newline='') as f:
+                        f.write(csv_content)
+                    return 0
+                except Exception as e:
+                    print("##ERROR## ", str(e))
+                    return str(e)
+            else:
+                return hard_cut(csv_content, max_len)
             
-    # def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
-    #     print_cpu_status()
-    #     if sqlite_path not in self.conns:
-    #         self.start_db(sqlite_path, exe_id, example_id)
-    #     if example_id+exe_id not in self.conns:
-    #         self.new_con(example_id, exe_id)
-    #     def target(q):
-    #         try:
-    #             result = self.exec_sql(sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
-    #             q.put(str(result))
-    #         except Exception as e:
-    #             traceback.print_exc()
-    #             print("Exception in process", str(e))
-    #             q.put(str(e))
-    #         finally:
-    #             self.conns[example_id+exe_id].close()
-    #             print(f"Close conn {example_id+exe_id}, current num: {len(self.conns)}")
-    #     q = Queue()
-    #     p = Process(target=target, args=(q,))
-    #     p.start()
-
-    #     p.join(timeout)
-    #     if p.is_alive():
-    #         try:
-    #             p.terminate()
-    #             p.join(timeout=2)
-    #             if p.is_alive():
-    #                 print("Terminate failed, forcing kill.")
-    #                 p.kill()
-    #                 p.join()
-    #         except Exception as e:
-    #             print(f"Error stopping process: {e}")
-    #         print(f"##ERROR## {sql_query} Timed out, p.exitcode: {p.exitcode}\n")
-    #         return f"##ERROR## {sql_query} Timed out\n"
-    #     else:
-    #         if not q.empty():
-    #             result = q.get()
-    #             return result
-    #         else:
-    #             return "##ERROR## Process p dead"
-
     def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
-        print_cpu_status()
-
-        # Setup connection
+        # print_cpu_status(self.conns.keys())
         if sqlite_path not in self.conns:
             self.start_db(sqlite_path, exe_id, example_id)
-
-        args = (sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
-
-        with Pool(processes=8) as pool:
-            async_result = pool.apply_async(_sql_worker_wrapper, (args,))
+        if example_id+exe_id not in self.conns:
+            self.new_con(example_id, exe_id, sqlite_path)
+        def target(q):
             try:
-                result = async_result.get(timeout=timeout)
+                result = self.exec_sql(sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
+                q.put(str(result))
+            except Exception as e:
+                traceback.print_exc()
+                print("Exception in process", str(e))
+                q.put(str(e))
+            # finally:
+            #     self.conns[example_id+exe_id].close()
+            #     print(f"Close conn {example_id+exe_id}, current num: {len(self.conns)}")
+        q = Queue()
+        p = Process(target=target, args=(q,))
+        p.start()
+
+        p.join(timeout)
+        if p.is_alive():
+            try:
+                p.terminate()
+                p.join(timeout=2)
+                if p.is_alive():
+                    print("Terminate failed, forcing kill.")
+                    p.kill()
+                    p.join()
+            except Exception as e:
+                print(f"Error stopping process: {e}")
+            print(f"##ERROR## {sql_query} Timed out, p.exitcode: {p.exitcode}\n")
+            return f"##ERROR## {sql_query} Timed out\n"
+        else:
+            if not q.empty():
+                result = q.get()
                 return result
-            except TimeoutError:
-                print(f"##ERROR## {sql_query} Timed out (via pool)\n")
-                return f"##ERROR## {sql_query} Timed out\n"
+            else:
+                return "##ERROR## Process p dead"
+
+    # def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
+    #     print_cpu_status()
+
+    #     # Setup connection
+    #     if sqlite_path not in self.conns:
+    #         self.start_db(sqlite_path, exe_id, example_id)
+
+    #     args = (sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
+
+    #     with Pool(processes=8) as pool:
+    #         async_result = pool.apply_async(_sql_worker_wrapper, (args,))
+    #         try:
+    #             result = async_result.get(timeout=timeout)
+    #             return result
+    #         except TimeoutError:
+    #             print(f"##ERROR## {sql_query} Timed out (via pool)\n")
+    #             return f"##ERROR## {sql_query} Timed out\n"
 
     def __del__(self):
         self.close_db()
 
 import psutil
-import platform
+import datetime
 import os
 
-def print_cpu_status():
-    print("\n" + "=" * 40 + " CPU Usage " + "=" * 40)
+def print_cpu_status(keys):
+    l = []
+    l.append("\n" + "=" * 40 + " CPU Usage " + "=" * 40)
     
     # Show total and per-core CPU usage
-    print(f"Total usage: {psutil.cpu_percent(interval=1)}%")
-    print("Per-core usage:")
+    l.append(f"Total usage: {psutil.cpu_percent(interval=1)}%")
+    l.append("Per-core usage:")
     for i, perc in enumerate(psutil.cpu_percent(percpu=True, interval=1)):
-        print(f" - Core {i}: {perc}%")
+        l.append(f" - Core {i}: {perc}%")
 
-    print("\n" + "=" * 40 + " Memory Usage " + "=" * 40)
+    l.append("\n" + "=" * 40 + " Memory Usage " + "=" * 40)
     
     # Display memory usage stats
     mem = psutil.virtual_memory()
-    print(f"Total memory: {mem.total / (1024**3):.2f} GB")
-    print(f"Used: {mem.used / (1024**3):.2f} GB ({mem.percent}%)")
-    print(f"Available: {mem.available / (1024**3):.2f} GB")
+    l.append(f"Total memory: {mem.total / (1024**3):.2f} GB")
+    l.append(f"Used: {mem.used / (1024**3):.2f} GB ({mem.percent}%)")
+    l.append(f"Available: {mem.available / (1024**3):.2f} GB")
 
-    print("=" * 92)
+    l.append("=" * 92)
+    l.append(f"len(keys): {len(keys)}\n{keys}")
+    with open(f"log/cpu_state_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log", "w") as f:
+        f.write("\n".join(l))
 
 
 # class SqlEnv:

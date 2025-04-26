@@ -49,6 +49,7 @@ from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils import Counter, weak_bind
+from vllm.version import __version__ as VLLM_VERSION
 from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 
 from .arg_utils import EngineArgs
@@ -58,12 +59,33 @@ from rllm.rewards.code_utils.sql_reward_evaluate import evaluate_spider2sql, eva
 from rllm.rewards.code_utils.sql_reward_utils import get_api_name, SqlEnv, calculate_md5
 import uuid
 import datetime
-import numpy as np
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import warnings
+import psutil
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
+def print_cpu_status(keys=[]):
+    l = []
+    l.append("\n" + "=" * 40 + " CPU Usage " + "=" * 40)
+    
+    # Show total and per-core CPU usage
+    l.append(f"Total usage: {psutil.cpu_percent(interval=1)}%")
+    l.append("Per-core usage:")
+    for i, perc in enumerate(psutil.cpu_percent(percpu=True, interval=1)):
+        l.append(f" - Core {i}: {perc}%")
 
+    l.append("\n" + "=" * 40 + " Memory Usage " + "=" * 40)
+    
+    # Display memory usage stats
+    mem = psutil.virtual_memory()
+    l.append(f"Total memory: {mem.total / (1024**3):.2f} GB")
+    l.append(f"Used: {mem.used / (1024**3):.2f} GB ({mem.percent}%)")
+    l.append(f"Available: {mem.available / (1024**3):.2f} GB")
+
+    l.append("=" * 92)
+    l.append(f"len(keys): {len(keys)}\n{keys}")
+    with open(f"log/cpu_state_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log", "w") as f:
+        f.write("\n".join(l))
 
 class SQLExecutor():
 
@@ -140,9 +162,9 @@ class SQLExecutor():
                 # env.launch_env()
                 # exec_result = env.answer
                 exec_result = self.exec_func_sql(sql_string, calculate_md5(log_gen), timeout=self.timeout_for_exploration, max_len=500, LIMIT=100, **kwargs)
-                # if "Timed out" in exec_result:
-                #     print(f"Timed out time: {time.time() - start}")
-                #     return [self.tokenizer.eos_token_id]
+                if "Timed out" in exec_result:
+                    print(f"Timed out time: {time.time() - start}")
+                    return [self.tokenizer.eos_token_id]
                 
                 exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>"
                 if self.logging:
@@ -210,169 +232,117 @@ class SQLExecutor():
         # print(f"End releasing  DB")
         # self.sql_env.executor = ThreadPoolExecutor(max_workers=1)
 
-    def process(self, outputs, scheduler_outputs):
-        """
-        Each new completion request has a unique request_id in Scheduler Outputs.
-        Depending on number of rollouts, in each Scheduler Ouput request id, multiple parent seq id are started
-        """
+    def process_one_output(self, index, completion_seq_output, scheduler_outputs):
+        seq_id_analyzed = []
+        # print(f"Group {index} has {len(completion_seq_output.samples)} samples")
+        seq_group_id = scheduler_outputs.scheduled_seq_groups[index].seq_group.request_id
 
+        if self.logging:
+            with open(self.log_path, "a") as f:
+                f.write(f"processing group {seq_group_id}\n")
+
+        for seq_output in completion_seq_output.samples:
+            seq_id = seq_output.parent_seq_id
+            seq_id_analyzed.append(seq_id)
+
+            if self.logging:
+                with open(self.log_path, "a") as f:
+                    f.write(f"processing seq_id {seq_id}\n")
+
+            if seq_id not in self.initial_prompts:
+                seq_group = scheduler_outputs.scheduled_seq_groups[index].seq_group
+                sqlite_path = seq_group.sampling_params.sqlite_path
+                example_id = seq_group.sampling_params.example_id
+                self.initial_prompts[str(seq_id)] = {
+                    "example_id": example_id,
+                    "api": get_api_name(example_id),
+                    "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
+                }
+
+            if seq_id in self.monitor_parent_seq_ids:
+                monitor_info = self.monitor_parent_seq_ids[seq_id]
+                actual_output_token = seq_output.output_token
+                replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
+                monitor_info["curr_pointer"] += 1
+
+                seq_output.output_token = replacement_token
+                seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
+                if replacement_token != actual_output_token:
+                    del seq_output.logprobs[actual_output_token]
+
+                if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
+                    del self.monitor_parent_seq_ids[seq_id]
+
+            output_token = seq_output.output_token
+
+            if seq_id not in self.parent_seq_ids_completions:
+                self.parent_seq_ids_completions[seq_id] = []
+            self.parent_seq_ids_completions[seq_id].append(output_token)
+
+            completions = self.parent_seq_ids_completions[seq_id]
+
+            if completions[-1] == self.monitor_token_id:
+                if seq_id not in self.calls_per_parent_seq_id:
+                    self.calls_per_parent_seq_id[seq_id] = 0
+                if seq_id not in self.time_per_parent_seq_id:
+                    self.time_per_parent_seq_id[seq_id] = []
+
+                self.calls_per_parent_seq_id[seq_id] += 1
+                self.time_per_parent_seq_id[seq_id] += [time.time()]
+
+                used_time = self.time_per_parent_seq_id[seq_id][-1] - self.start_time
+                if used_time > self.max_time or self.calls_per_parent_seq_id[seq_id] > self.max_calls:
+                    self.monitor_parent_seq_ids[seq_id] = {
+                        "exec_result": [self.tokenizer.eos_token_id],
+                        "curr_pointer": 0
+                    }
+                else:
+                    exec_res = self.fetch_execution_result(completions, seq_id)
+                    self.monitor_parent_seq_ids[seq_id] = {
+                        "exec_result": exec_res,
+                        "curr_pointer": 0
+                    }
+            elif completions[-1] == self.ans_end_id:
+                self.fetch_execution_result(completions, seq_id)
+
+        return seq_id_analyzed
+
+    def process(self, outputs, scheduler_outputs):
         if self.beginning:
             self.beginning = False
             return outputs
 
-        # Assumption: There is only one Sampler Output Object
         assert len(outputs) == 1
         outputs = outputs[0]
 
-        # Process each CompletionSequenceGroupOutput object
-        seq_id_analyzed = []
-        for index, completion_seq_output in enumerate(outputs.outputs):
-            seq_group_id = scheduler_outputs.scheduled_seq_groups[index].seq_group.request_id
+        seq_id_analyzed_all = []
+        # print(f"Number of groups (outputs.outputs): {len(outputs.outputs)}")
+        # print_cpu_status()
+        with ThreadPoolExecutor(max_workers=32) as executor:
+            futures = []
+            for index, completion_seq_output in enumerate(outputs.outputs):
+                futures.append(executor.submit(self.process_one_output, index, completion_seq_output, scheduler_outputs))
 
-            if self.logging:
-                with open(self.log_path, "a") as f:
-                    f.write(f"processing group {seq_group_id}\n")
+            for future in as_completed(futures):
+                seq_id_analyzed_all.extend(future.result())
+        # for index, completion_seq_output in enumerate(outputs.outputs):
+        #     seq_id_analyzed_all += self.process_one_output(index, completion_seq_output, scheduler_outputs)
 
-            for seq_output in completion_seq_output.samples:
-                seq_id = seq_output.parent_seq_id
-
-                # if seq_id in seq_id_analyzed:
-                #     print("WARNING", outputs)
-                seq_id_analyzed.append(seq_id)
-
-                if self.logging:
-                    with open(self.log_path, "a") as f:
-                        f.write(f"processing seq_id {seq_id}\n")
-
-                # Save the initial prompts for each request ID
-                if seq_id not in self.initial_prompts:
-                    seq_group = scheduler_outputs.scheduled_seq_groups[index].seq_group
-                    seq_group_id = seq_group.request_id
-                    sqlite_path = seq_group.sampling_params.sqlite_path
-                    example_id = seq_group.sampling_params.example_id
-                    if self.logging:
-                        with open(self.log_path, "a") as f:
-                            f.write(f"Saving initial prompt for {example_id} which has seq_group_id {seq_group_id} and sqlite_path {sqlite_path}\n")
-                    self.initial_prompts[str(seq_id)] = {
-                        "example_id": example_id,
-                        "api": get_api_name(example_id),
-                        "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
-                    }
-
-
-                # Check if the sequence ID is being monitored
-                if seq_id in self.monitor_parent_seq_ids:
-                    if self.logging:
-                        with open(self.log_path, "a") as f:
-                            f.write(f"Monitoring seq_id {seq_id}\n")
-
-                    monitor_info = self.monitor_parent_seq_ids[seq_id]
-                    # TODO: index error
-                    # if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                    #     print(monitor_info["curr_pointer"], monitor_info["exec_result"], f"Removing seq_id {seq_id} from monitoring, outputs: {outputs}, scheduler_outputs: {scheduler_outputs}\n")
-                    #     del self.monitor_parent_seq_ids[seq_id]
-                    # else:
-                    actual_output_token = seq_output.output_token
-                    replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
-                    monitor_info["curr_pointer"] += 1
-
-                    # replace output token
-                    seq_output.output_token = replacement_token
-                    
-                    # replace the logprobs also
-                    seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
-                    if replacement_token != actual_output_token:
-                        del seq_output.logprobs[actual_output_token]
-
-                    # Remove from monitoring if all tokens have been processed
-                    if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                        if self.logging:
-                            with open(self.log_path, "a") as f:
-                                f.write(f"Removing seq_id {seq_id} from monitoring\n")
-                        del self.monitor_parent_seq_ids[seq_id]
-
-                output_token = seq_output.output_token
-                # Store the output token for the sequence ID
-                if seq_id not in self.parent_seq_ids_completions:
-                    self.parent_seq_ids_completions[seq_id] = []
-                self.parent_seq_ids_completions[seq_id].append(output_token)
-
-                # Check for the monitor token sequence in completions
-                completions = self.parent_seq_ids_completions[seq_id]
-
-                if completions[-1] == self.monitor_token_id:
-                    if self.logging:
-                        with open(self.log_path, "a") as f:
-                            f.write(f"Detected monitor token for seq_id: {seq_id}: {self.tokenizer.decode(completions)}, ids: {completions}")
-
-                    # Check if a lot of calls have been made for this seq_id
-                    if seq_id not in self.calls_per_parent_seq_id:
-                        self.calls_per_parent_seq_id[seq_id] = 0
-                    if seq_id not in self.time_per_parent_seq_id:
-                        self.time_per_parent_seq_id[seq_id] = []
-                    self.calls_per_parent_seq_id[seq_id] += 1
-                    self.time_per_parent_seq_id[seq_id] += [time.time()]
-                    
-                    used_time = self.time_per_parent_seq_id[seq_id][-1] - self.start_time
-                    if used_time > self.max_time:
-                        if self.logging:
-                            with open(self.log_path, "a") as f:
-                                f.write(f"Exceeded max calls for seq_id {seq_id}\n")
-                        print(f"Timeout for seq_id {seq_id}, time: {used_time}")
-
-                        self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": [self.tokenizer.eos_token_id],
-                            "curr_pointer": 0
-                        }
-                    elif self.calls_per_parent_seq_id[seq_id] > self.max_calls:
-
-                        self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": [self.tokenizer.eos_token_id],
-                            "curr_pointer": 0
-                        }
-                        print(f"Max calls for seq_id {seq_id}")
-
-                        if self.logging:
-                            with open(self.log_path, "a") as f:
-                                f.write(f"Making API call for seq_id {seq_id}\n")
-                    else:
-                        exec_res = self.fetch_execution_result(completions, seq_id)
-                        self.monitor_parent_seq_ids[seq_id] = {
-                            "exec_result": exec_res,
-                            "curr_pointer": 0
-                        }
-                elif completions[-1] == self.ans_end_id:
-                    self.fetch_execution_result(completions, seq_id)
-                # elif self.tokenizer.decode(completions[-1]) == "</exec_result>":
-                #     gen_text = self.tokenizer.decode(completions)
-                #     all_tag_counts = {
-                #         'exec_sql_open': len(re.findall(r'<exec_sql>', gen_text)),
-                #         'exec_sql_close': len(re.findall(r'</exec_sql>', gen_text)),
-                #         'exec_result_open': len(re.findall(r'<exec_result>', gen_text)),
-                #         'exec_result_close': len(re.findall(r'</exec_result>', gen_text)),
-                #     }
-                #     if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
-                #             all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close']):
-                #             print(f"Fatal err: should not generate {completions[-1]}")
-                #             self.monitor_parent_seq_ids[seq_id] = {
-                #                 "exec_result": [self.tokenizer.eos_token_id],
-                #                 "curr_pointer": 0
-                #             }
         to_be_removed = []
         for index in self.monitor_parent_seq_ids:
-            if index not in seq_id_analyzed:
+            if index not in seq_id_analyzed_all:
                 to_be_removed.append(index)
 
         for index in self.calls_per_parent_seq_id:
-            if index not in seq_id_analyzed:
+            if index not in seq_id_analyzed_all:
                 to_be_removed.append(index)
 
         for index in self.parent_seq_ids_completions:
-            if index not in seq_id_analyzed:
+            if index not in seq_id_analyzed_all:
                 to_be_removed.append(index)
 
         for index in self.initial_prompts:
-            if index not in seq_id_analyzed:
+            if index not in seq_id_analyzed_all:
                 to_be_removed.append(index)
 
         for index in to_be_removed:
@@ -457,7 +427,7 @@ class LLMEngine(LLMEngine):
             "multi_step_stream_outputs=%s, enable_prefix_caching=%s, "
             "use_async_output_proc=%s, use_cached_outputs=%s, "
             "mm_processor_kwargs=%s)",
-            0.02,
+            VLLM_VERSION,
             model_config.model,
             speculative_config,
             model_config.tokenizer,

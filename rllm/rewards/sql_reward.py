@@ -65,7 +65,7 @@ class RewardSQLFn(RewardFn):
         if not tags:
             return False
 
-        if len(tags) % 2 != 0 or len(tags) < 2:
+        if len(tags) % 2 != 0 or len(tags) < 6:
             return False
 
         for i, tag in enumerate(tags):
@@ -83,7 +83,7 @@ class RewardSQLFn(RewardFn):
     def __call__(self, input: RewardInput) -> RewardOutput:
         assert input.problem_type == RewardType.CODE, \
             "Invalid problem type: expected 'CODE', but got '{}'".format(input.problem_type)
-        print(f"input.metadata: {input.metadata}")
+        # print(f"input.metadata: {input.metadata}")
         example_id = input.metadata["example_id"]
         model_response = input.model_response
         

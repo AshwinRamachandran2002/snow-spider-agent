@@ -34,7 +34,7 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-
+import shutil
 
 WorkerType = Type[Worker]
 
@@ -605,6 +605,8 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
+                        shutil.rmtree(os.getenv("EXEC_FOLDER"))
+                        os.mkdir(os.getenv("EXEC_FOLDER"))
                         batch = self.actor_rollout_wg.generate_sequences(batch)
 
                     # compute values
@@ -631,6 +633,10 @@ class RayPPOTrainer(object):
                         valid_mask = torch.ones(len(uids), dtype=torch.bool)
                         solve_none = 0
                         solve_all = 0
+                        wrong_ans_and_wrong_format = 0
+                        wrong_ans_and_right_format = 0
+                        right_ans_and_wrong_format = 0
+                        right_ans_and_right_format = 0
                         for uid in unique_uids:
                             uid_mask = uids == uid
                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
@@ -642,12 +648,31 @@ class RayPPOTrainer(object):
                             elif (uid_rewards == 1).all():
                                 valid_mask[uid_mask] = False
                                 solve_all += 1
+
+                            wrong_ans_and_wrong_format += torch.sum(uid_rewards == 0)
+                            wrong_ans_and_right_format += torch.sum(uid_rewards == 0.1)
+                            right_ans_and_wrong_format += torch.sum(uid_rewards == 0.9)
+                            right_ans_and_right_format += torch.sum(uid_rewards == 1)
                         
                         # Log to metrics
                         metrics['batch/solve_none'] = solve_none
                         metrics['batch/solve_all'] = solve_all
                         metrics['batch/solve_partial'] = len(unique_uids) - solve_none - solve_all
 
+                        metrics['batch/wrong_ans_and_wrong_format'] = wrong_ans_and_wrong_format
+                        metrics['batch/wrong_ans_and_right_format'] = wrong_ans_and_right_format
+                        metrics['batch/right_ans_and_wrong_format'] = right_ans_and_wrong_format
+                        metrics['batch/right_ans_and_right_format'] = right_ans_and_right_format
+
+                        num_gen = 0
+                        log_gen = 0
+                        for i in os.listdir(os.getenv("EXEC_FOLDER")):
+                            if i.endswith("csv"):
+                                num_gen += 1
+                            if i.endswith("log"):
+                                log_gen += 1
+                        print(f"Gen results: {num_gen}/{log_gen}, reward_tensor: {reward_tensor.shape}")
+                        metrics['batch/valid'] = num_gen
 
                         if self.config.trainer.rejection_sample:
                             # If no valid samples remain, skip this batch and get a new one
