@@ -1,0 +1,8 @@
+SELECT
+    DATE_TRUNC('month', TO_TIMESTAMP("creation_date" / 1000000)) AS "month",
+    ROUND(COUNT_IF("tags" ILIKE '%python%')::FLOAT / COUNT(*), 4) AS "python_proportion"
+FROM STACKOVERFLOW.STACKOVERFLOW.POSTS_QUESTIONS
+WHERE "creation_date" >= 1640995200000000   -- 2022-01-01 00:00:00 UTC
+  AND "creation_date" <  1672531200000000   -- 2023-01-01 00:00:00 UTC
+GROUP BY 1
+ORDER BY 1;

@@ -1,0 +1,36 @@
+SELECT
+    s."DATE" AS "Date",
+    s."ASIN" AS "ASIN",
+    s."PRODUCT_TITLE" AS "Product_Title",
+    s."ORDERED_UNITS" AS "Ordered_Units",
+    ROUND(AVG(s."ORDERED_UNITS") OVER (PARTITION BY s."ASIN"), 4) AS "Average_Ordered_Units",
+    s."ORDERED_REVENUE" AS "Ordered_Revenue",
+    ROUND(AVG(s."ORDERED_REVENUE") OVER (PARTITION BY s."ASIN"), 4) AS "Average_Ordered_Revenue",
+    ROUND(s."ORDERED_REVENUE" / NULLIF(s."ORDERED_UNITS", 0), 4) AS "Average_Selling_Price_ASP",
+    t."GLANCE_VIEWS" AS "Glance_Views",
+    ROUND(s."ORDERED_UNITS" / NULLIF(t."GLANCE_VIEWS", 0), 4) AS "Conversion_Rate",
+    s."SHIPPED_UNITS" AS "Shipped_Units",
+    ROUND(AVG(s."SHIPPED_UNITS") OVER (PARTITION BY s."ASIN"), 4) AS "Average_Shipped_Units",
+    s."SHIPPED_REVENUE" AS "Shipped_Revenue",
+    ROUND(AVG(s."SHIPPED_REVENUE") OVER (PARTITION BY s."ASIN"), 4) AS "Average_Shipped_Revenue",
+    ROUND(n."NET_PPM", 4) AS "Net_Profit_Margin_PPM",
+    CONCAT(
+        'Sellable Units: ', COALESCE(TO_VARCHAR(i."SELLABLE_ON_HAND_UNITS"), 'N/A'),
+        ', Unsellable Units: ', COALESCE(TO_VARCHAR(i."UNSELLABLE_ON_HAND_UNITS"), 'N/A')
+    ) AS "Inventory_Details"
+FROM
+    AMAZON_VENDOR_ANALYTICS__SAMPLE_DATASET.PUBLIC.RETAIL_ANALYTICS_SALES s
+LEFT JOIN
+    AMAZON_VENDOR_ANALYTICS__SAMPLE_DATASET.PUBLIC.RETAIL_ANALYTICS_TRAFFIC t
+    ON s."ASIN" = t."ASIN" AND s."DATE" = t."DATE"
+LEFT JOIN
+    AMAZON_VENDOR_ANALYTICS__SAMPLE_DATASET.PUBLIC.RETAIL_ANALYTICS_NET_PPM n
+    ON s."ASIN" = n."ASIN" AND s."DATE" = n."DATE"
+LEFT JOIN
+    AMAZON_VENDOR_ANALYTICS__SAMPLE_DATASET.PUBLIC.RETAIL_ANALYTICS_INVENTORY i
+    ON s."ASIN" = i."ASIN" AND s."DATE" = i."DATE"
+WHERE
+    s."DISTRIBUTOR_VIEW" = 'Manufacturing'
+    AND s."DATE" BETWEEN '2022-01-07' AND '2022-02-06'
+ORDER BY
+    s."DATE", s."ASIN";

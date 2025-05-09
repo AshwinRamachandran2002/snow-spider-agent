@@ -1,0 +1,83 @@
+/*  Most-common next page after “/home” and the maximum time spent on “/home”
+    by users whose campaign name contains “Data Share” – January 2017          */
+
+WITH unioned_sessions AS (         -- 1️⃣  bring in every January-2017 table
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170101 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170102 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170103 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170104 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170105 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170106 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170107 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170108 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170109 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170110 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170111 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170112 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170113 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170114 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170115 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170116 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170117 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170118 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170119 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170120 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170121 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170122 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170123 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170124 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170125 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170126 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170127 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170128 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170129 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170130 UNION ALL
+    SELECT * FROM GA360.GOOGLE_ANALYTICS_SAMPLE.GA_SESSIONS_20170131
+),
+
+ordered_hits AS (                 -- 2️⃣  flatten hits & derive next page / next time
+    SELECT
+        s."fullVisitorId",
+        s."visitId",
+        h.value:"hitNumber"::NUMBER              AS hit_num,
+        h.value:"time"::NUMBER                   AS hit_time_ms,
+        h.value:"page":"pagePath"::STRING        AS page_path,
+        LEAD(h.value:"page":"pagePath"::STRING)
+            OVER (PARTITION BY s."fullVisitorId", s."visitId" ORDER BY h.value:"hitNumber"::NUMBER)
+                                                AS next_path,
+        LEAD(h.value:"time"::NUMBER)
+            OVER (PARTITION BY s."fullVisitorId", s."visitId" ORDER BY h.value:"hitNumber"::NUMBER)
+                                                AS next_time_ms
+    FROM   unioned_sessions  s,
+           LATERAL FLATTEN(input => s."hits") h
+    WHERE  s."trafficSource":"campaign"::STRING ILIKE '%Data%Share%'   -- campaign filter
+),
+
+next_page_counts AS (             -- 3️⃣  frequency of next pages after “/home”
+    SELECT   next_path,
+             COUNT(*) AS cnt
+    FROM     ordered_hits
+    WHERE    page_path ILIKE '/home%'     -- landed on “/home”
+      AND    next_path IS NOT NULL        -- there is a next page
+    GROUP BY next_path
+),
+
+most_common AS (                  -- 4️⃣  most common next page
+    SELECT next_path AS most_common_next_path
+    FROM   next_page_counts
+    ORDER  BY cnt DESC NULLS LAST
+    LIMIT  1
+),
+
+max_time AS (                      -- 5️⃣  maximum seconds spent on “/home”
+    SELECT MAX( (next_time_ms - hit_time_ms) / 1000 ) AS max_time_spent_secs
+    FROM   ordered_hits
+    WHERE  page_path ILIKE '/home%'
+      AND  next_time_ms IS NOT NULL
+)
+
+-- 6️⃣  final answer
+SELECT  m.most_common_next_path,
+        x.max_time_spent_secs
+FROM    most_common m
+CROSS   JOIN max_time x;

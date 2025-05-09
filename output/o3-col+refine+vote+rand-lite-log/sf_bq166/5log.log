@@ -1,0 +1,1791 @@
+2025-05-05 03:53:55 - Thread-2454 (execute) - INFO - [Exploration]
+```sql
+--Description: 1)  Inspect which TCGA projects are represented in the allelic CNV segment table
+SELECT DISTINCT 
+       "project_short_name"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+LIMIT 20;
+```
+
+```sql
+--Description: 2)  Preview a few allelic CNV segments only for the kidney clear-cell cohort (TCGA-KIRC)
+SELECT 
+       "case_barcode",
+       "chromosome",
+       "start_pos",
+       "end_pos",
+       "copy_number"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+```
+
+```sql
+--Description: 3)  Count how many distinct TCGA-KIRC cases have allelic CNV data
+SELECT COUNT(DISTINCT "case_barcode") AS "n_cases_kirc"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+```
+
+```sql
+--Description: 4)  Look at cytoband definitions for one chromosome to confirm genomic coordinates
+SELECT 
+       "chromosome",
+       "cytoband_name",
+       "hg38_start",
+       "hg38_stop"
+FROM   TCGA_MITELMAN.PROD.CYTOBANDS_HG38
+WHERE  "chromosome" = 'chr14'
+LIMIT 20;
+```
+
+```sql
+--Description: 5)  Join TCGA-KIRC CNV segments to cytobands on matching chromosome to see raw overlaps
+SELECT 
+       s."case_barcode",
+       s."chromosome",
+       s."start_pos"            AS "seg_start",
+       s."end_pos"              AS "seg_end",
+       b."cytoband_name",
+       b."hg38_start"           AS "band_start",
+       b."hg38_stop"            AS "band_end"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+```
+
+```sql
+--Description: 6)  Add the genomic overlap length between each CNV segment and cytoband
+SELECT 
+       s."case_barcode",
+       b."cytoband_name",
+       GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                    -  GREATEST(s."start_pos", b."hg38_start")) AS "overlap_bp"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+```
+
+```sql
+--Description: 7)  For each KIRC sample & cytoband, retain the segment with the largest overlap 
+--                then capture its maximum copy number
+WITH joined AS (
+    SELECT 
+           s."case_barcode",
+           b."cytoband_name",
+           s."copy_number",
+           ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                              ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+    FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON  s."chromosome" = b."chromosome"
+    WHERE  s."project_short_name" = 'TCGA-KIRC'
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       MAX("copy_number") AS "max_cn"   -- should be only the row with rn=1
+FROM   joined
+WHERE  rn = 1
+GROUP  BY "case_barcode", "cytoband_name"
+LIMIT 20;
+```
+
+```sql
+--Description: 8)  Categorize each sample’s cytoband-level CN status using the defined thresholds
+WITH per_band AS (
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           MAX("copy_number") AS "max_cn"
+    FROM (
+        -- reuse logic from step 7 but inline for brevity
+        SELECT 
+               s."case_barcode",
+               b."cytoband_name",
+               s."copy_number",
+               ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                  ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+        FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+        JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+               ON  s."chromosome" = b."chromosome"
+        WHERE  s."project_short_name" = 'TCGA-KIRC'
+    ) t
+    WHERE rn = 1
+    GROUP BY "case_barcode", "cytoband_name"
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       "max_cn",
+       CASE 
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+       END AS "cn_subtype"
+FROM   per_band
+LIMIT 20;
+```
+
+```sql
+--Description: 9)  Count how many distinct TCGA-KIRC cases fall into each CN subtype per cytoband
+WITH categorized AS (
+    -- (reuse query from step 8)
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           CASE 
+                WHEN "max_cn" > 3 THEN 'Amplification'
+                WHEN "max_cn" = 3 THEN 'Gain'
+                WHEN "max_cn" = 2 THEN 'Normal'
+                WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+           END AS "cn_subtype"
+    FROM (
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               MAX("copy_number") AS "max_cn"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) q
+        WHERE rn = 1
+        GROUP BY "case_barcode", "cytoband_name"
+    ) p
+)
+SELECT 
+       "cytoband_name",
+       "cn_subtype",
+       COUNT(DISTINCT "case_barcode") AS "n_cases"
+FROM   categorized
+GROUP  BY "cytoband_name", "cn_subtype"
+LIMIT 20;
+```
+
+```sql
+--Description: 10)  Convert counts to subtype percentages per cytoband, then sort by chromosome & name
+WITH totals AS (
+    SELECT 
+           "cytoband_name",
+           COUNT(DISTINCT "case_barcode") AS "total_cases"
+    FROM (
+        -- reuse categorized CTE from step 9
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               CASE 
+                    WHEN "max_cn" > 3 THEN 'Amplification'
+                    WHEN "max_cn" = 3 THEN 'Gain'
+                    WHEN "max_cn" = 2 THEN 'Normal'
+                    WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                    WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+               END AS "cn_subtype"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) w
+        WHERE rn = 1
+    ) v
+    GROUP BY "cytoband_name"
+),
+freqs AS (
+    SELECT 
+           c."cytoband_name",
+           c."cn_subtype",
+           COUNT(DISTINCT c."case_barcode") AS "n_cases_subtype"
+    FROM   (
+        -- same categorized subquery as above
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               CASE 
+                    WHEN "max_cn" > 3 THEN 'Amplification'
+                    WHEN "max_cn" = 3 THEN 'Gain'
+                    WHEN "max_cn" = 2 THEN 'Normal'
+                    WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                    WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+               END AS "cn_subtype"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) u
+        WHERE rn = 1
+    ) c
+    GROUP BY c."cytoband_name", c."cn_subtype"
+)
+SELECT 
+       f."cytoband_name",
+       f."cn_subtype",
+       ROUND(100.0 * f."n_cases_subtype" / t."total_cases", 2) AS "percent_cases"
+FROM   freqs f
+JOIN   totals t
+       ON f."cytoband_name" = t."cytoband_name"
+ORDER  BY SPLIT_PART(f."cytoband_name", 'p', 1),   -- crude chromosome sort
+          f."cytoband_name",
+          f."cn_subtype"
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 03:53:55 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 1)  Inspect which TCGA projects are represented in the allelic CNV segment table
+SELECT DISTINCT 
+       "project_short_name"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:56 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1)  Inspect which TCGA projects are represented in the allelic CNV segment table
+SELECT DISTINCT 
+       "project_short_name"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+LIMIT 20;
+Results:
+project_short_name
+TCGA-DLBC
+TCGA-KIRP
+TCGA-SARC
+TCGA-CHOL
+TCGA-COAD
+TCGA-SKCM
+TCGA-PAAD
+TCGA-BRCA
+TCGA-STAD
+TCGA-HNSC
+TCGA-ESCA
+TCGA-OV
+TCGA-READ
+TCGA-KIRC
+TCGA-CESC
+TCGA-UCS
+TCGA-GBM
+TCGA-KICH
+TCGA-BLCA
+TCGA-LGG
+
+[Successfully executed]
+2025-05-05 03:53:56 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 2)  Preview a few allelic CNV segments only for the kidney clear-cell cohort (TCGA-KIRC)
+SELECT 
+       "case_barcode",
+       "chromosome",
+       "start_pos",
+       "end_pos",
+       "copy_number"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:56 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2)  Preview a few allelic CNV segments only for the kidney clear-cell cohort (TCGA-KIRC)
+SELECT 
+       "case_barcode",
+       "chromosome",
+       "start_pos",
+       "end_pos",
+       "copy_number"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Results:
+case_barcode,chromosome,start_pos,end_pos,copy_number
+TCGA-3Z-A93Z,chr1,223482946,236622460,4
+TCGA-3Z-A93Z,chr6,30544386,170741917,4
+TCGA-3Z-A93Z,chr13,57193049,57204246,0
+TCGA-3Z-A93Z,chr16,10777,5726654,3
+TCGA-6D-AA2E,chr7,76514308,76977495,4
+TCGA-6D-AA2E,chr17,41266762,41274279,0
+TCGA-6D-AA2E,chr6,30559068,86696948,2
+TCGA-6D-AA2E,chr15,19811075,57532145,2
+TCGA-6D-AA2E,chr13,18452809,79851172,2
+TCGA-6D-AA2E,chr19,15669855,15714788,4
+TCGA-6D-AA2E,chr5,18607208,18666713,8
+
+[Successfully executed]
+2025-05-05 03:53:56 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 3)  Count how many distinct TCGA-KIRC cases have allelic CNV data
+SELECT COUNT(DISTINCT "case_barcode") AS "n_cases_kirc"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:56 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3)  Count how many distinct TCGA-KIRC cases have allelic CNV data
+SELECT COUNT(DISTINCT "case_barcode") AS "n_cases_kirc"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Results:
+n_cases_kirc
+517
+
+[Successfully executed]
+2025-05-05 03:53:56 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 4)  Look at cytoband definitions for one chromosome to confirm genomic coordinates
+SELECT 
+       "chromosome",
+       "cytoband_name",
+       "hg38_start",
+       "hg38_stop"
+FROM   TCGA_MITELMAN.PROD.CYTOBANDS_HG38
+WHERE  "chromosome" = 'chr14'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:57 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4)  Look at cytoband definitions for one chromosome to confirm genomic coordinates
+SELECT 
+       "chromosome",
+       "cytoband_name",
+       "hg38_start",
+       "hg38_stop"
+FROM   TCGA_MITELMAN.PROD.CYTOBANDS_HG38
+WHERE  "chromosome" = 'chr14'
+LIMIT 20;
+Results:
+chromosome,cytoband_name,hg38_start,hg38_stop
+chr14,14p13,0,3600000
+chr14,14p12,3600000,8000000
+chr14,14p11,8000000,17200000
+chr14,14q11,17200000,24100000
+chr14,14q12,24100000,32900000
+chr14,14q13,32900000,37400000
+chr14,14q21,37400000,50400000
+chr14,14q22,50400000,57600000
+chr14,14q23,57600000,67400000
+chr14,14q24,67400000,78800000
+chr14,14q31,78800000,89300000
+chr14,14q32,89300000,107043718
+
+[Successfully executed]
+2025-05-05 03:53:57 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 5)  Join TCGA-KIRC CNV segments to cytobands on matching chromosome to see raw overlaps
+SELECT 
+       s."case_barcode",
+       s."chromosome",
+       s."start_pos"            AS "seg_start",
+       s."end_pos"              AS "seg_end",
+       b."cytoband_name",
+       b."hg38_start"           AS "band_start",
+       b."hg38_stop"            AS "band_end"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:57 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 5)  Join TCGA-KIRC CNV segments to cytobands on matching chromosome to see raw overlaps
+SELECT 
+       s."case_barcode",
+       s."chromosome",
+       s."start_pos"            AS "seg_start",
+       s."end_pos"              AS "seg_end",
+       b."cytoband_name",
+       b."hg38_start"           AS "band_start",
+       b."hg38_stop"            AS "band_end"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Results:
+case_barcode,chromosome,seg_start,seg_end,cytoband_name,band_start,band_end
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p15,0,22000000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p14,22000000,31000000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p13,31000000,36400000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p12,36400000,43400000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p11,43400000,53400000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11q11,53400000,55800000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11q12,5
+
+[Successfully executed]
+2025-05-05 03:53:57 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 6)  Add the genomic overlap length between each CNV segment and cytoband
+SELECT 
+       s."case_barcode",
+       b."cytoband_name",
+       GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                    -  GREATEST(s."start_pos", b."hg38_start")) AS "overlap_bp"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:58 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 6)  Add the genomic overlap length between each CNV segment and cytoband
+SELECT 
+       s."case_barcode",
+       b."cytoband_name",
+       GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                    -  GREATEST(s."start_pos", b."hg38_start")) AS "overlap_bp"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Results:
+case_barcode,cytoband_name,overlap_bp
+TCGA-3Z-A93Z,1p36,0
+TCGA-3Z-A93Z,1p35,0
+TCGA-3Z-A93Z,1p34,0
+TCGA-3Z-A93Z,1p33,0
+TCGA-3Z-A93Z,1p32,0
+TCGA-3Z-A93Z,1p31,0
+TCGA-3Z-A93Z,1p22,0
+TCGA-3Z-A93Z,1p21,0
+TCGA-3Z-A93Z,1p13,0
+TCGA-3Z-A93Z,1p12,0
+TCGA-3Z-A93Z,1p11,0
+TCGA-3Z-A93Z,1q11,0
+TCGA-3Z-A93Z,1q12,0
+TCGA-3Z-A93Z,1q21,0
+TCGA-3Z-A93Z,1q22,0
+TCGA-3Z-A93Z,1q23,0
+TCGA-3Z-A93Z,1q24,0
+TCGA-3Z-A93Z,1q25,0
+TCGA-3Z-A93Z,1q31,0
+
+[Successfully executed]
+2025-05-05 03:53:58 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 7)  For each KIRC sample & cytoband, retain the segment with the largest overlap 
+--                then capture its maximum copy number
+WITH joined AS (
+    SELECT 
+           s."case_barcode",
+           b."cytoband_name",
+           s."copy_number",
+           ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                              ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+    FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON  s."chromosome" = b."chromosome"
+    WHERE  s."project_short_name" = 'TCGA-KIRC'
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       MAX("copy_number") AS "max_cn"   -- should be only the row with rn=1
+FROM   joined
+WHERE  rn = 1
+GROUP  BY "case_barcode", "cytoband_name"
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:58 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 7)  For each KIRC sample & cytoband, retain the segment with the largest overlap 
+--                then capture its maximum copy number
+WITH joined AS (
+    SELECT 
+           s."case_barcode",
+           b."cytoband_name",
+           s."copy_number",
+           ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                              ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+    FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON  s."chromosome" = b."chromosome"
+    WHERE  s."project_short_name" = 'TCGA-KIRC'
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       MAX("copy_number") AS "max_cn"   -- should be only the row with rn=1
+FROM   joined
+WHERE  rn = 1
+GROUP  BY "case_barcode", "cytoband_name"
+LIMIT 20;
+Results:
+case_barcode,cytoband_name,max_cn
+TCGA-B2-A4SR,12q21,2
+TCGA-BP-4343,1p35,2
+TCGA-B0-4814,2p21,2
+TCGA-A3-3378,7p11,2
+TCGA-BP-5176,13p12,2
+TCGA-B0-5701,Xq21,0
+TCGA-CW-6093,3q28,2
+TCGA-BP-4352,14q32,2
+TCGA-CJ-4638,8q11,2
+TCGA-B0-5690,2p13,2
+TCGA-BP-5006,10q25,2
+TCGA-CZ-4866,10q22,4
+TCGA-BP-4162,18q22,2
+TCGA-B8-4153,Xq26,1
+TCGA-B0-4694,2q35,2
+TCGA-AK-3447,11p13,2
+TCGA-A3-3372,2q36,4
+TCGA-B0-4838,1q42,5
+TCGA-MM-A564,5p14,6
+
+[Successfully executed]
+2025-05-05 03:53:58 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 8)  Categorize each sample’s cytoband-level CN status using the defined thresholds
+WITH per_band AS (
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           MAX("copy_number") AS "max_cn"
+    FROM (
+        -- reuse logic from step 7 but inline for brevity
+        SELECT 
+               s."case_barcode",
+               b."cytoband_name",
+               s."copy_number",
+               ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                  ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+        FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+        JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+               ON  s."chromosome" = b."chromosome"
+        WHERE  s."project_short_name" = 'TCGA-KIRC'
+    ) t
+    WHERE rn = 1
+    GROUP BY "case_barcode", "cytoband_name"
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       "max_cn",
+       CASE 
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+       END AS "cn_subtype"
+FROM   per_band
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:59 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 8)  Categorize each sample’s cytoband-level CN status using the defined thresholds
+WITH per_band AS (
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           MAX("copy_number") AS "max_cn"
+    FROM (
+        -- reuse logic from step 7 but inline for brevity
+        SELECT 
+               s."case_barcode",
+               b."cytoband_name",
+               s."copy_number",
+               ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                  ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+        FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+        JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+               ON  s."chromosome" = b."chromosome"
+        WHERE  s."project_short_name" = 'TCGA-KIRC'
+    ) t
+    WHERE rn = 1
+    GROUP BY "case_barcode", "cytoband_name"
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       "max_cn",
+       CASE 
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+       END AS "cn_subtype"
+FROM   per_band
+LIMIT 20;
+Results:
+case_barcode,cytoband_name,max_cn,cn_subtype
+TCGA-B0-5706,2p13,2,Normal
+TCGA-B0-5710,1q23,2,Normal
+TCGA-CZ-5987,1p31,2,Normal
+TCGA-BP-4977,14q11,2,Normal
+TCGA-MM-A564,19q13,4,Amplification
+TCGA-BP-4977,17p13,4,Amplification
+TCGA-B2-5641,9q21,1,Heterozygous Deletion
+TCGA-BP-5202,1p36,2,Normal
+TCGA-B8-4154,2q34,2,Normal
+TCGA-BP-4160,10q23,2,Normal
+TCGA-B8-A7U6,15q11,2,Normal
+TCGA-CJ-4884,22p12,2,Normal
+TCGA-AK-3453,15q13,2,Normal
+
+[Successfully executed]
+2025-05-05 03:53:59 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 9)  Count how many distinct TCGA-KIRC cases fall into each CN subtype per cytoband
+WITH categorized AS (
+    -- (reuse query from step 8)
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           CASE 
+                WHEN "max_cn" > 3 THEN 'Amplification'
+                WHEN "max_cn" = 3 THEN 'Gain'
+                WHEN "max_cn" = 2 THEN 'Normal'
+                WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+           END AS "cn_subtype"
+    FROM (
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               MAX("copy_number") AS "max_cn"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) q
+        WHERE rn = 1
+        GROUP BY "case_barcode", "cytoband_name"
+    ) p
+)
+SELECT 
+       "cytoband_name",
+       "cn_subtype",
+       COUNT(DISTINCT "case_barcode") AS "n_cases"
+FROM   categorized
+GROUP  BY "cytoband_name", "cn_subtype"
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:59 - Thread-2454 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 9)  Count how many distinct TCGA-KIRC cases fall into each CN subtype per cytoband
+WITH categorized AS (
+    -- (reuse query from step 8)
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           CASE 
+                WHEN "max_cn" > 3 THEN 'Amplification'
+                WHEN "max_cn" = 3 THEN 'Gain'
+                WHEN "max_cn" = 2 THEN 'Normal'
+                WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+           END AS "cn_subtype"
+    FROM (
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               MAX("copy_number") AS "max_cn"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) q
+        WHERE rn = 1
+        GROUP BY "case_barcode", "cytoband_name"
+    ) p
+)
+SELECT 
+       "cytoband_name",
+       "cn_subtype",
+       COUNT(DISTINCT "case_barcode") AS "n_cases"
+FROM   categorized
+GROUP  BY "cytoband_name", "cn_subtype"
+LIMIT 20;
+Results:
+cytoband_name,cn_subtype,n_cases
+3p22,Heterozygous Deletion,332
+15q24,Amplification,93
+15q11,Normal,332
+19q12,Amplification,113
+6q16,Normal,354
+6q24,Heterozygous Deletion,84
+18q12,Amplification,80
+17q23,Amplification,102
+17q12,Normal,382
+15p11,Gain,51
+3p26,Heterozygous Deletion,330
+14q24,Heterozygous Deletion,128
+Xq25,Heterozygous Deletion,125
+1q23,Normal,359
+7q33,Amplification,134
+7p21,Amplification,133
+11q21,Normal,384
+
+[Successfully executed]
+2025-05-05 03:53:59 - Thread-2454 (execute) - INFO - [Try to execute]
+--Description: 10)  Convert counts to subtype percentages per cytoband, then sort by chromosome & name
+WITH totals AS (
+    SELECT 
+           "cytoband_name",
+           COUNT(DISTINCT "case_barcode") AS "total_cases"
+    FROM (
+        -- reuse categorized CTE from step 9
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               CASE 
+                    WHEN "max_cn" > 3 THEN 'Amplification'
+                    WHEN "max_cn" = 3 THEN 'Gain'
+                    WHEN "max_cn" = 2 THEN 'Normal'
+                    WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                    WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+               END AS "cn_subtype"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) w
+        WHERE rn = 1
+    ) v
+    GROUP BY "cytoband_name"
+),
+freqs AS (
+    SELECT 
+           c."cytoband_name",
+           c."cn_subtype",
+           COUNT(DISTINCT c."case_barcode") AS "n_cases_subtype"
+    FROM   (
+        -- same categorized subquery as above
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               CASE 
+                    WHEN "max_cn" > 3 THEN 'Amplification'
+                    WHEN "max_cn" = 3 THEN 'Gain'
+                    WHEN "max_cn" = 2 THEN 'Normal'
+                    WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                    WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+               END AS "cn_subtype"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) u
+        WHERE rn = 1
+    ) c
+    GROUP BY c."cytoband_name", c."cn_subtype"
+)
+SELECT 
+       f."cytoband_name",
+       f."cn_subtype",
+       ROUND(100.0 * f."n_cases_subtype" / t."total_cases", 2) AS "percent_cases"
+FROM   freqs f
+JOIN   totals t
+       ON f."cytoband_name" = t."cytoband_name"
+ORDER  BY SPLIT_PART(f."cytoband_name", 'p', 1),   -- crude chromosome sort
+          f."cytoband_name",
+          f."cn_subtype"
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:53:59 - Thread-2454 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 11 at position 25\ninvalid identifier \'"max_cn"\''}
+[Error occurred]
+2025-05-05 03:55:36 - Thread-2454 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Derive cytoband-level copy-number status for all TCGA-KIRC cases, then
+-- report the percentage of cases that fall into each CNV subtype
+-- (Amplification, Gain, Normal, Heterozygous Deletion, Homozygous Deletion)
+-- for every cytoband.  The logic proceeds in four CTE layers:
+--
+--   1) per_band
+--        • Join CNV segments to cytobands (matching chromosome).
+--        • For each (case, cytoband) keep the segment that overlaps the band
+--          the most (ROW_NUMBER on overlap length).  Take that segment’s
+--          copy_number as the band-level “max_cn”.
+--
+--   2) categorized
+--        • Translate max_cn to the requested categorical subtypes.
+--
+--   3) totals
+--        • Count how many distinct TCGA-KIRC cases are represented in each
+--          cytoband (denominator for percentages).
+--
+--   4) freqs
+--        • Count how many distinct cases per (cytoband, subtype)
+--          (numerator for percentages).
+--
+-- The final SELECT computes 100 * numerator / denominator, rounds to two
+-- decimals, and lists the first 20 rows (ordered by cytoband then subtype).
+WITH per_band AS (
+    SELECT
+        j."case_barcode",
+        j."cytoband_name",
+        MAX(j."copy_number") AS "max_cn"
+    FROM (
+        SELECT
+            s."case_barcode",
+            b."cytoband_name",
+            s."copy_number",
+            ROW_NUMBER() OVER (
+                PARTITION BY s."case_barcode", b."cytoband_name"
+                ORDER BY GREATEST(
+                           0,
+                           LEAST(s."end_pos",  b."hg38_stop") -
+                           GREATEST(s."start_pos", b."hg38_start")
+                       ) DESC
+            ) AS rn
+        FROM TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+        JOIN TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+          ON s."chromosome" = b."chromosome"
+        WHERE s."project_short_name" = 'TCGA-KIRC'
+    ) j
+    WHERE j.rn = 1
+    GROUP BY j."case_barcode", j."cytoband_name"
+),
+categorized AS (
+    SELECT
+        pb."case_barcode",
+        pb."cytoband_name",
+        CASE
+            WHEN pb."max_cn" > 3 THEN 'Amplification'
+            WHEN pb."max_cn" = 3 THEN 'Gain'
+            WHEN pb."max_cn" = 2 THEN 'Normal'
+            WHEN pb."max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN pb."max_cn" = 0 THEN 'Homozygous Deletion'
+        END AS "cn_subtype"
+    FROM per_band pb
+),
+totals AS (
+    SELECT
+        "cytoband_name",
+        COUNT(DISTINCT "case_barcode") AS "total_cases"
+    FROM categorized
+    GROUP BY "cytoband_name"
+),
+freqs AS (
+    SELECT
+        "cytoband_name",
+        "cn_subtype",
+        COUNT(DISTINCT "case_barcode") AS "n_cases_subtype"
+    FROM categorized
+    GROUP BY "cytoband_name", "cn_subtype"
+)
+SELECT
+    f."cytoband_name",
+    f."cn_subtype",
+    ROUND(100.0 * f."n_cases_subtype" / t."total_cases", 2) AS "percent_cases"
+FROM freqs f
+JOIN totals t
+  ON f."cytoband_name" = t."cytoband_name"
+ORDER BY f."cytoband_name", f."cn_subtype"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:55:37 - Thread-2454 (execute) - INFO - [Results for corrected sql]
+cytoband_name,cn_subtype,percent_cases
+10p11,Amplification,15.86
+10p11,Gain,6.96
+10p11,Heterozygous Deletion,2.32
+10p11,Normal,74.85
+10p12,Amplification,15.86
+10p12,Gain,7.16
+10p12,Heterozygous Deletion,2.32
+10p12,Normal,74.66
+10p13,Amplification,15.86
+10p13,Gain,6.77
+10p13,Heterozygous Deletion,3.09
+10p13,Normal,74.27
+10p14,Amplification,16.44
+
+[Results for corrected sql]
+2025-05-05 03:55:37 - Thread-2454 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+-- Derive cytoband-level copy-number status for all TCGA-KIRC cases, then
+-- report the percentage of cases that fall into each CNV subtype
+-- (Amplification, Gain, Normal, Heterozygous Deletion, Homozygous Deletion)
+-- for every cytoband.  The logic proceeds in four CTE layers:
+--
+--   1) per_band
+--        • Join CNV segments to cytobands (matching chromosome).
+--        • For each (case, cytoband) keep the segment that overlaps the band
+--          the most (ROW_NUMBER on overlap length).  Take that segment’s
+--          copy_number as the band-level “max_cn”.
+--
+--   2) categorized
+--        • Translate max_cn to the requested categorical subtypes.
+--
+--   3) totals
+--        • Count how many distinct TCGA-KIRC cases are represented in each
+--          cytoband (denominator for percentages).
+--
+--   4) freqs
+--        • Count how many distinct cases per (cytoband, subtype)
+--          (numerator for percentages).
+--
+-- The final SELECT computes 100 * numerator / denominator, rounds to two
+-- decimals, and lists the first 20 rows (ordered by cytoband then subtype).
+WITH per_band AS (
+    SELECT
+        j."case_barcode",
+        j."cytoband_name",
+        MAX(j."copy_number") AS "max_cn"
+    FROM (
+        SELECT
+            s."case_barcode",
+            b."cytoband_name",
+            s."copy_number",
+            ROW_NUMBER() OVER (
+                PARTITION BY s."case_barcode", b."cytoband_name"
+                ORDER BY GREATEST(
+                           0,
+                           LEAST(s."end_pos",  b."hg38_stop") -
+                           GREATEST(s."start_pos", b."hg38_start")
+                       ) DESC
+            ) AS rn
+        FROM TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+        JOIN TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+          ON s."chromosome" = b."chromosome"
+        WHERE s."project_short_name" = 'TCGA-KIRC'
+    ) j
+    WHERE j.rn = 1
+    GROUP BY j."case_barcode", j."cytoband_name"
+),
+categorized AS (
+    SELECT
+        pb."case_barcode",
+        pb."cytoband_name",
+        CASE
+            WHEN pb."max_cn" > 3 THEN 'Amplification'
+            WHEN pb."max_cn" = 3 THEN 'Gain'
+            WHEN pb."max_cn" = 2 THEN 'Normal'
+            WHEN pb."max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN pb."max_cn" = 0 THEN 'Homozygous Deletion'
+        END AS "cn_subtype"
+    FROM per_band pb
+),
+totals AS (
+    SELECT
+        "cytoband_name",
+        COUNT(DISTINCT "case_barcode") AS "total_cases"
+    FROM categorized
+    GROUP BY "cytoband_name"
+),
+freqs AS (
+    SELECT
+        "cytoband_name",
+        "cn_subtype",
+        COUNT(DISTINCT "case_barcode") AS "n_cases_subtype"
+    FROM categorized
+    GROUP BY "cytoband_name", "cn_subtype"
+)
+SELECT
+    f."cytoband_name",
+    f."cn_subtype",
+    ROUND(100.0 * f."n_cases_subtype" / t."total_cases", 2) AS "percent_cases"
+FROM freqs f
+JOIN totals t
+  ON f."cytoband_name" = t."cytoband_name"
+ORDER BY f."cytoband_name", f."cn_subtype"
+LIMIT 20;
+Results:
+cytoband_name,cn_subtype,percent_cases
+10p11,Amplification,15.86
+10p11,Gain,6.96
+10p11,Heterozygous Deletion,2.32
+10p11,Normal,74.85
+10p12,Amplification,15.86
+10p12,Gain,7.16
+10p12,Heterozygous Deletion,2.32
+10p12,Normal,74.66
+10p13,Amplification,15.86
+10p13,Gain,6.77
+10p13,Heterozygous Deletion,3.09
+10p13,Normal,74.27
+10p14,Amplification,16.44
+
+[Successfully corrected]
+2025-05-05 03:55:37 - Thread-2454 (execute) - INFO - itercount: 0
+2025-05-05 03:55:37 - Thread-2454 (execute) - INFO - [Self-refine]
+Table full name: TCGA_MITELMAN.PROD.CYTOCONVERTED
+Column name: Type Type: TEXT
+Column name: End Type: NUMBER
+Column name: Chr Type: TEXT
+Column name: Start Type: NUMBER
+Sample rows:
+[{'Chr': 'chr14', 'Start': 0, 'End': 50400000, 'Type': 'Gain'}, {'Chr': 'chr14', 'Start': 0, 'End': 50400000, 'Type': 'Gain'}, {'Chr': 'chr14', 'Start': 0, 'End': 50400000, 'Type': 'Gain'}, {'Chr': 'chr14', 'Start': 0, 'End': 50400000, 'Type': 'Gain'}, {'Chr': 'chr14', 'Start': 0, 'End': 50400000, 'Type': 'Gain'}]
+
+--------------------------------------------------
+Table full name: TCGA_MITELMAN.PROD.CYTOBANDS_HG38
+Column name: cytoband_name Type: TEXT
+Column name: hg38_stop Type: NUMBER
+Column name: hg38_start Type: NUMBER
+Column name: chromosome Type: TEXT
+Sample rows:
+[{'chromosome': 'chr1', 'cytoband_name': '1p36', 'hg38_start': 0, 'hg38_stop': 27600000}, {'chromosome': 'chr1', 'cytoband_name': '1p34', 'hg38_start': 34300000, 'hg38_stop': 46300000}, {'chromosome': 'chr1', 'cytoband_name': '1p33', 'hg38_start': 46300000, 'hg38_stop': 50200000}, {'chromosome': 'chr1', 'cytoband_name': '1p31', 'hg38_start': 60800000, 'hg38_stop': 84400000}, {'chromosome': 'chr1', 'cytoband_name': '1p22', 'hg38_start': 84400000, 'hg38_stop': 94300000}]
+
+--------------------------------------------------
+Table full name: TCGA_MITELMAN.TCGA_VERSIONED.PER_SAMPLE_FILE_METADATA_HG38_GDC_R32
+Column name: data_type Type: TEXT Description: Experimental source of the data type, eg Tissue slide image, RNA-Seq
+Column name: case_barcode Type: TEXT Description: Original submitter case barcode, eg TCGA-DX-A8BN
+Column name: file_gdc_id Type: TEXT Description: Unique GDC identifier for this file. This can be used to access more information from the GDC data portal like this: https://portal.gdc.cancer.gov/files/c21b332c-06c6-4403-9032-f91c8f407ba44
+Column name: file_name_key Type: TEXT Description: GDC path to original BAM or VCF file
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; eg. TCGA-OV, etc.
+Column name: experimental_strategy Type: TEXT Description: Experimental strategy used to generate data (where applicable) e.g. WXS, RNA-Seq
+Column name: sample_barcode Type: TEXT Description: Submitter sample barcode, eg TCGA-12-1089-01A
+Sample rows:
+[{'file_gdc_id': 'b4dfdcd5-e28f-4d23-999c-0bef059519fe', 'case_barcode': 'TCGA-2G-AALX', 'sample_barcode': 'TCGA-2G-AALX-01A', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'experimental_strategy': 'Genotyping Array', 'file_name_key': 'gs://gdc-tcga-phs000178-open/b4dfdcd5-e28f-4d23-999c-0bef059519fe/TCGA-TGCT.eda339e2-6c8e-49fe-872a-472de3330363.ascat2.allelic_specific.seg.txt'}, {'file_gdc_id': 'e74343e0-f2ae-4241-a503-fd04a037729c', 'case_barcode': 'TCGA-YU-AA4L', 'sample_barcode': 'TCGA-YU-AA4L-10A', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'experimental_strategy': 'Genotyping Array', 'file_name_key': 'gs://gdc-tcga-phs000178-open/e74343e0-f2ae-4241-a503-fd04a037729c/TCGA-TGCT.935f7b67-629d-4210-a2b6-cd98772b0668.ascat2.allelic_specific.seg.txt'}, {'file_gdc_id': 'a4ba07b6-cf45-4280-a25c-75e6643612c7', 'case_barcode': 'TCGA-2G-AAKG', 'sample_barcode': 'TCGA-2G-AAKG-10A', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'experimental_strategy': 'Genotyping Array', 'file_name_key': 'gs://gdc-tcga-phs000178-open/a4ba07b6-cf45-4280-a25c-75e6643612c7/TCGA-TGCT.9d680abb-db4c-4b73-942f-58b9fd1856b0.ascat2.allelic_specific.seg.txt'}, {'file_gdc_id': '2ed43941-682b-4655-b975-74fc6c91278e', 'case_barcode': 'TCGA-XE-AAO3', 'sample_barcode': 'TCGA-XE-AAO3-01A', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'experimental_strategy': 'Genotyping Array', 'file_name_key': 'gs://gdc-tcga-phs000178-open/2ed43941-682b-4655-b975-74fc6c91278e/TCGA-TGCT.8c8fbd4a-8a34-4a30-9328-9320b2ffe339.ascat2.allelic_specific.seg.txt'}, {'file_gdc_id': '22d9b3ae-fdf4-4301-a440-09a30fd99add', 'case_barcode': 'TCGA-2G-AAGK', 'sample_barcode': 'TCGA-2G-AAGK-10A', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'experimental_strategy': 'Genotyping Array', 'file_name_key': 'gs://gdc-tcga-phs000178-open/22d9b3ae-fdf4-4301-a440-09a30fd99add/TCGA-TGCT.f48b91dd-870e-46bb-aa4c-fd131a29e6e3.ascat2.allelic_specific.seg.txt'}]
+
+--------------------------------------------------
+Table full name: TCGA_MITELMAN.TCGA_VERSIONED.PER_SAMPLE_FILE_METADATA_HG38_GDC_R34
+Column name: case_gdc_id Type: TEXT Description: Unique GDC identifier for this case (corresponds to the case_barcode).  Can be used to access more information from the GDC data portal like this: https://portal.gdc.cancer.gov/cases/c21b332c-06c6-4403-9032-f91c8f407ba37
+Column name: sample_barcode Type: TEXT Description: Submitter sample barcode, eg TCGA-12-1089-01A
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; eg. TCGA-OV, etc.
+Column name: file_type Type: TEXT Description: Description of the data, eg. clinical_supplement, aligned_reads
+Column name: data_type Type: TEXT Description: Experimental source of the data type, eg Tissue slide image, RNA-Seq
+Column name: sample_type_name Type: TEXT Description: Sample type, eg Primary Tumor, Solid Tissue Normal
+Sample rows:
+[{'case_gdc_id': 'bac49a26-1556-45b8-8729-a05df52623d8', 'sample_barcode': 'TCGA-2G-AAHL-01A', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'file_type': 'copy_number_segment'}, {'case_gdc_id': '8062ca27-542f-4a00-a047-c88b9b26f34f', 'sample_barcode': 'TCGA-2G-AAGI-10A', 'sample_type_name': 'Blood Derived Normal', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'file_type': 'copy_number_segment'}, {'case_gdc_id': 'dd6e87af-ea8f-41e9-bf7d-0222d88b7873', 'sample_barcode': 'TCGA-2G-AALW-01A', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'file_type': 'copy_number_segment'}, {'case_gdc_id': '07bec7d7-0aab-4b09-a796-bf1602bf682c', 'sample_barcode': 'TCGA-2G-AALS-10A', 'sample_type_name': 'Blood Derived Normal', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'file_type': 'copy_number_segment'}, {'case_gdc_id': 'e08bddcd-8ea5-4994-af6a-9fe9b7c93da4', 'sample_barcode': 'TCGA-4K-AA1I-01A', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'TCGA-TGCT', 'data_type': 'Allele-specific Copy Number Segment', 'file_type': 'copy_number_segment'}]
+
+--------------------------------------------------
+Table full name: TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+Column name: start_pos Type: NUMBER Description: 1-based start chromosome position of isoform
+Column name: chromosome Type: TEXT Description: Chromosome, possible values: chr1-22, and chrX
+Column name: case_barcode Type: TEXT Description: Original TCGA case barcode, eg TCGA-DX-A8BN
+Column name: copy_number Type: NUMBER Description: The sum of the Major and Minor Copy Numbers
+Column name: end_pos Type: NUMBER Description: 1-based end chromosome position of isoform
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; e.g. TCGA-OV, etc.
+Sample rows:
+[{'project_short_name': 'TCGA-HNSC', 'case_barcode': 'TCGA-BA-A6DJ', 'chromosome': 'chr3', 'start_pos': 7848592, 'end_pos': 60391703, 'copy_number': 4}, {'project_short_name': 'TCGA-HNSC', 'case_barcode': 'TCGA-BA-A6DJ', 'chromosome': 'chr7', 'start_pos': 50479066, 'end_pos': 70619708, 'copy_number': 4}, {'project_short_name': 'TCGA-HNSC', 'case_barcode': 'TCGA-BA-A6DJ', 'chromosome': 'chr3', 'start_pos': 60511373, 'end_pos': 60605486, 'copy_number': 2}, {'project_short_name': 'TCGA-HNSC', 'case_barcode': 'TCGA-CN-4741', 'chromosome': 'chr22', 'start_pos': 17833854, 'end_pos': 25316206, 'copy_number': 2}, {'project_short_name': 'TCGA-HNSC', 'case_barcode': 'TCGA-CN-4741', 'chromosome': 'chr7', 'start_pos': 142867988, 'end_pos': 142882443, 'copy_number': 4}]
+
+--------------------------------------------------
+Table full name: TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_MASKED_HG38_GDC_2017_02
+Column name: segment_mean Type: FLOAT Description: Mean CN value for this segment -- the value is base2 log(CN/2), centered at 0.
+Column name: end_pos Type: NUMBER Description: 1-based end chromosome position of isoform
+Column name: chromosome Type: TEXT Description: Chromosome, possible values: chr1-22, and chrX
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; e.g. TCGA-OV, etc.
+Column name: case_barcode Type: TEXT Description: Original TCGA case barcode, eg TCGA-DX-A8BN
+Column name: start_pos Type: NUMBER Description: 1-based start chromosome position of CN segment start-position
+Sample rows:
+[{'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'chromosome': '1', 'start_pos': 192535402, 'end_pos': 204952681, 'segment_mean': 0.5423}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'chromosome': '8', 'start_pos': 6492582, 'end_pos': 11506441, 'segment_mean': 0.0251}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'chromosome': '4', 'start_pos': 58407021, 'end_pos': 69565787, 'segment_mean': -0.6356}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'chromosome': '8', 'start_pos': 64761936, 'end_pos': 69759565, 'segment_mean': 0.1803}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'chromosome': '17', 'start_pos': 12948118, 'end_pos': 12949075, 'segment_mean': -2.7905}]
+
+--------------------------------------------------
+Table full name: TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_MASKED_HG38_GDC_R14
+Column name: case_barcode Type: TEXT Description: Original TCGA case barcode, eg TCGA-DX-A8BN
+Column name: chromosome Type: TEXT Description: Chromosome, possible values: chr1-22, and chrX
+Column name: start_pos Type: NUMBER Description: 1-based start chromosome position of isoform
+Column name: segment_mean Type: FLOAT Description: Mean CN value for this segment -- the value is base2 log(CN/2), centered at 0.
+Column name: end_pos Type: NUMBER Description: 1-based end chromosome position of isoform
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; e.g. TCGA-OV, etc.
+Sample rows:
+[{'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-01-0628', 'chromosome': '14', 'start_pos': 20033191, 'end_pos': 73765366, 'segment_mean': 0.0236}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-01-0628', 'chromosome': '5', 'start_pos': 913983, 'end_pos': 29017353, 'segment_mean': 0.0222}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-01-0628', 'chromosome': '2', 'start_pos': 480597, 'end_pos': 2792302, 'segment_mean': 0.0108}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-01-0628', 'chromosome': '12', 'start_pos': 42365129, 'end_pos': 42366732, 'segment_mean': -1.4563}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-01-0628', 'chromosome': '15', 'start_pos': 23437561, 'end_pos': 24042945, 'segment_mean': 0.0471}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+### Comprehensive Guide to Copy Number Variations in Cancer Genomics
+
+#### **1. Introduction to Copy Number Variations (CNVs)**
+
+Copy number variations (CNVs) are changes in the genome where regions have altered numbers of DNA segments. These variations include amplifications or deletions, significantly impacting genetic diversity and disease progression, particularly in cancer.
+
+#### **2. The Role of CNVs in Cancer**
+
+CNVs can drive cancer progression by amplifying oncogenes or deleting tumor suppressor genes, affecting gene dosage and cellular control mechanisms.
+
+#### **3. TCGA-KIRC Project Overview**
+
+The TCGA Kidney Renal Clear Cell Carcinoma (KIRC) project offers crucial CNV data to enhance our understanding of the molecular basis of kidney cancer.
+
+#### **4. CytoBands and Their Genomic Significance**
+
+CytoBands are chromosomal regions identified by staining patterns that help localize genetic functions and structural features.
+
+#### **5. Data Sources for CNV Analysis**
+
+- **TCGA CNV Data**: Provides genomic copy number changes in cancer tissues.
+- **Mitelman Database (CytoBands_hg38)**: Offers detailed cytoband data for mapping CNVs to chromosomes.
+
+#### **6. CNV Categories and Their Implications in Cancer**
+
+- **Amplifications** (>3 copies): Lead to oncogene overexpression, accelerating tumor growth.
+- **Gains** (=3 copies): Cause subtle changes in gene dosage, potentially enhancing cancer progression.
+- **Homozygous Deletions** (0 copies): Result in the loss of both copies of tumor suppressor genes, promoting tumor development.
+- **Heterozygous Deletions** (1 copy): Reduce the dosage of key regulatory genes, contributing to tumor progression.
+- **Normal Diploid** (2 copies): Maintain standard genomic copies, serving as a baseline for comparative analysis.
+
+#### **7. Methodology for Determining Overlaps**
+
+To localize CNVs within specific cytobands, we use:
+
+\[ \text{Overlap} = \max(0, \min(\text{end\_pos}, \text{hg38\_stop}) - \max(\text{start\_pos}, \text{hg38\_start})) \]
+
+This formula ensures that the overlap measurement is the actual intersected length of the CNV and cytoband segments. It uses:
+- `\min(\text{end\_pos}, \text{hg38\_stop})` to find the smallest endpoint between the CNV segment and the cytoband.
+- `\max(\text{start\_pos}, \text{hg38\_start})` to find the largest start point between the CNV segment and the cytoband.
+- The `max(0, ...)` function ensures that the overlap cannot be negative, which would indicate no actual overlap.
+
+
+#### **8. Conclusion**
+
+Analyzing CNVs is crucial for understanding cancer genetics and developing targeted therapies. Integrating CNV analysis with traditional markers enhances our insights into tumor biology.
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'TCGA_MITELMAN': {'PROD': ['CYTOCONVERTED', 'CYTOBANDS_HG38'], 'TCGA_VERSIONED': ['PER_SAMPLE_FILE_METADATA_HG38_GDC_R32', 'PER_SAMPLE_FILE_METADATA_HG38_GDC_R34', 'COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23', 'COPY_NUMBER_SEGMENT_MASKED_HG38_GDC_2017_02', 'COPY_NUMBER_SEGMENT_MASKED_HG38_GDC_R14']}}
+Some few-shot examples may be useful:
+Query:
+--Description: 1)  Inspect which TCGA projects are represented in the allelic CNV segment table
+SELECT DISTINCT 
+       "project_short_name"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+LIMIT 20;
+Answer:
+project_short_name
+TCGA-DLBC
+TCGA-KIRP
+TCGA-SARC
+TCGA-CHOL
+TCGA-COAD
+TCGA-SKCM
+TCGA-PAAD
+TCGA-BRCA
+TCGA-STAD
+TCGA-HNSC
+TCGA-ESCA
+TCGA-OV
+TCGA-READ
+TCGA-KIRC
+TCGA-CESC
+TCGA-UCS
+TCGA-GBM
+TCGA-KICH
+TCGA-BLCA
+TCGA-LGG
+Query:
+--Description: 2)  Preview a few allelic CNV segments only for the kidney clear-cell cohort (TCGA-KIRC)
+SELECT 
+       "case_barcode",
+       "chromosome",
+       "start_pos",
+       "end_pos",
+       "copy_number"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Answer:
+case_barcode,chromosome,start_pos,end_pos,copy_number
+TCGA-3Z-A93Z,chr1,223482946,236622460,4
+TCGA-3Z-A93Z,chr6,30544386,170741917,4
+TCGA-3Z-A93Z,chr13,57193049,57204246,0
+TCGA-3Z-A93Z,chr16,10777,5726654,3
+TCGA-6D-AA2E,chr7,76514308,76977495,4
+TCGA-6D-AA2E,chr17,41266762,41274279,0
+TCGA-6D-AA2E,chr6,30559068,86696948,2
+TCGA-6D-AA2E,chr15,19811075,57532145,2
+TCGA-6D-AA2E,chr13,18452809,79851172,2
+TCGA-6D-AA2E,chr19,15669855,15714788,4
+TCGA-6D-AA2E,chr5,18607208,18666713,8
+Query:
+--Description: 3)  Count how many distinct TCGA-KIRC cases have allelic CNV data
+SELECT COUNT(DISTINCT "case_barcode") AS "n_cases_kirc"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23
+WHERE  "project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Answer:
+n_cases_kirc
+517
+Query:
+--Description: 4)  Look at cytoband definitions for one chromosome to confirm genomic coordinates
+SELECT 
+       "chromosome",
+       "cytoband_name",
+       "hg38_start",
+       "hg38_stop"
+FROM   TCGA_MITELMAN.PROD.CYTOBANDS_HG38
+WHERE  "chromosome" = 'chr14'
+LIMIT 20;
+Answer:
+chromosome,cytoband_name,hg38_start,hg38_stop
+chr14,14p13,0,3600000
+chr14,14p12,3600000,8000000
+chr14,14p11,8000000,17200000
+chr14,14q11,17200000,24100000
+chr14,14q12,24100000,32900000
+chr14,14q13,32900000,37400000
+chr14,14q21,37400000,50400000
+chr14,14q22,50400000,57600000
+chr14,14q23,57600000,67400000
+chr14,14q24,67400000,78800000
+chr14,14q31,78800000,89300000
+chr14,14q32,89300000,107043718
+Query:
+--Description: 5)  Join TCGA-KIRC CNV segments to cytobands on matching chromosome to see raw overlaps
+SELECT 
+       s."case_barcode",
+       s."chromosome",
+       s."start_pos"            AS "seg_start",
+       s."end_pos"              AS "seg_end",
+       b."cytoband_name",
+       b."hg38_start"           AS "band_start",
+       b."hg38_stop"            AS "band_end"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Answer:
+case_barcode,chromosome,seg_start,seg_end,cytoband_name,band_start,band_end
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p15,0,22000000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p14,22000000,31000000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p13,31000000,36400000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p12,36400000,43400000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11p11,43400000,53400000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11q11,53400000,55800000
+TCGA-3Z-A93Z,chr11,131224290,131251620,11q12,5
+Query:
+--Description: 6)  Add the genomic overlap length between each CNV segment and cytoband
+SELECT 
+       s."case_barcode",
+       b."cytoband_name",
+       GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                    -  GREATEST(s."start_pos", b."hg38_start")) AS "overlap_bp"
+FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+       ON  s."chromosome" = b."chromosome"
+WHERE  s."project_short_name" = 'TCGA-KIRC'
+LIMIT 20;
+Answer:
+case_barcode,cytoband_name,overlap_bp
+TCGA-3Z-A93Z,1p36,0
+TCGA-3Z-A93Z,1p35,0
+TCGA-3Z-A93Z,1p34,0
+TCGA-3Z-A93Z,1p33,0
+TCGA-3Z-A93Z,1p32,0
+TCGA-3Z-A93Z,1p31,0
+TCGA-3Z-A93Z,1p22,0
+TCGA-3Z-A93Z,1p21,0
+TCGA-3Z-A93Z,1p13,0
+TCGA-3Z-A93Z,1p12,0
+TCGA-3Z-A93Z,1p11,0
+TCGA-3Z-A93Z,1q11,0
+TCGA-3Z-A93Z,1q12,0
+TCGA-3Z-A93Z,1q21,0
+TCGA-3Z-A93Z,1q22,0
+TCGA-3Z-A93Z,1q23,0
+TCGA-3Z-A93Z,1q24,0
+TCGA-3Z-A93Z,1q25,0
+TCGA-3Z-A93Z,1q31,0
+Query:
+--Description: 7)  For each KIRC sample & cytoband, retain the segment with the largest overlap 
+--                then capture its maximum copy number
+WITH joined AS (
+    SELECT 
+           s."case_barcode",
+           b."cytoband_name",
+           s."copy_number",
+           ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                              ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+    FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON  s."chromosome" = b."chromosome"
+    WHERE  s."project_short_name" = 'TCGA-KIRC'
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       MAX("copy_number") AS "max_cn"   -- should be only the row with rn=1
+FROM   joined
+WHERE  rn = 1
+GROUP  BY "case_barcode", "cytoband_name"
+LIMIT 20;
+Answer:
+case_barcode,cytoband_name,max_cn
+TCGA-B2-A4SR,12q21,2
+TCGA-BP-4343,1p35,2
+TCGA-B0-4814,2p21,2
+TCGA-A3-3378,7p11,2
+TCGA-BP-5176,13p12,2
+TCGA-B0-5701,Xq21,0
+TCGA-CW-6093,3q28,2
+TCGA-BP-4352,14q32,2
+TCGA-CJ-4638,8q11,2
+TCGA-B0-5690,2p13,2
+TCGA-BP-5006,10q25,2
+TCGA-CZ-4866,10q22,4
+TCGA-BP-4162,18q22,2
+TCGA-B8-4153,Xq26,1
+TCGA-B0-4694,2q35,2
+TCGA-AK-3447,11p13,2
+TCGA-A3-3372,2q36,4
+TCGA-B0-4838,1q42,5
+TCGA-MM-A564,5p14,6
+Query:
+--Description: 8)  Categorize each sample’s cytoband-level CN status using the defined thresholds
+WITH per_band AS (
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           MAX("copy_number") AS "max_cn"
+    FROM (
+        -- reuse logic from step 7 but inline for brevity
+        SELECT 
+               s."case_barcode",
+               b."cytoband_name",
+               s."copy_number",
+               ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                  ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                   -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+        FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+        JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+               ON  s."chromosome" = b."chromosome"
+        WHERE  s."project_short_name" = 'TCGA-KIRC'
+    ) t
+    WHERE rn = 1
+    GROUP BY "case_barcode", "cytoband_name"
+)
+SELECT 
+       "case_barcode",
+       "cytoband_name",
+       "max_cn",
+       CASE 
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+       END AS "cn_subtype"
+FROM   per_band
+LIMIT 20;
+Answer:
+case_barcode,cytoband_name,max_cn,cn_subtype
+TCGA-B0-5706,2p13,2,Normal
+TCGA-B0-5710,1q23,2,Normal
+TCGA-CZ-5987,1p31,2,Normal
+TCGA-BP-4977,14q11,2,Normal
+TCGA-MM-A564,19q13,4,Amplification
+TCGA-BP-4977,17p13,4,Amplification
+TCGA-B2-5641,9q21,1,Heterozygous Deletion
+TCGA-BP-5202,1p36,2,Normal
+TCGA-B8-4154,2q34,2,Normal
+TCGA-BP-4160,10q23,2,Normal
+TCGA-B8-A7U6,15q11,2,Normal
+TCGA-CJ-4884,22p12,2,Normal
+TCGA-AK-3453,15q13,2,Normal
+Query:
+--Description: 9)  Count how many distinct TCGA-KIRC cases fall into each CN subtype per cytoband
+WITH categorized AS (
+    -- (reuse query from step 8)
+    SELECT 
+           "case_barcode",
+           "cytoband_name",
+           CASE 
+                WHEN "max_cn" > 3 THEN 'Amplification'
+                WHEN "max_cn" = 3 THEN 'Gain'
+                WHEN "max_cn" = 2 THEN 'Normal'
+                WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+                WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+           END AS "cn_subtype"
+    FROM (
+        SELECT 
+               "case_barcode",
+               "cytoband_name",
+               MAX("copy_number") AS "max_cn"
+        FROM (
+            SELECT 
+                   s."case_barcode",
+                   b."cytoband_name",
+                   s."copy_number",
+                   ROW_NUMBER() OVER (PARTITION BY s."case_barcode", b."cytoband_name"
+                                      ORDER BY GREATEST(0, LEAST(s."end_pos",  b."hg38_stop") 
+                                                       -  GREATEST(s."start_pos", b."hg38_start")) DESC) AS rn
+            FROM   TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+            JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+                   ON  s."chromosome" = b."chromosome"
+            WHERE  s."project_short_name" = 'TCGA-KIRC'
+        ) q
+        WHERE rn = 1
+        GROUP BY "case_barcode", "cytoband_name"
+    ) p
+)
+SELECT 
+       "cytoband_name",
+       "cn_subtype",
+       COUNT(DISTINCT "case_barcode") AS "n_cases"
+FROM   categorized
+GROUP  BY "cytoband_name", "cn_subtype"
+LIMIT 20;
+Answer:
+cytoband_name,cn_subtype,n_cases
+3p22,Heterozygous Deletion,332
+15q24,Amplification,93
+15q11,Normal,332
+19q12,Amplification,113
+6q16,Normal,354
+6q24,Heterozygous Deletion,84
+18q12,Amplification,80
+17q23,Amplification,102
+17q12,Normal,382
+15p11,Gain,51
+3p26,Heterozygous Deletion,330
+14q24,Heterozygous Deletion,128
+Xq25,Heterozygous Deletion,125
+1q23,Normal,359
+7q33,Amplification,134
+7p21,Amplification,133
+11q21,Normal,384
+Task: Using segment-level copy number data from the copy_number_segment_allelic_hg38_gdc_r23 dataset restricted to 'TCGA-KIRC' samples, merge these segments with the cytogenetic band definitions in 'CytoBands_hg38' to identify each sample’s maximum copy number per cytoband. Classify these maximum copy numbers into amplifications (>3), gains (=3), homozygous deletions (=0), heterozygous deletions (=1), or normal (=2), then calculate the frequency of each subtype out of the total number of distinct cases, and finally present these frequencies as percentages sorted by chromosome and cytoband.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'TCGA_MITELMAN': {'PROD': ['CYTOCONVERTED', 'CYTOBANDS_HG38'], 'TCGA_VERSIONED': ['PER_SAMPLE_FILE_METADATA_HG38_GDC_R32', 'PER_SAMPLE_FILE_METADATA_HG38_GDC_R34', 'COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23', 'COPY_NUMBER_SEGMENT_MASKED_HG38_GDC_2017_02', 'COPY_NUMBER_SEGMENT_MASKED_HG38_GDC_R14']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 03:56:07 - Thread-2454 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*---------------------------------------------------------------------------
+  Copy-number status frequencies per cytoband for TCGA-KIRC
+---------------------------------------------------------------------------*/
+WITH kirc_segments AS (   -- 1.  all allele-specific CNV segments for KIRC
+    SELECT
+        s."case_barcode",
+        s."chromosome",
+        s."start_pos",
+        s."end_pos",
+        s."copy_number"
+    FROM TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    WHERE s."project_short_name" = 'TCGA-KIRC'
+),
+total_cases AS (          -- 2.  number of distinct KIRC cases
+    SELECT COUNT(DISTINCT "case_barcode") AS "n_total_cases"
+    FROM   kirc_segments
+),
+seg_band_overlap AS (     -- 3.  overlap of each segment with every cytoband
+    SELECT
+        k."case_barcode",
+        b."chromosome",
+        b."cytoband_name",
+        k."copy_number",
+        GREATEST(
+            0,
+            LEAST(k."end_pos", b."hg38_stop")
+              - GREATEST(k."start_pos", b."hg38_start")
+        ) AS "overlap_bp",
+        ROW_NUMBER() OVER (PARTITION BY k."case_barcode", b."cytoband_name"
+                           ORDER BY GREATEST(
+                                       0,
+                                       LEAST(k."end_pos", b."hg38_stop")
+                                         - GREATEST(k."start_pos", b."hg38_start")
+                                   ) DESC) AS "rn"
+    FROM   kirc_segments k
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON k."chromosome" = b."chromosome"
+),
+per_case_band AS (        -- 4.  keep only segment with largest overlap, get max CN
+    SELECT
+        "case_barcode",
+        "chromosome",
+        "cytoband_name",
+        MAX("copy_number") AS "max_cn"
+    FROM   seg_band_overlap
+    WHERE  "rn" = 1
+    GROUP  BY "case_barcode", "chromosome", "cytoband_name"
+),
+categorized AS (         -- 5.  classify CN state
+    SELECT
+        "case_barcode",
+        "chromosome",
+        "cytoband_name",
+        CASE
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+        END AS "cn_subtype"
+    FROM   per_case_band
+),
+freq AS (                -- 6.  count cases per cytoband & subtype
+    SELECT
+        "chromosome",
+        "cytoband_name",
+        "cn_subtype",
+        COUNT(DISTINCT "case_barcode") AS "n_cases"
+    FROM   categorized
+    GROUP  BY "chromosome", "cytoband_name", "cn_subtype"
+)
+/*-------------------------------------------------------------------------*/
+SELECT
+    f."chromosome",
+    f."cytoband_name",
+    f."cn_subtype",
+    f."n_cases",
+    ROUND(100.0 * f."n_cases" / t."n_total_cases", 2) AS "percentage_cases"
+FROM   freq f
+CROSS  JOIN total_cases t
+ORDER  BY
+    /* numeric chromosome ordering: chr1 … chr22, chrX (treated as 23) */
+    CASE
+        WHEN REPLACE(f."chromosome",'chr','') = 'X' THEN 23
+        ELSE TO_NUMBER(REPLACE(f."chromosome",'chr',''))
+    END,
+    f."cytoband_name",
+    f."cn_subtype";
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:56:08 - Thread-2454 (execute) - INFO - itercount: 1
+2025-05-05 03:56:08 - Thread-2454 (execute) - INFO - [Self-refine]
+Input sql:
+/*---------------------------------------------------------------------------
+  Copy-number status frequencies per cytoband for TCGA-KIRC
+---------------------------------------------------------------------------*/
+WITH kirc_segments AS (   -- 1.  all allele-specific CNV segments for KIRC
+    SELECT
+        s."case_barcode",
+        s."chromosome",
+        s."start_pos",
+        s."end_pos",
+        s."copy_number"
+    FROM TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    WHERE s."project_short_name" = 'TCGA-KIRC'
+),
+total_cases AS (          -- 2.  number of distinct KIRC cases
+    SELECT COUNT(DISTINCT "case_barcode") AS "n_total_cases"
+    FROM   kirc_segments
+),
+seg_band_overlap AS (     -- 3.  overlap of each segment with every cytoband
+    SELECT
+        k."case_barcode",
+        b."chromosome",
+        b."cytoband_name",
+        k."copy_number",
+        GREATEST(
+            0,
+            LEAST(k."end_pos", b."hg38_stop")
+              - GREATEST(k."start_pos", b."hg38_start")
+        ) AS "overlap_bp",
+        ROW_NUMBER() OVER (PARTITION BY k."case_barcode", b."cytoband_name"
+                           ORDER BY GREATEST(
+                                       0,
+                                       LEAST(k."end_pos", b."hg38_stop")
+                                         - GREATEST(k."start_pos", b."hg38_start")
+                                   ) DESC) AS "rn"
+    FROM   kirc_segments k
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON k."chromosome" = b."chromosome"
+),
+per_case_band AS (        -- 4.  keep only segment with largest overlap, get max CN
+    SELECT
+        "case_barcode",
+        "chromosome",
+        "cytoband_name",
+        MAX("copy_number") AS "max_cn"
+    FROM   seg_band_overlap
+    WHERE  "rn" = 1
+    GROUP  BY "case_barcode", "chromosome", "cytoband_name"
+),
+categorized AS (         -- 5.  classify CN state
+    SELECT
+        "case_barcode",
+        "chromosome",
+        "cytoband_name",
+        CASE
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+        END AS "cn_subtype"
+    FROM   per_case_band
+),
+freq AS (                -- 6.  count cases per cytoband & subtype
+    SELECT
+        "chromosome",
+        "cytoband_name",
+        "cn_subtype",
+        COUNT(DISTINCT "case_barcode") AS "n_cases"
+    FROM   categorized
+    GROUP  BY "chromosome", "cytoband_name", "cn_subtype"
+)
+/*-------------------------------------------------------------------------*/
+SELECT
+    f."chromosome",
+    f."cytoband_name",
+    f."cn_subtype",
+    f."n_cases",
+    ROUND(100.0 * f."n_cases" / t."n_total_cases", 2) AS "percentage_cases"
+FROM   freq f
+CROSS  JOIN total_cases t
+ORDER  BY
+    /* numeric chromosome ordering: chr1 … chr22, chrX (treated as 23) */
+    CASE
+        WHEN REPLACE(f."chromosome",'chr','') = 'X' THEN 23
+        ELSE TO_NUMBER(REPLACE(f."chromosome",'chr',''))
+    END,
+    f."cytoband_name",
+    f."cn_subtype";
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##100038 (22018): Numeric value 'Y' is not recognized"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 03:57:31 - Thread-2454 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*---------------------------------------------------------------------------
+  Copy-number status frequencies per cytoband for TCGA-KIRC
+---------------------------------------------------------------------------*/
+WITH kirc_segments AS (          -- 1. all allele-specific CNV segments for KIRC
+    SELECT
+        s."case_barcode",
+        s."chromosome",
+        s."start_pos",
+        s."end_pos",
+        s."copy_number"
+    FROM TCGA_MITELMAN.TCGA_VERSIONED.COPY_NUMBER_SEGMENT_ALLELIC_HG38_GDC_R23 s
+    WHERE s."project_short_name" = 'TCGA-KIRC'
+),
+total_cases AS (                 -- 2. number of distinct KIRC cases
+    SELECT COUNT(DISTINCT "case_barcode") AS "n_total_cases"
+    FROM   kirc_segments
+),
+seg_band_overlap AS (            -- 3. segment ↔ cytoband overlaps
+    SELECT
+        k."case_barcode",
+        b."chromosome",
+        b."cytoband_name",
+        k."copy_number",
+        /* overlap length (bp) */
+        GREATEST(
+            0,
+            LEAST(k."end_pos", b."hg38_stop")
+              - GREATEST(k."start_pos", b."hg38_start")
+        ) AS "overlap_bp",
+        ROW_NUMBER() OVER (
+            PARTITION BY k."case_barcode", b."cytoband_name"
+            ORDER BY GREATEST(
+                        0,
+                        LEAST(k."end_pos", b."hg38_stop")
+                          - GREATEST(k."start_pos", b."hg38_start")
+                     ) DESC
+        ) AS "rn"
+    FROM   kirc_segments k
+    JOIN   TCGA_MITELMAN.PROD.CYTOBANDS_HG38 b
+           ON k."chromosome" = b."chromosome"
+),
+per_case_band AS (               -- 4. keep segment with largest overlap, retain max CN
+    SELECT
+        "case_barcode",
+        "chromosome",
+        "cytoband_name",
+        MAX("copy_number") AS "max_cn"
+    FROM   seg_band_overlap
+    WHERE  "rn" = 1
+    GROUP  BY "case_barcode", "chromosome", "cytoband_name"
+),
+categorized AS (                 -- 5. classify CN state
+    SELECT
+        "case_barcode",
+        "chromosome",
+        "cytoband_name",
+        CASE
+            WHEN "max_cn" > 3 THEN 'Amplification'
+            WHEN "max_cn" = 3 THEN 'Gain'
+            WHEN "max_cn" = 2 THEN 'Normal'
+            WHEN "max_cn" = 1 THEN 'Heterozygous Deletion'
+            WHEN "max_cn" = 0 THEN 'Homozygous Deletion'
+        END AS "cn_subtype"
+    FROM   per_case_band
+),
+freq AS (                        -- 6. count cases per cytoband & subtype
+    SELECT
+        "chromosome",
+        "cytoband_name",
+        "cn_subtype",
+        COUNT(DISTINCT "case_barcode") AS "n_cases"
+    FROM   categorized
+    GROUP  BY "chromosome", "cytoband_name", "cn_subtype"
+)
+/*-------------------------------------------------------------------------*/
+SELECT
+    f."chromosome",
+    f."cytoband_name",
+    f."cn_subtype",
+    f."n_cases",
+    ROUND(100.0 * f."n_cases" / t."n_total_cases", 2) AS "percentage_cases"
+FROM   freq f
+CROSS  JOIN total_cases t
+ORDER  BY
+    /* chromosome ordering: chr1-22 → 1-22, chrX → 23, chrY → 24, chrM/chrMT → 25 */
+    CASE
+        WHEN REGEXP_REPLACE(f."chromosome", '^chr', '') = 'X'  THEN 23
+        WHEN REGEXP_REPLACE(f."chromosome", '^chr', '') = 'Y'  THEN 24
+        WHEN REGEXP_REPLACE(f."chromosome", '^chr', '') IN ('M','MT') THEN 25
+        ELSE TRY_TO_NUMBER(REGEXP_REPLACE(f."chromosome", '^chr', ''))
+    END,
+    f."cytoband_name",
+    f."cn_subtype";
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:57:33 - Thread-2454 (execute) - INFO - Total iteration counts: 1

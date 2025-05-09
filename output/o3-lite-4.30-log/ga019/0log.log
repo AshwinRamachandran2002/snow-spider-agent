@@ -1,0 +1,1931 @@
+2025-05-01 03:00:55 - Thread-1150 (execute) - INFO - [Answer format]
+```csv
+retention_percentage
+```
+[Answer format]
+2025-05-01 03:02:09 - Thread-1150 (execute) - INFO - [Exploration]
+Relevant columns and how they can help  
+
+• event_date : to keep only rows from 20180801‑20180930  
+• event_name : to spot installs (first_open) and un‑installs (app_remove)  
+• event_timestamp : to measure the “7‑day” window (micro‑seconds since epoch)  
+• user_pseudo_id : stable anonymous user id – the unit we count  
+• event_params : some GA events keep extra attributes here, but for this exercise we only need to know which rows are “app_remove” or “first_open”
+
+Typical conditions you will add  
+
+• event_date BETWEEN '20180801' AND '20180930'  
+• event_name IN ('first_open','app_remove')  
+• TIMESTAMP_MICROS(app_remove_ts) <= TIMESTAMP_MICROS(first_open_ts)+INTERVAL 7 DAY   ( to find uninstalls ≤7‑days )  
+
+Below are 10 exploratory → incremental → final BigQuery SQL snippets (each returns ≤20 rows just to inspect; remove the LIMIT when you want the full result).  
+All table names are in dataset firebase-public-project.analytics_153293282 and are daily‑partitioned, so we read them with the wildcard events_2018* and then filter on event_date.
+
+```sql
+-- 1. Quick look at the distinct event names on 1‑Aug‑2018
+SELECT DISTINCT event_name
+FROM `firebase-public-project.analytics_153293282.events_20180801`
+LIMIT 20;
+```
+
+```sql
+-- 2. Count the top‑20 events during Aug‑Sep 2018
+SELECT event_name, COUNT(*) AS hits
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_date BETWEEN '20180801' AND '20180930'
+GROUP BY event_name
+ORDER BY hits DESC
+LIMIT 20;
+```
+
+```sql
+-- 3. Show a few rows of the uninstall event to verify it is called “app_remove”
+SELECT event_date, event_timestamp, user_pseudo_id, event_params
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+```
+
+```sql
+-- 4. Take a glimpse of installations (first_open) in the period
+SELECT event_date, user_pseudo_id, event_timestamp
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+```
+
+```sql
+-- 5. One first_open per user (their first one in Aug‑Sep)
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS first_open_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+```
+
+```sql
+-- 6. For the same users, look at their earliest uninstall during the window
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS uninstall_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+```
+
+```sql
+-- 7. Join installs & uninstalls, keep flag if uninstalled ≤7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT i.user_pseudo_id,
+       i.first_open_ts,
+       u.uninstall_ts,
+       u.uninstall_ts IS NOT NULL 
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 AS uninstalled_within_7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+-- 8. Calculate counts of each category (≤7d, >7d, never)
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS installs,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NULL THEN 1           -- never uninstalled
+        WHEN u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000 THEN 1 -- >7d
+        ELSE 0
+      END) AS kept_≥7d_or_never,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NOT NULL
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 THEN 1
+        ELSE 0
+      END) AS uninstalled_≤7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+-- 9. Same as previous but compute the percentage
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NULL
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+      THEN 1
+      ELSE 0
+      END)                                    AS kept_users,
+  SAFE_DIVIDE(
+      SUM(CASE
+            WHEN u.uninstall_ts IS NULL
+              OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+          END),
+      COUNT(*)
+  ) AS pct_kept
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+-- 10. Final query (remove the LIMIT when you need the real value)
+--     percentage of users who did NOT uninstall within 7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(100 * SAFE_DIVIDE(
+      SUM(CASE
+            WHEN u.uninstall_ts IS NULL
+              OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1 ELSE 0 END),
+      COUNT(*)),2) AS pct_of_users_keep_app_≥7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+Run query 10 without the final `LIMIT` to obtain the actual percentage of August–September‑2018 installers who either never uninstalled or did so only after the 7‑day mark.
+[Exploration]
+2025-05-01 03:02:09 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 1. Quick look at the distinct event names on 1‑Aug‑2018
+SELECT DISTINCT event_name
+FROM `firebase-public-project.analytics_153293282.events_20180801`
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:11 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Quick look at the distinct event names on 1‑Aug‑2018
+SELECT DISTINCT event_name
+FROM `firebase-public-project.analytics_153293282.events_20180801`
+LIMIT 20;
+Results:
+event_name
+session_start
+level_complete_quickplay
+screen_view
+post_score
+level_start_quickplay
+level_end_quickplay
+level_fail_quickplay
+select_content
+user_engagement
+os_update
+error
+app_update
+level_complete
+level_up
+level_start
+level_end
+
+[Successfully executed]
+2025-05-01 03:02:11 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 2. Count the top‑20 events during Aug‑Sep 2018
+SELECT event_name, COUNT(*) AS hits
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_date BETWEEN '20180801' AND '20180930'
+GROUP BY event_name
+ORDER BY hits DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:18 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Count the top‑20 events during Aug‑Sep 2018
+SELECT event_name, COUNT(*) AS hits
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_date BETWEEN '20180801' AND '20180930'
+GROUP BY event_name
+ORDER BY hits DESC
+LIMIT 20;
+Results:
+event_name,hits
+screen_view,1283388
+user_engagement,691591
+level_start_quickplay,260422
+level_end_quickplay,175964
+post_score,126826
+level_complete_quickplay,108342
+level_fail_quickplay,67608
+select_content,59672
+level_reset_quickplay,59415
+session_start,40026
+
+[Successfully executed]
+2025-05-01 03:02:18 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 3. Show a few rows of the uninstall event to verify it is called “app_remove”
+SELECT event_date, event_timestamp, user_pseudo_id, event_params
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:23 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. Show a few rows of the uninstall event to verify it is called “app_remove”
+SELECT event_date, event_timestamp, user_pseudo_id, event_params
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+Results:
+event_date,event_timestamp,user_pseudo_id,event_params
+20180912,1536750348687000,97746CE0DF1E7BBB0EEB43509FEE15D3,"[{'key': 'firebase_event_origin', 'value': {'string_value': 'auto', 'int_value': None, 'float_value': None, 'double_value': None}}]"
+20180912,1536779847313000,4D907790B01ABA46B15A68BDCD097552,"[{'key': 'firebase_event_origin', 'value': {'string_value': 'auto', 'int_value': None, 'float_value': None, 'double_value': None}}]"
+
+[Successfully executed]
+2025-05-01 03:02:23 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 4. Take a glimpse of installations (first_open) in the period
+SELECT event_date, user_pseudo_id, event_timestamp
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:29 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4. Take a glimpse of installations (first_open) in the period
+SELECT event_date, user_pseudo_id, event_timestamp
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+Results:
+event_date,user_pseudo_id,event_timestamp
+20180815,0545C2BABDB15C6A952ECEA222E8F5E6,1534385001696000
+20180815,96B108514A10609B9E8F4F78B47B6776,1534364313386000
+20180815,7F8E0A83EA3833F063DA2107E073AC03,1534351821439000
+20180815,B234DE95E7BA43F7D422B2A2ED211629,1534372312457000
+20180815,51E3AEBCB31617B0A5EC1A48877E9A70,1534390469545000
+
+[Successfully executed]
+2025-05-01 03:02:29 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 5. One first_open per user (their first one in Aug‑Sep)
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS first_open_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:34 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5. One first_open per user (their first one in Aug‑Sep)
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS first_open_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+Results:
+user_pseudo_id,first_open_ts
+D40846D1475D5E46D321750750943A9C,1534225898268000
+33BDCF9DBB2653780046CC6B334D5718,1534223937372000
+47D7334EE5D3D6CA9FD36A01E38F0407,1534227566476000
+75C00378B3BA26B12559020A83A74355,1534216681217000
+38EC067E0FD1205E85B7922DEA496A50,1536427068186000
+1DBB4AF1E7845ECD3445E08335D9272A,1536420928866000
+
+[Successfully executed]
+2025-05-01 03:02:34 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 6. For the same users, look at their earliest uninstall during the window
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS uninstall_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:39 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6. For the same users, look at their earliest uninstall during the window
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS uninstall_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+Results:
+user_pseudo_id,uninstall_ts
+F9231C977F262065AFA5F376C746E0ED,1538072887047000
+6EF5C3E8529602BC3A0834E668861FF0,1538059113226000
+B79FEE3597E3C4A3B5A38FE33B684341,1536694347122022
+F37788083CD17FEF93F66A5A8CFA9BCD,1536706263714004
+41B8B6917AC3C354AC6A10CDC715FDDB,1536684457978013
+289290E298ED08B95B10DE971359B101,1536686983196182
+
+[Successfully executed]
+2025-05-01 03:02:39 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 7. Join installs & uninstalls, keep flag if uninstalled ≤7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT i.user_pseudo_id,
+       i.first_open_ts,
+       u.uninstall_ts,
+       u.uninstall_ts IS NOT NULL 
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 AS uninstalled_within_7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:46 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7. Join installs & uninstalls, keep flag if uninstalled ≤7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT i.user_pseudo_id,
+       i.first_open_ts,
+       u.uninstall_ts,
+       u.uninstall_ts IS NOT NULL 
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 AS uninstalled_within_7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+Results:
+user_pseudo_id,first_open_ts,uninstall_ts,uninstalled_within_7d
+80DAC92E1CDE9C7177BB9B381AFDA762,1537760725083000,,False
+A7A23172C4418FA7E936DB668F34B2C8,1537731510128000,,False
+3307DD0AEFB45F2AFEE766A57E2EC357,1537716649304000,,False
+C5AD1A3C5BA7749BBA184BC5138E6090,1537720280822000,,False
+
+[Successfully executed]
+2025-05-01 03:02:46 - Thread-1150 (execute) - INFO - [Try to execute]
+-- 8. Calculate counts of each category (≤7d, >7d, never)
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS installs,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NULL THEN 1           -- never uninstalled
+        WHEN u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000 THEN 1 -- >7d
+        ELSE 0
+      END) AS kept_≥7d_or_never,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NOT NULL
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 THEN 1
+        ELSE 0
+      END) AS uninstalled_≤7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:02:47 - Thread-1150 (execute) - INFO - [Error occurred]
+400 Syntax error: Illegal input character "\342" at [24:20]; reason: invalidQuery, location: query, message: Syntax error: Illegal input character "\342" at [24:20]
+
+Location: US
+Job ID: f3549ada-443c-4025-96c0-cd6c849c2fd9
+
+[Error occurred]
+2025-05-01 03:03:58 - Thread-1150 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Calculate total installs during Aug‑Sep 2018 and the share of users who either never uninstalled or uninstalled only after 7 days.
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts            -- earliest install per user
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts             -- earliest uninstall per user
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NULL                               -- never uninstalled
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000 -- uninstall > 7 days
+        THEN 1
+        ELSE 0
+      END
+  ) AS kept_ge_7d_or_never,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NOT NULL
+          AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 -- uninstall ≤ 7 days
+        THEN 1
+        ELSE 0
+      END
+  ) AS uninstalled_le_7d,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ), 2
+  ) AS pct_kept_ge_7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id);
+```
+[Corrected SQL]
+2025-05-01 03:04:06 - Thread-1150 (execute) - INFO - [Results for corrected sql]
+total_installs,kept_ge_7d_or_never,uninstalled_le_7d,pct_kept_ge_7d_or_never
+2647,1868,779,70.57
+
+[Results for corrected sql]
+2025-05-01 03:04:21 - Thread-1150 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Query 9 – same logic as the fixed query 8 but additionally returns the retention percentage. 
+--             All identifiers use plain ASCII only.
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NULL
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+        THEN 1
+        ELSE 0
+      END
+  ) AS kept_ge_7d_or_never,
+  SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+  ) AS pct_kept
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+--Description: Query 10 – final metric: percentage of Aug‑Sep 2018 installers who 
+--             did not uninstall within 7 days (never uninstalled or did so after 7 days).
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ), 
+    2
+  ) AS pct_users_kept_ge_7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 03:04:21 - Thread-1150 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Calculate total installs during Aug‑Sep 2018 and the share of users who either never uninstalled or uninstalled only after 7 days.
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts            -- earliest install per user
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts             -- earliest uninstall per user
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NULL                               -- never uninstalled
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000 -- uninstall > 7 days
+        THEN 1
+        ELSE 0
+      END
+  ) AS kept_ge_7d_or_never,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NOT NULL
+          AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 -- uninstall ≤ 7 days
+        THEN 1
+        ELSE 0
+      END
+  ) AS uninstalled_le_7d,
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ), 2
+  ) AS pct_kept_ge_7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id);
+Results:
+total_installs,kept_ge_7d_or_never,uninstalled_le_7d,pct_kept_ge_7d_or_never
+2647,1868,779,70.57
+
+[Successfully corrected]
+2025-05-01 03:04:21 - Thread-1150 (execute) - INFO - [Try to execute]
+--Description: Query 9 – same logic as the fixed query 8 but additionally returns the retention percentage. 
+--             All identifiers use plain ASCII only.
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NULL
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+        THEN 1
+        ELSE 0
+      END
+  ) AS kept_ge_7d_or_never,
+  SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+  ) AS pct_kept
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20
+[Try to execute]
+2025-05-01 03:04:39 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Query 9 – same logic as the fixed query 8 but additionally returns the retention percentage. 
+--             All identifiers use plain ASCII only.
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NULL
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+        THEN 1
+        ELSE 0
+      END
+  ) AS kept_ge_7d_or_never,
+  SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+  ) AS pct_kept
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20
+Results:
+total_installs,kept_ge_7d_or_never,pct_kept
+2647,1868,0.7057045712126936
+
+[Successfully executed]
+2025-05-01 03:04:39 - Thread-1150 (execute) - INFO - [Try to execute]
+--Description: Query 10 – final metric: percentage of Aug‑Sep 2018 installers who 
+--             did not uninstall within 7 days (never uninstalled or did so after 7 days).
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ), 
+    2
+  ) AS pct_users_kept_ge_7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20
+[Try to execute]
+2025-05-01 03:05:02 - Thread-1150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Query 10 – final metric: percentage of Aug‑Sep 2018 installers who 
+--             did not uninstall within 7 days (never uninstalled or did so after 7 days).
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ), 
+    2
+  ) AS pct_users_kept_ge_7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20
+Results:
+pct_users_kept_ge_7d_or_never
+70.57
+
+[Successfully executed]
+2025-05-01 03:05:02 - Thread-1150 (execute) - INFO - itercount: 0
+2025-05-01 03:05:02 - Thread-1150 (execute) - INFO - [Self-refine]
+Table full name: firebase-public-project.analytics_153293282.events_20180801
+Column name: event_date Type: STRING Description: None
+Column name: event_timestamp Type: INT64 Description: None
+Column name: event_name Type: STRING Description: None
+Column name: event_params Type: ARRAY<STRUCT<key STRING, value STRUCT<string_value STRING, int_value INT64, float_value FLOAT64, double_value FLOAT64>>> Description: None
+Column name: event_previous_timestamp Type: INT64 Description: None
+Column name: event_value_in_usd Type: FLOAT64 Description: None
+Column name: event_bundle_sequence_id Type: INT64 Description: None
+Column name: event_server_timestamp_offset Type: INT64 Description: None
+Column name: user_id Type: STRING Description: None
+Column name: user_pseudo_id Type: STRING Description: None
+Column name: user_properties Type: ARRAY<STRUCT<key STRING, value STRUCT<string_value STRING, int_value INT64, float_value FLOAT64, double_value FLOAT64, set_timestamp_micros INT64>>> Description: None
+Column name: user_first_touch_timestamp Type: INT64 Description: None
+Column name: user_ltv Type: STRUCT<revenue FLOAT64, currency STRING> Description: None
+Column name: device Type: STRUCT<category STRING, mobile_brand_name STRING, mobile_model_name STRING, mobile_marketing_name STRING, mobile_os_hardware_model STRING, operating_system STRING, operating_system_version STRING, vendor_id STRING, advertising_id STRING, language STRING, is_limited_ad_tracking STRING, time_zone_offset_seconds INT64> Description: None
+Column name: geo Type: STRUCT<continent STRING, country STRING, region STRING, city STRING> Description: None
+Column name: app_info Type: STRUCT<id STRING, version STRING, install_store STRING, firebase_app_id STRING, install_source STRING> Description: None
+Column name: traffic_source Type: STRUCT<name STRING, medium STRING, source STRING> Description: None
+Column name: stream_id Type: STRING Description: None
+Column name: platform Type: STRING Description: None
+Sample rows:
+[{'event_date': '20180801', 'event_timestamp': 1533178516177000, 'event_name': 'session_start', 'event_params': "[{'key': 'firebase_screen_class', 'value': {'string_value': 'FIRootViewController', 'int_value': None, 'float_value': None, 'double_value': None}}\n {'key': 'firebase_event_origin', 'value': {'string_value': 'auto', 'int_value': None, 'float_value': None, 'double_value': None}}\n {'key': 'firebase_screen_id', 'value': {'string_value': None, 'int_value': 2637284676279794019, 'float_value': None, 'double_value': None}}\n {'key': 'firebase_conversion', 'value': {'string_value': None, 'int_value': 1, 'float_value': None, 'double_value': None}}]", 'event_previous_timestamp': 1533014267739000, 'event_value_in_usd': nan, 'event_bundle_sequence_id': 951, 'event_server_timestamp_offset': 272781, 'user_id': None, 'user_pseudo_id': 'B458770ED6E295374FEEB3A68902CC28', 'user_properties': "[{'key': 'firebase_exp_3', 'value': {'string_value': '2', 'int_value': None, 'float_value': None, 'd
+
+Some other tables have the similar structure: ['events_20180801', 'events_20180621', 'events_20180616', 'events_20180912', 'events_20180814', 'events_20180716', 'events_20181003', 'events_20180620', 'events_20180624', 'events_20180918', 'events_20180612', 'events_20180911', 'events_20180724', 'events_20180807', 'events_20180710', 'events_20180808', 'events_20180702', 'events_20180719', 'events_20180914', 'events_20180913', 'events_20180915', 'events_20180728', 'events_20180817', 'events_20180628', 'events_20180906', 'events_20180704', 'events_20180711', 'events_20180720', 'events_20180706', 'events_20180926', 'events_20180924', 'events_20180731', 'events_20180804', 'events_20180920', 'events_20180715', 'events_20180709', 'events_20180928', 'events_20180904', 'events_20180903', 'events_20180818', 'events_20180820', 'events_20180707', 'events_20180930', 'events_20180821', 'events_20180812', 'events_20180830', 'events_20180908', 'events_20180708', 'events_20180910', 'events_20180922', 'events_20180713', 'events_20180618', 'events_20180811', 'events_20181001', 'events_20180626', 'events_20180828', 'events_20180717', 'events_20180806', 'events_20180721', 'events_20180725', 'events_20180824', 'events_20180923', 'events_20180627', 'events_20180726', 'events_20180729', 'events_20180929', 'events_20180925', 'events_20180722', 'events_20180630', 'events_20180730', 'events_20180831', 'events_20180701', 'events_20180619', 'events_20180810', 'events_20180822', 'events_20180921', 'events_20180819', 'events_20180927', 'events_20180905', 'events_20180816', 'events_20180622', 'events_20180802', 'events_20180826', 'events_20180714', 'events_20180901', 'events_20180916', 'events_20180809', 'events_20181002', 'events_20180703', 'events_20180617', 'events_20180902', 'events_20180625', 'events_20180827', 'events_20180805', 'events_20180825', 'events_20180919', 'events_20180917', 'events_20180705', 'events_20180613', 'events_20180907', 'events_20180909', 'events_20180727', 'events_20180813', 'events_20180614', 'events_20180623', 'events_20180829', 'events_20180615', 'events_20180712', 'events_20180718', 'events_20180815', 'events_20180629', 'events_20180803', 'events_20180823', 'events_20180723']
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'firebase-public-project': {'analytics_153293282': ['events_20180801', 'events_20180801', 'events_20180621', 'events_20180616', 'events_20180912', 'events_20180814', 'events_20180716', 'events_20181003', 'events_20180620', 'events_20180624', 'events_20180918', 'events_20180612', 'events_20180911', 'events_20180724', 'events_20180807', 'events_20180710', 'events_20180808', 'events_20180702', 'events_20180719', 'events_20180914', 'events_20180913', 'events_20180915', 'events_20180728', 'events_20180817', 'events_20180628', 'events_20180906', 'events_20180704', 'events_20180711', 'events_20180720', 'events_20180706', 'events_20180926', 'events_20180924', 'events_20180731', 'events_20180804', 'events_20180920', 'events_20180715', 'events_20180709', 'events_20180928', 'events_20180904', 'events_20180903', 'events_20180818', 'events_20180820', 'events_20180707', 'events_20180930', 'events_20180821', 'events_20180812', 'events_20180830', 'events_20180908', 'events_20180708', 'events_20180910', 'events_20180922', 'events_20180713', 'events_20180618', 'events_20180811', 'events_20181001', 'events_20180626', 'events_20180828', 'events_20180717', 'events_20180806', 'events_20180721', 'events_20180725', 'events_20180824', 'events_20180923', 'events_20180627', 'events_20180726', 'events_20180729', 'events_20180929', 'events_20180925', 'events_20180722', 'events_20180630', 'events_20180730', 'events_20180831', 'events_20180701', 'events_20180619', 'events_20180810', 'events_20180822', 'events_20180921', 'events_20180819', 'events_20180927', 'events_20180905', 'events_20180816', 'events_20180622', 'events_20180802', 'events_20180826', 'events_20180714', 'events_20180901', 'events_20180916', 'events_20180809', 'events_20181002', 'events_20180703', 'events_20180617', 'events_20180902', 'events_20180625', 'events_20180827', 'events_20180805', 'events_20180825', 'events_20180919', 'events_20180917', 'events_20180705', 'events_20180613', 'events_20180907', 'events_20180909', 'events_20180727', 'events_20180813', 'events_20180614', 'events_20180623', 'events_20180829', 'events_20180615', 'events_20180712', 'events_20180718', 'events_20180815', 'events_20180629', 'events_20180803', 'events_20180823', 'events_20180723']}}
+Begin Exploring Related Columns
+Relevant columns and how they can help  
+
+• event_date : to keep only rows from 20180801‑20180930  
+• event_name : to spot installs (first_open) and un‑installs (app_remove)  
+• event_timestamp : to measure the “7‑day” window (micro‑seconds since epoch)  
+• user_pseudo_id : stable anonymous user id – the unit we count  
+• event_params : some GA events keep extra attributes here, but for this exercise we only need to know which rows are “app_remove” or “first_open”
+
+Typical conditions you will add  
+
+• event_date BETWEEN '20180801' AND '20180930'  
+• event_name IN ('first_open','app_remove')  
+• TIMESTAMP_MICROS(app_remove_ts) <= TIMESTAMP_MICROS(first_open_ts)+INTERVAL 7 DAY   ( to find uninstalls ≤7‑days )  
+
+Below are 10 exploratory → incremental → final BigQuery SQL snippets (each returns ≤20 rows just to inspect; remove the LIMIT when you want the full result).  
+All table names are in dataset firebase-public-project.analytics_153293282 and are daily‑partitioned, so we read them with the wildcard events_2018* and then filter on event_date.
+
+```sql
+-- 1. Quick look at the distinct event names on 1‑Aug‑2018
+SELECT DISTINCT event_name
+FROM `firebase-public-project.analytics_153293282.events_20180801`
+LIMIT 20;
+```
+
+```sql
+-- 2. Count the top‑20 events during Aug‑Sep 2018
+SELECT event_name, COUNT(*) AS hits
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_date BETWEEN '20180801' AND '20180930'
+GROUP BY event_name
+ORDER BY hits DESC
+LIMIT 20;
+```
+
+```sql
+-- 3. Show a few rows of the uninstall event to verify it is called “app_remove”
+SELECT event_date, event_timestamp, user_pseudo_id, event_params
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+```
+
+```sql
+-- 4. Take a glimpse of installations (first_open) in the period
+SELECT event_date, user_pseudo_id, event_timestamp
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+```
+
+```sql
+-- 5. One first_open per user (their first one in Aug‑Sep)
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS first_open_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+```
+
+```sql
+-- 6. For the same users, look at their earliest uninstall during the window
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS uninstall_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+```
+
+```sql
+-- 7. Join installs & uninstalls, keep flag if uninstalled ≤7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT i.user_pseudo_id,
+       i.first_open_ts,
+       u.uninstall_ts,
+       u.uninstall_ts IS NOT NULL 
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 AS uninstalled_within_7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+-- 8. Calculate counts of each category (≤7d, >7d, never)
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS installs,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NULL THEN 1           -- never uninstalled
+        WHEN u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000 THEN 1 -- >7d
+        ELSE 0
+      END) AS kept_≥7d_or_never,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NOT NULL
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 THEN 1
+        ELSE 0
+      END) AS uninstalled_≤7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+-- 9. Same as previous but compute the percentage
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(CASE
+        WHEN u.uninstall_ts IS NULL
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+      THEN 1
+      ELSE 0
+      END)                                    AS kept_users,
+  SAFE_DIVIDE(
+      SUM(CASE
+            WHEN u.uninstall_ts IS NULL
+              OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+          END),
+      COUNT(*)
+  ) AS pct_kept
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+```sql
+-- 10. Final query (remove the LIMIT when you need the real value)
+--     percentage of users who did NOT uninstall within 7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(100 * SAFE_DIVIDE(
+      SUM(CASE
+            WHEN u.uninstall_ts IS NULL
+              OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1 ELSE 0 END),
+      COUNT(*)),2) AS pct_of_users_keep_app_≥7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+```
+
+Run query 10 without the final `LIMIT` to obtain the actual percentage of August–September‑2018 installers who either never uninstalled or did so only after the 7‑day mark.
+Refined SQLs and results:
+Query:
+-- 1. Quick look at the distinct event names on 1‑Aug‑2018
+SELECT DISTINCT event_name
+FROM `firebase-public-project.analytics_153293282.events_20180801`
+LIMIT 20;
+Answer:
+event_name
+session_start
+level_complete_quickplay
+screen_view
+post_score
+level_start_quickplay
+level_end_quickplay
+level_fail_quickplay
+select_content
+user_engagement
+os_update
+error
+app_update
+level_complete
+level_up
+level_start
+level_end
+Query:
+-- 2. Count the top‑20 events during Aug‑Sep 2018
+SELECT event_name, COUNT(*) AS hits
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_date BETWEEN '20180801' AND '20180930'
+GROUP BY event_name
+ORDER BY hits DESC
+LIMIT 20;
+Answer:
+event_name,hits
+screen_view,1283388
+user_engagement,691591
+level_start_quickplay,260422
+level_end_quickplay,175964
+post_score,126826
+level_complete_quickplay,108342
+level_fail_quickplay,67608
+select_content,59672
+level_reset_quickplay,59415
+session_start,40026
+Query:
+-- 3. Show a few rows of the uninstall event to verify it is called “app_remove”
+SELECT event_date, event_timestamp, user_pseudo_id, event_params
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+Answer:
+event_date,event_timestamp,user_pseudo_id,event_params
+20180912,1536750348687000,97746CE0DF1E7BBB0EEB43509FEE15D3,"[{'key': 'firebase_event_origin', 'value': {'string_value': 'auto', 'int_value': None, 'float_value': None, 'double_value': None}}]"
+20180912,1536779847313000,4D907790B01ABA46B15A68BDCD097552,"[{'key': 'firebase_event_origin', 'value': {'string_value': 'auto', 'int_value': None, 'float_value': None, 'double_value': None}}]"
+Query:
+-- 4. Take a glimpse of installations (first_open) in the period
+SELECT event_date, user_pseudo_id, event_timestamp
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+LIMIT 20;
+Answer:
+event_date,user_pseudo_id,event_timestamp
+20180815,0545C2BABDB15C6A952ECEA222E8F5E6,1534385001696000
+20180815,96B108514A10609B9E8F4F78B47B6776,1534364313386000
+20180815,7F8E0A83EA3833F063DA2107E073AC03,1534351821439000
+20180815,B234DE95E7BA43F7D422B2A2ED211629,1534372312457000
+20180815,51E3AEBCB31617B0A5EC1A48877E9A70,1534390469545000
+Query:
+-- 5. One first_open per user (their first one in Aug‑Sep)
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS first_open_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'first_open'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+Answer:
+user_pseudo_id,first_open_ts
+D40846D1475D5E46D321750750943A9C,1534225898268000
+33BDCF9DBB2653780046CC6B334D5718,1534223937372000
+47D7334EE5D3D6CA9FD36A01E38F0407,1534227566476000
+75C00378B3BA26B12559020A83A74355,1534216681217000
+38EC067E0FD1205E85B7922DEA496A50,1536427068186000
+1DBB4AF1E7845ECD3445E08335D9272A,1536420928866000
+Query:
+-- 6. For the same users, look at their earliest uninstall during the window
+SELECT user_pseudo_id,
+       MIN(event_timestamp) AS uninstall_ts
+FROM `firebase-public-project.analytics_153293282.events_2018*`
+WHERE event_name = 'app_remove'
+  AND event_date BETWEEN '20180801' AND '20180930'
+GROUP BY user_pseudo_id
+LIMIT 20;
+Answer:
+user_pseudo_id,uninstall_ts
+F9231C977F262065AFA5F376C746E0ED,1538072887047000
+6EF5C3E8529602BC3A0834E668861FF0,1538059113226000
+B79FEE3597E3C4A3B5A38FE33B684341,1536694347122022
+F37788083CD17FEF93F66A5A8CFA9BCD,1536706263714004
+41B8B6917AC3C354AC6A10CDC715FDDB,1536684457978013
+289290E298ED08B95B10DE971359B101,1536686983196182
+Query:
+-- 7. Join installs & uninstalls, keep flag if uninstalled ≤7 days
+WITH installs AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT user_pseudo_id,
+         MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT i.user_pseudo_id,
+       i.first_open_ts,
+       u.uninstall_ts,
+       u.uninstall_ts IS NOT NULL 
+         AND u.uninstall_ts <= i.first_open_ts + 7*24*60*60*1000000 AS uninstalled_within_7d
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20;
+Answer:
+user_pseudo_id,first_open_ts,uninstall_ts,uninstalled_within_7d
+80DAC92E1CDE9C7177BB9B381AFDA762,1537760725083000,,False
+A7A23172C4418FA7E936DB668F34B2C8,1537731510128000,,False
+3307DD0AEFB45F2AFEE766A57E2EC357,1537716649304000,,False
+C5AD1A3C5BA7749BBA184BC5138E6090,1537720280822000,,False
+Query:
+--Description: Query 9 – same logic as the fixed query 8 but additionally returns the retention percentage. 
+--             All identifiers use plain ASCII only.
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  COUNT(*) AS total_installs,
+  SUM(
+      CASE
+        WHEN u.uninstall_ts IS NULL
+          OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+        THEN 1
+        ELSE 0
+      END
+  ) AS kept_ge_7d_or_never,
+  SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+  ) AS pct_kept
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20
+Answer:
+total_installs,kept_ge_7d_or_never,pct_kept
+2647,1868,0.7057045712126936
+Query:
+--Description: Query 10 – final metric: percentage of Aug‑Sep 2018 installers who 
+--             did not uninstall within 7 days (never uninstalled or did so after 7 days).
+WITH installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'first_open'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM `firebase-public-project.analytics_153293282.events_2018*`
+  WHERE event_name = 'app_remove'
+    AND event_date BETWEEN '20180801' AND '20180930'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN u.uninstall_ts IS NULL
+            OR u.uninstall_ts > i.first_open_ts + 7*24*60*60*1000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ), 
+    2
+  ) AS pct_users_kept_ge_7d_or_never
+FROM installs i
+LEFT JOIN uninstalls u
+USING (user_pseudo_id)
+LIMIT 20
+Answer:
+pct_users_kept_ge_7d_or_never
+70.57
+End Exploring Related Columns
+Task: Could you determine what percentage of users either did not uninstall our app within seven days or never uninstalled it after installing during August and September 2018?
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+Usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Follow the answer format like: ```csv
+retention_percentage
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'firebase-public-project': {'analytics_153293282': ['events_20180801', 'events_20180801', 'events_20180621', 'events_20180616', 'events_20180912', 'events_20180814', 'events_20180716', 'events_20181003', 'events_20180620', 'events_20180624', 'events_20180918', 'events_20180612', 'events_20180911', 'events_20180724', 'events_20180807', 'events_20180710', 'events_20180808', 'events_20180702', 'events_20180719', 'events_20180914', 'events_20180913', 'events_20180915', 'events_20180728', 'events_20180817', 'events_20180628', 'events_20180906', 'events_20180704', 'events_20180711', 'events_20180720', 'events_20180706', 'events_20180926', 'events_20180924', 'events_20180731', 'events_20180804', 'events_20180920', 'events_20180715', 'events_20180709', 'events_20180928', 'events_20180904', 'events_20180903', 'events_20180818', 'events_20180820', 'events_20180707', 'events_20180930', 'events_20180821', 'events_20180812', 'events_20180830', 'events_20180908', 'events_20180708', 'events_20180910', 'events_20180922', 'events_20180713', 'events_20180618', 'events_20180811', 'events_20181001', 'events_20180626', 'events_20180828', 'events_20180717', 'events_20180806', 'events_20180721', 'events_20180725', 'events_20180824', 'events_20180923', 'events_20180627', 'events_20180726', 'events_20180729', 'events_20180929', 'events_20180925', 'events_20180722', 'events_20180630', 'events_20180730', 'events_20180831', 'events_20180701', 'events_20180619', 'events_20180810', 'events_20180822', 'events_20180921', 'events_20180819', 'events_20180927', 'events_20180905', 'events_20180816', 'events_20180622', 'events_20180802', 'events_20180826', 'events_20180714', 'events_20180901', 'events_20180916', 'events_20180809', 'events_20181002', 'events_20180703', 'events_20180617', 'events_20180902', 'events_20180625', 'events_20180827', 'events_20180805', 'events_20180825', 'events_20180919', 'events_20180917', 'events_20180705', 'events_20180613', 'events_20180907', 'events_20180909', 'events_20180727', 'events_20180813', 'events_20180614', 'events_20180623', 'events_20180829', 'events_20180615', 'events_20180712', 'events_20180718', 'events_20180815', 'events_20180629', 'events_20180803', 'events_20180823', 'events_20180723']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 03:06:11 - Thread-1150 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH all_events AS (
+  SELECT event_name, event_timestamp, user_pseudo_id FROM (
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180801` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180802` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180803` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180804` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180805` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180806` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180807` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180808` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180809` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180810` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180811` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180812` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180813` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180814` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180815` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180816` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180817` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180818` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180819` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180820` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180821` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180822` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180823` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180824` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180825` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180826` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180827` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180828` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180829` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180830` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180831` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180901` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180902` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180903` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180904` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180905` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180906` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180907` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180908` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180909` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180910` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180911` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180912` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180913` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180914` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180915` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180916` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180917` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180918` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180919` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180920` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180921` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180922` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180923` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180924` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180925` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180926` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180927` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180928` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180929` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180930`
+  )
+  WHERE event_name IN ('first_open', 'app_remove')
+),
+installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM all_events
+  WHERE event_name = 'first_open'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM all_events
+  WHERE event_name = 'app_remove'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN uninstalls.uninstall_ts IS NULL
+               OR uninstalls.uninstall_ts > installs.first_open_ts + 604800000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ),
+    2
+  ) AS retention_percentage;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:06:12 - Thread-1150 (execute) - INFO - itercount: 1
+2025-05-01 03:06:12 - Thread-1150 (execute) - INFO - [Self-refine]
+Input sql:
+WITH all_events AS (
+  SELECT event_name, event_timestamp, user_pseudo_id FROM (
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180801` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180802` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180803` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180804` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180805` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180806` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180807` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180808` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180809` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180810` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180811` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180812` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180813` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180814` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180815` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180816` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180817` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180818` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180819` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180820` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180821` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180822` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180823` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180824` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180825` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180826` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180827` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180828` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180829` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180830` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180831` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180901` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180902` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180903` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180904` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180905` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180906` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180907` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180908` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180909` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180910` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180911` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180912` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180913` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180914` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180915` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180916` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180917` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180918` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180919` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180920` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180921` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180922` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180923` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180924` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180925` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180926` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180927` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180928` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180929` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180930`
+  )
+  WHERE event_name IN ('first_open', 'app_remove')
+),
+installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM all_events
+  WHERE event_name = 'first_open'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM all_events
+  WHERE event_name = 'app_remove'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN uninstalls.uninstall_ts IS NULL
+               OR uninstalls.uninstall_ts > installs.first_open_ts + 604800000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ),
+    2
+  ) AS retention_percentage;
+The error information is:
+400 Unrecognized name: uninstalls at [88:16]; reason: invalidQuery, location: query, message: Unrecognized name: uninstalls at [88:16]
+
+Location: US
+Job ID: 7e299826-2aa5-47f8-a0ec-280aa0137525
+
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 03:07:32 - Thread-1150 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH all_events AS (
+  SELECT event_name, event_timestamp, user_pseudo_id FROM (
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180801` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180802` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180803` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180804` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180805` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180806` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180807` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180808` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180809` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180810` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180811` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180812` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180813` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180814` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180815` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180816` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180817` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180818` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180819` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180820` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180821` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180822` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180823` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180824` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180825` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180826` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180827` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180828` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180829` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180830` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180831` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180901` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180902` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180903` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180904` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180905` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180906` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180907` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180908` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180909` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180910` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180911` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180912` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180913` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180914` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180915` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180916` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180917` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180918` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180919` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180920` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180921` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180922` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180923` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180924` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180925` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180926` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180927` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180928` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180929` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180930`
+  )
+  WHERE event_name IN ('first_open', 'app_remove')
+),
+installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM all_events
+  WHERE event_name = 'first_open'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM all_events
+  WHERE event_name = 'app_remove'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN uninstalls.uninstall_ts IS NULL
+               OR uninstalls.uninstall_ts > installs.first_open_ts + 604800000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ),
+    2
+  ) AS retention_percentage
+FROM installs
+LEFT JOIN uninstalls USING(user_pseudo_id);
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:07:34 - Thread-1150 (execute) - INFO - [Executed results in self-refine]
+retention_percentage
+70.57
+
+[Executed results in self-refine]
+2025-05-01 03:07:34 - Thread-1150 (execute) - INFO - itercount: 2
+2025-05-01 03:07:34 - Thread-1150 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Could you determine what percentage of users either did not uninstall our app within seven days or never uninstalled it after installing during August and September 2018?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+retention_percentage
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+retention_percentage
+70.57
+Current sql:
+WITH all_events AS (
+  SELECT event_name, event_timestamp, user_pseudo_id FROM (
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180801` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180802` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180803` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180804` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180805` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180806` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180807` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180808` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180809` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180810` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180811` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180812` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180813` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180814` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180815` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180816` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180817` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180818` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180819` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180820` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180821` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180822` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180823` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180824` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180825` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180826` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180827` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180828` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180829` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180830` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180831` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180901` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180902` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180903` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180904` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180905` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180906` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180907` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180908` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180909` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180910` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180911` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180912` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180913` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180914` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180915` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180916` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180917` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180918` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180919` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180920` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180921` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180922` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180923` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180924` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180925` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180926` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180927` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180928` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180929` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180930`
+  )
+  WHERE event_name IN ('first_open', 'app_remove')
+),
+installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM all_events
+  WHERE event_name = 'first_open'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM all_events
+  WHERE event_name = 'app_remove'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN uninstalls.uninstall_ts IS NULL
+               OR uninstalls.uninstall_ts > installs.first_open_ts + 604800000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ),
+    2
+  ) AS retention_percentage
+FROM installs
+LEFT JOIN uninstalls USING(user_pseudo_id);
+[Self-refine]
+2025-05-01 03:08:25 - Thread-1150 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH all_events AS (
+  SELECT event_name, event_timestamp, user_pseudo_id FROM (
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180801` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180802` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180803` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180804` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180805` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180806` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180807` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180808` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180809` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180810` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180811` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180812` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180813` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180814` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180815` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180816` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180817` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180818` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180819` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180820` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180821` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180822` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180823` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180824` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180825` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180826` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180827` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180828` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180829` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180830` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180831` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180901` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180902` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180903` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180904` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180905` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180906` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180907` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180908` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180909` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180910` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180911` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180912` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180913` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180914` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180915` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180916` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180917` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180918` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180919` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180920` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180921` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180922` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180923` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180924` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180925` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180926` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180927` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180928` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180929` UNION ALL
+    SELECT event_name, event_timestamp, user_pseudo_id FROM `firebase-public-project.analytics_153293282.events_20180930`
+  )
+  WHERE event_name IN ('first_open', 'app_remove')
+),
+installs AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS first_open_ts
+  FROM all_events
+  WHERE event_name = 'first_open'
+  GROUP BY user_pseudo_id
+),
+uninstalls AS (
+  SELECT
+    user_pseudo_id,
+    MIN(event_timestamp) AS uninstall_ts
+  FROM all_events
+  WHERE event_name = 'app_remove'
+  GROUP BY user_pseudo_id
+)
+SELECT
+  ROUND(
+    100 * SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN uninstalls.uninstall_ts IS NULL
+               OR uninstalls.uninstall_ts > installs.first_open_ts + 604800000000
+          THEN 1
+          ELSE 0
+        END
+      ),
+      COUNT(*)
+    ),
+    4
+  ) AS retention_percentage
+FROM installs
+LEFT JOIN uninstalls USING (user_pseudo_id);
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:08:29 - Thread-1150 (execute) - INFO - [Executed results in self-refine]
+retention_percentage
+70.5705
+
+[Executed results in self-refine]
+2025-05-01 03:08:29 - Thread-1150 (execute) - INFO - [Consistent results]
+retention_percentage
+70.5705
+
+[Consistent results]
+2025-05-01 03:08:29 - Thread-1150 (execute) - INFO - Total iteration counts: 2

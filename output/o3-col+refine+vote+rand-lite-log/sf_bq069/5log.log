@@ -1,0 +1,2126 @@
+2025-05-05 03:33:41 - Thread-2206 (execute) - INFO - [Exploration]
+```sql
+--Description: 1) Inspect a few non-NLST CT instances to get a feeling for key attributes
+SELECT
+  "collection_name",
+  "PatientID",
+  "SeriesInstanceUID",
+  "SOPInstanceUID",
+  "TransferSyntaxUID",
+  CAST("ImageType" AS STRING) AS "ImageType",
+  "PixelSpacing",
+  "ImageOrientationPatient"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+```
+
+```sql
+--Description: 2) List distinct TransferSyntaxUIDs used by non-NLST CT images
+SELECT DISTINCT
+  "TransferSyntaxUID"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+```
+
+```sql
+--Description: 3) Look for ImageType values that might indicate localizers
+SELECT DISTINCT
+  CAST("ImageType" AS STRING) AS "ImageType"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+  AND CAST("ImageType" AS STRING) ILIKE '%LOCAL%'
+LIMIT 20;
+```
+
+```sql
+--Description: 4) How many CT series per external collection (non-NLST)?
+SELECT
+  "collection_name",
+  COUNT(DISTINCT "SeriesInstanceUID") AS "series_cnt"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "collection_name"
+ORDER BY "series_cnt" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 5) Verify that individual series have a single ImageOrientationPatient value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS "orient_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "orient_variants" > 1
+LIMIT 20;
+```
+
+```sql
+--Description: 6) Check that each series has only one PixelSpacing value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("PixelSpacing")) AS "pix_spc_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "pix_spc_variants" > 1
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Find series where number of instances differs from number of unique ImagePositionPatient values
+SELECT
+  "SeriesInstanceUID",
+  COUNT(*)                                     AS "num_instances",
+  COUNT(DISTINCT TO_VARIANT("ImagePositionPatient")) AS "unique_positions"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING COUNT(*) <> COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Compute the absolute dot product (|cz|) between cross-product of orientation vectors and [0,0,1] for a sample of series
+WITH orient AS (
+  SELECT
+    "SeriesInstanceUID",
+    "ImageOrientationPatient"[0]::FLOAT AS o0,
+    "ImageOrientationPatient"[1]::FLOAT AS o1,
+    "ImageOrientationPatient"[2]::FLOAT AS o2,
+    "ImageOrientationPatient"[3]::FLOAT AS o3,
+    "ImageOrientationPatient"[4]::FLOAT AS o4,
+    "ImageOrientationPatient"[5]::FLOAT AS o5,
+    ROW_NUMBER() OVER (PARTITION BY "SeriesInstanceUID") AS rn
+  FROM "IDC"."IDC_V17"."DICOM_ALL"
+  WHERE "Modality" = 'CT'
+    AND "collection_name" <> 'NLST'
+)
+SELECT
+  "SeriesInstanceUID",
+  ABS( (o0 * o4) - (o1 * o3) ) AS "abs_dot_cz"
+FROM orient
+WHERE rn = 1           -- only need one instance per series (orientation already identical)
+LIMIT 20;
+```
+
+```sql
+--Description: 9) Examine min & max slice-to-slice z-spacing within each series
+WITH pos AS (
+  SELECT
+    "SeriesInstanceUID",
+    "ImagePositionPatient"[2]::FLOAT                     AS z,
+    ROW_NUMBER() OVER (PARTITION BY "SeriesInstanceUID"
+                       ORDER BY "ImagePositionPatient"[2]::FLOAT) AS rn
+  FROM "IDC"."IDC_V17"."DICOM_ALL"
+  WHERE "Modality" = 'CT'
+    AND "collection_name" <> 'NLST'
+)
+, diffs AS (
+  SELECT
+    "SeriesInstanceUID",
+    ABS(z - LAG(z) OVER (PARTITION BY "SeriesInstanceUID" ORDER BY rn)) AS dz
+  FROM pos
+)
+SELECT
+  "SeriesInstanceUID",
+  MIN(dz) AS "min_dz",
+  MAX(dz) AS "max_dz"
+FROM diffs
+GROUP BY "SeriesInstanceUID"
+LIMIT 20;
+```
+
+```sql
+--Description: 10) Full report (sample 20) for qualified CT series – geometry check, exposure stats & series size
+WITH base AS (   -- preliminary filters
+  SELECT *
+  FROM "IDC"."IDC_V17"."DICOM_ALL"
+  WHERE "Modality" = 'CT'
+    AND "collection_name" <> 'NLST'
+    AND "TransferSyntaxUID" NOT IN ('1.2.840.10008.1.2.4.70','1.2.840.10008.1.2.4.51')
+    AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCAL%'
+)
+, geo_ok AS (     -- geometry consistency rules
+  SELECT
+    "SeriesInstanceUID",
+    "SeriesNumber",
+    "StudyInstanceUID",
+    "PatientID",
+    COUNT(*)                                          AS num_instances,
+    COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient"))       AS orient_ct,
+    COUNT(DISTINCT TO_VARIANT("PixelSpacing"))                  AS pix_ct,
+    COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))          AS pos_ct,
+    COUNT(DISTINCT CONCAT(
+            "ImagePositionPatient"[0]::STRING, ',',
+            "ImagePositionPatient"[1]::STRING))                AS xy_ct,
+    COUNT(DISTINCT "Rows") AS row_ct,
+    COUNT(DISTINCT "Columns") AS col_ct
+  FROM base
+  GROUP BY 1,2,3,4
+  HAVING orient_ct = 1
+     AND pix_ct    = 1
+     AND pos_ct    = num_instances
+     AND xy_ct     = 1
+     AND row_ct    = 1
+     AND col_ct    = 1
+)
+, orient AS (      -- one orientation row per series to compute dot product
+  SELECT
+    g."SeriesInstanceUID",
+    g."SeriesNumber",
+    g."StudyInstanceUID",
+    g."PatientID",
+    b."ImageOrientationPatient"[0]::FLOAT AS o0,
+    b."ImageOrientationPatient"[1]::FLOAT AS o1,
+    b."ImageOrientationPatient"[2]::FLOAT AS o2,
+    b."ImageOrientationPatient"[3]::FLOAT AS o3,
+    b."ImageOrientationPatient"[4]::FLOAT AS o4,
+    b."ImageOrientationPatient"[5]::FLOAT AS o5
+  FROM geo_ok g
+  JOIN base b
+    ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY g."SeriesInstanceUID") = 1
+)
+, dot_chk AS (     -- dot product condition (|cz| within 0.99 – 1.01)
+  SELECT *,
+    ABS( (o0 * o4) - (o1 * o3) ) AS abs_dot
+  FROM orient
+  WHERE ABS( ABS( (o0 * o4) - (o1 * o3) ) - 1 ) <= 0.01
+)
+, z_vals AS (      -- z-coordinate list
+  SELECT
+    b."SeriesInstanceUID",
+    b."ImagePositionPatient"[2]::FLOAT AS z,
+    ROW_NUMBER() OVER (PARTITION BY b."SeriesInstanceUID"
+                       ORDER BY b."ImagePositionPatient"[2]::FLOAT) AS rn
+  FROM base b
+  JOIN dot_chk d
+    ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+)
+, z_diff AS (
+  SELECT
+    "SeriesInstanceUID",
+    ABS(z - LAG(z) OVER (PARTITION BY "SeriesInstanceUID" ORDER BY rn)) AS dz
+  FROM z_vals
+)
+, z_aggr AS (
+  SELECT
+    "SeriesInstanceUID",
+    MAX(dz) AS max_dz,
+    MIN(dz) AS min_dz,
+    MAX(dz) - MIN(dz) AS tol_dz
+  FROM z_diff
+  GROUP BY "SeriesInstanceUID"
+)
+, exp_aggr AS (    -- exposure statistics
+  SELECT
+    b."SeriesInstanceUID",
+    COUNT(DISTINCT b."Exposure")                                       AS exp_cnt,
+    MAX(NULLIF(b."Exposure",'')::FLOAT)                                AS exp_max,
+    MIN(NULLIF(b."Exposure",'')::FLOAT)                                AS exp_min,
+    MAX(NULLIF(b."Exposure",'')::FLOAT) - MIN(NULLIF(b."Exposure",'')::FLOAT) AS exp_range
+  FROM base b
+  JOIN dot_chk d
+    ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+  GROUP BY b."SeriesInstanceUID"
+)
+, size_aggr AS (   -- total series size in MiB
+  SELECT
+    "SeriesInstanceUID",
+    SUM("instance_size") / (1024.0*1024.0) AS series_mib
+  FROM base
+  GROUP BY "SeriesInstanceUID"
+)
+SELECT
+  d."SeriesInstanceUID"                                    AS "series_uid",
+  d."SeriesNumber"                                         AS "series_no",
+  d."StudyInstanceUID"                                     AS "study_uid",
+  d."PatientID"                                            AS "patient_id",
+  d.abs_dot                                                AS "max_abs_dot",
+  g.num_instances                                          AS "num_sop",
+  COUNT(DISTINCT b."SliceThickness")                       AS "distinct_thk",
+  z.max_dz                                                 AS "max_dz",
+  z.min_dz                                                 AS "min_dz",
+  z.tol_dz                                                 AS "tol_dz",
+  e.exp_cnt                                                AS "distinct_exp",
+  e.exp_max                                                AS "exp_max",
+  e.exp_min                                                AS "exp_min",
+  e.exp_range                                              AS "exp_range",
+  s.series_mib                                             AS "series_mib"
+FROM dot_chk d
+JOIN geo_ok      g ON d."SeriesInstanceUID" = g."SeriesInstanceUID"
+JOIN z_aggr      z ON d."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr    e ON d."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr   s ON d."SeriesInstanceUID" = s."SeriesInstanceUID"
+JOIN base        b ON d."SeriesInstanceUID" = b."SeriesInstanceUID"
+GROUP BY
+  d."SeriesInstanceUID", d."SeriesNumber", d."StudyInstanceUID",
+  d."PatientID", d.abs_dot, g.num_instances,
+  z.max_dz, z.min_dz, z.tol_dz,
+  e.exp_cnt, e.exp_max, e.exp_min, e.exp_range,
+  s.series_mib
+ORDER BY
+  z.tol_dz DESC,
+  e.exp_range DESC,
+  d."SeriesInstanceUID" DESC
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 03:33:41 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 1) Inspect a few non-NLST CT instances to get a feeling for key attributes
+SELECT
+  "collection_name",
+  "PatientID",
+  "SeriesInstanceUID",
+  "SOPInstanceUID",
+  "TransferSyntaxUID",
+  CAST("ImageType" AS STRING) AS "ImageType",
+  "PixelSpacing",
+  "ImageOrientationPatient"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:34:43 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1) Inspect a few non-NLST CT instances to get a feeling for key attributes
+SELECT
+  "collection_name",
+  "PatientID",
+  "SeriesInstanceUID",
+  "SOPInstanceUID",
+  "TransferSyntaxUID",
+  CAST("ImageType" AS STRING) AS "ImageType",
+  "PixelSpacing",
+  "ImageOrientationPatient"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+Results:
+collection_name,PatientID,SeriesInstanceUID,SOPInstanceUID,TransferSyntaxUID,ImageType,PixelSpacing,ImageOrientationPatient
+TCGA-LUAD,TCGA-50-6591,1.3.6.1.4.1.14519.5.2.1.6450.9002.846229601736691277174430202883,1.3.6.1.4.1.14519.5.2.1.6450.9002.738451669214003028604300251738,1.2.840.10008.1.2.1,"[""ORIGINAL"",""PRIMARY"",""AXIAL"",""CT_SOM5 SPI""]","[
+  ""0.9765625"",
+  ""0.9765625""
+]","[
+  ""1"",
+  ""0"",
+  ""0"",
+  ""0"",
+  ""1"",
+  ""0""
+]"
+TCGA-COAD,TCGA-CK-5916,1.3.6.1.4.1.14519.5.2.1.3
+
+[Successfully executed]
+2025-05-05 03:34:43 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 2) List distinct TransferSyntaxUIDs used by non-NLST CT images
+SELECT DISTINCT
+  "TransferSyntaxUID"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:34:44 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2) List distinct TransferSyntaxUIDs used by non-NLST CT images
+SELECT DISTINCT
+  "TransferSyntaxUID"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+Results:
+TransferSyntaxUID
+1.2.840.10008.1.2.1
+1.2.840.10008.1.2.2
+1.2.840.10008.1.2
+1.2.840.10008.1.2.4.70
+
+[Successfully executed]
+2025-05-05 03:34:44 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 3) Look for ImageType values that might indicate localizers
+SELECT DISTINCT
+  CAST("ImageType" AS STRING) AS "ImageType"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+  AND CAST("ImageType" AS STRING) ILIKE '%LOCAL%'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:35:43 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3) Look for ImageType values that might indicate localizers
+SELECT DISTINCT
+  CAST("ImageType" AS STRING) AS "ImageType"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+  AND CAST("ImageType" AS STRING) ILIKE '%LOCAL%'
+LIMIT 20;
+Results:
+ImageType
+"[""DERIVED"",""SECONDARY"",""LOCALIZER"",""CSA MIP THIN"",""CSAMANIPULATED""]"
+"[""ORIGINAL"",""PRIMARY"",""LOCALIZER"",""ES""]"
+"[""ORIGINAL"",""PRIMARY"",""LOCALIZER"",""CT_SOM5 TOP""]"
+"[""DERIVED"",""PRIMARY"",""LOCALIZER"",""CT_SOM5 SPO""]"
+"[""ORIGINAL"",""SECONDARY"",""LOCALIZER""]"
+"[""ORIGINAL"",""PRIMARY"",""LOCALIZER""]"
+"[""DERIVED"",""SECONDARY"",""LOCALIZER"",""CT_SOM5 SPO""]"
+"[""DERIVED"",""PRIMARY"",""LOCALIZER"",""CT_SOM5 MPR""]"
+"[""DERIVED"",""SECONDARY"",
+
+[Successfully executed]
+2025-05-05 03:35:43 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 4) How many CT series per external collection (non-NLST)?
+SELECT
+  "collection_name",
+  COUNT(DISTINCT "SeriesInstanceUID") AS "series_cnt"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "collection_name"
+ORDER BY "series_cnt" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:36:20 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4) How many CT series per external collection (non-NLST)?
+SELECT
+  "collection_name",
+  COUNT(DISTINCT "SeriesInstanceUID") AS "series_cnt"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "collection_name"
+ORDER BY "series_cnt" DESC
+LIMIT 20;
+Results:
+collection_name,series_cnt
+4D-Lung,5228
+Phantom FDA,4426
+COVID-19-NY-SBU,3069
+CT COLONOGRAPHY,1856
+ACRIN-NSCLC-FDG-PET,1580
+TCGA-KIRC,1272
+Lung-PET-CT-Dx,1039
+LIDC-IDRI,1018
+NSCLC Radiogenomics,629
+CPTAC-PDA,613
+RIDER Lung PET-CT,573
+TCGA-OV,573
+TCGA-LIHC,560
+TCGA-BLCA,542
+TCGA-UCEC,536
+HCC-TACE-Seg,535
+CPTAC-UCEC,527
+CMB-CRC,483
+Anti-PD-1_Lung,464
+CPTAC-CCRCC,461
+
+[Successfully executed]
+2025-05-05 03:36:20 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 5) Verify that individual series have a single ImageOrientationPatient value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS "orient_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "orient_variants" > 1
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:36:28 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 5) Verify that individual series have a single ImageOrientationPatient value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS "orient_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "orient_variants" > 1
+LIMIT 20;
+Results:
+SeriesInstanceUID,orient_variants
+1.3.6.1.4.1.14519.5.2.1.6450.2626.268553522901264666031768977336,4
+1.3.6.1.4.1.14519.5.2.1.1078.3273.374248908440379125648612375896,2
+1.3.6.1.4.1.14519.5.2.1.99.1071.27938678514572293419051692260823,3
+1.3.6.1.4.1.14519.5.2.1.99.1071.19481616364808013381341145537228,2
+1.3.6.1.4.1.14519.5.2.1.7009.2403.256093852597807914783340341975,5
+1.3.6.1.4.1.14519.5.2.1.1078.3273.251064039885423440417709558111,2
+1.3.6.1.4.1.14519.5.2.1.1706.4016.30551993917595077855785
+
+[Successfully executed]
+2025-05-05 03:36:28 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 6) Check that each series has only one PixelSpacing value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("PixelSpacing")) AS "pix_spc_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "pix_spc_variants" > 1
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:36:36 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 6) Check that each series has only one PixelSpacing value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("PixelSpacing")) AS "pix_spc_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "pix_spc_variants" > 1
+LIMIT 20;
+Results:
+SeriesInstanceUID,pix_spc_variants
+1.3.6.1.4.1.14519.5.2.1.99.1071.19703444045039842638470312356736,3
+1.3.6.1.4.1.14519.5.2.1.3344.4008.113934061784600286262742124879,2
+1.3.6.1.4.1.14519.5.2.1.3344.4020.934399155200472591293751222570,2
+1.3.6.1.4.1.14519.5.2.1.7009.2403.315487538330093914780295001423,2
+1.3.6.1.4.1.14519.5.2.1.4334.1501.266278629803542138030809760466,2
+1.3.6.1.4.1.14519.5.2.1.99.1071.15165513944433062587582139477040,2
+1.3.6.1.4.1.14519.5.2.1.7009.2403.1349251143147105654071
+
+[Successfully executed]
+2025-05-05 03:36:36 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 7) Find series where number of instances differs from number of unique ImagePositionPatient values
+SELECT
+  "SeriesInstanceUID",
+  COUNT(*)                                     AS "num_instances",
+  COUNT(DISTINCT TO_VARIANT("ImagePositionPatient")) AS "unique_positions"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING COUNT(*) <> COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:36:41 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 7) Find series where number of instances differs from number of unique ImagePositionPatient values
+SELECT
+  "SeriesInstanceUID",
+  COUNT(*)                                     AS "num_instances",
+  COUNT(DISTINCT TO_VARIANT("ImagePositionPatient")) AS "unique_positions"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING COUNT(*) <> COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))
+LIMIT 20;
+Results:
+SeriesInstanceUID,num_instances,unique_positions
+1.3.6.1.4.1.9328.50.17.303464007556840192894690071236135689559,21,20
+1.3.6.1.4.1.9328.50.17.272843819799304737646249343517278459504,21,20
+1.3.6.1.4.1.14519.5.2.1.7009.2401.309643719300203962441499709291,9,1
+1.3.6.1.4.1.14519.5.2.1.1706.8374.148980847694043615155368760967,10,9
+1.3.6.1.4.1.14519.5.2.1.6655.2359.328645376995981261342976516194,9,1
+1.3.6.1.4.1.14519.5.2.1.3098.5025.266596628154374056796240369545,3,1
+1.3.6.1.4.1.9328.50.17.289592
+
+[Successfully executed]
+2025-05-05 03:36:41 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 8) Compute the absolute dot product (|cz|) between cross-product of orientation vectors and [0,0,1] for a sample of series
+WITH orient AS (
+  SELECT
+    "SeriesInstanceUID",
+    "ImageOrientationPatient"[0]::FLOAT AS o0,
+    "ImageOrientationPatient"[1]::FLOAT AS o1,
+    "ImageOrientationPatient"[2]::FLOAT AS o2,
+    "ImageOrientationPatient"[3]::FLOAT AS o3,
+    "ImageOrientationPatient"[4]::FLOAT AS o4,
+    "ImageOrientationPatient"[5]::FLOAT AS o5,
+    ROW_NUMBER() OVER (PARTITION BY "SeriesInstanceUID") AS rn
+  FROM "IDC"."IDC_V17"."DICOM_ALL"
+  WHERE "Modality" = 'CT'
+    AND "collection_name" <> 'NLST'
+)
+SELECT
+  "SeriesInstanceUID",
+  ABS( (o0 * o4) - (o1 * o3) ) AS "abs_dot_cz"
+FROM orient
+WHERE rn = 1           -- only need one instance per series (orientation already identical)
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:36:41 - Thread-2206 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##002061 (42601): SQL compilation error:\nWindow function type [ROW_NUMBER] requires ORDER BY in window specification.'}
+[Error occurred]
+2025-05-05 03:37:31 - Thread-2206 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Pick one (first) instance per non-NLST CT series, then
+--             calculate the absolute value of the z-component (|cz|)
+--             of the cross-product of the two orientation vectors.
+--             That component equals (o0*o4 – o1*o3).  A window function
+--             with ROW_NUMBER() needs an ORDER BY, so we order by
+--             SOPInstanceUID inside the partition to obtain a stable
+--             “first row” for every SeriesInstanceUID.  Finally, show
+--             20 sample series to verify the computation.
+WITH one_per_series AS (
+    SELECT
+        "SeriesInstanceUID",
+        "ImageOrientationPatient"[0]::FLOAT AS o0,
+        "ImageOrientationPatient"[1]::FLOAT AS o1,
+        "ImageOrientationPatient"[2]::FLOAT AS o2,
+        "ImageOrientationPatient"[3]::FLOAT AS o3,
+        "ImageOrientationPatient"[4]::FLOAT AS o4,
+        "ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (PARTITION BY "SeriesInstanceUID"
+                           ORDER BY "SOPInstanceUID") AS rn
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+)
+SELECT
+    "SeriesInstanceUID",
+    ABS((o0 * o4) - (o1 * o3)) AS "abs_dot_cz"
+FROM one_per_series
+WHERE rn = 1
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:37:32 - Thread-2206 (execute) - INFO - [Results for corrected sql]
+SeriesInstanceUID,abs_dot_cz
+1.3.6.1.4.1.14519.5.2.1.7009.2403.213486704102299625438763040435,
+1.3.6.1.4.1.14519.5.2.1.6834.5010.855172515854595854290538526474,1.0
+1.2.840.113704.1.111.5400.1194464162.179,1.0
+1.3.6.1.4.1.14519.5.2.1.327918316962077617985030385195180974359,1.0
+1.2.840.113704.1.111.4996.1187800805.59,1.0
+1.3.6.1.4.1.14519.5.2.1.4334.1501.368619057949003001687514540916,1.0
+1.3.6.1.4.1.14519.5.2.1.6834.5010.824262952810195986323753161460,1.0
+1.2.840.113704.1.111.5092.1247523
+
+[Results for corrected sql]
+2025-05-05 03:38:12 - Thread-2206 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 9) Examine minimum and maximum slice-to-slice z-spacing for each
+--             non-NLST CT series (sample 20).  The ROW_NUMBER() window function
+--             already contains an ORDER BY on the z-coordinate, so it is valid.
+WITH pos AS (
+    SELECT
+        "SeriesInstanceUID",
+        "ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY "ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+),
+diffs AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM pos
+)
+SELECT
+    "SeriesInstanceUID",
+    MIN(dz) AS "min_dz",
+    MAX(dz) AS "max_dz"
+FROM diffs
+GROUP BY "SeriesInstanceUID"
+LIMIT 20;
+```
+
+```sql
+--Description: 10) Full report (sample 20) for qualified CT series.  The only
+--              change is adding an ORDER BY clause inside the ROW_NUMBER() used
+--              in the “orient” CTE to satisfy Snowflake’s requirement.
+WITH base AS (   -- preliminary filters
+    SELECT *
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ('1.2.840.10008.1.2.4.70',
+                                      '1.2.840.10008.1.2.4.51')
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCAL%'
+),
+geo_ok AS (       -- geometry consistency rules
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                            AS num_instances,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS orient_ct,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))            AS pix_ct,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))    AS pos_ct,
+        COUNT(DISTINCT CONCAT(
+                "ImagePositionPatient"[0]::STRING, ',',
+                "ImagePositionPatient"[1]::STRING))          AS xy_ct,
+        COUNT(DISTINCT "Rows")    AS row_ct,
+        COUNT(DISTINCT "Columns") AS col_ct
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING orient_ct = 1
+       AND pix_ct    = 1
+       AND pos_ct    = num_instances
+       AND xy_ct     = 1
+       AND row_ct    = 1
+       AND col_ct    = 1
+),
+orient AS (        -- one orientation row per series to compute dot product
+    SELECT
+        g."SeriesInstanceUID",
+        g."SeriesNumber",
+        g."StudyInstanceUID",
+        g."PatientID",
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (
+            PARTITION BY g."SeriesInstanceUID"
+            ORDER BY b."SOPInstanceUID"
+        ) AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+dot_chk AS (       -- dot product condition (|cz| within 0.99–1.01)
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0 * o4) - (o1 * o3)) - 1) <= 0.01
+),
+z_vals AS (        -- z-coordinate list per series
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY b."SeriesInstanceUID"
+            ORDER BY b."ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (      -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                                      AS exp_cnt,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_max,
+        MIN(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_min,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)
+          - MIN(NULLIF(b."Exposure",'')::FLOAT)                           AS exp_range
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (     -- total series size in MiB
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0 * 1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    d."SeriesInstanceUID"                              AS "series_uid",
+    d."SeriesNumber"                                   AS "series_no",
+    d."StudyInstanceUID"                               AS "study_uid",
+    d."PatientID"                                      AS "patient_id",
+    ABS((o0 * o4) - (o1 * o3))                         AS "max_abs_dot",
+    g.num_instances                                    AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")                 AS "distinct_thk",
+    z.max_dz                                           AS "max_dz",
+    z.min_dz                                           AS "min_dz",
+    z.tol_dz                                           AS "tol_dz",
+    e.exp_cnt                                          AS "distinct_exp",
+    e.exp_max                                          AS "exp_max",
+    e.exp_min                                          AS "exp_min",
+    e.exp_range                                        AS "exp_range",
+    s.series_mib                                       AS "series_mib"
+FROM dot_chk d
+JOIN geo_ok    g ON d."SeriesInstanceUID" = g."SeriesInstanceUID"
+JOIN z_aggr    z ON d."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON d."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON d."SeriesInstanceUID" = s."SeriesInstanceUID"
+JOIN base      b ON d."SeriesInstanceUID" = b."SeriesInstanceUID"
+GROUP BY
+    d."SeriesInstanceUID", d."SeriesNumber", d."StudyInstanceUID",
+    d."PatientID", o0, o1, o3, o4, g.num_instances,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.exp_cnt, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz     DESC,
+    e.exp_range  DESC,
+    d."SeriesInstanceUID" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 03:38:12 - Thread-2206 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Pick one (first) instance per non-NLST CT series, then
+--             calculate the absolute value of the z-component (|cz|)
+--             of the cross-product of the two orientation vectors.
+--             That component equals (o0*o4 – o1*o3).  A window function
+--             with ROW_NUMBER() needs an ORDER BY, so we order by
+--             SOPInstanceUID inside the partition to obtain a stable
+--             “first row” for every SeriesInstanceUID.  Finally, show
+--             20 sample series to verify the computation.
+WITH one_per_series AS (
+    SELECT
+        "SeriesInstanceUID",
+        "ImageOrientationPatient"[0]::FLOAT AS o0,
+        "ImageOrientationPatient"[1]::FLOAT AS o1,
+        "ImageOrientationPatient"[2]::FLOAT AS o2,
+        "ImageOrientationPatient"[3]::FLOAT AS o3,
+        "ImageOrientationPatient"[4]::FLOAT AS o4,
+        "ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (PARTITION BY "SeriesInstanceUID"
+                           ORDER BY "SOPInstanceUID") AS rn
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+)
+SELECT
+    "SeriesInstanceUID",
+    ABS((o0 * o4) - (o1 * o3)) AS "abs_dot_cz"
+FROM one_per_series
+WHERE rn = 1
+LIMIT 20;
+Results:
+SeriesInstanceUID,abs_dot_cz
+1.3.6.1.4.1.14519.5.2.1.7009.2403.213486704102299625438763040435,
+1.3.6.1.4.1.14519.5.2.1.6834.5010.855172515854595854290538526474,1.0
+1.2.840.113704.1.111.5400.1194464162.179,1.0
+1.3.6.1.4.1.14519.5.2.1.327918316962077617985030385195180974359,1.0
+1.2.840.113704.1.111.4996.1187800805.59,1.0
+1.3.6.1.4.1.14519.5.2.1.4334.1501.368619057949003001687514540916,1.0
+1.3.6.1.4.1.14519.5.2.1.6834.5010.824262952810195986323753161460,1.0
+1.2.840.113704.1.111.5092.1247523
+
+[Successfully corrected]
+2025-05-05 03:38:12 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 9) Examine minimum and maximum slice-to-slice z-spacing for each
+--             non-NLST CT series (sample 20).  The ROW_NUMBER() window function
+--             already contains an ORDER BY on the z-coordinate, so it is valid.
+WITH pos AS (
+    SELECT
+        "SeriesInstanceUID",
+        "ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY "ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+),
+diffs AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM pos
+)
+SELECT
+    "SeriesInstanceUID",
+    MIN(dz) AS "min_dz",
+    MAX(dz) AS "max_dz"
+FROM diffs
+GROUP BY "SeriesInstanceUID"
+LIMIT 20
+[Try to execute]
+2025-05-05 03:38:14 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 9) Examine minimum and maximum slice-to-slice z-spacing for each
+--             non-NLST CT series (sample 20).  The ROW_NUMBER() window function
+--             already contains an ORDER BY on the z-coordinate, so it is valid.
+WITH pos AS (
+    SELECT
+        "SeriesInstanceUID",
+        "ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY "ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+),
+diffs AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM pos
+)
+SELECT
+    "SeriesInstanceUID",
+    MIN(dz) AS "min_dz",
+    MAX(dz) AS "max_dz"
+FROM diffs
+GROUP BY "SeriesInstanceUID"
+LIMIT 20
+Results:
+SeriesInstanceUID,min_dz,max_dz
+1.3.6.1.4.1.14519.5.2.1.7009.2401.189150791818325325368607083274,,
+1.3.6.1.4.1.9328.50.4.176988,0.8000000000000114,49.60000000000001
+1.3.6.1.4.1.14519.5.2.1.1706.8374.104965800154485335432509670191,49.99998399999998,85.0
+1.3.6.1.4.1.14519.5.2.1.6834.5010.161114071226146893844539560884,12.0,36.0
+1.3.6.1.4.1.9328.50.4.713561,1.599975000000029,65.60000600000001
+1.3.6.1.4.1.14519.5.2.1.6834.5010.207847026353414149257063878224,6.0,48.0
+1.3.6.1.4.1.14519.5.2.1.10
+
+[Successfully executed]
+2025-05-05 03:38:14 - Thread-2206 (execute) - INFO - [Try to execute]
+--Description: 10) Full report (sample 20) for qualified CT series.  The only
+--              change is adding an ORDER BY clause inside the ROW_NUMBER() used
+--              in the “orient” CTE to satisfy Snowflake’s requirement.
+WITH base AS (   -- preliminary filters
+    SELECT *
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ('1.2.840.10008.1.2.4.70',
+                                      '1.2.840.10008.1.2.4.51')
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCAL%'
+),
+geo_ok AS (       -- geometry consistency rules
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                            AS num_instances,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS orient_ct,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))            AS pix_ct,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))    AS pos_ct,
+        COUNT(DISTINCT CONCAT(
+                "ImagePositionPatient"[0]::STRING, ',',
+                "ImagePositionPatient"[1]::STRING))          AS xy_ct,
+        COUNT(DISTINCT "Rows")    AS row_ct,
+        COUNT(DISTINCT "Columns") AS col_ct
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING orient_ct = 1
+       AND pix_ct    = 1
+       AND pos_ct    = num_instances
+       AND xy_ct     = 1
+       AND row_ct    = 1
+       AND col_ct    = 1
+),
+orient AS (        -- one orientation row per series to compute dot product
+    SELECT
+        g."SeriesInstanceUID",
+        g."SeriesNumber",
+        g."StudyInstanceUID",
+        g."PatientID",
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (
+            PARTITION BY g."SeriesInstanceUID"
+            ORDER BY b."SOPInstanceUID"
+        ) AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+dot_chk AS (       -- dot product condition (|cz| within 0.99–1.01)
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0 * o4) - (o1 * o3)) - 1) <= 0.01
+),
+z_vals AS (        -- z-coordinate list per series
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY b."SeriesInstanceUID"
+            ORDER BY b."ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (      -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                                      AS exp_cnt,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_max,
+        MIN(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_min,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)
+          - MIN(NULLIF(b."Exposure",'')::FLOAT)                           AS exp_range
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (     -- total series size in MiB
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0 * 1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    d."SeriesInstanceUID"                              AS "series_uid",
+    d."SeriesNumber"                                   AS "series_no",
+    d."StudyInstanceUID"                               AS "study_uid",
+    d."PatientID"                                      AS "patient_id",
+    ABS((o0 * o4) - (o1 * o3))                         AS "max_abs_dot",
+    g.num_instances                                    AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")                 AS "distinct_thk",
+    z.max_dz                                           AS "max_dz",
+    z.min_dz                                           AS "min_dz",
+    z.tol_dz                                           AS "tol_dz",
+    e.exp_cnt                                          AS "distinct_exp",
+    e.exp_max                                          AS "exp_max",
+    e.exp_min                                          AS "exp_min",
+    e.exp_range                                        AS "exp_range",
+    s.series_mib                                       AS "series_mib"
+FROM dot_chk d
+JOIN geo_ok    g ON d."SeriesInstanceUID" = g."SeriesInstanceUID"
+JOIN z_aggr    z ON d."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON d."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON d."SeriesInstanceUID" = s."SeriesInstanceUID"
+JOIN base      b ON d."SeriesInstanceUID" = b."SeriesInstanceUID"
+GROUP BY
+    d."SeriesInstanceUID", d."SeriesNumber", d."StudyInstanceUID",
+    d."PatientID", o0, o1, o3, o4, g.num_instances,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.exp_cnt, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz     DESC,
+    e.exp_range  DESC,
+    d."SeriesInstanceUID" DESC
+LIMIT 20
+[Try to execute]
+2025-05-05 03:38:34 - Thread-2206 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 10) Full report (sample 20) for qualified CT series.  The only
+--              change is adding an ORDER BY clause inside the ROW_NUMBER() used
+--              in the “orient” CTE to satisfy Snowflake’s requirement.
+WITH base AS (   -- preliminary filters
+    SELECT *
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ('1.2.840.10008.1.2.4.70',
+                                      '1.2.840.10008.1.2.4.51')
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCAL%'
+),
+geo_ok AS (       -- geometry consistency rules
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                            AS num_instances,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS orient_ct,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))            AS pix_ct,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))    AS pos_ct,
+        COUNT(DISTINCT CONCAT(
+                "ImagePositionPatient"[0]::STRING, ',',
+                "ImagePositionPatient"[1]::STRING))          AS xy_ct,
+        COUNT(DISTINCT "Rows")    AS row_ct,
+        COUNT(DISTINCT "Columns") AS col_ct
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING orient_ct = 1
+       AND pix_ct    = 1
+       AND pos_ct    = num_instances
+       AND xy_ct     = 1
+       AND row_ct    = 1
+       AND col_ct    = 1
+),
+orient AS (        -- one orientation row per series to compute dot product
+    SELECT
+        g."SeriesInstanceUID",
+        g."SeriesNumber",
+        g."StudyInstanceUID",
+        g."PatientID",
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (
+            PARTITION BY g."SeriesInstanceUID"
+            ORDER BY b."SOPInstanceUID"
+        ) AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+dot_chk AS (       -- dot product condition (|cz| within 0.99–1.01)
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0 * o4) - (o1 * o3)) - 1) <= 0.01
+),
+z_vals AS (        -- z-coordinate list per series
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY b."SeriesInstanceUID"
+            ORDER BY b."ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (      -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                                      AS exp_cnt,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_max,
+        MIN(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_min,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)
+          - MIN(NULLIF(b."Exposure",'')::FLOAT)                           AS exp_range
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (     -- total series size in MiB
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0 * 1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    d."SeriesInstanceUID"                              AS "series_uid",
+    d."SeriesNumber"                                   AS "series_no",
+    d."StudyInstanceUID"                               AS "study_uid",
+    d."PatientID"                                      AS "patient_id",
+    ABS((o0 * o4) - (o1 * o3))                         AS "max_abs_dot",
+    g.num_instances                                    AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")                 AS "distinct_thk",
+    z.max_dz                                           AS "max_dz",
+    z.min_dz                                           AS "min_dz",
+    z.tol_dz                                           AS "tol_dz",
+    e.exp_cnt                                          AS "distinct_exp",
+    e.exp_max                                          AS "exp_max",
+    e.exp_min                                          AS "exp_min",
+    e.exp_range                                        AS "exp_range",
+    s.series_mib                                       AS "series_mib"
+FROM dot_chk d
+JOIN geo_ok    g ON d."SeriesInstanceUID" = g."SeriesInstanceUID"
+JOIN z_aggr    z ON d."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON d."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON d."SeriesInstanceUID" = s."SeriesInstanceUID"
+JOIN base      b ON d."SeriesInstanceUID" = b."SeriesInstanceUID"
+GROUP BY
+    d."SeriesInstanceUID", d."SeriesNumber", d."StudyInstanceUID",
+    d."PatientID", o0, o1, o3, o4, g.num_instances,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.exp_cnt, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz     DESC,
+    e.exp_range  DESC,
+    d."SeriesInstanceUID" DESC
+LIMIT 20
+Results:
+series_uid,series_no,study_uid,patient_id,max_abs_dot,num_sop,distinct_thk,max_dz,min_dz,tol_dz,distinct_exp,exp_max,exp_min,exp_range,series_mib
+1.3.6.1.4.1.32722.99.99.272316563266792574873516129771159347637,1,1.3.6.1.4.1.32722.99.99.174829301640193981653651859269018631836,LUNG1-159,1.0,1,1,,,,0,,,,0.501368
+1.3.6.1.4.1.32722.99.99.249933495887812931141368473276454873160,1,1.3.6.1.4.1.32722.99.99.163636792881733286502021427343132101636,LUNG1-040,1.0,1,1,,,,0,,,,0.501373
+1.3.6.1.4.1.32722.99.
+
+[Successfully executed]
+2025-05-05 03:38:34 - Thread-2206 (execute) - INFO - itercount: 0
+2025-05-05 03:38:34 - Thread-2206 (execute) - INFO - [Self-refine]
+Table full name: IDC.IDC_V17.DICOM_METADATA
+Column name: ContentDate Type: DATE
+Column name: SliceLocation Type: TEXT
+Column name: AcquisitionTime Type: TIME
+Column name: BitsAllocated Type: NUMBER
+Column name: SeriesNumber Type: TEXT
+Column name: AcquisitionDate Type: DATE
+Column name: SeriesInstanceUID Type: TEXT
+Column name: Type Type: TEXT
+Column name: SpacingBetweenSlices Type: TEXT
+Column name: Location Type: TEXT
+Column name: ImageType Type: VARIANT
+Column name: ImageIndex Type: NUMBER
+Column name: InstanceNumber Type: TEXT
+Column name: SliceThickness Type: TEXT
+Column name: TransferSyntaxUID Type: TEXT
+Column name: FrameOfReferenceUID Type: TEXT
+Column name: Exposure Type: TEXT
+Column name: SeriesDate Type: DATE
+Column name: ImageOrientation Type: VARIANT
+Column name: ImageOrientationPatient Type: VARIANT
+Column name: SOPInstanceUID Type: TEXT
+Column name: ImagePositionPatient Type: VARIANT
+Column name: Modality Type: TEXT
+Column name: ExposureInmAs Type: FLOAT
+Column name: PixelSpacing Type: VARIANT
+Column name: NumberOfFrames Type: TEXT
+Column name: ExposureInuAs Type: TEXT
+Column name: StudyInstanceUID Type: TEXT
+Column name: SamplesPerPixel Type: NUMBER
+Column name: LargestImagePixelValue Type: NUMBER
+Column name: StudyDate Type: DATE
+Column name: PatientID Type: TEXT
+Column name: HighBit Type: NUMBER
+Column name: ImagePosition Type: VARIANT
+Column name: ExposureTime Type: TEXT
+Column name: PixelRepresentation Type: NUMBER
+Column name: SmallestImagePixelValue Type: NUMBER
+Column name: UID Type: TEXT
+Column name: ContentTime Type: TIME
+Column name: BitsStored Type: NUMBER
+Column name: InstanceCreationTime Type: TIME
+Column name: Rows Type: NUMBER
+Column name: EstimatedDoseSaving Type: FLOAT
+Column name: Columns Type: NUMBER
+Column name: SOPClassUID Type: TEXT
+Column name: CTDIvol Type: FLOAT
+Column name: InstanceCreationDate Type: DATE
+Sample rows:
+[{'TransferSyntaxUID': '1.2.840.10008.1.2.4.50', 'ImageType': '[\n  "DERIVED",\n  "PRIMARY",\n  "VOLUME",\n  "NONE"\n]', 'InstanceCreationDate': '2022-06-20', 'InstanceCreationTime': '03:39:35', 'SOPClassUID': '1.2.840.10008.5.1.4.1.1.77.1.6', 'SOPInstanceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.7.0', 'StudyDate': '2018-04-27', 'SeriesDate': '2018-04-27', 'AcquisitionDate': '2018-04-27', 'ContentDate': '2018-04-27', 'AcquisitionTime': '20:27:25', 'ContentTime': '20:27:25', 'Modality': 'SM', 'PatientID': 'C3N-01088', 'SliceThickness': None, 'SpacingBetweenSlices': None, 'ExposureTime': None, 'Exposure': None, 'ExposureInuAs': None, 'EstimatedDoseSaving': None, 'ExposureInmAs': None, 'CTDIvol': None, 'StudyInstanceUID': '2.25.58706717250894429958007117275973416179', 'SeriesInstanceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.2.0', 'SeriesNumber': '1', 'InstanceNumber': '1', 'ImagePositionPatient': '[]', 'ImageOrientationPatient': '[]', 'FrameOfReferenceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.5.0', 'SliceLocation': None, 'SamplesPerPixel': 3, 'NumberOfFrames': '35100', 'Rows': 240, 'Columns': 240, 'PixelSpacing': '[]', 'BitsAllocated': 8, 'BitsStored': 8, 'HighBit': 7, 'PixelRepresentation': 0, 'SmallestImagePixelValue': None, 'LargestImagePixelValue': None, 'ImageIndex': None}, {'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "DERIVED",\n  "PRIMARY",\n  "OVERVIEW",\n  "NONE"\n]', 'InstanceCreationDate': '2022-06-20', 'InstanceCreationTime': '03:39:41', 'SOPClassUID': '1.2.840.10008.5.1.4.1.1.77.1.6', 'SOPInstanceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.35.0', 'StudyDate': '2018-04-27', 'SeriesDate': '2018-04-27', 'AcquisitionDate': '2018-04-27', 'ContentDate': '2018-04-27', 'AcquisitionTime': '20:27:25', 'ContentTime': '20:27:25', 'Modality': 'SM', 'PatientID': 'C3N-01088', 'SliceThickness': None, 'SpacingBetweenSlices': None, 'ExposureTime': None, 'Exposure': None, 'ExposureInuAs': None, 'EstimatedDoseSaving': None, 'ExposureInmAs': None, 'CTDIvol': None, 'StudyInstanceUID': '2.25.58706717250894429958007117275973416179', 'SeriesInstanceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.2.0', 'SeriesNumber': '1', 'InstanceNumber': '6', 'ImagePositionPatient': '[]', 'ImageOrientationPatient': '[]', 'FrameOfReferenceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.5.0', 'SliceLocation': None, 'SamplesPerPixel': 3, 'NumberOfFrames': '1', 'Rows': 629, 'Columns': 1600, 'PixelSpacing': '[]', 'BitsAllocated': 8, 'BitsStored': 8, 'HighBit': 7, 'PixelRepresentation': 0, 'SmallestImagePixelValue': None, 'LargestImagePixelValue': None, 'ImageIndex': None}, {'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "DERIVED",\n  "PRIMARY",\n  "LABEL",\n  "NONE"\n]', 'InstanceCreationDate': '2022-06-20', 'InstanceCreationTime': '03:39:41', 'SOPClassUID': '1.2.840.10008.5.1.4.1.1.77.1.6', 'SOPInstanceUID': '1.3.6.1.4.1.5962.99.1.2133926228.1619968177.1655696367956.37.0', 'StudyDate': '2018-04-27', 'SeriesDate': '2018-04-27', 'AcquisitionDate': '2018-04-27', 'ContentDate': '2018-04-27', 'AcquisitionTime': '20:27:25', 'ContentTime': '20:27:25', 'Modality': 'SM', 'PatientID': 'C3N-01088', 'SliceThickness': None, 'SpacingBetweenSlices': None, 'ExposureTime': None, 'Exposure': None, 'ExposureInuAs': None, 'EstimatedDoseSaving': None, 'ExposureInmAs': None, 'CTDIvol': None, 'StudyInstanceUID': '2.25.58706717250894429958007117275973416179', 'SeriesInstanceUID': '1.3.6.1.4.1.5962.99.1.154767222.292368839.1640832307062.2.0', 'SeriesNumber': '1', 'InstanceNumber': '5', 'ImagePositionPatient': '[]', 'ImageOrientationPatient': '[]', 'FrameOfReferenceUID': '1.3.6.1.4.1.5962.99.1.2133926228.1619968177.1655696367956.7.0', 'SliceLocation': None, 'SamplesPerPixel': 3, 'NumberOfFrames': '1', 'Rows': 716, 'Columns': 666, 'PixelSpacing': '[]', 'BitsAllocated': 8, 'BitsStored': 8, 'HighBit': 7, 'PixelRepresentation': 0, 'SmallestImagePixelValue': None, 'LargestImagePixelValue': None, 'ImageIndex': None}, {'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "DERIVED",\n  "PRIMARY",\n  "OVERVIEW",\n  "NONE"\n]', 'InstanceCreationDate': '2022-06-20', 'InstanceCreationTime': '02:51:21', 'SOPClassUID': '1.2.840.10008.5.1.4.1.1.77.1.6', 'SOPInstanceUID': '1.3.6.1.4.1.5962.99.1.157627571.692579403.1640835167411.42.0', 'StudyDate': '2018-04-27', 'SeriesDate': '2018-04-27', 'AcquisitionDate': '2018-04-27', 'ContentDate': '2018-04-27', 'AcquisitionTime': '20:19:37', 'ContentTime': '20:19:37', 'Modality': 'SM', 'PatientID': 'C3N-01088', 'SliceThickness': None, 'SpacingBetweenSlices': None, 'ExposureTime': None, 'Exposure': None, 'ExposureInuAs': None, 'EstimatedDoseSaving': None, 'ExposureInmAs': None, 'CTDIvol': None, 'StudyInstanceUID': '2.25.58706717250894429958007117275973416179', 'SeriesInstanceUID': '1.3.6.1.4.1.5962.99.1.157627571.692579403.1640835167411.2.0', 'SeriesNumber': '1', 'InstanceNumber': '7', 'ImagePositionPatient': '[]', 'ImageOrientationPatient': '[]', 'FrameOfReferenceUID': '1.3.6.1.4.1.5962.99.1.157627571.692579403.1640835167411.5.0', 'SliceLocation': None, 'SamplesPerPixel': 3, 'NumberOfFrames': '1', 'Rows': 629, 'Columns': 1600, 'PixelSpacing': '[]', 'BitsAllocated': 8, 'BitsStored': 8, 'HighBit': 7, 'PixelRepresentation': 0, 'SmallestImagePixelValue': None, 'LargestImagePixelValue': None, 'ImageIndex': None}, {'TransferSyntaxUID': '1.2.840.10008.1.2.4.50', 'ImageType': '[\n  "DERIVED",\n  "PRIMARY",\n  "VOLUME",\n  "NONE"\n]', 'InstanceCreationDate': '2022-06-20', 'InstanceCreationTime': '02:51:11', 'SOPClassUID': '1.2.840.10008.5.1.4.1.1.77.1.6', 'SOPInstanceUID': '1.3.6.1.4.1.5962.99.1.157627571.692579403.1640835167411.7.0', 'StudyDate': '2018-04-27', 'SeriesDate': '2018-04-27', 'AcquisitionDate': '2018-04-27', 'ContentDate': '2018-04-27', 'AcquisitionTime': '20:19:37', 'ContentTime': '20:19:37', 'Modality': 'SM', 'PatientID': 'C3N-01088', 'SliceThickness': None, 'SpacingBetweenSlices': None, 'ExposureTime': None, 'Exposure': None, 'ExposureInuAs': None, 'EstimatedDoseSaving': None, 'ExposureInmAs': None, 'CTDIvol': None, 'StudyInstanceUID': '2.25.58706717250894429958007117275973416179', 'SeriesInstanceUID': '1.3.6.1.4.1.5962.99.1.157627571.692579403.1640835167411.2.0', 'SeriesNumber': '1', 'InstanceNumber': '1', 'ImagePositionPatient': '[]', 'ImageOrientationPatient': '[]', 'FrameOfReferenceUID': '1.3.6.1.4.1.5962.99.1.157627571.692579403.1640835167411.5.0', 'SliceLocation': None, 'SamplesPerPixel': 3, 'NumberOfFrames': '53430', 'Rows': 240, 'Columns': 240, 'PixelSpacing': '[]', 'BitsAllocated': 8, 'BitsStored': 8, 'HighBit': 7, 'PixelRepresentation': 0, 'SmallestImagePixelValue': None, 'LargestImagePixelValue': None, 'ImageIndex': None}]
+
+--------------------------------------------------
+Table full name: IDC.IDC_V17.DICOM_ALL
+Column name: ExposureTime Type: TEXT
+Column name: ImagePosition Type: VARIANT
+Column name: PatientID Type: TEXT Description: Patient ID assigned by submitter of this data
+Column name: SliceThickness Type: TEXT
+Column name: UID Type: TEXT
+Column name: Modality Type: TEXT
+Column name: instance_size Type: NUMBER Description: Size in bytes of this version of this instance
+Column name: SOPInstanceUID Type: TEXT
+Column name: InstanceNumber Type: TEXT
+Column name: ImageType Type: VARIANT
+Column name: ImageOrientation Type: VARIANT
+Column name: SeriesNumber Type: TEXT
+Column name: PixelSpacing Type: VARIANT
+Column name: Rows Type: NUMBER
+Column name: ExposureInmAs Type: FLOAT
+Column name: StudyInstanceUID Type: TEXT
+Column name: Columns Type: NUMBER
+Column name: collection_name Type: TEXT Description: The ID of the collection containing this instance as expected by the TCIA API
+Column name: Exposure Type: TEXT
+Column name: ImagePositionPatient Type: VARIANT
+Column name: ImageOrientationPatient Type: VARIANT
+Column name: SeriesInstanceUID Type: TEXT
+Column name: Type Type: TEXT
+Column name: TransferSyntaxUID Type: TEXT
+Sample rows:
+[{'collection_name': 'NLST', 'PatientID': '115644', 'StudyInstanceUID': '1.2.840.113654.2.55.62621785606309318595425188615995118704', 'SeriesInstanceUID': '1.2.840.113654.2.55.286585074629136673697149467703631406338', 'SOPInstanceUID': '1.2.840.113654.2.55.232251254905686701117181565039442087865', 'instance_size': 526602, 'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "ORIGINAL",\n  "PRIMARY",\n  "AXIAL"\n]', 'Modality': 'CT', 'SliceThickness': '2.500000', 'ExposureTime': '798', 'ExposureInmAs': None, 'SeriesNumber': '2', 'InstanceNumber': '21', 'ImagePositionPatient': '[\n  "-165.399994",\n  "-155.000000",\n  "-66.144997"\n]', 'ImageOrientationPatient': '[\n  "1.000000",\n  "0.000000",\n  "0.000000",\n  "0.000000",\n  "1.000000",\n  "0.000000"\n]', 'Rows': 512, 'Columns': 512, 'PixelSpacing': '[\n  "0.605469",\n  "0.605469"\n]'}, {'collection_name': 'NLST', 'PatientID': '125284', 'StudyInstanceUID': '1.2.840.113654.2.55.252823246291318780125419075611881707753', 'SeriesInstanceUID': '1.2.840.113654.2.55.206816254587970136084378013338289118172', 'SOPInstanceUID': '1.2.840.113654.2.55.281149784892428811639464384293629235745', 'instance_size': 526608, 'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "ORIGINAL",\n  "PRIMARY",\n  "AXIAL"\n]', 'Modality': 'CT', 'SliceThickness': '2.500000', 'ExposureTime': '798', 'ExposureInmAs': None, 'SeriesNumber': '2', 'InstanceNumber': '50', 'ImagePositionPatient': '[\n  "-149.300003",\n  "-153.399994",\n  "-129.880005"\n]', 'ImageOrientationPatient': '[\n  "1.000000",\n  "0.000000",\n  "0.000000",\n  "0.000000",\n  "1.000000",\n  "0.000000"\n]', 'Rows': 512, 'Columns': 512, 'PixelSpacing': '[\n  "0.605469",\n  "0.605469"\n]'}, {'collection_name': 'NLST', 'PatientID': '111916', 'StudyInstanceUID': '1.2.840.113654.2.55.321739936466302978441987047842606358921', 'SeriesInstanceUID': '1.2.840.113654.2.55.177630169322150231721484650076633097612', 'SOPInstanceUID': '1.2.840.113654.2.55.169820662853239776981123072671212105735', 'instance_size': 526610, 'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "ORIGINAL",\n  "PRIMARY",\n  "AXIAL"\n]', 'Modality': 'CT', 'SliceThickness': '2.500000', 'ExposureTime': '798', 'ExposureInmAs': None, 'SeriesNumber': '2', 'InstanceNumber': '114', 'ImagePositionPatient': '[\n  "-178.600006",\n  "-175.000000",\n  "-271.994995"\n]', 'ImageOrientationPatient': '[\n  "1.000000",\n  "0.000000",\n  "0.000000",\n  "0.000000",\n  "1.000000",\n  "0.000000"\n]', 'Rows': 512, 'Columns': 512, 'PixelSpacing': '[\n  "0.683594",\n  "0.683594"\n]'}, {'collection_name': 'NLST', 'PatientID': '105094', 'StudyInstanceUID': '1.2.840.113654.2.55.238810784403423496900404050276632823832', 'SeriesInstanceUID': '1.2.840.113654.2.55.241127592238091291973528290810645287066', 'SOPInstanceUID': '1.2.840.113654.2.55.195670402165839899895759391289032265317', 'instance_size': 526608, 'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "ORIGINAL",\n  "PRIMARY",\n  "AXIAL"\n]', 'Modality': 'CT', 'SliceThickness': '2.500000', 'ExposureTime': '798', 'ExposureInmAs': None, 'SeriesNumber': '2', 'InstanceNumber': '72', 'ImagePositionPatient': '[\n  "-179.699997",\n  "-141.699997",\n  "-272.170013"\n]', 'ImageOrientationPatient': '[\n  "1.000000",\n  "0.000000",\n  "0.000000",\n  "0.000000",\n  "1.000000",\n  "0.000000"\n]', 'Rows': 512, 'Columns': 512, 'PixelSpacing': '[\n  "0.683594",\n  "0.683594"\n]'}, {'collection_name': 'NLST', 'PatientID': '131538', 'StudyInstanceUID': '1.2.840.113654.2.55.65506226137788125731294707744660637427', 'SeriesInstanceUID': '1.2.840.113654.2.55.256299343016283789104389095516984631610', 'SOPInstanceUID': '1.2.840.113654.2.55.85167056264528248627639073741729153183', 'instance_size': 526602, 'TransferSyntaxUID': '1.2.840.10008.1.2.1', 'ImageType': '[\n  "ORIGINAL",\n  "PRIMARY",\n  "AXIAL"\n]', 'Modality': 'CT', 'SliceThickness': '2.500000', 'ExposureTime': '798', 'ExposureInmAs': None, 'SeriesNumber': '3', 'InstanceNumber': '69', 'ImagePositionPatient': '[\n  "-182.800003",\n  "-146.899994",\n  "-272.154999"\n]', 'ImageOrientationPatient': '[\n  "1.000000",\n  "0.000000",\n  "0.000000",\n  "0.000000",\n  "1.000000",\n  "0.000000"\n]', 'Rows': 512, 'Columns': 512, 'PixelSpacing': '[\n  "0.683594",\n  "0.683594"\n]'}]
+
+--------------------------------------------------
+Table full name: IDC.IDC_V17.DICOM_PIVOT
+Column name: Modality Type: TEXT
+Column name: max_TotalPixelMatrixRows Type: NUMBER
+Column name: min_PixelSpacing Type: FLOAT
+Column name: instance_size Type: NUMBER
+Column name: SOPInstanceUID Type: TEXT
+Column name: collection_id Type: TEXT
+Column name: SeriesNumber Type: TEXT
+Column name: FrameOfReferenceUID Type: TEXT
+Column name: SliceThickness Type: FLOAT
+Column name: SeriesInstanceUID Type: TEXT
+Column name: StudyInstanceUID Type: TEXT
+Column name: ImageType Type: TEXT
+Column name: Volume Type: NUMBER
+Column name: PatientID Type: TEXT
+Column name: max_TotalPixelMatrixColumns Type: NUMBER
+Sample rows:
+[{'PatientID': 'UPENN-GBM-00513', 'SeriesInstanceUID': '1.3.6.1.4.1.14519.5.2.1.185195136958159502142654387221547856729', 'SliceThickness': 5.0, 'SeriesNumber': '14', 'StudyInstanceUID': '1.3.6.1.4.1.14519.5.2.1.92084504364921012205012538829705733768', 'SOPInstanceUID': '1.3.6.1.4.1.14519.5.2.1.201644798538859159720916103279874451632', 'Modality': 'MR', 'collection_id': 'upenn_gbm', 'FrameOfReferenceUID': None, 'instance_size': 36948, 'Volume': None, 'min_PixelSpacing': 1.7, 'max_TotalPixelMatrixColumns': 128, 'max_TotalPixelMatrixRows': 128, 'ImageType': 'ORIGINAL, PRIMARY, PERFUSION, NONE, ND, NORM'}, {'PatientID': 'UPENN-GBM-00519', 'SeriesInstanceUID': '1.3.6.1.4.1.14519.5.2.1.285201929497843344185967283825964169195', 'SliceThickness': 4.0, 'SeriesNumber': '13', 'StudyInstanceUID': '1.3.6.1.4.1.14519.5.2.1.285969882316463253344322862464631605069', 'SOPInstanceUID': '1.3.6.1.4.1.14519.5.2.1.284648789561114483507224549503882513471', 'Modality': 'MR', 'collection_id': 'upenn_gbm', 'FrameOfReferenceUID': None, 'instance_size': 36970, 'Volume': None, 'min_PixelSpacing': 1.7, 'max_TotalPixelMatrixColumns': 128, 'max_TotalPixelMatrixRows': 128, 'ImageType': 'ORIGINAL, PRIMARY, PERFUSION, NONE, ND, NORM'}, {'PatientID': 'UPENN-GBM-00416', 'SeriesInstanceUID': '1.3.6.1.4.1.14519.5.2.1.75622442647298518363100372261560810525', 'SliceThickness': 4.0, 'SeriesNumber': '13', 'StudyInstanceUID': '1.3.6.1.4.1.14519.5.2.1.16570277643982576751137554563747012374', 'SOPInstanceUID': '1.3.6.1.4.1.14519.5.2.1.64715764737679289365432093996341540549', 'Modality': 'MR', 'collection_id': 'upenn_gbm', 'FrameOfReferenceUID': None, 'instance_size': 36916, 'Volume': None, 'min_PixelSpacing': 1.7, 'max_TotalPixelMatrixColumns': 128, 'max_TotalPixelMatrixRows': 128, 'ImageType': 'ORIGINAL, PRIMARY, PERFUSION, NONE, ND, NORM'}, {'PatientID': 'UPENN-GBM-00473', 'SeriesInstanceUID': '1.3.6.1.4.1.14519.5.2.1.135489908748676184571973467902447917371', 'SliceThickness': 3.5, 'SeriesNumber': '13', 'StudyInstanceUID': '1.3.6.1.4.1.14519.5.2.1.152520037553718269187855913202992933964', 'SOPInstanceUID': '1.3.6.1.4.1.14519.5.2.1.114859382544420303794672772499243450451', 'Modality': 'MR', 'collection_id': 'upenn_gbm', 'FrameOfReferenceUID': None, 'instance_size': 37022, 'Volume': None, 'min_PixelSpacing': 1.7, 'max_TotalPixelMatrixColumns': 128, 'max_TotalPixelMatrixRows': 128, 'ImageType': 'ORIGINAL, PRIMARY, PERFUSION, NONE, ND, NORM'}, {'PatientID': 'UPENN-GBM-00459', 'SeriesInstanceUID': '1.3.6.1.4.1.14519.5.2.1.152910459779232363967902946401636166563', 'SliceThickness': 3.0, 'SeriesNumber': '13', 'StudyInstanceUID': '1.3.6.1.4.1.14519.5.2.1.304279265306776379494650249168307485581', 'SOPInstanceUID': '1.3.6.1.4.1.14519.5.2.1.308657597317534610205545200298236188919', 'Modality': 'MR', 'collection_id': 'upenn_gbm', 'FrameOfReferenceUID': None, 'instance_size': 36962, 'Volume': None, 'min_PixelSpacing': 1.7, 'max_TotalPixelMatrixColumns': 128, 'max_TotalPixelMatrixRows': 128, 'ImageType': 'ORIGINAL, PRIMARY, PERFUSION, NONE, ND, NORM'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+The assumptions include:
+- consider only those series that have CT modality and do not belong to the NLST collection
+- filter out DICOM images that use the following two compression formats:
+    - JPEG Lossless, Non-Hierarchical, First-Order Prediction, 1.2.840.10008.1.2.4.70;
+    - JPEG Baseline (Process 1), 1.2.840.10008.1.2.4.51;
+- do not contain localizer image type
+- all instances in a series have identical values for image orientation (patient) and pixel spacing (converted to string before comparison)
+- all instances in a series have 1 ± 0.01 as the dot product between the two vectors below:
+    - cross product of first and second vectors;
+    - vector [0, 0, 1];
+- have number of instances in the series equal to the number of distinct values of Image Position (Patient) attribute (converted to string for comparison)
+- all instances in a series have identical values for the first two components of Image Position (Patient)
+- all instances in a series have identical pixel rows, and similarly identical pixel columns
+- for the difference between the values of the 3rd component of Image Position (Patient), after sorting all instances by that third component
+
+
+BTW, the desired output report should contain:
+1. The unique identifier for each image series;
+2. The number assigned to the series within a study;
+3. The unique identifier for the study that the series belongs to;
+4. The unique identifier for the patient;
+5. The maximum dot product value between the cross product of image orientation vectors and a reference vector, indicating geometric alignment;
+6. The total number of SOP instances (individual images) in each series;
+7. The number of distinct slice thickness values within the series;
+8. The maximum and minimum difference between consecutive slice intervals (the z-coordinate spacing);
+9. The tolerance value for slice interval differences (the z-coordinate spacing);
+10. The number of distinct exposure values;
+11. The maximum and minimum exposure value recorded for the images;
+12. The difference between the maximum and minimum exposure values within the series, indicating the range of exposure variation;
+13. The total size of the image series in megabytes (MiB).
+And please sort the final output by slice interval difference tolerance, maximum exposure difference and series unique ID (all in descending order).
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'IDC': {'IDC_V17': ['DICOM_METADATA', 'DICOM_ALL', 'DICOM_PIVOT']}}
+Some few-shot examples may be useful:
+Query:
+--Description: 1) Inspect a few non-NLST CT instances to get a feeling for key attributes
+SELECT
+  "collection_name",
+  "PatientID",
+  "SeriesInstanceUID",
+  "SOPInstanceUID",
+  "TransferSyntaxUID",
+  CAST("ImageType" AS STRING) AS "ImageType",
+  "PixelSpacing",
+  "ImageOrientationPatient"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+Answer:
+collection_name,PatientID,SeriesInstanceUID,SOPInstanceUID,TransferSyntaxUID,ImageType,PixelSpacing,ImageOrientationPatient
+TCGA-LUAD,TCGA-50-6591,1.3.6.1.4.1.14519.5.2.1.6450.9002.846229601736691277174430202883,1.3.6.1.4.1.14519.5.2.1.6450.9002.738451669214003028604300251738,1.2.840.10008.1.2.1,"[""ORIGINAL"",""PRIMARY"",""AXIAL"",""CT_SOM5 SPI""]","[
+  ""0.9765625"",
+  ""0.9765625""
+]","[
+  ""1"",
+  ""0"",
+  ""0"",
+  ""0"",
+  ""1"",
+  ""0""
+]"
+TCGA-COAD,TCGA-CK-5916,1.3.6.1.4.1.14519.5.2.1.3
+Query:
+--Description: 2) List distinct TransferSyntaxUIDs used by non-NLST CT images
+SELECT DISTINCT
+  "TransferSyntaxUID"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+LIMIT 20;
+Answer:
+TransferSyntaxUID
+1.2.840.10008.1.2.1
+1.2.840.10008.1.2.2
+1.2.840.10008.1.2
+1.2.840.10008.1.2.4.70
+Query:
+--Description: 3) Look for ImageType values that might indicate localizers
+SELECT DISTINCT
+  CAST("ImageType" AS STRING) AS "ImageType"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+  AND CAST("ImageType" AS STRING) ILIKE '%LOCAL%'
+LIMIT 20;
+Answer:
+ImageType
+"[""DERIVED"",""SECONDARY"",""LOCALIZER"",""CSA MIP THIN"",""CSAMANIPULATED""]"
+"[""ORIGINAL"",""PRIMARY"",""LOCALIZER"",""ES""]"
+"[""ORIGINAL"",""PRIMARY"",""LOCALIZER"",""CT_SOM5 TOP""]"
+"[""DERIVED"",""PRIMARY"",""LOCALIZER"",""CT_SOM5 SPO""]"
+"[""ORIGINAL"",""SECONDARY"",""LOCALIZER""]"
+"[""ORIGINAL"",""PRIMARY"",""LOCALIZER""]"
+"[""DERIVED"",""SECONDARY"",""LOCALIZER"",""CT_SOM5 SPO""]"
+"[""DERIVED"",""PRIMARY"",""LOCALIZER"",""CT_SOM5 MPR""]"
+"[""DERIVED"",""SECONDARY"",
+Query:
+--Description: 4) How many CT series per external collection (non-NLST)?
+SELECT
+  "collection_name",
+  COUNT(DISTINCT "SeriesInstanceUID") AS "series_cnt"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "collection_name"
+ORDER BY "series_cnt" DESC
+LIMIT 20;
+Answer:
+collection_name,series_cnt
+4D-Lung,5228
+Phantom FDA,4426
+COVID-19-NY-SBU,3069
+CT COLONOGRAPHY,1856
+ACRIN-NSCLC-FDG-PET,1580
+TCGA-KIRC,1272
+Lung-PET-CT-Dx,1039
+LIDC-IDRI,1018
+NSCLC Radiogenomics,629
+CPTAC-PDA,613
+RIDER Lung PET-CT,573
+TCGA-OV,573
+TCGA-LIHC,560
+TCGA-BLCA,542
+TCGA-UCEC,536
+HCC-TACE-Seg,535
+CPTAC-UCEC,527
+CMB-CRC,483
+Anti-PD-1_Lung,464
+CPTAC-CCRCC,461
+Query:
+--Description: 5) Verify that individual series have a single ImageOrientationPatient value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS "orient_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "orient_variants" > 1
+LIMIT 20;
+Answer:
+SeriesInstanceUID,orient_variants
+1.3.6.1.4.1.14519.5.2.1.6450.2626.268553522901264666031768977336,4
+1.3.6.1.4.1.14519.5.2.1.1078.3273.374248908440379125648612375896,2
+1.3.6.1.4.1.14519.5.2.1.99.1071.27938678514572293419051692260823,3
+1.3.6.1.4.1.14519.5.2.1.99.1071.19481616364808013381341145537228,2
+1.3.6.1.4.1.14519.5.2.1.7009.2403.256093852597807914783340341975,5
+1.3.6.1.4.1.14519.5.2.1.1078.3273.251064039885423440417709558111,2
+1.3.6.1.4.1.14519.5.2.1.1706.4016.30551993917595077855785
+Query:
+--Description: 6) Check that each series has only one PixelSpacing value
+SELECT
+  "SeriesInstanceUID",
+  COUNT(DISTINCT TO_VARIANT("PixelSpacing")) AS "pix_spc_variants"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING "pix_spc_variants" > 1
+LIMIT 20;
+Answer:
+SeriesInstanceUID,pix_spc_variants
+1.3.6.1.4.1.14519.5.2.1.99.1071.19703444045039842638470312356736,3
+1.3.6.1.4.1.14519.5.2.1.3344.4008.113934061784600286262742124879,2
+1.3.6.1.4.1.14519.5.2.1.3344.4020.934399155200472591293751222570,2
+1.3.6.1.4.1.14519.5.2.1.7009.2403.315487538330093914780295001423,2
+1.3.6.1.4.1.14519.5.2.1.4334.1501.266278629803542138030809760466,2
+1.3.6.1.4.1.14519.5.2.1.99.1071.15165513944433062587582139477040,2
+1.3.6.1.4.1.14519.5.2.1.7009.2403.1349251143147105654071
+Query:
+--Description: 7) Find series where number of instances differs from number of unique ImagePositionPatient values
+SELECT
+  "SeriesInstanceUID",
+  COUNT(*)                                     AS "num_instances",
+  COUNT(DISTINCT TO_VARIANT("ImagePositionPatient")) AS "unique_positions"
+FROM "IDC"."IDC_V17"."DICOM_ALL"
+WHERE "Modality" = 'CT'
+  AND "collection_name" <> 'NLST'
+GROUP BY "SeriesInstanceUID"
+HAVING COUNT(*) <> COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))
+LIMIT 20;
+Answer:
+SeriesInstanceUID,num_instances,unique_positions
+1.3.6.1.4.1.9328.50.17.303464007556840192894690071236135689559,21,20
+1.3.6.1.4.1.9328.50.17.272843819799304737646249343517278459504,21,20
+1.3.6.1.4.1.14519.5.2.1.7009.2401.309643719300203962441499709291,9,1
+1.3.6.1.4.1.14519.5.2.1.1706.8374.148980847694043615155368760967,10,9
+1.3.6.1.4.1.14519.5.2.1.6655.2359.328645376995981261342976516194,9,1
+1.3.6.1.4.1.14519.5.2.1.3098.5025.266596628154374056796240369545,3,1
+1.3.6.1.4.1.9328.50.17.289592
+Query:
+--Description: 9) Examine minimum and maximum slice-to-slice z-spacing for each
+--             non-NLST CT series (sample 20).  The ROW_NUMBER() window function
+--             already contains an ORDER BY on the z-coordinate, so it is valid.
+WITH pos AS (
+    SELECT
+        "SeriesInstanceUID",
+        "ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY "ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+),
+diffs AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM pos
+)
+SELECT
+    "SeriesInstanceUID",
+    MIN(dz) AS "min_dz",
+    MAX(dz) AS "max_dz"
+FROM diffs
+GROUP BY "SeriesInstanceUID"
+LIMIT 20
+Answer:
+SeriesInstanceUID,min_dz,max_dz
+1.3.6.1.4.1.14519.5.2.1.7009.2401.189150791818325325368607083274,,
+1.3.6.1.4.1.9328.50.4.176988,0.8000000000000114,49.60000000000001
+1.3.6.1.4.1.14519.5.2.1.1706.8374.104965800154485335432509670191,49.99998399999998,85.0
+1.3.6.1.4.1.14519.5.2.1.6834.5010.161114071226146893844539560884,12.0,36.0
+1.3.6.1.4.1.9328.50.4.713561,1.599975000000029,65.60000600000001
+1.3.6.1.4.1.14519.5.2.1.6834.5010.207847026353414149257063878224,6.0,48.0
+1.3.6.1.4.1.14519.5.2.1.10
+Query:
+--Description: 10) Full report (sample 20) for qualified CT series.  The only
+--              change is adding an ORDER BY clause inside the ROW_NUMBER() used
+--              in the “orient” CTE to satisfy Snowflake’s requirement.
+WITH base AS (   -- preliminary filters
+    SELECT *
+    FROM "IDC"."IDC_V17"."DICOM_ALL"
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ('1.2.840.10008.1.2.4.70',
+                                      '1.2.840.10008.1.2.4.51')
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCAL%'
+),
+geo_ok AS (       -- geometry consistency rules
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                            AS num_instances,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) AS orient_ct,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))            AS pix_ct,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))    AS pos_ct,
+        COUNT(DISTINCT CONCAT(
+                "ImagePositionPatient"[0]::STRING, ',',
+                "ImagePositionPatient"[1]::STRING))          AS xy_ct,
+        COUNT(DISTINCT "Rows")    AS row_ct,
+        COUNT(DISTINCT "Columns") AS col_ct
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING orient_ct = 1
+       AND pix_ct    = 1
+       AND pos_ct    = num_instances
+       AND xy_ct     = 1
+       AND row_ct    = 1
+       AND col_ct    = 1
+),
+orient AS (        -- one orientation row per series to compute dot product
+    SELECT
+        g."SeriesInstanceUID",
+        g."SeriesNumber",
+        g."StudyInstanceUID",
+        g."PatientID",
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (
+            PARTITION BY g."SeriesInstanceUID"
+            ORDER BY b."SOPInstanceUID"
+        ) AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+dot_chk AS (       -- dot product condition (|cz| within 0.99–1.01)
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0 * o4) - (o1 * o3)) - 1) <= 0.01
+),
+z_vals AS (        -- z-coordinate list per series
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (
+            PARTITION BY b."SeriesInstanceUID"
+            ORDER BY b."ImagePositionPatient"[2]::FLOAT
+        ) AS rn
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (
+            PARTITION BY "SeriesInstanceUID"
+            ORDER BY rn
+        )) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (      -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                                      AS exp_cnt,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_max,
+        MIN(NULLIF(b."Exposure",'')::FLOAT)                               AS exp_min,
+        MAX(NULLIF(b."Exposure",'')::FLOAT)
+          - MIN(NULLIF(b."Exposure",'')::FLOAT)                           AS exp_range
+    FROM base b
+    JOIN dot_chk d
+      ON b."SeriesInstanceUID" = d."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (     -- total series size in MiB
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0 * 1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    d."SeriesInstanceUID"                              AS "series_uid",
+    d."SeriesNumber"                                   AS "series_no",
+    d."StudyInstanceUID"                               AS "study_uid",
+    d."PatientID"                                      AS "patient_id",
+    ABS((o0 * o4) - (o1 * o3))                         AS "max_abs_dot",
+    g.num_instances                                    AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")                 AS "distinct_thk",
+    z.max_dz                                           AS "max_dz",
+    z.min_dz                                           AS "min_dz",
+    z.tol_dz                                           AS "tol_dz",
+    e.exp_cnt                                          AS "distinct_exp",
+    e.exp_max                                          AS "exp_max",
+    e.exp_min                                          AS "exp_min",
+    e.exp_range                                        AS "exp_range",
+    s.series_mib                                       AS "series_mib"
+FROM dot_chk d
+JOIN geo_ok    g ON d."SeriesInstanceUID" = g."SeriesInstanceUID"
+JOIN z_aggr    z ON d."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON d."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON d."SeriesInstanceUID" = s."SeriesInstanceUID"
+JOIN base      b ON d."SeriesInstanceUID" = b."SeriesInstanceUID"
+GROUP BY
+    d."SeriesInstanceUID", d."SeriesNumber", d."StudyInstanceUID",
+    d."PatientID", o0, o1, o3, o4, g.num_instances,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.exp_cnt, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz     DESC,
+    e.exp_range  DESC,
+    d."SeriesInstanceUID" DESC
+LIMIT 20
+Answer:
+series_uid,series_no,study_uid,patient_id,max_abs_dot,num_sop,distinct_thk,max_dz,min_dz,tol_dz,distinct_exp,exp_max,exp_min,exp_range,series_mib
+1.3.6.1.4.1.32722.99.99.272316563266792574873516129771159347637,1,1.3.6.1.4.1.32722.99.99.174829301640193981653651859269018631836,LUNG1-159,1.0,1,1,,,,0,,,,0.501368
+1.3.6.1.4.1.32722.99.99.249933495887812931141368473276454873160,1,1.3.6.1.4.1.32722.99.99.163636792881733286502021427343132101636,LUNG1-040,1.0,1,1,,,,0,,,,0.501373
+1.3.6.1.4.1.32722.99.
+Task: Could you help me generate a report of CT image series from the dicom_all table such that all series from the NLST collection are excluded, any localizers or JPEG-compressed series (transfer syntaxes 1.2.840.10008.1.2.4.70 or 1.2.840.10008.1.2.4.51) are skipped, and only those passing certain geometry checks—namely a single orientation, identical pixel spacing, matching SOP instance and position counts, uniform pixel rows and columns, and a near-unity dot product of image orientation vectors—are included, while also computing slice interval differences, exposure differences, and approximate series size in MB for each qualified series?
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'IDC': {'IDC_V17': ['DICOM_METADATA', 'DICOM_ALL', 'DICOM_PIVOT']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 03:39:26 - Thread-2206 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  CT series quality-controlled summary (Snowflake dialect)
+    --------------------------------------------------------
+    – excludes NLST collection
+    – skips JPEG-compressed & localizer series
+    – applies geometry consistency checks
+    – returns per-series geometry / exposure / size statistics
+*/
+WITH base AS (   -- pre-filtered CT instances
+    SELECT *
+    FROM IDC.IDC_V17.DICOM_ALL
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ( '1.2.840.10008.1.2.4.70'      /* JPEG-LS lossless */
+                                     , '1.2.840.10008.1.2.4.51')     /* JPEG baseline   */
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCALIZER%'
+),
+geo_ok AS (      -- geometry rules per series
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                    AS num_sop,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) = 1      AS ok_orient,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))   = 1               AS ok_pixsp,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))             AS pos_cnt,
+        COUNT(DISTINCT CONCAT(
+                   "ImagePositionPatient"[0]::STRING, ',',
+                   "ImagePositionPatient"[1]::STRING))  = 1            AS ok_xy,
+        COUNT(DISTINCT "Rows")       = 1            AS ok_rows,
+        COUNT(DISTINCT "Columns")    = 1            AS ok_cols
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING ok_orient AND ok_pixsp AND ok_xy AND ok_rows AND ok_cols
+           AND pos_cnt = num_sop                              -- positions = instances
+),
+orient AS (      -- one orientation row per qualified series
+    SELECT
+        g.*,
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (PARTITION BY g."SeriesInstanceUID"
+                           ORDER BY b."SOPInstanceUID") AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+orient_ok AS (   -- keep series whose slice‐normal ≈ [0,0,±1]
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0*o4) - (o1*o3)) - 1) <= 0.01      -- |dot| ∈ [0.99,1.01]
+),
+z_vals AS (      -- z-coordinate list per series
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (PARTITION BY b."SeriesInstanceUID"
+                           ORDER BY b."ImagePositionPatient"[2]::FLOAT) AS rn
+    FROM base b
+    JOIN orient_ok o
+      ON b."SeriesInstanceUID" = o."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (PARTITION BY "SeriesInstanceUID" ORDER BY rn)) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (    -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                           AS distinct_exp,
+        MAX(TRY_TO_FLOAT(b."Exposure"))                        AS exp_max,
+        MIN(TRY_TO_FLOAT(b."Exposure"))                        AS exp_min,
+        MAX(TRY_TO_FLOAT(b."Exposure"))
+          - MIN(TRY_TO_FLOAT(b."Exposure"))                    AS exp_range
+    FROM base b
+    JOIN orient_ok o  ON b."SeriesInstanceUID" = o."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (   -- cumulative series size (MiB)
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0*1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    o."SeriesInstanceUID"                     AS "series_uid",
+    o."SeriesNumber"                          AS "series_no",
+    o."StudyInstanceUID"                      AS "study_uid",
+    o."PatientID"                             AS "patient_id",
+    ABS((o.o0*o.o4) - (o.o1*o.o3))            AS "max_dot_prod",
+    o.num_sop                                 AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")        AS "distinct_thk",
+    z.max_dz                                  AS "max_dz",
+    z.min_dz                                  AS "min_dz",
+    z.tol_dz                                  AS "tol_dz",
+    e.distinct_exp                            AS "distinct_exp",
+    e.exp_max                                 AS "exp_max",
+    e.exp_min                                 AS "exp_min",
+    e.exp_range                               AS "exp_range",
+    s.series_mib                              AS "series_mib"
+FROM orient_ok o
+JOIN base      b ON o."SeriesInstanceUID" = b."SeriesInstanceUID"
+JOIN z_aggr    z ON o."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON o."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON o."SeriesInstanceUID" = s."SeriesInstanceUID"
+GROUP BY
+    o."SeriesInstanceUID", o."SeriesNumber", o."StudyInstanceUID",
+    o."PatientID", o.o0, o.o1, o.o3, o.o4, o.num_sop,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.distinct_exp, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz    DESC NULLS LAST,
+    e.exp_range DESC NULLS LAST,
+    o."SeriesInstanceUID" DESC;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:39:26 - Thread-2206 (execute) - INFO - itercount: 1
+2025-05-05 03:39:26 - Thread-2206 (execute) - INFO - [Self-refine]
+Input sql:
+/*  CT series quality-controlled summary (Snowflake dialect)
+    --------------------------------------------------------
+    – excludes NLST collection
+    – skips JPEG-compressed & localizer series
+    – applies geometry consistency checks
+    – returns per-series geometry / exposure / size statistics
+*/
+WITH base AS (   -- pre-filtered CT instances
+    SELECT *
+    FROM IDC.IDC_V17.DICOM_ALL
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ( '1.2.840.10008.1.2.4.70'      /* JPEG-LS lossless */
+                                     , '1.2.840.10008.1.2.4.51')     /* JPEG baseline   */
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCALIZER%'
+),
+geo_ok AS (      -- geometry rules per series
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                    AS num_sop,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) = 1      AS ok_orient,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))   = 1               AS ok_pixsp,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))             AS pos_cnt,
+        COUNT(DISTINCT CONCAT(
+                   "ImagePositionPatient"[0]::STRING, ',',
+                   "ImagePositionPatient"[1]::STRING))  = 1            AS ok_xy,
+        COUNT(DISTINCT "Rows")       = 1            AS ok_rows,
+        COUNT(DISTINCT "Columns")    = 1            AS ok_cols
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING ok_orient AND ok_pixsp AND ok_xy AND ok_rows AND ok_cols
+           AND pos_cnt = num_sop                              -- positions = instances
+),
+orient AS (      -- one orientation row per qualified series
+    SELECT
+        g.*,
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (PARTITION BY g."SeriesInstanceUID"
+                           ORDER BY b."SOPInstanceUID") AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+orient_ok AS (   -- keep series whose slice‐normal ≈ [0,0,±1]
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0*o4) - (o1*o3)) - 1) <= 0.01      -- |dot| ∈ [0.99,1.01]
+),
+z_vals AS (      -- z-coordinate list per series
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (PARTITION BY b."SeriesInstanceUID"
+                           ORDER BY b."ImagePositionPatient"[2]::FLOAT) AS rn
+    FROM base b
+    JOIN orient_ok o
+      ON b."SeriesInstanceUID" = o."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (PARTITION BY "SeriesInstanceUID" ORDER BY rn)) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (    -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                           AS distinct_exp,
+        MAX(TRY_TO_FLOAT(b."Exposure"))                        AS exp_max,
+        MIN(TRY_TO_FLOAT(b."Exposure"))                        AS exp_min,
+        MAX(TRY_TO_FLOAT(b."Exposure"))
+          - MIN(TRY_TO_FLOAT(b."Exposure"))                    AS exp_range
+    FROM base b
+    JOIN orient_ok o  ON b."SeriesInstanceUID" = o."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (   -- cumulative series size (MiB)
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0*1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    o."SeriesInstanceUID"                     AS "series_uid",
+    o."SeriesNumber"                          AS "series_no",
+    o."StudyInstanceUID"                      AS "study_uid",
+    o."PatientID"                             AS "patient_id",
+    ABS((o.o0*o.o4) - (o.o1*o.o3))            AS "max_dot_prod",
+    o.num_sop                                 AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")        AS "distinct_thk",
+    z.max_dz                                  AS "max_dz",
+    z.min_dz                                  AS "min_dz",
+    z.tol_dz                                  AS "tol_dz",
+    e.distinct_exp                            AS "distinct_exp",
+    e.exp_max                                 AS "exp_max",
+    e.exp_min                                 AS "exp_min",
+    e.exp_range                               AS "exp_range",
+    s.series_mib                              AS "series_mib"
+FROM orient_ok o
+JOIN base      b ON o."SeriesInstanceUID" = b."SeriesInstanceUID"
+JOIN z_aggr    z ON o."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON o."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON o."SeriesInstanceUID" = s."SeriesInstanceUID"
+GROUP BY
+    o."SeriesInstanceUID", o."SeriesNumber", o."StudyInstanceUID",
+    o."PatientID", o.o0, o.o1, o.o3, o.o4, o.num_sop,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.distinct_exp, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz    DESC NULLS LAST,
+    e.exp_range DESC NULLS LAST,
+    o."SeriesInstanceUID" DESC;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##002140 (42601): SQL compilation error:\nUnknown functions TRY_TO_FLOAT, TRY_TO_FLOAT, TRY_TO_FLOAT, TRY_TO_FLOAT'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 03:40:05 - Thread-2206 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Quality-controlled CT series report  (Snowflake dialect)
+    --------------------------------------------------------
+    – drop NLST, JPEG-compressed and localizer series
+    – geometry consistency checks
+    – slice-spacing, exposure and size statistics
+*/
+WITH base AS (   -- preliminary CT rows
+    SELECT *
+    FROM IDC.IDC_V17.DICOM_ALL
+    WHERE "Modality" = 'CT'
+      AND "collection_name" <> 'NLST'
+      AND "TransferSyntaxUID" NOT IN ('1.2.840.10008.1.2.4.70',  -- JPEG-LS lossless
+                                      '1.2.840.10008.1.2.4.51')  -- JPEG baseline
+      AND CAST("ImageType" AS STRING) NOT ILIKE '%LOCALIZER%'
+),
+geo_ok AS (      -- geometry constraints per series
+    SELECT
+        "SeriesInstanceUID",
+        "SeriesNumber",
+        "StudyInstanceUID",
+        "PatientID",
+        COUNT(*)                                     AS num_sop,
+        COUNT(DISTINCT TO_VARIANT("ImageOrientationPatient")) = 1  AS ok_orient,
+        COUNT(DISTINCT TO_VARIANT("PixelSpacing"))   = 1            AS ok_pixsp,
+        COUNT(DISTINCT TO_VARIANT("ImagePositionPatient"))          AS pos_cnt,
+        COUNT(DISTINCT CONCAT(
+               "ImagePositionPatient"[0]::STRING, ',',
+               "ImagePositionPatient"[1]::STRING))  = 1             AS ok_xy,
+        COUNT(DISTINCT "Rows")    = 1               AS ok_rows,
+        COUNT(DISTINCT "Columns") = 1               AS ok_cols
+    FROM base
+    GROUP BY 1,2,3,4
+    HAVING ok_orient AND ok_pixsp AND ok_xy AND ok_rows AND ok_cols
+           AND pos_cnt = num_sop
+),
+orient AS (      -- pick one orientation row per series
+    SELECT
+        g.*,
+        b."ImageOrientationPatient"[0]::FLOAT AS o0,
+        b."ImageOrientationPatient"[1]::FLOAT AS o1,
+        b."ImageOrientationPatient"[2]::FLOAT AS o2,
+        b."ImageOrientationPatient"[3]::FLOAT AS o3,
+        b."ImageOrientationPatient"[4]::FLOAT AS o4,
+        b."ImageOrientationPatient"[5]::FLOAT AS o5,
+        ROW_NUMBER() OVER (PARTITION BY g."SeriesInstanceUID"
+                           ORDER BY b."SOPInstanceUID") AS rn
+    FROM geo_ok g
+    JOIN base b
+      ON g."SeriesInstanceUID" = b."SeriesInstanceUID"
+),
+orient_ok AS (   -- keep series whose slice normal ≈ [0,0,±1]
+    SELECT *
+    FROM orient
+    WHERE rn = 1
+      AND ABS(ABS((o0*o4) - (o1*o3)) - 1) <= 0.01
+),
+z_vals AS (      -- z-coordinate list
+    SELECT
+        b."SeriesInstanceUID",
+        b."ImagePositionPatient"[2]::FLOAT AS z,
+        ROW_NUMBER() OVER (PARTITION BY b."SeriesInstanceUID"
+                           ORDER BY b."ImagePositionPatient"[2]::FLOAT) AS rn
+    FROM base b
+    JOIN orient_ok o ON b."SeriesInstanceUID" = o."SeriesInstanceUID"
+),
+z_diff AS (
+    SELECT
+        "SeriesInstanceUID",
+        ABS(z - LAG(z) OVER (PARTITION BY "SeriesInstanceUID" ORDER BY rn)) AS dz
+    FROM z_vals
+),
+z_aggr AS (
+    SELECT
+        "SeriesInstanceUID",
+        MAX(dz) AS max_dz,
+        MIN(dz) AS min_dz,
+        MAX(dz) - MIN(dz) AS tol_dz
+    FROM z_diff
+    GROUP BY "SeriesInstanceUID"
+),
+exp_aggr AS (    -- exposure statistics
+    SELECT
+        b."SeriesInstanceUID",
+        COUNT(DISTINCT b."Exposure")                               AS distinct_exp,
+        MAX(TRY_TO_NUMBER(NULLIF(b."Exposure", '')))               AS exp_max,
+        MIN(TRY_TO_NUMBER(NULLIF(b."Exposure", '')))               AS exp_min,
+        MAX(TRY_TO_NUMBER(NULLIF(b."Exposure", '')))
+          - MIN(TRY_TO_NUMBER(NULLIF(b."Exposure", '')))           AS exp_range
+    FROM base b
+    JOIN orient_ok o ON b."SeriesInstanceUID" = o."SeriesInstanceUID"
+    GROUP BY b."SeriesInstanceUID"
+),
+size_aggr AS (   -- total size in MiB
+    SELECT
+        "SeriesInstanceUID",
+        SUM("instance_size") / (1024.0*1024.0) AS series_mib
+    FROM base
+    GROUP BY "SeriesInstanceUID"
+)
+SELECT
+    o."SeriesInstanceUID"                     AS "series_uid",
+    o."SeriesNumber"                          AS "series_no",
+    o."StudyInstanceUID"                      AS "study_uid",
+    o."PatientID"                             AS "patient_id",
+    ABS((o.o0*o.o4) - (o.o1*o.o3))            AS "max_dot_prod",
+    o.num_sop                                 AS "num_sop",
+    COUNT(DISTINCT b."SliceThickness")        AS "distinct_thk",
+    z.max_dz                                  AS "max_dz",
+    z.min_dz                                  AS "min_dz",
+    z.tol_dz                                  AS "tol_dz",
+    e.distinct_exp                            AS "distinct_exp",
+    e.exp_max                                 AS "exp_max",
+    e.exp_min                                 AS "exp_min",
+    e.exp_range                               AS "exp_range",
+    s.series_mib                              AS "series_mib"
+FROM orient_ok o
+JOIN base      b ON o."SeriesInstanceUID" = b."SeriesInstanceUID"
+JOIN z_aggr    z ON o."SeriesInstanceUID" = z."SeriesInstanceUID"
+JOIN exp_aggr  e ON o."SeriesInstanceUID" = e."SeriesInstanceUID"
+JOIN size_aggr s ON o."SeriesInstanceUID" = s."SeriesInstanceUID"
+GROUP BY
+    o."SeriesInstanceUID", o."SeriesNumber", o."StudyInstanceUID",
+    o."PatientID", o.o0, o.o1, o.o3, o.o4, o.num_sop,
+    z.max_dz, z.min_dz, z.tol_dz,
+    e.distinct_exp, e.exp_max, e.exp_min, e.exp_range,
+    s.series_mib
+ORDER BY
+    z.tol_dz    DESC NULLS LAST,
+    e.exp_range DESC NULLS LAST,
+    o."SeriesInstanceUID" DESC;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:41:23 - Thread-2206 (execute) - INFO - Total iteration counts: 1

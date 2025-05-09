@@ -1,0 +1,1991 @@
+2025-05-01 03:04:11 - Thread-1189 (execute) - INFO - [Answer format]
+```csv
+rfm_segment,average_sales_per_order,vs_overall_average
+```
+[Answer format]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Exploration]
+Below is a step‑by‑step cheat‑sheet that first identifies the columns that matter, the filters that must be applied, and finally supplies ten exploratory SQL statements (from very simple to the complete RFM segmentation and “average sales / order” report).  
+The queries are written for SQLite and always show at most 20 rows so that they can safely be inspected in any scratch environment.
+
+-------------------------------------------------
+1.  Relevant Columns and Typical Conditions
+-------------------------------------------------
+orders.order_id            : join key to order_payments / order_items  
+orders.customer_id         : link to customers  
+orders.order_status        : keep only `'delivered'` rows  
+orders.order_purchase_timestamp : purchase date – drives Recency  
+
+customers.customer_id      : join key to orders  
+customers.customer_unique_id : the required customer identifier in the task  
+
+order_payments.order_id    : join key back to orders  
+order_payments.payment_value : monetary value paid for an order  
+
+Typical mandatory filter  
+orders.order_status = 'delivered'            -- keep only fulfilled orders  
+
+-------------------------------------------------
+2.  Definitions to be used in the final queries
+-------------------------------------------------
+Recency  :  Difference in days between a customer’s latest delivered purchase  
+            and the global latest delivered purchase date in the data set  
+            (smaller value ⇒ more recent).
+
+Frequency:  Number of delivered orders made by the customer.
+
+Monetary :  Sum of payment_value of all delivered orders made by the customer.
+
+Average Sales / Order:  Monetary / Frequency  (per customer).
+
+RFM Scoring (example – can be adapted)  
+• Calculate quintiles (20‑percent cuts) for each metric.  
+• Assign a score 1–5: 5 = “best” for Recency (lowest), Frequency & Monetary (highest).  
+• Segment examples:  
+  – Champions      = R≥4 AND F≥4 AND M≥4  
+  – Loyal          = R≥3 AND F≥4  
+  – Potential      = R≥4 AND F≤3 AND M≤3  
+  – At Risk        = R≤2  
+  – Sleepers       = R=1 AND F=1 AND M=1  
+
+-------------------------------------------------
+3.  Ten Incremental SQL Queries
+-------------------------------------------------
+
+```sql
+-- 1) Distinct order statuses – confirm that 'delivered' exists
+SELECT DISTINCT order_status
+FROM orders
+LIMIT 20;
+```
+
+```sql
+-- 2) Peek at delivered orders and their purchase timestamps
+SELECT order_id,
+       order_purchase_timestamp
+FROM orders
+WHERE order_status = 'delivered'
+LIMIT 20;
+```
+
+```sql
+-- 3) Join delivered orders with customers to obtain the unique customer id
+SELECT o.order_id,
+       c.customer_unique_id
+FROM   orders   AS o
+JOIN   customers AS c  ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+```
+
+```sql
+-- 4) Verify payment values per delivered order
+SELECT p.order_id,
+       ROUND(p.payment_value, 2) AS payment_value
+FROM   order_payments AS p
+JOIN   orders         AS o ON o.order_id = p.order_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+```
+
+```sql
+-- 5) Count how many delivered orders each customer_unique_id has (Frequency)
+SELECT c.customer_unique_id,
+       COUNT(*) AS delivered_orders
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY delivered_orders DESC
+LIMIT 20;
+```
+
+```sql
+-- 6) Total spend (Monetary) by customer_unique_id for delivered orders
+SELECT c.customer_unique_id,
+       ROUND(SUM(p.payment_value), 2) AS total_spend
+FROM   orders         AS o
+JOIN   customers      AS c ON c.customer_id = o.customer_id
+JOIN   order_payments AS p ON p.order_id    = o.order_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY total_spend DESC
+LIMIT 20;
+```
+
+```sql
+-- 7) Latest purchase date per customer (needed for Recency)
+SELECT c.customer_unique_id,
+       MAX(DATE(o.order_purchase_timestamp)) AS last_purchase_date
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+LIMIT 20;
+```
+
+```sql
+-- 8) Build the basic R, F, M table in one shot (no scoring yet)
+WITH delivered_orders AS (
+    SELECT o.order_id,
+           c.customer_unique_id,
+           DATE(o.order_purchase_timestamp)       AS purchase_date,
+           p.payment_value
+    FROM   orders         AS o
+    JOIN   customers      AS c ON c.customer_id = o.customer_id
+    JOIN   order_payments AS p ON p.order_id    = o.order_id
+    WHERE  o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+    FROM   delivered_orders
+)
+SELECT d.customer_unique_id,
+       -- Recency in days
+       CAST( julianday( (SELECT dataset_max_date FROM anchor) )
+             - julianday( MAX(d.purchase_date) )
+             AS INTEGER )                          AS recency_days,
+       COUNT(DISTINCT d.order_id)                  AS frequency,
+       ROUND(SUM(d.payment_value), 2)              AS monetary,
+       ROUND( SUM(d.payment_value) * 1.0
+              / COUNT(DISTINCT d.order_id), 2)     AS avg_sales_per_order
+FROM   delivered_orders AS d
+GROUP  BY d.customer_unique_id
+LIMIT 20;
+```
+
+```sql
+-- 9) Apply quintile scoring for R, F, M (creates R_score, F_score, M_score)
+WITH rfm_raw AS (
+    -- reuse query (8) but without LIMIT
+    WITH delivered_orders AS (
+        SELECT o.order_id,
+               c.customer_unique_id,
+               DATE(o.order_purchase_timestamp) AS purchase_date,
+               p.payment_value
+        FROM   orders   AS o
+        JOIN   customers AS c ON c.customer_id = o.customer_id
+        JOIN   order_payments AS p ON p.order_id = o.order_id
+        WHERE  o.order_status = 'delivered'
+    ),
+    anchor AS (
+        SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+        FROM   delivered_orders
+    )
+    SELECT d.customer_unique_id,
+           CAST(julianday( (SELECT dataset_max_date FROM anchor) )
+                - julianday(MAX(d.purchase_date)) AS INTEGER) AS recency_days,
+           COUNT(DISTINCT d.order_id)                           AS frequency,
+           SUM(d.payment_value)                                 AS monetary
+    FROM   delivered_orders d
+    GROUP  BY d.customer_unique_id
+),
+bounds AS (
+    SELECT
+      -- Recency quintiles (lower is better so we reverse the score later)
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY recency_days)  AS r_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY recency_days)  AS r_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY recency_days)  AS r_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY recency_days)  AS r_q4,
+      -- Frequency quintiles
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY frequency)     AS f_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY frequency)     AS f_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY frequency)     AS f_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY frequency)     AS f_q4,
+      -- Monetary quintiles
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY monetary)      AS m_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY monetary)      AS m_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY monetary)      AS m_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY monetary)      AS m_q4
+    FROM rfm_raw
+)
+SELECT r.*,
+       -- Recency: low days = good ⇒ invert scoring
+       CASE WHEN r.recency_days <= (SELECT r_q1 FROM bounds) THEN 5
+            WHEN r.recency_days <= (SELECT r_q2 FROM bounds) THEN 4
+            WHEN r.recency_days <= (SELECT r_q3 FROM bounds) THEN 3
+            WHEN r.recency_days <= (SELECT r_q4 FROM bounds) THEN 2
+            ELSE 1 END                                           AS R_score,
+       -- Frequency: high = good
+       CASE WHEN r.frequency >= (SELECT f_q4 FROM bounds) THEN 5
+            WHEN r.frequency >= (SELECT f_q3 FROM bounds) THEN 4
+            WHEN r.frequency >= (SELECT f_q2 FROM bounds) THEN 3
+            WHEN r.frequency >= (SELECT f_q1 FROM bounds) THEN 2
+            ELSE 1 END                                           AS F_score,
+       -- Monetary: high = good
+       CASE WHEN r.monetary >= (SELECT m_q4 FROM bounds) THEN 5
+            WHEN r.monetary >= (SELECT m_q3 FROM bounds) THEN 4
+            WHEN r.monetary >= (SELECT m_q2 FROM bounds) THEN 3
+            WHEN r.monetary >= (SELECT m_q1 FROM bounds) THEN 2
+            ELSE 1 END                                           AS M_score
+FROM rfm_raw r
+LIMIT 20;
+```
+
+```sql
+-- 10) Final report: Average sales / order per RFM segment
+WITH rfm_scored AS (
+    -- reuse query (9) without LIMIT and keep the score columns
+    -- (assume the CTE rfm_scored now has customer_unique_id,
+    --  recency_days, frequency, monetary, avg_sales_per_order,
+    --  R_score, F_score, M_score)
+    SELECT *
+    FROM (
+        -- embed query (9) but extend it with avg_sales_per_order
+        WITH delivered_orders AS (
+            SELECT o.order_id,
+                   c.customer_unique_id,
+                   DATE(o.order_purchase_timestamp) AS purchase_date,
+                   p.payment_value
+            FROM   orders   AS o
+            JOIN   customers AS c ON c.customer_id = o.customer_id
+            JOIN   order_payments AS p ON p.order_id = o.order_id
+            WHERE  o.order_status = 'delivered'
+        ),
+        anchor AS (
+            SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+            FROM   delivered_orders
+        ),
+        rfm_raw AS (
+            SELECT d.customer_unique_id,
+                   CAST(julianday( (SELECT dataset_max_date FROM anchor) )
+                        - julianday(MAX(d.purchase_date)) AS INTEGER) AS recency_days,
+                   COUNT(DISTINCT d.order_id)                        AS frequency,
+                   SUM(d.payment_value)                              AS monetary,
+                   SUM(d.payment_value) * 1.0
+                   / COUNT(DISTINCT d.order_id)                      AS avg_sales_per_order
+            FROM   delivered_orders d
+            GROUP  BY d.customer_unique_id
+        ),
+        bounds AS (
+            SELECT
+              percentile_cont(0.2) WITHIN GROUP (ORDER BY recency_days)  AS r_q1,
+              percentile_cont(0.4) WITHIN GROUP (ORDER BY recency_days)  AS r_q2,
+              percentile_cont(0.6) WITHIN GROUP (ORDER BY recency_days)  AS r_q3,
+              percentile_cont(0.8) WITHIN GROUP (ORDER BY recency_days)  AS r_q4,
+              percentile_cont(0.2) WITHIN GROUP (ORDER BY frequency)     AS f_q1,
+              percentile_cont(0.4) WITHIN GROUP (ORDER BY frequency)     AS f_q2,
+              percentile_cont(0.6) WITHIN GROUP (ORDER BY frequency)     AS f_q3,
+              percentile_cont(0.8) WITHIN GROUP (ORDER BY frequency)     AS f_q4,
+              percentile_cont(0.2) WITHIN GROUP (ORDER BY monetary)      AS m_q1,
+              percentile_cont(0.4) WITHIN GROUP (ORDER BY monetary)      AS m_q2,
+              percentile_cont(0.6) WITHIN GROUP (ORDER BY monetary)      AS m_q3,
+              percentile_cont(0.8) WITHIN GROUP (ORDER BY monetary)      AS m_q4
+            FROM rfm_raw
+        )
+        SELECT r.*,
+               CASE WHEN r.recency_days <= (SELECT r_q1 FROM bounds) THEN 5
+                    WHEN r.recency_days <= (SELECT r_q2 FROM bounds) THEN 4
+                    WHEN r.recency_days <= (SELECT r_q3 FROM bounds) THEN 3
+                    WHEN r.recency_days <= (SELECT r_q4 FROM bounds) THEN 2
+                    ELSE 1 END                                       AS R_score,
+               CASE WHEN r.frequency >= (SELECT f_q4 FROM bounds) THEN 5
+                    WHEN r.frequency >= (SELECT f_q3 FROM bounds) THEN 4
+                    WHEN r.frequency >= (SELECT f_q2 FROM bounds) THEN 3
+                    WHEN r.frequency >= (SELECT f_q1 FROM bounds) THEN 2
+                    ELSE 1 END                                       AS F_score,
+               CASE WHEN r.monetary  >= (SELECT m_q4 FROM bounds) THEN 5
+                    WHEN r.monetary  >= (SELECT m_q3 FROM bounds) THEN 4
+                    WHEN r.monetary  >= (SELECT m_q2 FROM bounds) THEN 3
+                    WHEN r.monetary  >= (SELECT m_q1 FROM bounds) THEN 2
+                    ELSE 1 END                                       AS M_score
+        FROM rfm_raw r
+    )
+),
+segment_map AS (
+    SELECT customer_unique_id,
+           R_score,
+           F_score,
+           M_score,
+           avg_sales_per_order,
+           CASE
+               WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+               WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+               WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+               WHEN R_score<=2                                THEN 'At Risk'
+               ELSE 'Sleepers'
+           END AS rfm_segment
+    FROM rfm_scored
+)
+SELECT rfm_segment,
+       ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+       COUNT(*)                          AS customers_in_segment
+FROM   segment_map
+GROUP  BY rfm_segment
+ORDER  BY avg_sales_per_order_segment DESC
+LIMIT 20;
+```
+
+-------------------------------------------------
+4.  How to interpret the final output
+-------------------------------------------------
+• `avg_sales_per_order_segment` – average spend each customer makes on a single order, but averaged again across all customers in that segment.  
+• `customers_in_segment`          – size of the segment, useful to judge reliability.  
+
+Compare the segments: typically “Champions” and “Loyal” groups should show the highest average sales per order, whereas “Sleepers” or “At Risk” segments will score much lower, highlighting opportunities for re‑activation campaigns or cross‑sell initiatives.
+
+You can now run these queries in sequence, inspect intermediate results, fine‑tune quintile cut‑offs if necessary, and finally obtain the required “average sales per order by RFM segment” analysis.
+[Exploration]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 1) Distinct order statuses – confirm that 'delivered' exists
+SELECT DISTINCT order_status
+FROM orders
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1) Distinct order statuses – confirm that 'delivered' exists
+SELECT DISTINCT order_status
+FROM orders
+LIMIT 20;
+Results:
+order_status
+delivered
+invoiced
+shipped
+processing
+unavailable
+canceled
+created
+approved
+
+[Successfully executed]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 2) Peek at delivered orders and their purchase timestamps
+SELECT order_id,
+       order_purchase_timestamp
+FROM orders
+WHERE order_status = 'delivered'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2) Peek at delivered orders and their purchase timestamps
+SELECT order_id,
+       order_purchase_timestamp
+FROM orders
+WHERE order_status = 'delivered'
+LIMIT 20;
+Results:
+order_id,order_purchase_timestamp
+e481f51cbdc54678b7cc49136f2d6af7,2017-10-02 10:56:33
+53cdb2fc8bc7dce0b6741e2150273451,2018-07-24 20:41:37
+47770eb9100c2d0c44946d9cf07ec65d,2018-08-08 08:38:49
+949d5b44dbf5de918fe9c16f97b45f8a,2017-11-18 19:28:06
+ad21c59c0840e6cb83a9ceb5573f8159,2018-02-13 21:18:39
+a4591c265e18cb1dcee52889e2d8acc3,2017-07-09 21:57:05
+6514b8ad8028c9f2cc2374ded245783f,2017-05-16 13:10:30
+76c6e866289321a7c93b82b54852dc33,2017-01-23 18:29:09
+e69bfb5eb88e0ed6a785585b27e16dbf,
+
+[Successfully executed]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 3) Join delivered orders with customers to obtain the unique customer id
+SELECT o.order_id,
+       c.customer_unique_id
+FROM   orders   AS o
+JOIN   customers AS c  ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3) Join delivered orders with customers to obtain the unique customer id
+SELECT o.order_id,
+       c.customer_unique_id
+FROM   orders   AS o
+JOIN   customers AS c  ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+Results:
+order_id,customer_unique_id
+e481f51cbdc54678b7cc49136f2d6af7,7c396fd4830fd04220f754e42b4e5bff
+53cdb2fc8bc7dce0b6741e2150273451,af07308b275d755c9edb36a90c618231
+47770eb9100c2d0c44946d9cf07ec65d,3a653a41f6f9fc3d2a113cf8398680e8
+949d5b44dbf5de918fe9c16f97b45f8a,7c142cf63193a1473d2e66489a9ae977
+ad21c59c0840e6cb83a9ceb5573f8159,72632f0f9dd73dfee390c9b22eb56dd6
+a4591c265e18cb1dcee52889e2d8acc3,80bb27c7c16e8f973207a5086ab329e2
+6514b8ad8028c9f2cc2374ded245783f,932afa1e708222e5821dac9cd5db4cae
+
+[Successfully executed]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 4) Verify payment values per delivered order
+SELECT p.order_id,
+       ROUND(p.payment_value, 2) AS payment_value
+FROM   order_payments AS p
+JOIN   orders         AS o ON o.order_id = p.order_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4) Verify payment values per delivered order
+SELECT p.order_id,
+       ROUND(p.payment_value, 2) AS payment_value
+FROM   order_payments AS p
+JOIN   orders         AS o ON o.order_id = p.order_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+Results:
+order_id,payment_value
+e481f51cbdc54678b7cc49136f2d6af7,2.0
+e481f51cbdc54678b7cc49136f2d6af7,18.12
+e481f51cbdc54678b7cc49136f2d6af7,18.59
+53cdb2fc8bc7dce0b6741e2150273451,141.46
+47770eb9100c2d0c44946d9cf07ec65d,179.12
+949d5b44dbf5de918fe9c16f97b45f8a,72.2
+ad21c59c0840e6cb83a9ceb5573f8159,28.62
+a4591c265e18cb1dcee52889e2d8acc3,175.26
+6514b8ad8028c9f2cc2374ded245783f,75.16
+76c6e866289321a7c93b82b54852dc33,35.95
+e69bfb5eb88e0ed6a785585b27e16dbf,8.34
+e69bfb5eb88e0ed6a785585b27e16dbf,161.
+
+[Successfully executed]
+2025-05-01 03:05:18 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 5) Count how many delivered orders each customer_unique_id has (Frequency)
+SELECT c.customer_unique_id,
+       COUNT(*) AS delivered_orders
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY delivered_orders DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:19 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5) Count how many delivered orders each customer_unique_id has (Frequency)
+SELECT c.customer_unique_id,
+       COUNT(*) AS delivered_orders
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY delivered_orders DESC
+LIMIT 20;
+Results:
+customer_unique_id,delivered_orders
+8d50f5eadf50201ccdcedfb9e2ac8455,15
+3e43e6105506432c953e165fb2acf44c,9
+ca77025e7201e3b30c44b472ff346268,7
+6469f99c1f9dfae7733b25662e7f1782,7
+1b6c7548a2a1f9037c1fd3ddfed95f33,7
+f0e310a6839dce9de1638e0fe5ab282a,6
+dc813062e0fc23409cd255f7f53c7074,6
+63cfc61cee11cbe306bff5857d00bfe4,6
+47c1a3033b8b77b3ab6e109eb4d5fdf3,6
+12f5d6e1cbf93dafd9dcc19095df0b3d,6
+fe81bb32c243a86b2f86fbf053fe6140,5
+de34b16117594161a6a89c50b289d35a,5
+b4e4f24de1e8725b74e4a1f4975116
+
+[Successfully executed]
+2025-05-01 03:05:19 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 6) Total spend (Monetary) by customer_unique_id for delivered orders
+SELECT c.customer_unique_id,
+       ROUND(SUM(p.payment_value), 2) AS total_spend
+FROM   orders         AS o
+JOIN   customers      AS c ON c.customer_id = o.customer_id
+JOIN   order_payments AS p ON p.order_id    = o.order_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY total_spend DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:20 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6) Total spend (Monetary) by customer_unique_id for delivered orders
+SELECT c.customer_unique_id,
+       ROUND(SUM(p.payment_value), 2) AS total_spend
+FROM   orders         AS o
+JOIN   customers      AS c ON c.customer_id = o.customer_id
+JOIN   order_payments AS p ON p.order_id    = o.order_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY total_spend DESC
+LIMIT 20;
+Results:
+customer_unique_id,total_spend
+0a0a92112bd4c708ca5fde585afaa872,13664.08
+da122df9eeddfedc1dc1f5349a1a690c,7571.63
+763c8b1c9c68a0229c42c9fc6f662b93,7274.88
+dc4802a71eae9be1dd28f5d788ceb526,6929.31
+459bef486812aa25204be022145caa62,6922.21
+ff4159b92c40ebe40454e3e6a7c35ed6,6726.66
+4007669dec559734d6f53e029e360987,6081.54
+eebb5dda148d3893cdaf5b5ca3040ccb,4764.34
+48e1ac109decbb87765a3eade6854098,4681.78
+c8460e4251689ba205045f3ea17884a1,4655.91
+edde2314c6c30e864a128ac95d6b2112,4513.32
+a229e
+
+[Successfully executed]
+2025-05-01 03:05:20 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 7) Latest purchase date per customer (needed for Recency)
+SELECT c.customer_unique_id,
+       MAX(DATE(o.order_purchase_timestamp)) AS last_purchase_date
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:20 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7) Latest purchase date per customer (needed for Recency)
+SELECT c.customer_unique_id,
+       MAX(DATE(o.order_purchase_timestamp)) AS last_purchase_date
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+LIMIT 20;
+Results:
+customer_unique_id,last_purchase_date
+0000366f3b9a7992bf8c76cfdf3221e2,2018-05-10
+0000b849f77a49e4a4ce2b2a4ca5be3f,2018-05-07
+0000f46a3911fa3c0805444483337064,2017-03-10
+0000f6ccb0745a6a4b88665a16c9f078,2017-10-12
+0004aac84e0df4da2b147fca70cf8255,2017-11-14
+0004bd2a26a76fe21f786e4fbd80607f,2018-04-05
+00050ab1314c0e55a6ca13cf7181fecf,2018-04-20
+00053a61a98854899e70ed204dd4bafe,2018-02-28
+0005e1862207bf6ccc02e4228effd9a0,2017-03-04
+0005ef4cd20d2893f0d9fbd94d3c0d97,2018-03-12
+0006fdc98a4
+
+[Successfully executed]
+2025-05-01 03:05:20 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 8) Build the basic R, F, M table in one shot (no scoring yet)
+WITH delivered_orders AS (
+    SELECT o.order_id,
+           c.customer_unique_id,
+           DATE(o.order_purchase_timestamp)       AS purchase_date,
+           p.payment_value
+    FROM   orders         AS o
+    JOIN   customers      AS c ON c.customer_id = o.customer_id
+    JOIN   order_payments AS p ON p.order_id    = o.order_id
+    WHERE  o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+    FROM   delivered_orders
+)
+SELECT d.customer_unique_id,
+       -- Recency in days
+       CAST( julianday( (SELECT dataset_max_date FROM anchor) )
+             - julianday( MAX(d.purchase_date) )
+             AS INTEGER )                          AS recency_days,
+       COUNT(DISTINCT d.order_id)                  AS frequency,
+       ROUND(SUM(d.payment_value), 2)              AS monetary,
+       ROUND( SUM(d.payment_value) * 1.0
+              / COUNT(DISTINCT d.order_id), 2)     AS avg_sales_per_order
+FROM   delivered_orders AS d
+GROUP  BY d.customer_unique_id
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:22 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8) Build the basic R, F, M table in one shot (no scoring yet)
+WITH delivered_orders AS (
+    SELECT o.order_id,
+           c.customer_unique_id,
+           DATE(o.order_purchase_timestamp)       AS purchase_date,
+           p.payment_value
+    FROM   orders         AS o
+    JOIN   customers      AS c ON c.customer_id = o.customer_id
+    JOIN   order_payments AS p ON p.order_id    = o.order_id
+    WHERE  o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+    FROM   delivered_orders
+)
+SELECT d.customer_unique_id,
+       -- Recency in days
+       CAST( julianday( (SELECT dataset_max_date FROM anchor) )
+             - julianday( MAX(d.purchase_date) )
+             AS INTEGER )                          AS recency_days,
+       COUNT(DISTINCT d.order_id)                  AS frequency,
+       ROUND(SUM(d.payment_value), 2)              AS monetary,
+       ROUND( SUM(d.payment_value) * 1.0
+              / COUNT(DISTINCT d.order_id), 2)     AS avg_sales_per_order
+FROM   delivered_orders AS d
+GROUP  BY d.customer_unique_id
+LIMIT 20;
+Results:
+customer_unique_id,recency_days,frequency,monetary,avg_sales_per_order
+0000366f3b9a7992bf8c76cfdf3221e2,111,1,141.9,141.9
+0000b849f77a49e4a4ce2b2a4ca5be3f,114,1,27.19,27.19
+0000f46a3911fa3c0805444483337064,537,1,86.22,86.22
+0000f6ccb0745a6a4b88665a16c9f078,321,1,43.62,43.62
+0004aac84e0df4da2b147fca70cf8255,288,1,196.89,196.89
+0004bd2a26a76fe21f786e4fbd80607f,146,1,166.98,166.98
+00050ab1314c0e55a6ca13cf7181fecf,131,1,35.38,35.38
+00053a61a98854899e70ed204dd4bafe,182,1,419.18,419.18
+0005e1
+
+[Successfully executed]
+2025-05-01 03:05:22 - Thread-1189 (execute) - INFO - [Try to execute]
+-- 9) Apply quintile scoring for R, F, M (creates R_score, F_score, M_score)
+WITH rfm_raw AS (
+    -- reuse query (8) but without LIMIT
+    WITH delivered_orders AS (
+        SELECT o.order_id,
+               c.customer_unique_id,
+               DATE(o.order_purchase_timestamp) AS purchase_date,
+               p.payment_value
+        FROM   orders   AS o
+        JOIN   customers AS c ON c.customer_id = o.customer_id
+        JOIN   order_payments AS p ON p.order_id = o.order_id
+        WHERE  o.order_status = 'delivered'
+    ),
+    anchor AS (
+        SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+        FROM   delivered_orders
+    )
+    SELECT d.customer_unique_id,
+           CAST(julianday( (SELECT dataset_max_date FROM anchor) )
+                - julianday(MAX(d.purchase_date)) AS INTEGER) AS recency_days,
+           COUNT(DISTINCT d.order_id)                           AS frequency,
+           SUM(d.payment_value)                                 AS monetary
+    FROM   delivered_orders d
+    GROUP  BY d.customer_unique_id
+),
+bounds AS (
+    SELECT
+      -- Recency quintiles (lower is better so we reverse the score later)
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY recency_days)  AS r_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY recency_days)  AS r_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY recency_days)  AS r_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY recency_days)  AS r_q4,
+      -- Frequency quintiles
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY frequency)     AS f_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY frequency)     AS f_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY frequency)     AS f_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY frequency)     AS f_q4,
+      -- Monetary quintiles
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY monetary)      AS m_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY monetary)      AS m_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY monetary)      AS m_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY monetary)      AS m_q4
+    FROM rfm_raw
+)
+SELECT r.*,
+       -- Recency: low days = good ⇒ invert scoring
+       CASE WHEN r.recency_days <= (SELECT r_q1 FROM bounds) THEN 5
+            WHEN r.recency_days <= (SELECT r_q2 FROM bounds) THEN 4
+            WHEN r.recency_days <= (SELECT r_q3 FROM bounds) THEN 3
+            WHEN r.recency_days <= (SELECT r_q4 FROM bounds) THEN 2
+            ELSE 1 END                                           AS R_score,
+       -- Frequency: high = good
+       CASE WHEN r.frequency >= (SELECT f_q4 FROM bounds) THEN 5
+            WHEN r.frequency >= (SELECT f_q3 FROM bounds) THEN 4
+            WHEN r.frequency >= (SELECT f_q2 FROM bounds) THEN 3
+            WHEN r.frequency >= (SELECT f_q1 FROM bounds) THEN 2
+            ELSE 1 END                                           AS F_score,
+       -- Monetary: high = good
+       CASE WHEN r.monetary >= (SELECT m_q4 FROM bounds) THEN 5
+            WHEN r.monetary >= (SELECT m_q3 FROM bounds) THEN 4
+            WHEN r.monetary >= (SELECT m_q2 FROM bounds) THEN 3
+            WHEN r.monetary >= (SELECT m_q1 FROM bounds) THEN 2
+            ELSE 1 END                                           AS M_score
+FROM rfm_raw r
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:05:22 - Thread-1189 (execute) - INFO - [Error occurred]
+near "(": syntax error
+[Error occurred]
+2025-05-01 03:06:57 - Thread-1189 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+-- 1. Start from orders that are 'delivered' and join payments + customers → delivered_orders.
+-- 2. Find the most recent delivered purchase in the whole dataset (anchor CTE).
+-- 3. Build R (recency in days), F (count of delivered orders), M (total spend) and
+--    Avg‑sales/order for every customer_unique_id (rfm_raw CTE).
+-- 4. Convert R, F, M into quintile scores 1‑to‑5 using NTILE window functions
+--    (Recency score is inverted so 5 = most recent) → rfm_scores CTE.
+-- 5. Translate the RFM scores into five label segments (segment_map CTE).
+-- 6. Return, for each segment, the average “average sales per order” and how many
+--    customers it contains, ordered by spending.
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp) AS purchase_date,
+            p.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c ON c.customer_id = o.customer_id
+    JOIN    order_payments  AS p ON p.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  d.customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(d.purchase_date)) AS INTEGER)      AS recency_days,
+            COUNT(DISTINCT d.order_id)                                AS frequency,
+            SUM(d.payment_value)                                      AS monetary,
+            SUM(d.payment_value) * 1.0 /
+            COUNT(DISTINCT d.order_id)                                AS avg_sales_per_order
+    FROM    delivered_orders d
+    GROUP   BY d.customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score, -- invert for recency
+            NTILE(5)  OVER (ORDER BY frequency DESC)       AS F_score,
+            NTILE(5)  OVER (ORDER BY monetary  DESC)       AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                                'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+)
+SELECT  rfm_segment,
+        ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+        COUNT(*)                           AS customers_in_segment
+FROM    segment_map
+GROUP   BY rfm_segment
+ORDER   BY avg_sales_per_order_segment DESC;
+```
+[Corrected SQL]
+2025-05-01 03:07:00 - Thread-1189 (execute) - INFO - [Results for corrected sql]
+rfm_segment,avg_sales_per_order_segment,customers_in_segment
+Potential,233.19,22872
+Sleepers,215.88,11215
+At Risk,160.99,37342
+Loyal,54.94,7622
+Champions,54.63,14306
+
+[Results for corrected sql]
+2025-05-01 03:07:29 - Thread-1189 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: “Final report” rewritten for plain SQLite.
+--Steps
+-- 1) delivered_orders  – all payment lines from delivered orders.
+-- 2) anchor            – most recent purchase date in the dataset.
+-- 3) rfm_raw           – R (days), F (#orders), M (spend), Avg‑sales/order.
+-- 4) rfm_scores        – convert R, F, M to 1‑to‑5 scores using NTILE
+--                        (invert Recency so 5 = most recent).
+-- 5) segment_map       – assign a human‑readable RFM segment.
+-- 6) Final SELECT      – average sales / order and customer count per segment.
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp) AS purchase_date,
+            p.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c ON c.customer_id = o.customer_id
+    JOIN    order_payments  AS p ON p.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  d.customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(d.purchase_date)) AS INTEGER)      AS recency_days,
+            COUNT(DISTINCT d.order_id)                                AS frequency,
+            SUM(d.payment_value)                                      AS monetary,
+            SUM(d.payment_value) * 1.0 /
+            COUNT(DISTINCT d.order_id)                                AS avg_sales_per_order
+    FROM    delivered_orders d
+    GROUP   BY d.customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score,  -- invert
+            NTILE(5)  OVER (ORDER BY frequency DESC)       AS F_score,
+            NTILE(5)  OVER (ORDER BY monetary  DESC)       AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                                'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+)
+SELECT  rfm_segment,
+        ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+        COUNT(*)                           AS customers_in_segment
+FROM    segment_map
+GROUP   BY rfm_segment
+ORDER   BY avg_sales_per_order_segment DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 03:07:29 - Thread-1189 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description / Thinking process:
+-- 1. Start from orders that are 'delivered' and join payments + customers → delivered_orders.
+-- 2. Find the most recent delivered purchase in the whole dataset (anchor CTE).
+-- 3. Build R (recency in days), F (count of delivered orders), M (total spend) and
+--    Avg‑sales/order for every customer_unique_id (rfm_raw CTE).
+-- 4. Convert R, F, M into quintile scores 1‑to‑5 using NTILE window functions
+--    (Recency score is inverted so 5 = most recent) → rfm_scores CTE.
+-- 5. Translate the RFM scores into five label segments (segment_map CTE).
+-- 6. Return, for each segment, the average “average sales per order” and how many
+--    customers it contains, ordered by spending.
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp) AS purchase_date,
+            p.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c ON c.customer_id = o.customer_id
+    JOIN    order_payments  AS p ON p.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  d.customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(d.purchase_date)) AS INTEGER)      AS recency_days,
+            COUNT(DISTINCT d.order_id)                                AS frequency,
+            SUM(d.payment_value)                                      AS monetary,
+            SUM(d.payment_value) * 1.0 /
+            COUNT(DISTINCT d.order_id)                                AS avg_sales_per_order
+    FROM    delivered_orders d
+    GROUP   BY d.customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score, -- invert for recency
+            NTILE(5)  OVER (ORDER BY frequency DESC)       AS F_score,
+            NTILE(5)  OVER (ORDER BY monetary  DESC)       AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                                'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+)
+SELECT  rfm_segment,
+        ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+        COUNT(*)                           AS customers_in_segment
+FROM    segment_map
+GROUP   BY rfm_segment
+ORDER   BY avg_sales_per_order_segment DESC;
+Results:
+rfm_segment,avg_sales_per_order_segment,customers_in_segment
+Potential,233.19,22872
+Sleepers,215.88,11215
+At Risk,160.99,37342
+Loyal,54.94,7622
+Champions,54.63,14306
+
+[Successfully corrected]
+2025-05-01 03:07:29 - Thread-1189 (execute) - INFO - [Try to execute]
+--Description: “Final report” rewritten for plain SQLite.
+--Steps
+-- 1) delivered_orders  – all payment lines from delivered orders.
+-- 2) anchor            – most recent purchase date in the dataset.
+-- 3) rfm_raw           – R (days), F (#orders), M (spend), Avg‑sales/order.
+-- 4) rfm_scores        – convert R, F, M to 1‑to‑5 scores using NTILE
+--                        (invert Recency so 5 = most recent).
+-- 5) segment_map       – assign a human‑readable RFM segment.
+-- 6) Final SELECT      – average sales / order and customer count per segment.
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp) AS purchase_date,
+            p.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c ON c.customer_id = o.customer_id
+    JOIN    order_payments  AS p ON p.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  d.customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(d.purchase_date)) AS INTEGER)      AS recency_days,
+            COUNT(DISTINCT d.order_id)                                AS frequency,
+            SUM(d.payment_value)                                      AS monetary,
+            SUM(d.payment_value) * 1.0 /
+            COUNT(DISTINCT d.order_id)                                AS avg_sales_per_order
+    FROM    delivered_orders d
+    GROUP   BY d.customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score,  -- invert
+            NTILE(5)  OVER (ORDER BY frequency DESC)       AS F_score,
+            NTILE(5)  OVER (ORDER BY monetary  DESC)       AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                                'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+)
+SELECT  rfm_segment,
+        ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+        COUNT(*)                           AS customers_in_segment
+FROM    segment_map
+GROUP   BY rfm_segment
+ORDER   BY avg_sales_per_order_segment DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 03:07:31 - Thread-1189 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: “Final report” rewritten for plain SQLite.
+--Steps
+-- 1) delivered_orders  – all payment lines from delivered orders.
+-- 2) anchor            – most recent purchase date in the dataset.
+-- 3) rfm_raw           – R (days), F (#orders), M (spend), Avg‑sales/order.
+-- 4) rfm_scores        – convert R, F, M to 1‑to‑5 scores using NTILE
+--                        (invert Recency so 5 = most recent).
+-- 5) segment_map       – assign a human‑readable RFM segment.
+-- 6) Final SELECT      – average sales / order and customer count per segment.
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp) AS purchase_date,
+            p.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c ON c.customer_id = o.customer_id
+    JOIN    order_payments  AS p ON p.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  d.customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(d.purchase_date)) AS INTEGER)      AS recency_days,
+            COUNT(DISTINCT d.order_id)                                AS frequency,
+            SUM(d.payment_value)                                      AS monetary,
+            SUM(d.payment_value) * 1.0 /
+            COUNT(DISTINCT d.order_id)                                AS avg_sales_per_order
+    FROM    delivered_orders d
+    GROUP   BY d.customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score,  -- invert
+            NTILE(5)  OVER (ORDER BY frequency DESC)       AS F_score,
+            NTILE(5)  OVER (ORDER BY monetary  DESC)       AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                                'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+)
+SELECT  rfm_segment,
+        ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+        COUNT(*)                           AS customers_in_segment
+FROM    segment_map
+GROUP   BY rfm_segment
+ORDER   BY avg_sales_per_order_segment DESC
+LIMIT 20
+Results:
+rfm_segment,avg_sales_per_order_segment,customers_in_segment
+Potential,233.19,22872
+Sleepers,215.88,11215
+At Risk,160.99,37342
+Loyal,54.94,7622
+Champions,54.63,14306
+
+[Successfully executed]
+2025-05-01 03:07:31 - Thread-1189 (execute) - INFO - itercount: 0
+2025-05-01 03:07:31 - Thread-1189 (execute) - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: product_category_name_translation
+Column name: product_category_name Type: TEXT Description: 
+Column name: product_category_name_english Type: TEXT Description: 
+Sample rows:
+[('beleza_saude', 'health_beauty'), ('informatica_acessorios', 'computers_accessories'), ('automotivo', 'auto')]
+
+--------------------------------------------------
+Table full name: sellers
+Column name: seller_id Type: TEXT Description: 
+Column name: seller_zip_code_prefix Type: INTEGER Description: 
+Column name: seller_city Type: TEXT Description: 
+Column name: seller_state Type: TEXT Description: 
+Sample rows:
+[('3442f8959a84dea7ee197c632cb2df15', 13023, 'campinas', 'SP'), ('d1b65fc7debc3361ea86b5f14c68d2e2', 13844, 'mogi guacu', 'SP'), ('ce3ad9de960102d0677a81f5d0bb7b2d', 20031, 'rio de janeiro', 'RJ')]
+
+--------------------------------------------------
+Table full name: customers
+Column name: customer_id Type: TEXT Description: 
+Column name: customer_unique_id Type: TEXT Description: 
+Column name: customer_zip_code_prefix Type: INTEGER Description: 
+Column name: customer_city Type: TEXT Description: 
+Column name: customer_state Type: TEXT Description: 
+Sample rows:
+[('06b8999e2fba1a1fbc88172c00ba8bc7', '861eff4711a542e4b93843c6dd7febb0', 14409, 'franca', 'SP'), ('18955e83d337fd6b2def6b18a428ac77', '290c77bc529b7ac935b93aa66c333dc3', 9790, 'sao bernardo do campo', 'SP'), ('4e7b3e00288586ebd08712fdd0374a03', '060e732b5b29e8181a18229c7b0b2b5e', 1151, 'sao paulo', 'SP')]
+
+--------------------------------------------------
+Table full name: geolocation
+Column name: geolocation_zip_code_prefix Type: INTEGER Description: 
+Column name: geolocation_lat Type: REAL Description: 
+Column name: geolocation_lng Type: REAL Description: 
+Column name: geolocation_city Type: TEXT Description: 
+Column name: geolocation_state Type: TEXT Description: 
+Sample rows:
+[(1037, -23.54562128115268, -46.63929204800168, 'sao paulo', 'SP'), (1046, -23.54608112703553, -46.64482029837157, 'sao paulo', 'SP'), (1046, -23.54612896641469, -46.64295148361138, 'sao paulo', 'SP')]
+
+--------------------------------------------------
+Table full name: order_items
+Column name: order_id Type: TEXT Description: 
+Column name: order_item_id Type: INTEGER Description: 
+Column name: product_id Type: TEXT Description: 
+Column name: seller_id Type: TEXT Description: 
+Column name: shipping_limit_date Type: TEXT Description: 
+Column name: price Type: REAL Description: 
+Column name: freight_value Type: REAL Description: 
+Sample rows:
+[('00010242fe8c5a6d1ba2dd792cb16214', 1, '4244733e06e7ecb4970a6e2683c13e61', '48436dade18ac8b2bce089ec2a041202', '2017-09-19 09:45:35', 58.9, 13.29), ('00018f77f2f0320c557190d7a144bdd3', 1, 'e5f2d52b802189ee658865ca93d83a8f', 'dd7ddc04e1b6c2c614352b383efe2d36', '2017-05-03 11:05:13', 239.9, 19.93), ('000229ec398224ef6ca0657da4fc703e', 1, 'c777355d18b72b67abbeef9df44fd0fd', '5b51032eddd242adc84c38acab88f23d', '2018-01-18 14:48:30', 199.0, 17.87)]
+
+--------------------------------------------------
+Table full name: order_payments
+Column name: order_id Type: TEXT Description: 
+Column name: payment_sequential Type: INTEGER Description: 
+Column name: payment_type Type: TEXT Description: 
+Column name: payment_installments Type: INTEGER Description: 
+Column name: payment_value Type: REAL Description: 
+Sample rows:
+[('b81ef226f3fe1789b1e8b2acac839d17', 1, 'credit_card', 8, 99.33), ('a9810da82917af2d9aefd1278f1dcfa0', 1, 'credit_card', 1, 24.39), ('25e8ea4e93396b6fa0d3dd708e76c1bd', 1, 'credit_card', 1, 65.71)]
+
+--------------------------------------------------
+Table full name: order_reviews
+Column name: review_id Type: TEXT Description: 
+Column name: order_id Type: TEXT Description: 
+Column name: review_score Type: INTEGER Description: 
+Column name: review_comment_title Type: TEXT Description: 
+Column name: review_comment_message Type: TEXT Description: 
+Column name: review_creation_date Type: TEXT Description: 
+Column name: review_answer_timestamp Type: TEXT Description: 
+Sample rows:
+[('7bc2406110b926393aa56f80a40eba40', '73fc7af87114b39712e6da79b0a377eb', 4, None, None, '2018-01-18 00:00:00', '2018-01-18 21:46:59'), ('80e641a11e56f04c1ad469d5645fdfde', 'a548910a1c6147796b98fdf73dbeba33', 5, None, None, '2018-03-10 00:00:00', '2018-03-11 03:05:13'), ('228ce5500dc1d8e020d8d1322874b6f0', 'f9e4b658b201a9f2ecdecbb34bed034b', 5, None, None, '2018-02-17 00:00:00', '2018-02-18 14:36:24')]
+
+--------------------------------------------------
+Table full name: orders
+Column name: order_id Type: TEXT Description: 
+Column name: customer_id Type: TEXT Description: 
+Column name: order_status Type: TEXT Description: 
+Column name: order_purchase_timestamp Type: TEXT Description: 
+Column name: order_approved_at Type: TEXT Description: 
+Column name: order_delivered_carrier_date Type: TEXT Description: 
+Column name: order_delivered_customer_date Type: TEXT Description: 
+Column name: order_estimated_delivery_date Type: TEXT Description: 
+Sample rows:
+[('e481f51cbdc54678b7cc49136f2d6af7', '9ef432eb6251297304e76186b10a928d', 'delivered', '2017-10-02 10:56:33', '2017-10-02 11:07:15', '2017-10-04 19:55:00', '2017-10-10 21:25:13', '2017-10-18 00:00:00'), ('53cdb2fc8bc7dce0b6741e2150273451', 'b0830fb4747a6c6d20dea0b8c802d7ef', 'delivered', '2018-07-24 20:41:37', '2018-07-26 03:24:27', '2018-07-26 14:31:00', '2018-08-07 15:27:45', '2018-08-13 00:00:00'), ('47770eb9100c2d0c44946d9cf07ec65d', '41ce2a54c0b03bf3443c3d931a367089', 'delivered', '2018-08-08 08:38:49', '2018-08-08 08:55:23', '2018-08-08 13:50:00', '2018-08-17 18:06:29', '2018-09-04 00:00:00')]
+
+--------------------------------------------------
+Table full name: products
+Column name: product_id Type: TEXT Description: 
+Column name: product_category_name Type: TEXT Description: 
+Column name: product_name_lenght Type: REAL Description: 
+Column name: product_description_lenght Type: REAL Description: 
+Column name: product_photos_qty Type: REAL Description: 
+Column name: product_weight_g Type: REAL Description: 
+Column name: product_length_cm Type: REAL Description: 
+Column name: product_height_cm Type: REAL Description: 
+Column name: product_width_cm Type: REAL Description: 
+Sample rows:
+[('1e9e8ef04dbcff4541ed26657ea517e5', 'perfumaria', 40.0, 287.0, 1.0, 225.0, 16.0, 10.0, 14.0), ('3aa071139cb16b67ca9e5dea641aaa2f', 'artes', 44.0, 276.0, 1.0, 1000.0, 30.0, 18.0, 20.0), ('96bd76ec8810374ed1b65e291975717f', 'esporte_lazer', 46.0, 250.0, 1.0, 154.0, 18.0, 9.0, 15.0)]
+
+--------------------------------------------------
+Table full name: leads_qualified
+Column name: mql_id Type: TEXT Description: 
+Column name: first_contact_date Type: TEXT Description: 
+Column name: landing_page_id Type: TEXT Description: 
+Column name: origin Type: TEXT Description: 
+Sample rows:
+[('dac32acd4db4c29c230538b72f8dd87d', '2018-02-01', '88740e65d5d6b056e0cda098e1ea6313', 'social'), ('8c18d1de7f67e60dbd64e3c07d7e9d5d', '2017-10-20', '007f9098284a86ee80ddeb25d53e0af8', 'paid_search'), ('b4bc852d233dfefc5131f593b538befa', '2018-03-22', 'a7982125ff7aa3b2054c6e44f9d28522', 'organic_search')]
+
+--------------------------------------------------
+Table full name: leads_closed
+Column name: mql_id Type: TEXT Description: 
+Column name: seller_id Type: TEXT Description: 
+Column name: sdr_id Type: TEXT Description: 
+Column name: sr_id Type: TEXT Description: 
+Column name: won_date Type: TEXT Description: 
+Column name: business_segment Type: TEXT Description: 
+Column name: lead_type Type: TEXT Description: 
+Column name: lead_behaviour_profile Type: TEXT Description: 
+Column name: has_company Type: INTEGER Description: 
+Column name: has_gtin Type: INTEGER Description: 
+Column name: average_stock Type: TEXT Description: 
+Column name: business_type Type: TEXT Description: 
+Column name: declared_product_catalog_size Type: REAL Description: 
+Column name: declared_monthly_revenue Type: REAL Description: 
+Sample rows:
+[('5420aad7fec3549a85876ba1c529bd84', '2c43fb513632d29b3b58df74816f1b06', 'a8387c01a09e99ce014107505b92388c', '4ef15afb4b2723d8f3d81e51ec7afefe', '2018-02-26 19:58:54', 'pet', 'online_medium', 'cat', None, None, None, 'reseller', None, 0.0), ('a555fb36b9368110ede0f043dfc3b9a0', 'bbb7d7893a450660432ea6652310ebb7', '09285259593c61296eef10c734121d5b', 'd3d1e91a157ea7f90548eef82f1955e3', '2018-05-08 20:17:59', 'car_accessories', 'industry', 'eagle', None, None, None, 'reseller', None, 0.0), ('327174d3648a2d047e8940d7d15204ca', '612170e34b97004b3ba37eae81836b4c', 'b90f87164b5f8c2cfa5c8572834dbe3f', '6565aa9ce3178a5caf6171827af3a9ba', '2018-06-05 17:27:23', 'home_appliances', 'online_big', 'cat', None, None, None, 'reseller', None, 0.0)]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['product_category_name_translation', 'sellers', 'customers', 'geolocation', 'order_items', 'order_payments', 'order_reviews', 'orders', 'products', 'leads_qualified', 'leads_closed']
+Begin Exploring Related Columns
+Below is a step‑by‑step cheat‑sheet that first identifies the columns that matter, the filters that must be applied, and finally supplies ten exploratory SQL statements (from very simple to the complete RFM segmentation and “average sales / order” report).  
+The queries are written for SQLite and always show at most 20 rows so that they can safely be inspected in any scratch environment.
+
+-------------------------------------------------
+1.  Relevant Columns and Typical Conditions
+-------------------------------------------------
+orders.order_id            : join key to order_payments / order_items  
+orders.customer_id         : link to customers  
+orders.order_status        : keep only `'delivered'` rows  
+orders.order_purchase_timestamp : purchase date – drives Recency  
+
+customers.customer_id      : join key to orders  
+customers.customer_unique_id : the required customer identifier in the task  
+
+order_payments.order_id    : join key back to orders  
+order_payments.payment_value : monetary value paid for an order  
+
+Typical mandatory filter  
+orders.order_status = 'delivered'            -- keep only fulfilled orders  
+
+-------------------------------------------------
+2.  Definitions to be used in the final queries
+-------------------------------------------------
+Recency  :  Difference in days between a customer’s latest delivered purchase  
+            and the global latest delivered purchase date in the data set  
+            (smaller value ⇒ more recent).
+
+Frequency:  Number of delivered orders made by the customer.
+
+Monetary :  Sum of payment_value of all delivered orders made by the customer.
+
+Average Sales / Order:  Monetary / Frequency  (per customer).
+
+RFM Scoring (example – can be adapted)  
+• Calculate quintiles (20‑percent cuts) for each metric.  
+• Assign a score 1–5: 5 = “best” for Recency (lowest), Frequency & Monetary (highest).  
+• Segment examples:  
+  – Champions      = R≥4 AND F≥4 AND M≥4  
+  – Loyal          = R≥3 AND F≥4  
+  – Potential      = R≥4 AND F≤3 AND M≤3  
+  – At Risk        = R≤2  
+  – Sleepers       = R=1 AND F=1 AND M=1  
+
+-------------------------------------------------
+3.  Ten Incremental SQL Queries
+-------------------------------------------------
+
+```sql
+-- 1) Distinct order statuses – confirm that 'delivered' exists
+SELECT DISTINCT order_status
+FROM orders
+LIMIT 20;
+```
+
+```sql
+-- 2) Peek at delivered orders and their purchase timestamps
+SELECT order_id,
+       order_purchase_timestamp
+FROM orders
+WHERE order_status = 'delivered'
+LIMIT 20;
+```
+
+```sql
+-- 3) Join delivered orders with customers to obtain the unique customer id
+SELECT o.order_id,
+       c.customer_unique_id
+FROM   orders   AS o
+JOIN   customers AS c  ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+```
+
+```sql
+-- 4) Verify payment values per delivered order
+SELECT p.order_id,
+       ROUND(p.payment_value, 2) AS payment_value
+FROM   order_payments AS p
+JOIN   orders         AS o ON o.order_id = p.order_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+```
+
+```sql
+-- 5) Count how many delivered orders each customer_unique_id has (Frequency)
+SELECT c.customer_unique_id,
+       COUNT(*) AS delivered_orders
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY delivered_orders DESC
+LIMIT 20;
+```
+
+```sql
+-- 6) Total spend (Monetary) by customer_unique_id for delivered orders
+SELECT c.customer_unique_id,
+       ROUND(SUM(p.payment_value), 2) AS total_spend
+FROM   orders         AS o
+JOIN   customers      AS c ON c.customer_id = o.customer_id
+JOIN   order_payments AS p ON p.order_id    = o.order_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY total_spend DESC
+LIMIT 20;
+```
+
+```sql
+-- 7) Latest purchase date per customer (needed for Recency)
+SELECT c.customer_unique_id,
+       MAX(DATE(o.order_purchase_timestamp)) AS last_purchase_date
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+LIMIT 20;
+```
+
+```sql
+-- 8) Build the basic R, F, M table in one shot (no scoring yet)
+WITH delivered_orders AS (
+    SELECT o.order_id,
+           c.customer_unique_id,
+           DATE(o.order_purchase_timestamp)       AS purchase_date,
+           p.payment_value
+    FROM   orders         AS o
+    JOIN   customers      AS c ON c.customer_id = o.customer_id
+    JOIN   order_payments AS p ON p.order_id    = o.order_id
+    WHERE  o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+    FROM   delivered_orders
+)
+SELECT d.customer_unique_id,
+       -- Recency in days
+       CAST( julianday( (SELECT dataset_max_date FROM anchor) )
+             - julianday( MAX(d.purchase_date) )
+             AS INTEGER )                          AS recency_days,
+       COUNT(DISTINCT d.order_id)                  AS frequency,
+       ROUND(SUM(d.payment_value), 2)              AS monetary,
+       ROUND( SUM(d.payment_value) * 1.0
+              / COUNT(DISTINCT d.order_id), 2)     AS avg_sales_per_order
+FROM   delivered_orders AS d
+GROUP  BY d.customer_unique_id
+LIMIT 20;
+```
+
+```sql
+-- 9) Apply quintile scoring for R, F, M (creates R_score, F_score, M_score)
+WITH rfm_raw AS (
+    -- reuse query (8) but without LIMIT
+    WITH delivered_orders AS (
+        SELECT o.order_id,
+               c.customer_unique_id,
+               DATE(o.order_purchase_timestamp) AS purchase_date,
+               p.payment_value
+        FROM   orders   AS o
+        JOIN   customers AS c ON c.customer_id = o.customer_id
+        JOIN   order_payments AS p ON p.order_id = o.order_id
+        WHERE  o.order_status = 'delivered'
+    ),
+    anchor AS (
+        SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+        FROM   delivered_orders
+    )
+    SELECT d.customer_unique_id,
+           CAST(julianday( (SELECT dataset_max_date FROM anchor) )
+                - julianday(MAX(d.purchase_date)) AS INTEGER) AS recency_days,
+           COUNT(DISTINCT d.order_id)                           AS frequency,
+           SUM(d.payment_value)                                 AS monetary
+    FROM   delivered_orders d
+    GROUP  BY d.customer_unique_id
+),
+bounds AS (
+    SELECT
+      -- Recency quintiles (lower is better so we reverse the score later)
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY recency_days)  AS r_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY recency_days)  AS r_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY recency_days)  AS r_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY recency_days)  AS r_q4,
+      -- Frequency quintiles
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY frequency)     AS f_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY frequency)     AS f_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY frequency)     AS f_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY frequency)     AS f_q4,
+      -- Monetary quintiles
+      percentile_cont(0.2) WITHIN GROUP (ORDER BY monetary)      AS m_q1,
+      percentile_cont(0.4) WITHIN GROUP (ORDER BY monetary)      AS m_q2,
+      percentile_cont(0.6) WITHIN GROUP (ORDER BY monetary)      AS m_q3,
+      percentile_cont(0.8) WITHIN GROUP (ORDER BY monetary)      AS m_q4
+    FROM rfm_raw
+)
+SELECT r.*,
+       -- Recency: low days = good ⇒ invert scoring
+       CASE WHEN r.recency_days <= (SELECT r_q1 FROM bounds) THEN 5
+            WHEN r.recency_days <= (SELECT r_q2 FROM bounds) THEN 4
+            WHEN r.recency_days <= (SELECT r_q3 FROM bounds) THEN 3
+            WHEN r.recency_days <= (SELECT r_q4 FROM bounds) THEN 2
+            ELSE 1 END                                           AS R_score,
+       -- Frequency: high = good
+       CASE WHEN r.frequency >= (SELECT f_q4 FROM bounds) THEN 5
+            WHEN r.frequency >= (SELECT f_q3 FROM bounds) THEN 4
+            WHEN r.frequency >= (SELECT f_q2 FROM bounds) THEN 3
+            WHEN r.frequency >= (SELECT f_q1 FROM bounds) THEN 2
+            ELSE 1 END                                           AS F_score,
+       -- Monetary: high = good
+       CASE WHEN r.monetary >= (SELECT m_q4 FROM bounds) THEN 5
+            WHEN r.monetary >= (SELECT m_q3 FROM bounds) THEN 4
+            WHEN r.monetary >= (SELECT m_q2 FROM bounds) THEN 3
+            WHEN r.monetary >= (SELECT m_q1 FROM bounds) THEN 2
+            ELSE 1 END                                           AS M_score
+FROM rfm_raw r
+LIMIT 20;
+```
+
+```sql
+-- 10) Final report: Average sales / order per RFM segment
+WITH rfm_scored AS (
+    -- reuse query (9) without LIMIT and keep the score columns
+    -- (assume the CTE rfm_scored now has customer_unique_id,
+    --  recency_days, frequency, monetary, avg_sales_per_order,
+    --  R_score, F_score, M_score)
+    SELECT *
+    FROM (
+        -- embed query (9) but extend it with avg_sales_per_order
+        WITH delivered_orders AS (
+            SELECT o.order_id,
+                   c.customer_unique_id,
+                   DATE(o.order_purchase_timestamp) AS purchase_date,
+                   p.payment_value
+            FROM   orders   AS o
+            JOIN   customers AS c ON c.customer_id = o.customer_id
+            JOIN   order_payments AS p ON p.order_id = o.order_id
+            WHERE  o.order_status = 'delivered'
+        ),
+        anchor AS (
+            SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+            FROM   delivered_orders
+        ),
+        rfm_raw AS (
+            SELECT d.customer_unique_id,
+                   CAST(julianday( (SELECT dataset_max_date FROM anchor) )
+                        - julianday(MAX(d.purchase_date)) AS INTEGER) AS recency_days,
+                   COUNT(DISTINCT d.order_id)                        AS frequency,
+                   SUM(d.payment_value)                              AS monetary,
+                   SUM(d.payment_value) * 1.0
+                   / COUNT(DISTINCT d.order_id)                      AS avg_sales_per_order
+            FROM   delivered_orders d
+            GROUP  BY d.customer_unique_id
+        ),
+        bounds AS (
+            SELECT
+              percentile_cont(0.2) WITHIN GROUP (ORDER BY recency_days)  AS r_q1,
+              percentile_cont(0.4) WITHIN GROUP (ORDER BY recency_days)  AS r_q2,
+              percentile_cont(0.6) WITHIN GROUP (ORDER BY recency_days)  AS r_q3,
+              percentile_cont(0.8) WITHIN GROUP (ORDER BY recency_days)  AS r_q4,
+              percentile_cont(0.2) WITHIN GROUP (ORDER BY frequency)     AS f_q1,
+              percentile_cont(0.4) WITHIN GROUP (ORDER BY frequency)     AS f_q2,
+              percentile_cont(0.6) WITHIN GROUP (ORDER BY frequency)     AS f_q3,
+              percentile_cont(0.8) WITHIN GROUP (ORDER BY frequency)     AS f_q4,
+              percentile_cont(0.2) WITHIN GROUP (ORDER BY monetary)      AS m_q1,
+              percentile_cont(0.4) WITHIN GROUP (ORDER BY monetary)      AS m_q2,
+              percentile_cont(0.6) WITHIN GROUP (ORDER BY monetary)      AS m_q3,
+              percentile_cont(0.8) WITHIN GROUP (ORDER BY monetary)      AS m_q4
+            FROM rfm_raw
+        )
+        SELECT r.*,
+               CASE WHEN r.recency_days <= (SELECT r_q1 FROM bounds) THEN 5
+                    WHEN r.recency_days <= (SELECT r_q2 FROM bounds) THEN 4
+                    WHEN r.recency_days <= (SELECT r_q3 FROM bounds) THEN 3
+                    WHEN r.recency_days <= (SELECT r_q4 FROM bounds) THEN 2
+                    ELSE 1 END                                       AS R_score,
+               CASE WHEN r.frequency >= (SELECT f_q4 FROM bounds) THEN 5
+                    WHEN r.frequency >= (SELECT f_q3 FROM bounds) THEN 4
+                    WHEN r.frequency >= (SELECT f_q2 FROM bounds) THEN 3
+                    WHEN r.frequency >= (SELECT f_q1 FROM bounds) THEN 2
+                    ELSE 1 END                                       AS F_score,
+               CASE WHEN r.monetary  >= (SELECT m_q4 FROM bounds) THEN 5
+                    WHEN r.monetary  >= (SELECT m_q3 FROM bounds) THEN 4
+                    WHEN r.monetary  >= (SELECT m_q2 FROM bounds) THEN 3
+                    WHEN r.monetary  >= (SELECT m_q1 FROM bounds) THEN 2
+                    ELSE 1 END                                       AS M_score
+        FROM rfm_raw r
+    )
+),
+segment_map AS (
+    SELECT customer_unique_id,
+           R_score,
+           F_score,
+           M_score,
+           avg_sales_per_order,
+           CASE
+               WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+               WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+               WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+               WHEN R_score<=2                                THEN 'At Risk'
+               ELSE 'Sleepers'
+           END AS rfm_segment
+    FROM rfm_scored
+)
+SELECT rfm_segment,
+       ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+       COUNT(*)                          AS customers_in_segment
+FROM   segment_map
+GROUP  BY rfm_segment
+ORDER  BY avg_sales_per_order_segment DESC
+LIMIT 20;
+```
+
+-------------------------------------------------
+4.  How to interpret the final output
+-------------------------------------------------
+• `avg_sales_per_order_segment` – average spend each customer makes on a single order, but averaged again across all customers in that segment.  
+• `customers_in_segment`          – size of the segment, useful to judge reliability.  
+
+Compare the segments: typically “Champions” and “Loyal” groups should show the highest average sales per order, whereas “Sleepers” or “At Risk” segments will score much lower, highlighting opportunities for re‑activation campaigns or cross‑sell initiatives.
+
+You can now run these queries in sequence, inspect intermediate results, fine‑tune quintile cut‑offs if necessary, and finally obtain the required “average sales per order by RFM segment” analysis.
+Refined SQLs and results:
+Query:
+-- 1) Distinct order statuses – confirm that 'delivered' exists
+SELECT DISTINCT order_status
+FROM orders
+LIMIT 20;
+Answer:
+order_status
+delivered
+invoiced
+shipped
+processing
+unavailable
+canceled
+created
+approved
+Query:
+-- 2) Peek at delivered orders and their purchase timestamps
+SELECT order_id,
+       order_purchase_timestamp
+FROM orders
+WHERE order_status = 'delivered'
+LIMIT 20;
+Answer:
+order_id,order_purchase_timestamp
+e481f51cbdc54678b7cc49136f2d6af7,2017-10-02 10:56:33
+53cdb2fc8bc7dce0b6741e2150273451,2018-07-24 20:41:37
+47770eb9100c2d0c44946d9cf07ec65d,2018-08-08 08:38:49
+949d5b44dbf5de918fe9c16f97b45f8a,2017-11-18 19:28:06
+ad21c59c0840e6cb83a9ceb5573f8159,2018-02-13 21:18:39
+a4591c265e18cb1dcee52889e2d8acc3,2017-07-09 21:57:05
+6514b8ad8028c9f2cc2374ded245783f,2017-05-16 13:10:30
+76c6e866289321a7c93b82b54852dc33,2017-01-23 18:29:09
+e69bfb5eb88e0ed6a785585b27e16dbf,
+Query:
+-- 3) Join delivered orders with customers to obtain the unique customer id
+SELECT o.order_id,
+       c.customer_unique_id
+FROM   orders   AS o
+JOIN   customers AS c  ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+Answer:
+order_id,customer_unique_id
+e481f51cbdc54678b7cc49136f2d6af7,7c396fd4830fd04220f754e42b4e5bff
+53cdb2fc8bc7dce0b6741e2150273451,af07308b275d755c9edb36a90c618231
+47770eb9100c2d0c44946d9cf07ec65d,3a653a41f6f9fc3d2a113cf8398680e8
+949d5b44dbf5de918fe9c16f97b45f8a,7c142cf63193a1473d2e66489a9ae977
+ad21c59c0840e6cb83a9ceb5573f8159,72632f0f9dd73dfee390c9b22eb56dd6
+a4591c265e18cb1dcee52889e2d8acc3,80bb27c7c16e8f973207a5086ab329e2
+6514b8ad8028c9f2cc2374ded245783f,932afa1e708222e5821dac9cd5db4cae
+Query:
+-- 4) Verify payment values per delivered order
+SELECT p.order_id,
+       ROUND(p.payment_value, 2) AS payment_value
+FROM   order_payments AS p
+JOIN   orders         AS o ON o.order_id = p.order_id
+WHERE  o.order_status = 'delivered'
+LIMIT 20;
+Answer:
+order_id,payment_value
+e481f51cbdc54678b7cc49136f2d6af7,2.0
+e481f51cbdc54678b7cc49136f2d6af7,18.12
+e481f51cbdc54678b7cc49136f2d6af7,18.59
+53cdb2fc8bc7dce0b6741e2150273451,141.46
+47770eb9100c2d0c44946d9cf07ec65d,179.12
+949d5b44dbf5de918fe9c16f97b45f8a,72.2
+ad21c59c0840e6cb83a9ceb5573f8159,28.62
+a4591c265e18cb1dcee52889e2d8acc3,175.26
+6514b8ad8028c9f2cc2374ded245783f,75.16
+76c6e866289321a7c93b82b54852dc33,35.95
+e69bfb5eb88e0ed6a785585b27e16dbf,8.34
+e69bfb5eb88e0ed6a785585b27e16dbf,161.
+Query:
+-- 5) Count how many delivered orders each customer_unique_id has (Frequency)
+SELECT c.customer_unique_id,
+       COUNT(*) AS delivered_orders
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY delivered_orders DESC
+LIMIT 20;
+Answer:
+customer_unique_id,delivered_orders
+8d50f5eadf50201ccdcedfb9e2ac8455,15
+3e43e6105506432c953e165fb2acf44c,9
+ca77025e7201e3b30c44b472ff346268,7
+6469f99c1f9dfae7733b25662e7f1782,7
+1b6c7548a2a1f9037c1fd3ddfed95f33,7
+f0e310a6839dce9de1638e0fe5ab282a,6
+dc813062e0fc23409cd255f7f53c7074,6
+63cfc61cee11cbe306bff5857d00bfe4,6
+47c1a3033b8b77b3ab6e109eb4d5fdf3,6
+12f5d6e1cbf93dafd9dcc19095df0b3d,6
+fe81bb32c243a86b2f86fbf053fe6140,5
+de34b16117594161a6a89c50b289d35a,5
+b4e4f24de1e8725b74e4a1f4975116
+Query:
+-- 6) Total spend (Monetary) by customer_unique_id for delivered orders
+SELECT c.customer_unique_id,
+       ROUND(SUM(p.payment_value), 2) AS total_spend
+FROM   orders         AS o
+JOIN   customers      AS c ON c.customer_id = o.customer_id
+JOIN   order_payments AS p ON p.order_id    = o.order_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+ORDER  BY total_spend DESC
+LIMIT 20;
+Answer:
+customer_unique_id,total_spend
+0a0a92112bd4c708ca5fde585afaa872,13664.08
+da122df9eeddfedc1dc1f5349a1a690c,7571.63
+763c8b1c9c68a0229c42c9fc6f662b93,7274.88
+dc4802a71eae9be1dd28f5d788ceb526,6929.31
+459bef486812aa25204be022145caa62,6922.21
+ff4159b92c40ebe40454e3e6a7c35ed6,6726.66
+4007669dec559734d6f53e029e360987,6081.54
+eebb5dda148d3893cdaf5b5ca3040ccb,4764.34
+48e1ac109decbb87765a3eade6854098,4681.78
+c8460e4251689ba205045f3ea17884a1,4655.91
+edde2314c6c30e864a128ac95d6b2112,4513.32
+a229e
+Query:
+-- 7) Latest purchase date per customer (needed for Recency)
+SELECT c.customer_unique_id,
+       MAX(DATE(o.order_purchase_timestamp)) AS last_purchase_date
+FROM   orders    AS o
+JOIN   customers AS c ON c.customer_id = o.customer_id
+WHERE  o.order_status = 'delivered'
+GROUP  BY c.customer_unique_id
+LIMIT 20;
+Answer:
+customer_unique_id,last_purchase_date
+0000366f3b9a7992bf8c76cfdf3221e2,2018-05-10
+0000b849f77a49e4a4ce2b2a4ca5be3f,2018-05-07
+0000f46a3911fa3c0805444483337064,2017-03-10
+0000f6ccb0745a6a4b88665a16c9f078,2017-10-12
+0004aac84e0df4da2b147fca70cf8255,2017-11-14
+0004bd2a26a76fe21f786e4fbd80607f,2018-04-05
+00050ab1314c0e55a6ca13cf7181fecf,2018-04-20
+00053a61a98854899e70ed204dd4bafe,2018-02-28
+0005e1862207bf6ccc02e4228effd9a0,2017-03-04
+0005ef4cd20d2893f0d9fbd94d3c0d97,2018-03-12
+0006fdc98a4
+Query:
+-- 8) Build the basic R, F, M table in one shot (no scoring yet)
+WITH delivered_orders AS (
+    SELECT o.order_id,
+           c.customer_unique_id,
+           DATE(o.order_purchase_timestamp)       AS purchase_date,
+           p.payment_value
+    FROM   orders         AS o
+    JOIN   customers      AS c ON c.customer_id = o.customer_id
+    JOIN   order_payments AS p ON p.order_id    = o.order_id
+    WHERE  o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS dataset_max_date
+    FROM   delivered_orders
+)
+SELECT d.customer_unique_id,
+       -- Recency in days
+       CAST( julianday( (SELECT dataset_max_date FROM anchor) )
+             - julianday( MAX(d.purchase_date) )
+             AS INTEGER )                          AS recency_days,
+       COUNT(DISTINCT d.order_id)                  AS frequency,
+       ROUND(SUM(d.payment_value), 2)              AS monetary,
+       ROUND( SUM(d.payment_value) * 1.0
+              / COUNT(DISTINCT d.order_id), 2)     AS avg_sales_per_order
+FROM   delivered_orders AS d
+GROUP  BY d.customer_unique_id
+LIMIT 20;
+Answer:
+customer_unique_id,recency_days,frequency,monetary,avg_sales_per_order
+0000366f3b9a7992bf8c76cfdf3221e2,111,1,141.9,141.9
+0000b849f77a49e4a4ce2b2a4ca5be3f,114,1,27.19,27.19
+0000f46a3911fa3c0805444483337064,537,1,86.22,86.22
+0000f6ccb0745a6a4b88665a16c9f078,321,1,43.62,43.62
+0004aac84e0df4da2b147fca70cf8255,288,1,196.89,196.89
+0004bd2a26a76fe21f786e4fbd80607f,146,1,166.98,166.98
+00050ab1314c0e55a6ca13cf7181fecf,131,1,35.38,35.38
+00053a61a98854899e70ed204dd4bafe,182,1,419.18,419.18
+0005e1
+Query:
+--Description: “Final report” rewritten for plain SQLite.
+--Steps
+-- 1) delivered_orders  – all payment lines from delivered orders.
+-- 2) anchor            – most recent purchase date in the dataset.
+-- 3) rfm_raw           – R (days), F (#orders), M (spend), Avg‑sales/order.
+-- 4) rfm_scores        – convert R, F, M to 1‑to‑5 scores using NTILE
+--                        (invert Recency so 5 = most recent).
+-- 5) segment_map       – assign a human‑readable RFM segment.
+-- 6) Final SELECT      – average sales / order and customer count per segment.
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp) AS purchase_date,
+            p.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c ON c.customer_id = o.customer_id
+    JOIN    order_payments  AS p ON p.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  d.customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(d.purchase_date)) AS INTEGER)      AS recency_days,
+            COUNT(DISTINCT d.order_id)                                AS frequency,
+            SUM(d.payment_value)                                      AS monetary,
+            SUM(d.payment_value) * 1.0 /
+            COUNT(DISTINCT d.order_id)                                AS avg_sales_per_order
+    FROM    delivered_orders d
+    GROUP   BY d.customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score,  -- invert
+            NTILE(5)  OVER (ORDER BY frequency DESC)       AS F_score,
+            NTILE(5)  OVER (ORDER BY monetary  DESC)       AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                                'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+)
+SELECT  rfm_segment,
+        ROUND(AVG(avg_sales_per_order), 2) AS avg_sales_per_order_segment,
+        COUNT(*)                           AS customers_in_segment
+FROM    segment_map
+GROUP   BY rfm_segment
+ORDER   BY avg_sales_per_order_segment DESC
+LIMIT 20
+Answer:
+rfm_segment,avg_sales_per_order_segment,customers_in_segment
+Potential,233.19,22872
+Sleepers,215.88,11215
+At Risk,160.99,37342
+Loyal,54.94,7622
+Champions,54.63,14306
+End Exploring Related Columns
+Task: According to the RFM definition document, calculate the average sales per order for each customer within distinct RFM segments, considering only 'delivered' orders. Use the customer unique identifier. Clearly define how to calculate Recency based on the latest purchase timestamp and specify the criteria for classifying RFM segments. The average sales should be computed as the total spend divided by the total number of orders. Please analyze and report the differences in average sales across the RFM segments
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+Usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Follow the answer format like: ```csv
+rfm_segment,average_sales_per_order,vs_overall_average
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is (table names): 
+['product_category_name_translation', 'sellers', 'customers', 'geolocation', 'order_items', 'order_payments', 'order_reviews', 'orders', 'products', 'leads_qualified', 'leads_closed']
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 03:08:23 - Thread-1189 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp)          AS purchase_date,
+            op.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c  ON c.customer_id  = o.customer_id
+    JOIN    order_payments  AS op ON op.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (      -- Recency‑Frequency‑Monetary per customer
+    SELECT  customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(purchase_date))        AS INTEGER)  AS recency_days,
+            COUNT(DISTINCT order_id)                                    AS frequency,
+            SUM(payment_value)                                          AS monetary,
+            SUM(payment_value) * 1.0 / COUNT(DISTINCT order_id)         AS avg_sales_per_order
+    FROM    delivered_orders
+    GROUP   BY customer_unique_id
+),
+rfm_scores AS (   -- convert each metric to a 1‑5 score (5 = best)
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days  ASC)  AS R_score,   -- invert Recency
+            NTILE(5)    OVER (ORDER BY frequency      DESC) AS F_score,
+            NTILE(5)    OVER (ORDER BY monetary       DESC) AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (  -- classify customers into RFM segments
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                               'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+),
+segment_stats AS (        -- average sales / order for each segment
+    SELECT  rfm_segment,
+            ROUND(AVG(avg_sales_per_order), 4) AS average_sales_per_order
+    FROM    segment_map
+    GROUP   BY rfm_segment
+),
+overall AS (
+    SELECT ROUND(AVG(avg_sales_per_order), 4) AS overall_average
+    FROM   segment_map
+)
+SELECT  s.rfm_segment,
+        s.average_sales_per_order,
+        ROUND(s.average_sales_per_order - (SELECT overall_average FROM overall), 4)
+        AS vs_overall_average
+FROM    segment_stats AS s
+ORDER   BY s.average_sales_per_order DESC, s.rfm_segment;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:08:28 - Thread-1189 (execute) - INFO - [Executed results in self-refine]
+rfm_segment,average_sales_per_order,vs_overall_average
+Potential,233.1874,72.8708
+Sleepers,215.8796,55.563
+At Risk,160.9917,0.6751
+Loyal,54.9435,-105.3731
+Champions,54.6343,-105.6823
+
+[Executed results in self-refine]
+2025-05-01 03:08:28 - Thread-1189 (execute) - INFO - itercount: 1
+2025-05-01 03:08:28 - Thread-1189 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing According to the RFM definition document, calculate the average sales per order for each customer within distinct RFM segments, considering only 'delivered' orders. Use the customer unique identifier. Clearly define how to calculate Recency based on the latest purchase timestamp and specify the criteria for classifying RFM segments. The average sales should be computed as the total spend divided by the total number of orders. Please analyze and report the differences in average sales across the RFM segments, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+rfm_segment,average_sales_per_order,vs_overall_average
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+rfm_segment,average_sales_per_order,vs_overall_average
+Potential,233.1874,72.8708
+Sleepers,215.8796,55.563
+At Risk,160.9917,0.6751
+Loyal,54.9435,-105.3731
+Champions,54.6343,-105.6823
+Current sql:
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp)          AS purchase_date,
+            op.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c  ON c.customer_id  = o.customer_id
+    JOIN    order_payments  AS op ON op.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (      -- Recency‑Frequency‑Monetary per customer
+    SELECT  customer_unique_id,
+            CAST( julianday((SELECT max_date FROM anchor))
+                  - julianday(MAX(purchase_date))        AS INTEGER)  AS recency_days,
+            COUNT(DISTINCT order_id)                                    AS frequency,
+            SUM(payment_value)                                          AS monetary,
+            SUM(payment_value) * 1.0 / COUNT(DISTINCT order_id)         AS avg_sales_per_order
+    FROM    delivered_orders
+    GROUP   BY customer_unique_id
+),
+rfm_scores AS (   -- convert each metric to a 1‑5 score (5 = best)
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days  ASC)  AS R_score,   -- invert Recency
+            NTILE(5)    OVER (ORDER BY frequency      DESC) AS F_score,
+            NTILE(5)    OVER (ORDER BY monetary       DESC) AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (  -- classify customers into RFM segments
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                               'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+),
+segment_stats AS (        -- average sales / order for each segment
+    SELECT  rfm_segment,
+            ROUND(AVG(avg_sales_per_order), 4) AS average_sales_per_order
+    FROM    segment_map
+    GROUP   BY rfm_segment
+),
+overall AS (
+    SELECT ROUND(AVG(avg_sales_per_order), 4) AS overall_average
+    FROM   segment_map
+)
+SELECT  s.rfm_segment,
+        s.average_sales_per_order,
+        ROUND(s.average_sales_per_order - (SELECT overall_average FROM overall), 4)
+        AS vs_overall_average
+FROM    segment_stats AS s
+ORDER   BY s.average_sales_per_order DESC, s.rfm_segment;
+[Self-refine]
+2025-05-01 03:08:44 - Thread-1189 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH delivered_orders AS (
+    SELECT  o.order_id,
+            c.customer_unique_id,
+            DATE(o.order_purchase_timestamp)          AS purchase_date,
+            op.payment_value
+    FROM    orders          AS o
+    JOIN    customers       AS c  ON c.customer_id  = o.customer_id
+    JOIN    order_payments  AS op ON op.order_id    = o.order_id
+    WHERE   o.order_status = 'delivered'
+),
+anchor AS (
+    SELECT DATE(MAX(purchase_date)) AS max_date
+    FROM   delivered_orders
+),
+rfm_raw AS (
+    SELECT  customer_unique_id,
+            CAST(julianday((SELECT max_date FROM anchor)) -
+                 julianday(MAX(purchase_date)) AS INTEGER)  AS recency_days,
+            COUNT(DISTINCT order_id)                                    AS frequency,
+            SUM(payment_value)                                          AS monetary,
+            SUM(payment_value) * 1.0 / COUNT(DISTINCT order_id)         AS avg_sales_per_order
+    FROM    delivered_orders
+    GROUP   BY customer_unique_id
+),
+rfm_scores AS (
+    SELECT  *,
+            6 - NTILE(5) OVER (ORDER BY recency_days ASC)  AS R_score,
+            NTILE(5)    OVER (ORDER BY frequency DESC)     AS F_score,
+            NTILE(5)    OVER (ORDER BY monetary  DESC)     AS M_score
+    FROM    rfm_raw
+),
+segment_map AS (
+    SELECT  customer_unique_id,
+            avg_sales_per_order,
+            CASE
+                WHEN R_score>=4 AND F_score>=4 AND M_score>=4 THEN 'Champions'
+                WHEN R_score>=3 AND F_score>=4                 THEN 'Loyal'
+                WHEN R_score>=4 AND F_score<=3 AND M_score<=3 THEN 'Potential'
+                WHEN R_score<=2                                THEN 'At Risk'
+                ELSE                                               'Sleepers'
+            END AS rfm_segment
+    FROM    rfm_scores
+),
+segment_stats AS (
+    SELECT  rfm_segment,
+            ROUND(AVG(avg_sales_per_order), 4) AS average_sales_per_order
+    FROM    segment_map
+    GROUP   BY rfm_segment
+),
+overall AS (
+    SELECT ROUND(AVG(avg_sales_per_order), 4) AS overall_average
+    FROM   segment_map
+)
+SELECT  s.rfm_segment,
+        s.average_sales_per_order,
+        ROUND(s.average_sales_per_order - (SELECT overall_average FROM overall), 4)
+        AS vs_overall_average
+FROM    segment_stats AS s
+ORDER   BY s.average_sales_per_order DESC, s.rfm_segment;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:08:49 - Thread-1189 (execute) - INFO - [Executed results in self-refine]
+rfm_segment,average_sales_per_order,vs_overall_average
+Potential,233.1874,72.8708
+Sleepers,215.8796,55.563
+At Risk,160.9917,0.6751
+Loyal,54.9435,-105.3731
+Champions,54.6343,-105.6823
+
+[Executed results in self-refine]
+2025-05-01 03:08:49 - Thread-1189 (execute) - INFO - [Consistent results]
+rfm_segment,average_sales_per_order,vs_overall_average
+Potential,233.1874,72.8708
+Sleepers,215.8796,55.563
+At Risk,160.9917,0.6751
+Loyal,54.9435,-105.3731
+Champions,54.6343,-105.6823
+
+[Consistent results]
+2025-05-01 03:08:49 - Thread-1189 (execute) - INFO - Total iteration counts: 1

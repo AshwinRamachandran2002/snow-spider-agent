@@ -1,0 +1,2541 @@
+2025-05-01 02:14:39 - Thread-747 (execute) - INFO - [Answer format]
+```csv
+user_id,user_display_name,combined_view_count
+```
+[Answer format]
+2025-05-01 02:16:01 - Thread-747 (execute) - INFO - [Exploration]
+Relevant tables / columns and how they will be used  
+
+bigquery‑public‑data.stackoverflow.posts_questions  
+• id – the question identifier (primary key, join‑key)  
+• owner_user_id – question author (association rule #1)  
+• view_count – number of views that must be aggregated per user  
+• accepted_answer_id – id of the accepted answer (association rule #2)  
+
+bigquery‑public‑data.stackoverflow.posts_answers  
+• id – answer identifier (to match accepted_answer_id and create rankings)  
+• parent_id – id of the question this answer belongs to (join with posts_questions.id)  
+• owner_user_id – answer author (association rules #2‑#5)  
+• score – answer score (rules #3, #4, #5)  
+
+bigquery‑public‑data.stackoverflow.users  
+• id – user identifier (to link statistics to a user)  
+• display_name – human‑readable name for the final output  
+
+Typical conditions that will be used  
+• posts_answers.score > 5                                         – rule #3  
+• posts_answers.score > 0 AND posts_answers.score >= 0.20*total – rule #4  
+• DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) <= 3 – rule #5  
+• accepted_answer_id IS NOT NULL – rule #2 filter  
+• view_count IS NOT NULL – only count questions with a recorded view total  
+
+--------------------------------------------------------------------
+Ten exploratory → incremental SQL snippets
+--------------------------------------------------------------------
+
+```sql
+-- 1) Quick look at questions: id, owner, views
+SELECT id AS question_id,
+       owner_user_id,
+       view_count
+FROM   `bigquery-public-data.stackoverflow.posts_questions`
+WHERE  view_count IS NOT NULL
+LIMIT  20;
+```
+
+```sql
+-- 2) Quick look at answers: answer id, question id, author, score
+SELECT id          AS answer_id,
+       parent_id   AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+LIMIT  20;
+```
+
+```sql
+-- 3) Join questions with their accepted answers to find the accepted-answer author
+SELECT q.id  AS question_id,
+       q.view_count,
+       q.accepted_answer_id,
+       a.owner_user_id AS accepted_user_id
+FROM   `bigquery-public-data.stackoverflow.posts_questions`  AS q
+JOIN   `bigquery-public-data.stackoverflow.posts_answers`    AS a
+       ON q.accepted_answer_id = a.id
+WHERE  q.accepted_answer_id IS NOT NULL
+LIMIT  20;
+```
+
+```sql
+-- 4) Total answer‑score per question (needed for the 20 % rule)
+SELECT parent_id        AS question_id,
+       SUM(score)       AS total_answer_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+GROUP  BY question_id
+ORDER  BY total_answer_score DESC
+LIMIT  20;
+```
+
+```sql
+-- 5) Answers whose score is strictly greater than 5
+SELECT id            AS answer_id,
+       parent_id     AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+WHERE  score > 5
+LIMIT  20;
+```
+
+```sql
+-- 6) Answers whose score is > 0 and ≥ 20 % of summed scores for that question
+WITH total AS (
+  SELECT parent_id AS question_id,
+         SUM(score) AS total_score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  GROUP  BY question_id)
+SELECT a.id            AS answer_id,
+       a.parent_id     AS question_id,
+       a.owner_user_id,
+       a.score,
+       t.total_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+JOIN   total t
+       ON a.parent_id = t.question_id
+WHERE  a.score > 0
+  AND  a.score >= 0.20 * t.total_score
+LIMIT  20;
+```
+
+```sql
+-- 7) Top‑3 scoring answers per question (ties get same rank)
+SELECT *
+FROM (
+  SELECT a.id                     AS answer_id,
+         a.parent_id              AS question_id,
+         a.owner_user_id,
+         a.score,
+         DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rank_in_question
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+WHERE  rank_in_question <= 3
+LIMIT  20;
+```
+
+```sql
+-- 8) Build DISTINCT (question,user) pairs for every association rule
+WITH
+question_owners AS (
+  SELECT id            AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL),
+accepted_answerers AS (
+  SELECT q.id          AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id),
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5),
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id)
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t
+         ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT a.parent_id AS question_id,
+           a.owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+  WHERE  rnk <= 3)
+SELECT DISTINCT question_id, user_id
+FROM (
+  SELECT * FROM question_owners
+  UNION ALL
+  SELECT * FROM accepted_answerers
+  UNION ALL
+  SELECT * FROM answers_score_gt5
+  UNION ALL
+  SELECT * FROM answers_pct20
+  UNION ALL
+  SELECT * FROM top3_answers)
+LIMIT 20;
+```
+
+```sql
+-- 9) Aggregate view‑counts per user, for all associated questions
+WITH associations AS (  /* query #8 goes here */ ),
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL)
+SELECT a.user_id,
+       SUM(q.view_count) AS total_question_views
+FROM   associations a
+JOIN   question_views q USING (question_id)
+GROUP  BY a.user_id
+ORDER  BY total_question_views DESC
+LIMIT  20;
+```
+
+```sql
+-- 10) Final answer – top‑10 users by combined view‑count of associated questions
+WITH
+questions AS (
+  SELECT id               AS question_id,
+         owner_user_id    AS question_owner_id,
+         view_count,
+         accepted_answer_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL),
+answers AS (
+  SELECT id               AS answer_id,
+         parent_id        AS question_id,
+         owner_user_id    AS answer_owner_id,
+         score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`),
+total_scores AS (
+  SELECT question_id,
+         SUM(score) AS total_score
+  FROM   answers
+  GROUP  BY question_id),
+top3 AS (
+  SELECT question_id,
+         answer_owner_id
+  FROM (
+    SELECT question_id,
+           answer_owner_id,
+           DENSE_RANK() OVER (PARTITION BY question_id ORDER BY score DESC) AS rnk
+    FROM   answers)
+  WHERE  rnk <= 3),
+accepted AS (
+  SELECT q.question_id,
+         a.answer_owner_id
+  FROM   questions q
+  JOIN   answers   a
+         ON q.accepted_answer_id = a.answer_id),
+score_gt5 AS (
+  SELECT question_id,
+         answer_owner_id
+  FROM   answers
+  WHERE  score > 5),
+pct20 AS (
+  SELECT a.question_id,
+         a.answer_owner_id
+  FROM   answers a
+  JOIN   total_scores t USING (question_id)
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+question_owners AS (
+  SELECT question_id,
+         question_owner_id AS user_id
+  FROM   questions
+  WHERE  question_owner_id IS NOT NULL),
+all_assoc AS (
+  SELECT * FROM question_owners
+  UNION DISTINCT
+  SELECT * FROM accepted
+  UNION DISTINCT
+  SELECT * FROM score_gt5
+  UNION DISTINCT
+  SELECT * FROM pct20
+  UNION DISTINCT
+  SELECT * FROM top3),
+user_views AS (
+  SELECT a.user_id,
+         q.view_count
+  FROM   all_assoc a
+  JOIN   questions q USING (question_id))
+SELECT u.user_id,
+       us.display_name,
+       SUM(view_count) AS combined_view_count
+FROM   user_views u
+JOIN   `bigquery-public-data.stackoverflow.users` us
+       ON u.user_id = us.id
+GROUP  BY u.user_id, us.display_name
+ORDER  BY combined_view_count DESC
+LIMIT  10;
+```
+[Exploration]
+2025-05-01 02:16:01 - Thread-747 (execute) - INFO - [Try to execute]
+-- 1) Quick look at questions: id, owner, views
+SELECT id AS question_id,
+       owner_user_id,
+       view_count
+FROM   `bigquery-public-data.stackoverflow.posts_questions`
+WHERE  view_count IS NOT NULL
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:02 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1) Quick look at questions: id, owner, views
+SELECT id AS question_id,
+       owner_user_id,
+       view_count
+FROM   `bigquery-public-data.stackoverflow.posts_questions`
+WHERE  view_count IS NOT NULL
+LIMIT  20;
+Results:
+question_id,owner_user_id,view_count
+73842327,16454187,1
+73629682,13025866,1281
+73535922,19874740,2
+73547530,19237401,2
+73583644,14402223,2
+73613976,17733245,2
+73646614,19948219,2
+73698409,17899988,2
+
+[Successfully executed]
+2025-05-01 02:16:02 - Thread-747 (execute) - INFO - [Try to execute]
+-- 2) Quick look at answers: answer id, question id, author, score
+SELECT id          AS answer_id,
+       parent_id   AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:04 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2) Quick look at answers: answer id, question id, author, score
+SELECT id          AS answer_id,
+       parent_id   AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+LIMIT  20;
+Results:
+answer_id,question_id,owner_user_id,score
+10182780,10182744,775014,0
+10182786,10182559,122718,0
+10182787,10182763,1297269,0
+10182788,10092328,1317793,0
+10182792,10150347,221515,0
+10182808,10181167,924149,0
+
+[Successfully executed]
+2025-05-01 02:16:04 - Thread-747 (execute) - INFO - [Try to execute]
+-- 3) Join questions with their accepted answers to find the accepted-answer author
+SELECT q.id  AS question_id,
+       q.view_count,
+       q.accepted_answer_id,
+       a.owner_user_id AS accepted_user_id
+FROM   `bigquery-public-data.stackoverflow.posts_questions`  AS q
+JOIN   `bigquery-public-data.stackoverflow.posts_answers`    AS a
+       ON q.accepted_answer_id = a.id
+WHERE  q.accepted_answer_id IS NOT NULL
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:07 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3) Join questions with their accepted answers to find the accepted-answer author
+SELECT q.id  AS question_id,
+       q.view_count,
+       q.accepted_answer_id,
+       a.owner_user_id AS accepted_user_id
+FROM   `bigquery-public-data.stackoverflow.posts_questions`  AS q
+JOIN   `bigquery-public-data.stackoverflow.posts_answers`    AS a
+       ON q.accepted_answer_id = a.id
+WHERE  q.accepted_answer_id IS NOT NULL
+LIMIT  20;
+Results:
+question_id,view_count,accepted_answer_id,accepted_user_id
+73584832,12,73584973,19508866
+73735620,12,73735621,807149
+73789567,12,73808363,390150
+73839672,12,73839745,5812524
+73838984,13,73839181,16749821
+
+[Successfully executed]
+2025-05-01 02:16:07 - Thread-747 (execute) - INFO - [Try to execute]
+-- 4) Total answer‑score per question (needed for the 20 % rule)
+SELECT parent_id        AS question_id,
+       SUM(score)       AS total_answer_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+GROUP  BY question_id
+ORDER  BY total_answer_score DESC
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:10 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4) Total answer‑score per question (needed for the 20 % rule)
+SELECT parent_id        AS question_id,
+       SUM(score)       AS total_answer_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+GROUP  BY question_id
+ORDER  BY total_answer_score DESC
+LIMIT  20;
+Results:
+question_id,total_answer_score
+11227809,58764
+927358,55765
+2003505,37628
+184618,32645
+179123,28068
+231767,25603
+5767325,23832
+503093,23042
+1642028,23028
+111102,21388
+
+[Successfully executed]
+2025-05-01 02:16:10 - Thread-747 (execute) - INFO - [Try to execute]
+-- 5) Answers whose score is strictly greater than 5
+SELECT id            AS answer_id,
+       parent_id     AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+WHERE  score > 5
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:12 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5) Answers whose score is strictly greater than 5
+SELECT id            AS answer_id,
+       parent_id     AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+WHERE  score > 5
+LIMIT  20;
+Results:
+answer_id,question_id,owner_user_id,score
+18,17,,59
+165,145,,10
+1028,947,,8
+1073,1069,,29
+2977,2968,,7
+6206,769,,7
+6620,6607,,44
+
+[Successfully executed]
+2025-05-01 02:16:12 - Thread-747 (execute) - INFO - [Try to execute]
+-- 6) Answers whose score is > 0 and ≥ 20 % of summed scores for that question
+WITH total AS (
+  SELECT parent_id AS question_id,
+         SUM(score) AS total_score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  GROUP  BY question_id)
+SELECT a.id            AS answer_id,
+       a.parent_id     AS question_id,
+       a.owner_user_id,
+       a.score,
+       t.total_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+JOIN   total t
+       ON a.parent_id = t.question_id
+WHERE  a.score > 0
+  AND  a.score >= 0.20 * t.total_score
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:16 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6) Answers whose score is > 0 and ≥ 20 % of summed scores for that question
+WITH total AS (
+  SELECT parent_id AS question_id,
+         SUM(score) AS total_score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  GROUP  BY question_id)
+SELECT a.id            AS answer_id,
+       a.parent_id     AS question_id,
+       a.owner_user_id,
+       a.score,
+       t.total_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+JOIN   total t
+       ON a.parent_id = t.question_id
+WHERE  a.score > 0
+  AND  a.score >= 0.20 * t.total_score
+LIMIT  20;
+Results:
+answer_id,question_id,owner_user_id,score,total_score
+37852896,37850112,823822,1,2
+37853441,37853154,3363481,1,1
+37855271,35721282,1210784,1,1
+37858696,37858280,197487,1,1
+37861246,37850269,634824,1,1
+
+[Successfully executed]
+2025-05-01 02:16:16 - Thread-747 (execute) - INFO - [Try to execute]
+-- 7) Top‑3 scoring answers per question (ties get same rank)
+SELECT *
+FROM (
+  SELECT a.id                     AS answer_id,
+         a.parent_id              AS question_id,
+         a.owner_user_id,
+         a.score,
+         DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rank_in_question
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+WHERE  rank_in_question <= 3
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:18 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7) Top‑3 scoring answers per question (ties get same rank)
+SELECT *
+FROM (
+  SELECT a.id                     AS answer_id,
+         a.parent_id              AS question_id,
+         a.owner_user_id,
+         a.score,
+         DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rank_in_question
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+WHERE  rank_in_question <= 3
+LIMIT  20;
+Results:
+answer_id,question_id,owner_user_id,score,rank_in_question
+7,4,9,517,1
+86,4,39,145,2
+7263,4,905,101,3
+31910,48,3063,150,1
+58,48,37,65,2
+56,48,39,60,3
+
+[Successfully executed]
+2025-05-01 02:16:18 - Thread-747 (execute) - INFO - [Try to execute]
+-- 8) Build DISTINCT (question,user) pairs for every association rule
+WITH
+question_owners AS (
+  SELECT id            AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL),
+accepted_answerers AS (
+  SELECT q.id          AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id),
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5),
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id)
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t
+         ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT a.parent_id AS question_id,
+           a.owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+  WHERE  rnk <= 3)
+SELECT DISTINCT question_id, user_id
+FROM (
+  SELECT * FROM question_owners
+  UNION ALL
+  SELECT * FROM accepted_answerers
+  UNION ALL
+  SELECT * FROM answers_score_gt5
+  UNION ALL
+  SELECT * FROM answers_pct20
+  UNION ALL
+  SELECT * FROM top3_answers)
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:16:24 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8) Build DISTINCT (question,user) pairs for every association rule
+WITH
+question_owners AS (
+  SELECT id            AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL),
+accepted_answerers AS (
+  SELECT q.id          AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id),
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5),
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id)
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t
+         ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT a.parent_id AS question_id,
+           a.owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+  WHERE  rnk <= 3)
+SELECT DISTINCT question_id, user_id
+FROM (
+  SELECT * FROM question_owners
+  UNION ALL
+  SELECT * FROM accepted_answerers
+  UNION ALL
+  SELECT * FROM answers_score_gt5
+  UNION ALL
+  SELECT * FROM answers_pct20
+  UNION ALL
+  SELECT * FROM top3_answers)
+LIMIT 20;
+Results:
+question_id,user_id
+72862435,7884305
+72865925,10871073
+72730592,13513328
+41509439,3011380
+72930354,12388621
+38271273,5405451
+70302520,8756246
+73180391,11865956
+66920708,1829281
+73211686,734069
+72685327,5309272
+73186541,7297700
+
+[Successfully executed]
+2025-05-01 02:16:24 - Thread-747 (execute) - INFO - [Try to execute]
+-- 9) Aggregate view‑counts per user, for all associated questions
+WITH associations AS (  /* query #8 goes here */ ),
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL)
+SELECT a.user_id,
+       SUM(q.view_count) AS total_question_views
+FROM   associations a
+JOIN   question_views q USING (question_id)
+GROUP  BY a.user_id
+ORDER  BY total_question_views DESC
+LIMIT  20;
+[Try to execute]
+2025-05-01 02:16:24 - Thread-747 (execute) - INFO - [Error occurred]
+400 Syntax error: Unexpected ")" at [2:50]; reason: invalidQuery, location: query, message: Syntax error: Unexpected ")" at [2:50]
+
+Location: US
+Job ID: 583096be-3221-4f00-8b38-efaf008931cd
+
+[Error occurred]
+2025-05-01 02:18:57 - Thread-747 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+-- 1. Identify every (question_id, user_id) pair that satisfies at least
+--    one of the five association rules spelled out in the task.
+-- 2. UNION ALL those rule‑specific result sets and SELECT DISTINCT to
+--    obtain a de‑duplicated association list.
+-- 3. Join that list with the question table to pick up each question’s
+--    view_count (ignoring questions without a recorded view_count).
+-- 4. SUM the view_count per user_id.
+-- 5. Sort by the aggregated view total and return the top 20 users.
+--
+-- CTE layout mirrors these steps: one CTE for each rule, one CTE to unify
+-- them, one CTE for question views, and the final SELECT.
+
+WITH
+/* ───────── Rule 1: question owners ───────── */
+question_owners AS (
+  SELECT id AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL
+),
+/* ───────── Rule 2: accepted‑answer authors ───────── */
+accepted_answerers AS (
+  SELECT q.id              AS question_id,
+         a.owner_user_id   AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+    ON   q.accepted_answer_id = a.id
+),
+/* ───────── Rule 3: answers with score > 5 ───────── */
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5
+),
+/* ───── Rule 4: answers ≥ 20 % of total answer score (and > 0) ───── */
+answers_pct20 AS (
+  /* first compute total answer score per question */
+  WITH totals AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id
+  )
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   totals t ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score
+),
+/* ───────── Rule 5: top‑3 scoring answers per question ───────── */
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT parent_id        AS question_id,
+           owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  )
+  WHERE rnk <= 3
+),
+/* ───────── Combine rules (distinct pairs) ───────── */
+associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM question_owners
+    UNION ALL
+    SELECT * FROM accepted_answerers
+    UNION ALL
+    SELECT * FROM answers_score_gt5
+    UNION ALL
+    SELECT * FROM answers_pct20
+    UNION ALL
+    SELECT * FROM top3_answers
+  )
+),
+/* ───────── Question view counts ───────── */
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL
+)
+/* ───────── Final aggregation ───────── */
+SELECT a.user_id,
+       SUM(q.view_count) AS combined_view_count
+FROM   associations   a
+JOIN   question_views q USING (question_id)
+GROUP  BY a.user_id
+ORDER  BY combined_view_count DESC
+LIMIT  20;
+```
+[Corrected SQL]
+2025-05-01 02:19:05 - Thread-747 (execute) - INFO - [Results for corrected sql]
+user_id,combined_view_count
+,2683940051
+22656.0,369328376
+6309.0,289556426
+5423108.0,243310768
+860099.0,220980414
+157882.0,209226714
+29407.0,169490852
+541136.0,168689586
+893.0,152554391
+100297.0,140468823
+
+[Results for corrected sql]
+2025-05-01 02:19:58 - Thread-747 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  Return the 10 users who are associated with the most‑viewed
+--questions (association defined by the five rules).  The query:
+--  • Builds one CTE for every rule to obtain (question_id,user_id) pairs.
+--  • Unions these CTEs, removes duplicates and rows where user_id IS NULL.
+--  • Joins the resulting associations with the questions table to obtain the
+--    view_count for each question.
+--  • Aggregates view_count per user and orders by the total, showing the top 10
+--    together with the users’ display names.
+
+WITH
+/*──────── Rule 1: question authors ────────*/
+question_owners AS (
+  SELECT id AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL
+),
+/*──────── Rule 2: accepted‑answer authors ────────*/
+accepted_answerers AS (
+  SELECT q.id            AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id
+),
+/*──────── Rule 3: answers with score > 5 ────────*/
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5
+),
+/*──────── Rule 4: answers whose score ≥ 20 % of total (and > 0) ────────*/
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id
+  )
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score
+),
+/*──────── Rule 5: top‑3 highest‑scoring answers per question ────────*/
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT parent_id AS question_id,
+           owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  )
+  WHERE rnk <= 3
+),
+/*──────── Combine all rules, drop duplicates & NULL users ────────*/
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM question_owners
+    UNION ALL
+    SELECT * FROM accepted_answerers
+    UNION ALL
+    SELECT * FROM answers_score_gt5
+    UNION ALL
+    SELECT * FROM answers_pct20
+    UNION ALL
+    SELECT * FROM top3_answers
+  )
+  WHERE user_id IS NOT NULL
+),
+/*──────── Question view counts ────────*/
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL
+),
+/*──────── Aggregate total views per user ────────*/
+user_view_totals AS (
+  SELECT a.user_id,
+         SUM(q.view_count) AS total_views
+  FROM   all_associations a
+  JOIN   question_views   q USING (question_id)
+  GROUP  BY a.user_id
+)
+/*──────── Final list with display names ────────*/
+SELECT u.user_id,
+       p.display_name,
+       u.total_views AS combined_view_count
+FROM   user_view_totals u
+JOIN   `bigquery-public-data.stackoverflow.users` p
+       ON u.user_id = p.id
+ORDER  BY combined_view_count DESC
+LIMIT  10;
+```
+[Corrected other sqls]
+2025-05-01 02:19:58 - Thread-747 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description / Thinking process:
+-- 1. Identify every (question_id, user_id) pair that satisfies at least
+--    one of the five association rules spelled out in the task.
+-- 2. UNION ALL those rule‑specific result sets and SELECT DISTINCT to
+--    obtain a de‑duplicated association list.
+-- 3. Join that list with the question table to pick up each question’s
+--    view_count (ignoring questions without a recorded view_count).
+-- 4. SUM the view_count per user_id.
+-- 5. Sort by the aggregated view total and return the top 20 users.
+--
+-- CTE layout mirrors these steps: one CTE for each rule, one CTE to unify
+-- them, one CTE for question views, and the final SELECT.
+
+WITH
+/* ───────── Rule 1: question owners ───────── */
+question_owners AS (
+  SELECT id AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL
+),
+/* ───────── Rule 2: accepted‑answer authors ───────── */
+accepted_answerers AS (
+  SELECT q.id              AS question_id,
+         a.owner_user_id   AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+    ON   q.accepted_answer_id = a.id
+),
+/* ───────── Rule 3: answers with score > 5 ───────── */
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5
+),
+/* ───── Rule 4: answers ≥ 20 % of total answer score (and > 0) ───── */
+answers_pct20 AS (
+  /* first compute total answer score per question */
+  WITH totals AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id
+  )
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   totals t ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score
+),
+/* ───────── Rule 5: top‑3 scoring answers per question ───────── */
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT parent_id        AS question_id,
+           owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  )
+  WHERE rnk <= 3
+),
+/* ───────── Combine rules (distinct pairs) ───────── */
+associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM question_owners
+    UNION ALL
+    SELECT * FROM accepted_answerers
+    UNION ALL
+    SELECT * FROM answers_score_gt5
+    UNION ALL
+    SELECT * FROM answers_pct20
+    UNION ALL
+    SELECT * FROM top3_answers
+  )
+),
+/* ───────── Question view counts ───────── */
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL
+)
+/* ───────── Final aggregation ───────── */
+SELECT a.user_id,
+       SUM(q.view_count) AS combined_view_count
+FROM   associations   a
+JOIN   question_views q USING (question_id)
+GROUP  BY a.user_id
+ORDER  BY combined_view_count DESC
+LIMIT  20;
+Results:
+user_id,combined_view_count
+,2683940051
+22656.0,369328376
+6309.0,289556426
+5423108.0,243310768
+860099.0,220980414
+157882.0,209226714
+29407.0,169490852
+541136.0,168689586
+893.0,152554391
+100297.0,140468823
+
+[Successfully corrected]
+2025-05-01 02:19:58 - Thread-747 (execute) - INFO - [Try to execute]
+--Description:  Return the 10 users who are associated with the most‑viewed
+--questions (association defined by the five rules).  The query:
+--  • Builds one CTE for every rule to obtain (question_id,user_id) pairs.
+--  • Unions these CTEs, removes duplicates and rows where user_id IS NULL.
+--  • Joins the resulting associations with the questions table to obtain the
+--    view_count for each question.
+--  • Aggregates view_count per user and orders by the total, showing the top 10
+--    together with the users’ display names.
+
+WITH
+/*──────── Rule 1: question authors ────────*/
+question_owners AS (
+  SELECT id AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL
+),
+/*──────── Rule 2: accepted‑answer authors ────────*/
+accepted_answerers AS (
+  SELECT q.id            AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id
+),
+/*──────── Rule 3: answers with score > 5 ────────*/
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5
+),
+/*──────── Rule 4: answers whose score ≥ 20 % of total (and > 0) ────────*/
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id
+  )
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score
+),
+/*──────── Rule 5: top‑3 highest‑scoring answers per question ────────*/
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT parent_id AS question_id,
+           owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  )
+  WHERE rnk <= 3
+),
+/*──────── Combine all rules, drop duplicates & NULL users ────────*/
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM question_owners
+    UNION ALL
+    SELECT * FROM accepted_answerers
+    UNION ALL
+    SELECT * FROM answers_score_gt5
+    UNION ALL
+    SELECT * FROM answers_pct20
+    UNION ALL
+    SELECT * FROM top3_answers
+  )
+  WHERE user_id IS NOT NULL
+),
+/*──────── Question view counts ────────*/
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL
+),
+/*──────── Aggregate total views per user ────────*/
+user_view_totals AS (
+  SELECT a.user_id,
+         SUM(q.view_count) AS total_views
+  FROM   all_associations a
+  JOIN   question_views   q USING (question_id)
+  GROUP  BY a.user_id
+)
+/*──────── Final list with display names ────────*/
+SELECT u.user_id,
+       p.display_name,
+       u.total_views AS combined_view_count
+FROM   user_view_totals u
+JOIN   `bigquery-public-data.stackoverflow.users` p
+       ON u.user_id = p.id
+ORDER  BY combined_view_count DESC
+LIMIT  10
+[Try to execute]
+2025-05-01 02:20:09 - Thread-747 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  Return the 10 users who are associated with the most‑viewed
+--questions (association defined by the five rules).  The query:
+--  • Builds one CTE for every rule to obtain (question_id,user_id) pairs.
+--  • Unions these CTEs, removes duplicates and rows where user_id IS NULL.
+--  • Joins the resulting associations with the questions table to obtain the
+--    view_count for each question.
+--  • Aggregates view_count per user and orders by the total, showing the top 10
+--    together with the users’ display names.
+
+WITH
+/*──────── Rule 1: question authors ────────*/
+question_owners AS (
+  SELECT id AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL
+),
+/*──────── Rule 2: accepted‑answer authors ────────*/
+accepted_answerers AS (
+  SELECT q.id            AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id
+),
+/*──────── Rule 3: answers with score > 5 ────────*/
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5
+),
+/*──────── Rule 4: answers whose score ≥ 20 % of total (and > 0) ────────*/
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id
+  )
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score
+),
+/*──────── Rule 5: top‑3 highest‑scoring answers per question ────────*/
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT parent_id AS question_id,
+           owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  )
+  WHERE rnk <= 3
+),
+/*──────── Combine all rules, drop duplicates & NULL users ────────*/
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM question_owners
+    UNION ALL
+    SELECT * FROM accepted_answerers
+    UNION ALL
+    SELECT * FROM answers_score_gt5
+    UNION ALL
+    SELECT * FROM answers_pct20
+    UNION ALL
+    SELECT * FROM top3_answers
+  )
+  WHERE user_id IS NOT NULL
+),
+/*──────── Question view counts ────────*/
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL
+),
+/*──────── Aggregate total views per user ────────*/
+user_view_totals AS (
+  SELECT a.user_id,
+         SUM(q.view_count) AS total_views
+  FROM   all_associations a
+  JOIN   question_views   q USING (question_id)
+  GROUP  BY a.user_id
+)
+/*──────── Final list with display names ────────*/
+SELECT u.user_id,
+       p.display_name,
+       u.total_views AS combined_view_count
+FROM   user_view_totals u
+JOIN   `bigquery-public-data.stackoverflow.users` p
+       ON u.user_id = p.id
+ORDER  BY combined_view_count DESC
+LIMIT  10
+Results:
+user_id,display_name,combined_view_count
+22656,Jon Skeet,369328376
+6309,VonC,289556426
+5423108,Alireza,243310768
+860099,Kamil Kiełczewski,220980414
+157882,BalusC,209226714
+29407,Darin Dimitrov,169490852
+541136,Russia Must Remove Putin,168689586
+
+[Successfully executed]
+2025-05-01 02:20:09 - Thread-747 (execute) - INFO - itercount: 0
+2025-05-01 02:20:09 - Thread-747 (execute) - INFO - [Self-refine]
+Table full name: bigquery-public-data.stackoverflow.posts_answers
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: INT64 Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 21048655, 'title': None, 'body': '<p>If you will not use strongSelf in the code suggested by Kevin Ballard then it might lead to a crash because of weak getting nilled out.</p>\n\n<p>Also a good practice would be to even check for strong being non nil at the point of creating      </p>\n\n<pre><code>strongSelf = weakSelf\n\n   if(strongSelf)\n   {\n       // do your stuff here \n   }\n</code></pre>', 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': 'NaT', 'creation_date': '2014-01-10 15:53:33.090000+00:00', 'favorite_count': None, 'last_activity_date': '2014-01-10 15:53:33.090000+00:00', 'last_edit_date': 'NaT', 'last_editor_display_name': None, 'last_editor_user_id': None, 'owner_display_name': None, 'owner_user_id': 1785418, 'parent_id': 14370325, 'post_type_id': 2, 'score': 0, 'tags': None, 'view_count': None}, {'id': 21048662, 'title': None, 'body': '<p>Every Draw object creates a new timer so you have the game running n times at
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.users
+Column name: id Type: INT64 Description: None
+Column name: display_name Type: STRING Description: None
+Column name: about_me Type: STRING Description: None
+Column name: age Type: STRING Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: last_access_date Type: TIMESTAMP Description: None
+Column name: location Type: STRING Description: None
+Column name: reputation Type: INT64 Description: None
+Column name: up_votes Type: INT64 Description: None
+Column name: down_votes Type: INT64 Description: None
+Column name: views Type: INT64 Description: None
+Column name: profile_image_url Type: STRING Description: None
+Column name: website_url Type: STRING Description: None
+Sample rows:
+[{'id': 282, 'display_name': 'Bert Lamb', 'about_me': '<p>Director of Engineering, Litmus.com</p>', 'age': None, 'creation_date': '2008-08-04 12:18:45.500000+00:00', 'last_access_date': '2022-02-07 15:14:57.867000+00:00', 'location': 'Durham, NH, USA', 'reputation': 2265, 'up_votes': 141, 'down_votes': 2, 'views': 195, 'profile_image_url': None, 'website_url': 'http://www.bertlamb.com'}, {'id': 2832, 'display_name': 'Thunder3', 'about_me': None, 'age': None, 'creation_date': '2008-08-25 12:57:37.340000+00:00', 'last_access_date': '2012-04-12 15:38:12.890000+00:00', 'location': 'California', 'reputation': 1108, 'up_votes': 14, 'down_votes': 1, 'views': 118, 'profile_image_url': None, 'website_url': None}, {'id': 6209, 'display_name': 'Micah', 'about_me': None, 'age': None, 'creation_date': '2008-09-12 23:03:24.723000+00:00', 'last_access_date': '2021-09-15 14:37:48.553000+00:00', 'location': None, 'reputation': 1507, 'up_votes': 35, 'down_votes': 0, 'views': 83, 'profile_image_url': Non
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_orphaned_tag_wiki
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 4164933, 'title': None, 'body': '<p><a href="http://en.wikipedia.org/wiki/Argument-dependent_name_lookup" rel="nofollow">ADL</a> is mostly associated with <a href="/tags/c++/info">C++</a>.</p>', 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': 'NaT', 'creation_date': '2010-11-12 13:10:14.273000+00:00', 'favorite_count': None, 'last_activity_date': '2010-11-12 15:48:57.207000+00:00', 'last_edit_date': '2010-11-12 15:48:57.207000+00:00', 'last_editor_display_name': 'Roger Pate', 'last_editor_user_id': None, 'owner_display_name': None, 'owner_user_id': -1, 'parent_id': None, 'post_type_id': 3, 'score': 0, 'tags': None, 'view_count': None}, {'id': 4164934, 'title': None, 'body': 'ADL is argument-dependent lookup, sometimes called Koenig lookup.', 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': 'NaT', 'creation_date': '2010-11-12 13:10:14.273000+00:00', 'favorite_count': None, 'last_activity_d
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_tag_wiki
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 5046395, 'title': None, 'body': '<p>The Web (short form of "World Wide Web") is a collection of usually linked documents that are each accessible on a network. The information on the web is accessible through a web browser, implementing the Hypertext Transport Protocol (HTTP).</p>', 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': 'NaT', 'creation_date': '2011-02-18 20:47:53.817000+00:00', 'favorite_count': None, 'last_activity_date': '2011-06-23 21:43:01.793000+00:00', 'last_edit_date': '2011-06-23 21:43:01.793000+00:00', 'last_editor_display_name': 'user213154', 'last_editor_user_id': None, 'owner_display_name': 'user213154', 'owner_user_id': None, 'parent_id': None, 'post_type_id': 5, 'score': 0, 'tags': None, 'view_count': None}, {'id': 5062415, 'title': None, 'body': '<p>Celerity is a JRuby wrapper around HtmlUnit – a headless Java browser with JavaScript support. It provides a simple API for programmatic navigation through web 
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.stackoverflow_posts
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: INT64 Description: None
+Column name: answer_count Type: INT64 Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: INT64 Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: INT64 Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: INT64 Description: None
+Sample rows:
+[{'id': 40666, 'title': None, 'body': '<p>If I get this right you want a vector that is normal to the screen plane but in world coordinates?</p> <p>In that case you want to <code>INVERT</code> the transformation from <code>World -&gt; Screen and do Screen -&gt; World</code> of <code>(00-1)</code> or <code>(001)</code> depending on which axis the screen points down.</p> <p>Since the ModelView matrix is just a rotation matrix (ignoring the homogeneous transformation part) you can simply pull this out by taking the transpose of the rotational part or simple reading in the bottom row - as this transposes onto the <code>Z</code> coordinate column under transposition.</p>', 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': 'NaT', 'creation_date': '2008-09-02 21:05:56.027000+00:00', 'favorite_count': None, 'last_activity_date': '2016-02-20 16:39:00.497000+00:00', 'last_edit_date': '2016-02-20 16:39:00.497000+00:00', 'last_editor_display_name': None,
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_questions
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: INT64 Description: None
+Column name: answer_count Type: INT64 Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: INT64 Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: INT64 Description: None
+Sample rows:
+[{'id': 24449808, 'title': 'Node.js Abort chain in Q in different point', 'body': '<p>I have a pretty long chain of check in Q, and I would to interrupt it when an error rise:</p>\n\n<p>I have looked to <a href="https://stackoverflow.com/questions/21821936/how-to-abort-a-failing-q-promise-in-node-js">How to abort a failing Q promise in Node.JS</a> and other answers on SO, but it seems impossible to me, that can\'t exist nothing else.</p>\n\n<p>Example\n`</p>\n\n<pre><code>Q().then(function(){\n    return Q.ninvoke(myObject, \'save\');\n}).fail(functon(err){ // if error\n    res.status(400).send(err.message);// like duplicate key\n}).then(function(){\n    add object another object to db referenced to myObject\n}).fail(functon(err){ // if error\n    res.status(400).send(err.message);// like connection error\n}).then(function(){\n    do somethinng else\n}).done()\n</code></pre>\n\n<p>`</p>\n\n<p>Obviously, if it can\'t save the first object, I would not go on through other steps, but I wo
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.comments
+Column name: id Type: INT64 Description: None
+Column name: text Type: STRING Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: post_id Type: INT64 Description: None
+Column name: user_id Type: INT64 Description: None
+Column name: user_display_name Type: STRING Description: None
+Column name: score Type: INT64 Description: None
+Sample rows:
+[{'id': 32669925, 'text': "What is there to say?  In array context, as provided by `my @fileData`, the `<>` operator reads lines into the array with an implicit loop.  It works.  Occasionally, it is useful. Perl has a couple of mottos.  One is TMTOWTDI — There's More Than One Way To Do It.  Another is DWIM — Do What I Mean; at least, Perl does this more than many languages, provided you know what you're asking for.  This is a piece of dwimmery.", 'creation_date': '2014-02-07 06:35:37.693000+00:00', 'post_id': 21620857, 'user_id': 15168, 'user_display_name': None, 'score': 5}, {'id': 32670020, 'text': '... and it takes 2 seconds to add it to windows (8.1 in my case) > Control Panel > Add Programes > Turn windows features on', 'creation_date': '2014-02-07 06:39:30.367000+00:00', 'post_id': 8920568, 'user_id': 81053, 'user_display_name': None, 'score': 30}, {'id': 32670048, 'text': 'Yes, the 4th argument being "0" causes the replaecment string to be inserted without overwriting any of the
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_tag_wiki_excerpt
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 4742863, 'title': None, 'body': "SlimDX is an MIT-licensed, open-source framework that allows developers working with managed languages like C# and IronPython to leverage DirectX and many of Microsoft's other gaming-related multimedia APIs.", 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': 'NaT', 'creation_date': '2011-01-20 02:14:32.800000+00:00', 'favorite_count': None, 'last_activity_date': '2011-01-20 02:14:32.800000+00:00', 'last_edit_date': '2011-01-20 02:14:32.800000+00:00', 'last_editor_display_name': 'user197015', 'last_editor_user_id': None, 'owner_display_name': 'user197015', 'owner_user_id': None, 'parent_id': None, 'post_type_id': 4, 'score': 0, 'tags': None, 'view_count': None}, {'id': 5062416, 'title': None, 'body': 'Celerity is a JRuby wrapper around HtmlUnit – a headless Java browser with JavaScript support. It provides a simple API for programmatic navigation through web applications. Celerity aims at being API com
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_wiki_placeholder
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: STRING Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 8041931, 'title': None, 'body': '<p>On Stack Exchange, we believe the core <a href="https://stackoverflow.com/help/site-moderators">moderators</a> should come <em>from</em> the community, and be elected <em>by</em> the community itself through popular vote. We hold regular elections to determine who these community moderators will be.</p>\n<p>Community moderators are <a href="https://stackoverflow.blog/2009/05/18/a-theory-of-moderation/">accorded the highest level of privilege in our community</a>, and should themselves be exemplars of positive behavior and leaders within the community.</p>\n<h2>Candidacy Criteria</h2>\n<p>Generally, moderators should have the following qualities:</p>\n<ul>\n<li>patient and fair</li>\n<li>leads by example</li>\n<li>shows respect for their fellow community members in their actions and words</li>\n<li>open to some light but firm moderation to keep the community on track, and resolve uncommon disputes and exceptions</li>\n</ul>\n<p>For the Stack O
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_privilege_wiki
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: STRING Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 15111874, 'title': None, 'body': '<h3>What is edit questions and answers?</h3>\n\n<p>We believe in the power of community editing. That means once you\'ve generated enough reputation, we trust you to edit <em>anything</em> in the system without it going through the peer review system. Not just your posts—<em>anyone\'s posts!</em></p>\n\n<h3>When should I edit posts?</h3>\n\n<p>Any time you feel you can make the post better, and are inclined to do so. Editing is encouraged!</p>\n\n<p>Some common reasons to edit are:</p>\n\n<ul>\n<li>to fix grammatical or spelling mistakes</li>\n<li>to clarify the meaning of a post without changing it</li>\n<li>to correct minor mistakes or add addendums / updates as the post ages</li>\n<li>to add related resources or hyperlinks</li>\n</ul>\n\n<p>Try to make the post substantively better when you edit, not just change a single character. Tiny, trivial edits are discouraged.</p>\n\n<h3>How do I edit posts?</h3>\n\n<p>The <code>edit</code> link is a
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.post_history
+Column name: id Type: INT64 Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: post_id Type: INT64 Description: None
+Column name: post_history_type_id Type: INT64 Description: None
+Column name: revision_guid Type: STRING Description: None
+Column name: user_id Type: INT64 Description: None
+Column name: text Type: STRING Description: None
+Column name: comment Type: STRING Description: None
+Sample rows:
+[{'id': 79288580, 'creation_date': '2014-12-08 05:45:42.583000+00:00', 'post_id': 27352112, 'post_history_type_id': 2, 'revision_guid': '405ebdc0-31a8-430d-a457-7321d8992fb9', 'user_id': None, 'text': 'i am newbie in angularjs, i am trying to develop a simple ng-grid in which the data which is coming need to be filter before displaying, so what i am trying i am trying to filter but its not giving me exact filter if filter value is \'/xyz/\' then it is giving me \'/xyz/asd\' also but i need only \'/xyz/\' value. \n\'/xyz/\' is folderpath\nwhere i am doing wrong can anyone help me please.\n\n    app.controller(\'DeatilCtrl\', function($scope, $http) {\n   $scope.totalServerItems = 0;\n      $scope.pagingOptions = {\n          pageSizes: [15, 20, 30],\n          pageSize: 15,\n          currentPage: 1\n      }; \n  \n      $scope.filterByPath ={\n        filterText : \'/xyz/\' \n      };\n      $scope.setPagingData = function(data, page, pageSize){ \n          var pagedData = data.slice((
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.badges
+Column name: id Type: INT64 Description: None
+Column name: name Type: STRING Description: None
+Column name: date Type: TIMESTAMP Description: None
+Column name: user_id Type: INT64 Description: None
+Column name: class Type: INT64 Description: None
+Column name: tag_based Type: BOOL Description: None
+Sample rows:
+[{'id': 286426, 'name': 'Great Answer', 'date': '2009-04-17 07:22:38.120000+00:00', 'user_id': 49786, 'class': 1, 'tag_based': False}, {'id': 1096086, 'name': 'Unsung Hero', 'date': '2010-10-01 01:10:23.593000+00:00', 'user_id': 164998, 'class': 1, 'tag_based': False}, {'id': 1237100, 'name': 'Great Question', 'date': '2010-11-27 21:45:43.777000+00:00', 'user_id': 86060, 'class': 1, 'tag_based': False}, {'id': 1352523, 'name': 'Great Answer', 'date': '2011-01-16 05:33:11.323000+00:00', 'user_id': 16076, 'class': 1, 'tag_based': False}, {'id': 1364351, 'name': 'Stellar Question', 'date': '2011-01-20 11:45:12.737000+00:00', 'user_id': 1043, 'class': 1, 'tag_based': False}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.post_links
+Column name: id Type: INT64 Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: link_type_id Type: INT64 Description: None
+Column name: post_id Type: INT64 Description: None
+Column name: related_post_id Type: INT64 Description: None
+Sample rows:
+[{'id': 1894, 'creation_date': '2010-04-26 03:00:57.193000+00:00', 'link_type_id': 1, 'post_id': 131759, 'related_post_id': 192892}, {'id': 1925, 'creation_date': '2010-04-26 03:00:57.613000+00:00', 'link_type_id': 1, 'post_id': 133236, 'related_post_id': 769338}, {'id': 1926, 'creation_date': '2010-04-26 03:00:57.647000+00:00', 'link_type_id': 1, 'post_id': 133335, 'related_post_id': 122533}, {'id': 2196, 'creation_date': '2010-04-26 03:01:00.657000+00:00', 'link_type_id': 1, 'post_id': 145271, 'related_post_id': 111161}, {'id': 2560, 'creation_date': '2010-04-26 03:01:05.790000+00:00', 'link_type_id': 1, 'post_id': 160298, 'related_post_id': 773}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.tags
+Column name: id Type: INT64 Description: None
+Column name: tag_name Type: STRING Description: None
+Column name: count Type: INT64 Description: None
+Column name: excerpt_post_id Type: INT64 Description: None
+Column name: wiki_post_id Type: INT64 Description: None
+Sample rows:
+[{'id': 149358, 'tag_name': 'announcement', 'count': 0, 'excerpt_post_id': 69362460, 'wiki_post_id': 69362459}, {'id': 2136, 'tag_name': 'regsvr32', 'count': 256, 'excerpt_post_id': 10051236, 'wiki_post_id': 10051235}, {'id': 8287, 'tag_name': 'rpg', 'count': 256, 'excerpt_post_id': 7080550, 'wiki_post_id': 7080549}, {'id': 9136, 'tag_name': 'dbexpress', 'count': 256, 'excerpt_post_id': 7663373, 'wiki_post_id': 7663372}, {'id': 9213, 'tag_name': 'multiple-domains', 'count': 256, 'excerpt_post_id': 22931444, 'wiki_post_id': 22931443}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.votes
+Column name: id Type: INT64 Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: post_id Type: INT64 Description: None
+Column name: vote_type_id Type: INT64 Description: None
+Sample rows:
+[{'id': 246000083, 'creation_date': '2022-01-31 00:00:00+00:00', 'post_id': 70928934, 'vote_type_id': 15}, {'id': 246062313, 'creation_date': '2022-02-01 00:00:00+00:00', 'post_id': 70942438, 'vote_type_id': 11}, {'id': 239397522, 'creation_date': '2021-09-29 00:00:00+00:00', 'post_id': 69374423, 'vote_type_id': 11}, {'id': 239441896, 'creation_date': '2021-09-30 00:00:00+00:00', 'post_id': 69375289, 'vote_type_id': 15}, {'id': 135787328, 'creation_date': '2017-04-01 00:00:00+00:00', 'post_id': 43161698, 'vote_type_id': 11}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.stackoverflow.posts_moderator_nomination
+Column name: id Type: INT64 Description: None
+Column name: title Type: STRING Description: None
+Column name: body Type: STRING Description: None
+Column name: accepted_answer_id Type: STRING Description: None
+Column name: answer_count Type: STRING Description: None
+Column name: comment_count Type: INT64 Description: None
+Column name: community_owned_date Type: TIMESTAMP Description: None
+Column name: creation_date Type: TIMESTAMP Description: None
+Column name: favorite_count Type: STRING Description: None
+Column name: last_activity_date Type: TIMESTAMP Description: None
+Column name: last_edit_date Type: TIMESTAMP Description: None
+Column name: last_editor_display_name Type: STRING Description: None
+Column name: last_editor_user_id Type: INT64 Description: None
+Column name: owner_display_name Type: STRING Description: None
+Column name: owner_user_id Type: INT64 Description: None
+Column name: parent_id Type: STRING Description: None
+Column name: post_type_id Type: INT64 Description: None
+Column name: score Type: INT64 Description: None
+Column name: tags Type: STRING Description: None
+Column name: view_count Type: STRING Description: None
+Sample rows:
+[{'id': 4729565, 'title': None, 'body': '<p>I am detail oriented and would like to moderate this site to keep it a clean and fun place to visit everyday.</p>', 'accepted_answer_id': None, 'answer_count': None, 'comment_count': 0, 'community_owned_date': '2011-01-18 22:03:54.897000+00:00', 'creation_date': '2011-01-18 22:03:54.897000+00:00', 'favorite_count': None, 'last_activity_date': '2011-01-18 22:03:54.897000+00:00', 'last_edit_date': '2011-01-18 22:03:54.897000+00:00', 'last_editor_display_name': None, 'last_editor_user_id': 171206, 'owner_display_name': None, 'owner_user_id': 171206, 'parent_id': None, 'post_type_id': 6, 'score': 0, 'tags': None, 'view_count': None}, {'id': 4729601, 'title': None, 'body': '<p>Back when he was in high school, my dad ran for senior class president on the slogan of </p>\n\n<blockquote>\n  <p>"Slicer is Nicer".</p>\n</blockquote>\n\n<p>Well, I may certainly be nice too, and that will be tempered with patience, respect and professionalism.  As a profe
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'bigquery-public-data': {'stackoverflow': ['posts_answers', 'users', 'posts_orphaned_tag_wiki', 'posts_tag_wiki', 'stackoverflow_posts', 'posts_questions', 'comments', 'posts_tag_wiki_excerpt', 'posts_wiki_placeholder', 'posts_privilege_wiki', 'post_history', 'badges', 'post_links', 'tags', 'votes', 'posts_moderator_nomination']}}
+Begin Exploring Related Columns
+Relevant tables / columns and how they will be used  
+
+bigquery‑public‑data.stackoverflow.posts_questions  
+• id – the question identifier (primary key, join‑key)  
+• owner_user_id – question author (association rule #1)  
+• view_count – number of views that must be aggregated per user  
+• accepted_answer_id – id of the accepted answer (association rule #2)  
+
+bigquery‑public‑data.stackoverflow.posts_answers  
+• id – answer identifier (to match accepted_answer_id and create rankings)  
+• parent_id – id of the question this answer belongs to (join with posts_questions.id)  
+• owner_user_id – answer author (association rules #2‑#5)  
+• score – answer score (rules #3, #4, #5)  
+
+bigquery‑public‑data.stackoverflow.users  
+• id – user identifier (to link statistics to a user)  
+• display_name – human‑readable name for the final output  
+
+Typical conditions that will be used  
+• posts_answers.score > 5                                         – rule #3  
+• posts_answers.score > 0 AND posts_answers.score >= 0.20*total – rule #4  
+• DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) <= 3 – rule #5  
+• accepted_answer_id IS NOT NULL – rule #2 filter  
+• view_count IS NOT NULL – only count questions with a recorded view total  
+
+--------------------------------------------------------------------
+Ten exploratory → incremental SQL snippets
+--------------------------------------------------------------------
+
+```sql
+-- 1) Quick look at questions: id, owner, views
+SELECT id AS question_id,
+       owner_user_id,
+       view_count
+FROM   `bigquery-public-data.stackoverflow.posts_questions`
+WHERE  view_count IS NOT NULL
+LIMIT  20;
+```
+
+```sql
+-- 2) Quick look at answers: answer id, question id, author, score
+SELECT id          AS answer_id,
+       parent_id   AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+LIMIT  20;
+```
+
+```sql
+-- 3) Join questions with their accepted answers to find the accepted-answer author
+SELECT q.id  AS question_id,
+       q.view_count,
+       q.accepted_answer_id,
+       a.owner_user_id AS accepted_user_id
+FROM   `bigquery-public-data.stackoverflow.posts_questions`  AS q
+JOIN   `bigquery-public-data.stackoverflow.posts_answers`    AS a
+       ON q.accepted_answer_id = a.id
+WHERE  q.accepted_answer_id IS NOT NULL
+LIMIT  20;
+```
+
+```sql
+-- 4) Total answer‑score per question (needed for the 20 % rule)
+SELECT parent_id        AS question_id,
+       SUM(score)       AS total_answer_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+GROUP  BY question_id
+ORDER  BY total_answer_score DESC
+LIMIT  20;
+```
+
+```sql
+-- 5) Answers whose score is strictly greater than 5
+SELECT id            AS answer_id,
+       parent_id     AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+WHERE  score > 5
+LIMIT  20;
+```
+
+```sql
+-- 6) Answers whose score is > 0 and ≥ 20 % of summed scores for that question
+WITH total AS (
+  SELECT parent_id AS question_id,
+         SUM(score) AS total_score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  GROUP  BY question_id)
+SELECT a.id            AS answer_id,
+       a.parent_id     AS question_id,
+       a.owner_user_id,
+       a.score,
+       t.total_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+JOIN   total t
+       ON a.parent_id = t.question_id
+WHERE  a.score > 0
+  AND  a.score >= 0.20 * t.total_score
+LIMIT  20;
+```
+
+```sql
+-- 7) Top‑3 scoring answers per question (ties get same rank)
+SELECT *
+FROM (
+  SELECT a.id                     AS answer_id,
+         a.parent_id              AS question_id,
+         a.owner_user_id,
+         a.score,
+         DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rank_in_question
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+WHERE  rank_in_question <= 3
+LIMIT  20;
+```
+
+```sql
+-- 8) Build DISTINCT (question,user) pairs for every association rule
+WITH
+question_owners AS (
+  SELECT id            AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL),
+accepted_answerers AS (
+  SELECT q.id          AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id),
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5),
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id)
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t
+         ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT a.parent_id AS question_id,
+           a.owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+  WHERE  rnk <= 3)
+SELECT DISTINCT question_id, user_id
+FROM (
+  SELECT * FROM question_owners
+  UNION ALL
+  SELECT * FROM accepted_answerers
+  UNION ALL
+  SELECT * FROM answers_score_gt5
+  UNION ALL
+  SELECT * FROM answers_pct20
+  UNION ALL
+  SELECT * FROM top3_answers)
+LIMIT 20;
+```
+
+```sql
+-- 9) Aggregate view‑counts per user, for all associated questions
+WITH associations AS (  /* query #8 goes here */ ),
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL)
+SELECT a.user_id,
+       SUM(q.view_count) AS total_question_views
+FROM   associations a
+JOIN   question_views q USING (question_id)
+GROUP  BY a.user_id
+ORDER  BY total_question_views DESC
+LIMIT  20;
+```
+
+```sql
+-- 10) Final answer – top‑10 users by combined view‑count of associated questions
+WITH
+questions AS (
+  SELECT id               AS question_id,
+         owner_user_id    AS question_owner_id,
+         view_count,
+         accepted_answer_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL),
+answers AS (
+  SELECT id               AS answer_id,
+         parent_id        AS question_id,
+         owner_user_id    AS answer_owner_id,
+         score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`),
+total_scores AS (
+  SELECT question_id,
+         SUM(score) AS total_score
+  FROM   answers
+  GROUP  BY question_id),
+top3 AS (
+  SELECT question_id,
+         answer_owner_id
+  FROM (
+    SELECT question_id,
+           answer_owner_id,
+           DENSE_RANK() OVER (PARTITION BY question_id ORDER BY score DESC) AS rnk
+    FROM   answers)
+  WHERE  rnk <= 3),
+accepted AS (
+  SELECT q.question_id,
+         a.answer_owner_id
+  FROM   questions q
+  JOIN   answers   a
+         ON q.accepted_answer_id = a.answer_id),
+score_gt5 AS (
+  SELECT question_id,
+         answer_owner_id
+  FROM   answers
+  WHERE  score > 5),
+pct20 AS (
+  SELECT a.question_id,
+         a.answer_owner_id
+  FROM   answers a
+  JOIN   total_scores t USING (question_id)
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+question_owners AS (
+  SELECT question_id,
+         question_owner_id AS user_id
+  FROM   questions
+  WHERE  question_owner_id IS NOT NULL),
+all_assoc AS (
+  SELECT * FROM question_owners
+  UNION DISTINCT
+  SELECT * FROM accepted
+  UNION DISTINCT
+  SELECT * FROM score_gt5
+  UNION DISTINCT
+  SELECT * FROM pct20
+  UNION DISTINCT
+  SELECT * FROM top3),
+user_views AS (
+  SELECT a.user_id,
+         q.view_count
+  FROM   all_assoc a
+  JOIN   questions q USING (question_id))
+SELECT u.user_id,
+       us.display_name,
+       SUM(view_count) AS combined_view_count
+FROM   user_views u
+JOIN   `bigquery-public-data.stackoverflow.users` us
+       ON u.user_id = us.id
+GROUP  BY u.user_id, us.display_name
+ORDER  BY combined_view_count DESC
+LIMIT  10;
+```
+Refined SQLs and results:
+Query:
+-- 1) Quick look at questions: id, owner, views
+SELECT id AS question_id,
+       owner_user_id,
+       view_count
+FROM   `bigquery-public-data.stackoverflow.posts_questions`
+WHERE  view_count IS NOT NULL
+LIMIT  20;
+Answer:
+question_id,owner_user_id,view_count
+73842327,16454187,1
+73629682,13025866,1281
+73535922,19874740,2
+73547530,19237401,2
+73583644,14402223,2
+73613976,17733245,2
+73646614,19948219,2
+73698409,17899988,2
+Query:
+-- 2) Quick look at answers: answer id, question id, author, score
+SELECT id          AS answer_id,
+       parent_id   AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+LIMIT  20;
+Answer:
+answer_id,question_id,owner_user_id,score
+10182780,10182744,775014,0
+10182786,10182559,122718,0
+10182787,10182763,1297269,0
+10182788,10092328,1317793,0
+10182792,10150347,221515,0
+10182808,10181167,924149,0
+Query:
+-- 3) Join questions with their accepted answers to find the accepted-answer author
+SELECT q.id  AS question_id,
+       q.view_count,
+       q.accepted_answer_id,
+       a.owner_user_id AS accepted_user_id
+FROM   `bigquery-public-data.stackoverflow.posts_questions`  AS q
+JOIN   `bigquery-public-data.stackoverflow.posts_answers`    AS a
+       ON q.accepted_answer_id = a.id
+WHERE  q.accepted_answer_id IS NOT NULL
+LIMIT  20;
+Answer:
+question_id,view_count,accepted_answer_id,accepted_user_id
+73584832,12,73584973,19508866
+73735620,12,73735621,807149
+73789567,12,73808363,390150
+73839672,12,73839745,5812524
+73838984,13,73839181,16749821
+Query:
+-- 4) Total answer‑score per question (needed for the 20 % rule)
+SELECT parent_id        AS question_id,
+       SUM(score)       AS total_answer_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+GROUP  BY question_id
+ORDER  BY total_answer_score DESC
+LIMIT  20;
+Answer:
+question_id,total_answer_score
+11227809,58764
+927358,55765
+2003505,37628
+184618,32645
+179123,28068
+231767,25603
+5767325,23832
+503093,23042
+1642028,23028
+111102,21388
+Query:
+-- 5) Answers whose score is strictly greater than 5
+SELECT id            AS answer_id,
+       parent_id     AS question_id,
+       owner_user_id,
+       score
+FROM   `bigquery-public-data.stackoverflow.posts_answers`
+WHERE  score > 5
+LIMIT  20;
+Answer:
+answer_id,question_id,owner_user_id,score
+18,17,,59
+165,145,,10
+1028,947,,8
+1073,1069,,29
+2977,2968,,7
+6206,769,,7
+6620,6607,,44
+Query:
+-- 6) Answers whose score is > 0 and ≥ 20 % of summed scores for that question
+WITH total AS (
+  SELECT parent_id AS question_id,
+         SUM(score) AS total_score
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  GROUP  BY question_id)
+SELECT a.id            AS answer_id,
+       a.parent_id     AS question_id,
+       a.owner_user_id,
+       a.score,
+       t.total_score
+FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+JOIN   total t
+       ON a.parent_id = t.question_id
+WHERE  a.score > 0
+  AND  a.score >= 0.20 * t.total_score
+LIMIT  20;
+Answer:
+answer_id,question_id,owner_user_id,score,total_score
+37852896,37850112,823822,1,2
+37853441,37853154,3363481,1,1
+37855271,35721282,1210784,1,1
+37858696,37858280,197487,1,1
+37861246,37850269,634824,1,1
+Query:
+-- 7) Top‑3 scoring answers per question (ties get same rank)
+SELECT *
+FROM (
+  SELECT a.id                     AS answer_id,
+         a.parent_id              AS question_id,
+         a.owner_user_id,
+         a.score,
+         DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rank_in_question
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+WHERE  rank_in_question <= 3
+LIMIT  20;
+Answer:
+answer_id,question_id,owner_user_id,score,rank_in_question
+7,4,9,517,1
+86,4,39,145,2
+7263,4,905,101,3
+31910,48,3063,150,1
+58,48,37,65,2
+56,48,39,60,3
+Query:
+-- 8) Build DISTINCT (question,user) pairs for every association rule
+WITH
+question_owners AS (
+  SELECT id            AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL),
+accepted_answerers AS (
+  SELECT q.id          AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id),
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5),
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id)
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t
+         ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score),
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT a.parent_id AS question_id,
+           a.owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY a.parent_id ORDER BY a.score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers` a)
+  WHERE  rnk <= 3)
+SELECT DISTINCT question_id, user_id
+FROM (
+  SELECT * FROM question_owners
+  UNION ALL
+  SELECT * FROM accepted_answerers
+  UNION ALL
+  SELECT * FROM answers_score_gt5
+  UNION ALL
+  SELECT * FROM answers_pct20
+  UNION ALL
+  SELECT * FROM top3_answers)
+LIMIT 20;
+Answer:
+question_id,user_id
+72862435,7884305
+72865925,10871073
+72730592,13513328
+41509439,3011380
+72930354,12388621
+38271273,5405451
+70302520,8756246
+73180391,11865956
+66920708,1829281
+73211686,734069
+72685327,5309272
+73186541,7297700
+Query:
+--Description:  Return the 10 users who are associated with the most‑viewed
+--questions (association defined by the five rules).  The query:
+--  • Builds one CTE for every rule to obtain (question_id,user_id) pairs.
+--  • Unions these CTEs, removes duplicates and rows where user_id IS NULL.
+--  • Joins the resulting associations with the questions table to obtain the
+--    view_count for each question.
+--  • Aggregates view_count per user and orders by the total, showing the top 10
+--    together with the users’ display names.
+
+WITH
+/*──────── Rule 1: question authors ────────*/
+question_owners AS (
+  SELECT id AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  owner_user_id IS NOT NULL
+),
+/*──────── Rule 2: accepted‑answer authors ────────*/
+accepted_answerers AS (
+  SELECT q.id            AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_questions` q
+  JOIN   `bigquery-public-data.stackoverflow.posts_answers`   a
+         ON q.accepted_answer_id = a.id
+),
+/*──────── Rule 3: answers with score > 5 ────────*/
+answers_score_gt5 AS (
+  SELECT parent_id     AS question_id,
+         owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  WHERE  score > 5
+),
+/*──────── Rule 4: answers whose score ≥ 20 % of total (and > 0) ────────*/
+answers_pct20 AS (
+  WITH total AS (
+    SELECT parent_id AS question_id,
+           SUM(score) AS total_score
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+    GROUP  BY question_id
+  )
+  SELECT a.parent_id     AS question_id,
+         a.owner_user_id AS user_id
+  FROM   `bigquery-public-data.stackoverflow.posts_answers` a
+  JOIN   total t ON a.parent_id = t.question_id
+  WHERE  a.score > 0
+    AND  a.score >= 0.20 * t.total_score
+),
+/*──────── Rule 5: top‑3 highest‑scoring answers per question ────────*/
+top3_answers AS (
+  SELECT question_id,
+         owner_user_id AS user_id
+  FROM (
+    SELECT parent_id AS question_id,
+           owner_user_id,
+           DENSE_RANK() OVER (PARTITION BY parent_id ORDER BY score DESC) AS rnk
+    FROM   `bigquery-public-data.stackoverflow.posts_answers`
+  )
+  WHERE rnk <= 3
+),
+/*──────── Combine all rules, drop duplicates & NULL users ────────*/
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM question_owners
+    UNION ALL
+    SELECT * FROM accepted_answerers
+    UNION ALL
+    SELECT * FROM answers_score_gt5
+    UNION ALL
+    SELECT * FROM answers_pct20
+    UNION ALL
+    SELECT * FROM top3_answers
+  )
+  WHERE user_id IS NOT NULL
+),
+/*──────── Question view counts ────────*/
+question_views AS (
+  SELECT id AS question_id,
+         view_count
+  FROM   `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE  view_count IS NOT NULL
+),
+/*──────── Aggregate total views per user ────────*/
+user_view_totals AS (
+  SELECT a.user_id,
+         SUM(q.view_count) AS total_views
+  FROM   all_associations a
+  JOIN   question_views   q USING (question_id)
+  GROUP  BY a.user_id
+)
+/*──────── Final list with display names ────────*/
+SELECT u.user_id,
+       p.display_name,
+       u.total_views AS combined_view_count
+FROM   user_view_totals u
+JOIN   `bigquery-public-data.stackoverflow.users` p
+       ON u.user_id = p.id
+ORDER  BY combined_view_count DESC
+LIMIT  10
+Answer:
+user_id,display_name,combined_view_count
+22656,Jon Skeet,369328376
+6309,VonC,289556426
+5423108,Alireza,243310768
+860099,Kamil Kiełczewski,220980414
+157882,BalusC,209226714
+29407,Darin Dimitrov,169490852
+541136,Russia Must Remove Putin,168689586
+End Exploring Related Columns
+Task: Which 10 users have the highest combined view counts for questions they are associated with, where a user is considered associated if they own the question, or their answer is the accepted answer, or their answer's score is greater than 5, or their answer's score exceeds 20% of the total answer scores for that question (and is above 0), or their answer is among the top three highest-scoring answers for that question?
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+Usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Follow the answer format like: ```csv
+user_id,user_display_name,combined_view_count
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'bigquery-public-data': {'stackoverflow': ['posts_answers', 'users', 'posts_orphaned_tag_wiki', 'posts_tag_wiki', 'stackoverflow_posts', 'posts_questions', 'comments', 'posts_tag_wiki_excerpt', 'posts_wiki_placeholder', 'posts_privilege_wiki', 'post_history', 'badges', 'post_links', 'tags', 'votes', 'posts_moderator_nomination']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 02:21:08 - Thread-747 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH
+/* ---------- questions with view counts ---------- */
+questions AS (
+  SELECT
+    id AS question_id,
+    owner_user_id AS question_owner,
+    accepted_answer_id,
+    view_count
+  FROM `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE view_count IS NOT NULL
+),
+/* ---------- all answers ---------- */
+answers AS (
+  SELECT
+    id AS answer_id,
+    parent_id  AS question_id,
+    owner_user_id AS answer_owner,
+    score
+  FROM `bigquery-public-data.stackoverflow.posts_answers`
+),
+/* ---------- total answer score per question (for 20 % rule) ---------- */
+total_scores AS (
+  SELECT
+    question_id,
+    SUM(score) AS total_score
+  FROM answers
+  GROUP BY question_id
+),
+/* ---------- rule 1 : question authors ---------- */
+assoc_question_owner AS (
+  SELECT
+    question_id,
+    question_owner AS user_id
+  FROM questions
+  WHERE question_owner IS NOT NULL
+),
+/* ---------- rule 2 : accepted‑answer authors ---------- */
+assoc_accepted_answerer AS (
+  SELECT
+    q.question_id,
+    a.answer_owner AS user_id
+  FROM questions q
+  JOIN answers  a
+    ON q.accepted_answer_id = a.answer_id
+  WHERE a.answer_owner IS NOT NULL
+),
+/* ---------- rule 3 : answers with score > 5 ---------- */
+assoc_score_gt5 AS (
+  SELECT
+    question_id,
+    answer_owner AS user_id
+  FROM answers
+  WHERE score > 5
+    AND answer_owner IS NOT NULL
+),
+/* ---------- rule 4 : answers ≥ 20 % of total score and > 0 ---------- */
+assoc_pct20 AS (
+  SELECT
+    a.question_id,
+    a.answer_owner AS user_id
+  FROM answers a
+  JOIN total_scores t
+    ON a.question_id = t.question_id
+  WHERE a.score > 0
+    AND a.score >= 0.20 * t.total_score
+    AND a.answer_owner IS NOT NULL
+),
+/* ---------- rule 5 : top‑3 highest‑scoring answers per question ---------- */
+assoc_top3 AS (
+  SELECT
+    question_id,
+    answer_owner AS user_id
+  FROM (
+    SELECT
+      question_id,
+      answer_owner,
+      DENSE_RANK() OVER (PARTITION BY question_id ORDER BY score DESC) AS rnk
+    FROM answers
+    WHERE answer_owner IS NOT NULL
+  )
+  WHERE rnk <= 3
+),
+/* ---------- union of all association rules ---------- */
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM assoc_question_owner
+    UNION ALL
+    SELECT * FROM assoc_accepted_answerer
+    UNION ALL
+    SELECT * FROM assoc_score_gt5
+    UNION ALL
+    SELECT * FROM assoc_pct20
+    UNION ALL
+    SELECT * FROM assoc_top3
+  )
+),
+/* ---------- aggregate question views per user ---------- */
+user_view_totals AS (
+  SELECT
+    a.user_id,
+    SUM(q.view_count) AS combined_view_count
+  FROM all_associations a
+  JOIN questions q
+    ON a.question_id = q.question_id
+  GROUP BY a.user_id
+)
+/* ---------- final top‑10 users ---------- */
+SELECT
+  u.user_id,
+  COALESCE(us.display_name, '') AS user_display_name,
+  u.combined_view_count
+FROM user_view_totals u
+LEFT JOIN `bigquery-public-data.stackoverflow.users` us
+  ON u.user_id = us.id
+ORDER BY
+  combined_view_count DESC,
+  user_id
+LIMIT 10;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:21:17 - Thread-747 (execute) - INFO - [Executed results in self-refine]
+user_id,user_display_name,combined_view_count
+22656,Jon Skeet,369380635
+6309,VonC,289755448
+5423108,Alireza,243629542
+860099,Kamil Kiełczewski,221316654
+157882,BalusC,209226714
+29407,Darin Dimitrov,169493045
+541136,Russia Must Remove Putin,168689586
+893,Greg Hewgill,152614712
+100297,Martijn Pieters,140468823
+55075,kenorb,138720610
+
+[Executed results in self-refine]
+2025-05-01 02:21:17 - Thread-747 (execute) - INFO - itercount: 1
+2025-05-01 02:21:17 - Thread-747 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Which 10 users have the highest combined view counts for questions they are associated with, where a user is considered associated if they own the question, or their answer is the accepted answer, or their answer's score is greater than 5, or their answer's score exceeds 20% of the total answer scores for that question (and is above 0), or their answer is among the top three highest-scoring answers for that question?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+user_id,user_display_name,combined_view_count
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+user_id,user_display_name,combined_view_count
+22656,Jon Skeet,369380635
+6309,VonC,289755448
+5423108,Alireza,243629542
+860099,Kamil Kiełczewski,221316654
+157882,BalusC,209226714
+29407,Darin Dimitrov,169493045
+541136,Russia Must Remove Putin,168689586
+893,Greg Hewgill,152614712
+100297,Martijn Pieters,140468823
+55075,kenorb,138720610
+Current sql:
+WITH
+/* ---------- questions with view counts ---------- */
+questions AS (
+  SELECT
+    id AS question_id,
+    owner_user_id AS question_owner,
+    accepted_answer_id,
+    view_count
+  FROM `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE view_count IS NOT NULL
+),
+/* ---------- all answers ---------- */
+answers AS (
+  SELECT
+    id AS answer_id,
+    parent_id  AS question_id,
+    owner_user_id AS answer_owner,
+    score
+  FROM `bigquery-public-data.stackoverflow.posts_answers`
+),
+/* ---------- total answer score per question (for 20 % rule) ---------- */
+total_scores AS (
+  SELECT
+    question_id,
+    SUM(score) AS total_score
+  FROM answers
+  GROUP BY question_id
+),
+/* ---------- rule 1 : question authors ---------- */
+assoc_question_owner AS (
+  SELECT
+    question_id,
+    question_owner AS user_id
+  FROM questions
+  WHERE question_owner IS NOT NULL
+),
+/* ---------- rule 2 : accepted‑answer authors ---------- */
+assoc_accepted_answerer AS (
+  SELECT
+    q.question_id,
+    a.answer_owner AS user_id
+  FROM questions q
+  JOIN answers  a
+    ON q.accepted_answer_id = a.answer_id
+  WHERE a.answer_owner IS NOT NULL
+),
+/* ---------- rule 3 : answers with score > 5 ---------- */
+assoc_score_gt5 AS (
+  SELECT
+    question_id,
+    answer_owner AS user_id
+  FROM answers
+  WHERE score > 5
+    AND answer_owner IS NOT NULL
+),
+/* ---------- rule 4 : answers ≥ 20 % of total score and > 0 ---------- */
+assoc_pct20 AS (
+  SELECT
+    a.question_id,
+    a.answer_owner AS user_id
+  FROM answers a
+  JOIN total_scores t
+    ON a.question_id = t.question_id
+  WHERE a.score > 0
+    AND a.score >= 0.20 * t.total_score
+    AND a.answer_owner IS NOT NULL
+),
+/* ---------- rule 5 : top‑3 highest‑scoring answers per question ---------- */
+assoc_top3 AS (
+  SELECT
+    question_id,
+    answer_owner AS user_id
+  FROM (
+    SELECT
+      question_id,
+      answer_owner,
+      DENSE_RANK() OVER (PARTITION BY question_id ORDER BY score DESC) AS rnk
+    FROM answers
+    WHERE answer_owner IS NOT NULL
+  )
+  WHERE rnk <= 3
+),
+/* ---------- union of all association rules ---------- */
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM assoc_question_owner
+    UNION ALL
+    SELECT * FROM assoc_accepted_answerer
+    UNION ALL
+    SELECT * FROM assoc_score_gt5
+    UNION ALL
+    SELECT * FROM assoc_pct20
+    UNION ALL
+    SELECT * FROM assoc_top3
+  )
+),
+/* ---------- aggregate question views per user ---------- */
+user_view_totals AS (
+  SELECT
+    a.user_id,
+    SUM(q.view_count) AS combined_view_count
+  FROM all_associations a
+  JOIN questions q
+    ON a.question_id = q.question_id
+  GROUP BY a.user_id
+)
+/* ---------- final top‑10 users ---------- */
+SELECT
+  u.user_id,
+  COALESCE(us.display_name, '') AS user_display_name,
+  u.combined_view_count
+FROM user_view_totals u
+LEFT JOIN `bigquery-public-data.stackoverflow.users` us
+  ON u.user_id = us.id
+ORDER BY
+  combined_view_count DESC,
+  user_id
+LIMIT 10;
+[Self-refine]
+2025-05-01 02:21:50 - Thread-747 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH
+/* ---------- questions with view counts ---------- */
+questions AS (
+  SELECT
+    id AS question_id,
+    owner_user_id AS question_owner,
+    accepted_answer_id,
+    view_count
+  FROM `bigquery-public-data.stackoverflow.posts_questions`
+  WHERE view_count IS NOT NULL
+),
+/* ---------- all answers ---------- */
+answers AS (
+  SELECT
+    id AS answer_id,
+    parent_id AS question_id,
+    owner_user_id AS answer_owner,
+    score
+  FROM `bigquery-public-data.stackoverflow.posts_answers`
+),
+/* ---------- total answer score per question (for 20 % rule) ---------- */
+total_scores AS (
+  SELECT
+    question_id,
+    SUM(score) AS total_score
+  FROM answers
+  GROUP BY question_id
+),
+/* ---------- rule 1 : question authors ---------- */
+assoc_question_owner AS (
+  SELECT
+    question_id,
+    question_owner AS user_id
+  FROM questions
+  WHERE question_owner IS NOT NULL
+),
+/* ---------- rule 2 : accepted‑answer authors ---------- */
+assoc_accepted_answerer AS (
+  SELECT
+    q.question_id,
+    a.answer_owner AS user_id
+  FROM questions q
+  JOIN answers a
+    ON q.accepted_answer_id = a.answer_id
+  WHERE a.answer_owner IS NOT NULL
+),
+/* ---------- rule 3 : answers with score > 5 ---------- */
+assoc_score_gt5 AS (
+  SELECT
+    question_id,
+    answer_owner AS user_id
+  FROM answers
+  WHERE score > 5
+    AND answer_owner IS NOT NULL
+),
+/* ---------- rule 4 : answers ≥ 20 % of total score and > 0 ---------- */
+assoc_pct20 AS (
+  SELECT
+    a.question_id,
+    a.answer_owner AS user_id
+  FROM answers a
+  JOIN total_scores t
+    ON a.question_id = t.question_id
+  WHERE a.score > 0
+    AND a.score >= 0.20 * t.total_score
+    AND a.answer_owner IS NOT NULL
+),
+/* ---------- rule 5 : top‑3 highest‑scoring answers per question ---------- */
+assoc_top3 AS (
+  SELECT
+    question_id,
+    answer_owner AS user_id
+  FROM (
+    SELECT
+      question_id,
+      answer_owner,
+      DENSE_RANK() OVER (PARTITION BY question_id ORDER BY score DESC) AS rnk
+    FROM answers
+    WHERE answer_owner IS NOT NULL
+  )
+  WHERE rnk <= 3
+),
+/* ---------- union of all association rules ---------- */
+all_associations AS (
+  SELECT DISTINCT question_id, user_id FROM (
+    SELECT * FROM assoc_question_owner
+    UNION ALL
+    SELECT * FROM assoc_accepted_answerer
+    UNION ALL
+    SELECT * FROM assoc_score_gt5
+    UNION ALL
+    SELECT * FROM assoc_pct20
+    UNION ALL
+    SELECT * FROM assoc_top3
+  )
+),
+/* ---------- aggregate question views per user ---------- */
+user_view_totals AS (
+  SELECT
+    a.user_id,
+    SUM(q.view_count) AS combined_view_count
+  FROM all_associations a
+  JOIN questions q
+    ON a.question_id = q.question_id
+  GROUP BY a.user_id
+)
+/* ---------- final top‑10 users ---------- */
+SELECT
+  u.user_id,
+  COALESCE(us.display_name, '') AS user_display_name,
+  u.combined_view_count
+FROM user_view_totals u
+LEFT JOIN `bigquery-public-data.stackoverflow.users` us
+  ON u.user_id = us.id
+ORDER BY
+  combined_view_count DESC,
+  user_id
+LIMIT 10;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:21:58 - Thread-747 (execute) - INFO - [Executed results in self-refine]
+user_id,user_display_name,combined_view_count
+22656,Jon Skeet,369380635
+6309,VonC,289755448
+5423108,Alireza,243629542
+860099,Kamil Kiełczewski,221316654
+157882,BalusC,209226714
+29407,Darin Dimitrov,169493045
+541136,Russia Must Remove Putin,168689586
+893,Greg Hewgill,152614712
+100297,Martijn Pieters,140468823
+55075,kenorb,138720610
+
+[Executed results in self-refine]
+2025-05-01 02:21:58 - Thread-747 (execute) - INFO - [Consistent results]
+user_id,user_display_name,combined_view_count
+22656,Jon Skeet,369380635
+6309,VonC,289755448
+5423108,Alireza,243629542
+860099,Kamil Kiełczewski,221316654
+157882,BalusC,209226714
+29407,Darin Dimitrov,169493045
+541136,Russia Must Remove Putin,168689586
+893,Greg Hewgill,152614712
+100297,Martijn Pieters,140468823
+55075,kenorb,138720610
+
+[Consistent results]
+2025-05-01 02:21:58 - Thread-747 (execute) - INFO - Total iteration counts: 1

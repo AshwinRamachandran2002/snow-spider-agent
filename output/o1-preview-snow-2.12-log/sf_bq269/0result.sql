@@ -1,0 +1,69 @@
+WITH sessions AS (
+  SELECT "fullVisitorId", "date", "totals"
+  FROM (
+    SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170602"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170604"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170605"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170606"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170609"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170610"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170613"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170615"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170616"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170617"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170618"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170619"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170622"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170623"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170625"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170626"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170627"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170629"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170702"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170703"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170704"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170707"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170709"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170710"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170711"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170713"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170715"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170716"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170717"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170718"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170719"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170720"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170721"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170722"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170723"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170724"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170725"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170726"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170727"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170728"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170729"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170730"
+    UNION ALL SELECT "fullVisitorId", "date", "totals" FROM "GA360"."GOOGLE_ANALYTICS_SAMPLE"."GA_SESSIONS_20170731"
+  )
+),
+visitor_pageviews AS (
+  SELECT
+    s."fullVisitorId",
+    DATE_TRUNC('month', TO_DATE(s."date", 'YYYYMMDD')) AS "date_month",
+    CASE WHEN TO_NUMBER(s."totals":"transactions") >= 1 THEN 'purchase' ELSE 'non_purchase' END AS "classification",
+    SUM(TO_NUMBER(s."totals":"pageviews")) AS "total_pageviews"
+  FROM sessions AS s
+  WHERE TO_NUMBER(s."totals":"pageviews") IS NOT NULL
+    AND TO_DATE(s."date", 'YYYYMMDD') BETWEEN TO_DATE('2017-06-01', 'YYYY-MM-DD') AND TO_DATE('2017-07-31', 'YYYY-MM-DD')
+  GROUP BY
+    s."fullVisitorId",
+    DATE_TRUNC('month', TO_DATE(s."date", 'YYYYMMDD')),
+    "classification"
+)
+SELECT
+  TO_CHAR("date_month", 'FMMonth YYYY') AS "Month",
+  ROUND(AVG(CASE WHEN "classification" = 'purchase' THEN "total_pageviews" END), 4) AS "Average_Pageviews_Purchase",
+  ROUND(AVG(CASE WHEN "classification" = 'non_purchase' THEN "total_pageviews" END), 4) AS "Average_Pageviews_Non_Purchase"
+FROM visitor_pageviews
+GROUP BY "Month"
+ORDER BY "Month";

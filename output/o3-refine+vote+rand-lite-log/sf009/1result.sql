@@ -1,0 +1,29 @@
+WITH buildings_with_city AS (
+    SELECT
+        "CLASS"      AS BUILDING_CLASS,
+        "SUBCLASS"   AS BUILDING_SUBCLASS,
+        COALESCE(TRY_TO_DECIMAL("SURFACE_AREA_SQ_M"), 0)                AS SURFACE_AREA,
+        LOWER(TRIM((PARSE_JSON("CONTAINS_ADDRESSES")[0]:"addr:city")::STRING)) AS CITY
+    FROM
+        NETHERLANDS_OPEN_MAP_DATA.NETHERLANDS.V_BUILDING
+)
+
+SELECT
+    BUILDING_CLASS,
+    BUILDING_SUBCLASS,
+    /* Amsterdam statistics */
+    SUM(CASE WHEN CITY = 'amsterdam' THEN SURFACE_AREA ELSE 0 END)  AS AMSTERDAM_TOTAL_SURFACE_AREA_SQ_M,
+    COUNT_IF(CITY = 'amsterdam')                                    AS AMSTERDAM_BUILDING_COUNT,
+    /* Rotterdam statistics */
+    SUM(CASE WHEN CITY = 'rotterdam' THEN SURFACE_AREA ELSE 0 END)  AS ROTTERDAM_TOTAL_SURFACE_AREA_SQ_M,
+    COUNT_IF(CITY = 'rotterdam')                                    AS ROTTERDAM_BUILDING_COUNT
+FROM
+    buildings_with_city
+WHERE
+    CITY IN ('amsterdam', 'rotterdam')
+GROUP BY
+    BUILDING_CLASS,
+    BUILDING_SUBCLASS
+ORDER BY
+    BUILDING_CLASS ASC,
+    BUILDING_SUBCLASS ASC;

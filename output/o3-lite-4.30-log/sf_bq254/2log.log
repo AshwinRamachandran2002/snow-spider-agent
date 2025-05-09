@@ -1,0 +1,1641 @@
+2025-05-01 01:18:46 - Thread-291 (execute) - INFO - [Answer format]
+```csv
+name
+```
+[Answer format]
+2025-05-01 01:21:24 - Thread-291 (execute) - INFO - [Exploration]
+Relevant columns & potential usage for the task  
+• GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES  
+  – "feature_type": restrict to ‘multipolygons’.  
+  – "geometry": polygon WKB, cast to GEOGRAPHY with TO_GEOGRAPHY() for spatial tests.  
+  – "all_tags": VARIANT array, flatten to detect (or exclude) the ‘wikidata’ & ‘name’ tags.  
+  – "osm_id", "osm_way_id": object identifiers, optional in final list.  
+
+• GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS  
+  – "geometry": point WKB, cast to GEOGRAPHY.  
+  – "all_tags": later if we want to look at attributes of the points.  
+
+Typical conditions that will be useful  
+1. Identify the reference multipolygon with Wikidata = Q191:  
+   EXISTS ( SELECT 1 FROM LATERAL FLATTEN(input => pf."all_tags") f  
+            WHERE f.value:"key"::STRING = 'wikidata'  
+              AND f.value:"value"::STRING = 'Q191')  
+2. Other multipolygons in the same area (simple example – intersect / within a buffer):  
+   ST_INTERSECTS( pf2_geom , q191_geom ) OR  
+   ST_DWITHIN( pf2_geom , q191_geom , <distance_in_meters> )  
+3. Exclude any polygon that already carries a wikidata tag:  
+   NOT EXISTS ( SELECT 1 FROM LATERAL FLATTEN(input => pf2."all_tags") f  
+                WHERE f.value:"key"::STRING = 'wikidata')  
+4. Name extraction for the winning polygons:  
+   SELECT f_name.value:"value"::STRING AS "name"  
+   FROM   LATERAL FLATTEN(input => pf2."all_tags") f_name  
+   WHERE  f_name.value:"key"::STRING = 'name'  
+5. Point‑in‑polygon counting:  
+   ST_CONTAINS( pf2_geom , pt_geom )  
+   (aggregate COUNT(*) per polygon)
+
+Ten progressively‑complex sample queries
+----------------------------------------
+
+```sql
+-- 1. Quick look at how 'wikidata' is stored in multipolygons’ all_tags
+SELECT pf."osm_way_id",
+       f.value:"key"::STRING  AS tag_key,
+       f.value:"value"::STRING AS tag_val
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       LATERAL FLATTEN(input => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING ILIKE '%wikidata%'
+LIMIT 20;
+```
+
+```sql
+-- 2. Find the multipolygon that has wikidata = 'Q191'
+SELECT pf."osm_way_id",
+       TO_GEOGRAPHY(pf."geometry")               AS q191_geom,
+       f_name.value:"value"::STRING              AS q191_name
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+       ,LATERAL FLATTEN(input => pf."all_tags") f_wd
+       ,LATERAL FLATTEN(input => pf."all_tags") f_name
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f_wd.value:"key"::STRING  = 'wikidata'
+  AND  f_wd.value:"value"::STRING = 'Q191'
+  AND  f_name.value:"key"::STRING = 'name'
+LIMIT 20;
+```
+
+```sql
+-- 3. Inspect the bounding box (envelope) of that Q191 geometry
+SELECT ST_ASWKT(ST_ENVELOPE(TO_GEOGRAPHY("geometry"))) AS bbox_wkt
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+WHERE  "feature_type" = 'multipolygons'
+  AND  EXISTS (
+        SELECT 1
+        FROM   LATERAL FLATTEN(input => "all_tags") f
+        WHERE  f.value:"key"::STRING = 'wikidata'
+          AND  f.value:"value"::STRING = 'Q191')
+LIMIT 20;
+```
+
+```sql
+-- 4. Grab all other multipolygons that spatially intersect that envelope
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY("geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+    WHERE  "feature_type" = 'multipolygons'
+      AND  EXISTS (
+          SELECT 1 FROM LATERAL FLATTEN(input => "all_tags") f
+          WHERE  f.value:"key"::STRING = 'wikidata'
+             AND f.value:"value"::STRING = 'Q191')
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+LIMIT 20;
+```
+
+```sql
+-- 5. Same as (4) but exclude polygons that already have a wikidata tag
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY("geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+    WHERE  "feature_type" = 'multipolygons'
+      AND  EXISTS (
+          SELECT 1 FROM LATERAL FLATTEN(input => "all_tags") f
+          WHERE  f.value:"key"::STRING = 'wikidata'
+             AND f.value:"value"::STRING = 'Q191')
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+  AND  NOT EXISTS (
+        SELECT 1 FROM LATERAL FLATTEN(input => pf."all_tags") f
+        WHERE  f.value:"key"::STRING = 'wikidata')
+LIMIT 20;
+```
+
+```sql
+-- 6. Get names of these candidate polygons (if any)
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY("geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+    WHERE  "feature_type" = 'multipolygons'
+      AND  EXISTS (
+        SELECT 1 FROM LATERAL FLATTEN(input => "all_tags") f
+        WHERE f.value:"key"::STRING = 'wikidata'
+          AND f.value:"value"::STRING = 'Q191')
+)
+SELECT pf."osm_way_id",
+       f_name.value:"value"::STRING AS candidate_name
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191,
+       LATERAL FLATTEN(input => pf."all_tags") f_name
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+  AND  NOT EXISTS (
+        SELECT 1 FROM LATERAL FLATTEN(input => pf."all_tags") f_wd
+        WHERE  f_wd.value:"key"::STRING = 'wikidata')
+  AND  f_name.value:"key"::STRING = 'name'
+LIMIT 20;
+```
+
+```sql
+-- 7. Sample of points that fall inside one arbitrary candidate polygon
+WITH one_polygon AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id" = <REPLACE_WITH_ONE_ID>
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp,
+       one_polygon p
+WHERE  ST_CONTAINS( p.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+LIMIT 20;
+```
+
+```sql
+-- 8. Count how many points lie in each candidate multipolygon
+WITH
+q191 AS (
+    SELECT TO_GEOGRAPHY("geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+    WHERE  "feature_type" = 'multipolygons'
+      AND  EXISTS (
+        SELECT 1 FROM LATERAL FLATTEN(input => "all_tags") f
+        WHERE  f.value:"key"::STRING = 'wikidata'
+          AND  f.value:"value"::STRING = 'Q191')
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")                     AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+      AND  NOT EXISTS (
+           SELECT 1 FROM LATERAL FLATTEN(input => pf."all_tags") f
+           WHERE  f.value:"key"::STRING = 'wikidata')
+)
+SELECT c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+       JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+         ON ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."osm_way_id"
+ORDER BY pt_in_poly DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. Retrieve name tag along with the point counts for top 10 polygons
+WITH
+q191 AS (
+    SELECT TO_GEOGRAPHY("geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+    WHERE  "feature_type" = 'multipolygons'
+      AND  EXISTS (
+        SELECT 1 FROM LATERAL FLATTEN(input => "all_tags") f
+        WHERE  f.value:"key"::STRING = 'wikidata'
+          AND  f.value:"value"::STRING = 'Q191')
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")                     AS poly_geom,
+           ( SELECT f_name.value:"value"::STRING
+             FROM   LATERAL FLATTEN(input => pf."all_tags") f_name
+             WHERE  f_name.value:"key"::STRING = 'name'
+             LIMIT 1)                                     AS poly_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+      AND  NOT EXISTS (
+           SELECT 1 FROM LATERAL FLATTEN(input => pf."all_tags") f
+           WHERE  f.value:"key"::STRING = 'wikidata')
+)
+SELECT c."poly_name",
+       c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+       JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+         ON ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 10;
+```
+
+```sql
+-- 10. Final query: return the two polygons with the most interior points
+WITH
+q191 AS (
+    SELECT TO_GEOGRAPHY("geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+    WHERE  "feature_type" = 'multipolygons'
+      AND  EXISTS (
+        SELECT 1 FROM LATERAL FLATTEN(input => "all_tags") f
+        WHERE  f.value:"key"::STRING = 'wikidata'
+          AND  f.value:"value"::STRING = 'Q191')
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")                     AS poly_geom,
+           ( SELECT f_name.value:"value"::STRING
+             FROM   LATERAL FLATTEN(input => pf."all_tags") f_name
+             WHERE  f_name.value:"key"::STRING = 'name'
+             LIMIT 1)                                     AS poly_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+      AND  NOT EXISTS (
+           SELECT 1 FROM LATERAL FLATTEN(input => pf."all_tags") f
+           WHERE  f.value:"key"::STRING = 'wikidata')
+)
+SELECT c."poly_name"           AS target_polygon_name,
+       c."osm_way_id"          AS target_way_id,
+       COUNT(*)                AS points_inside
+FROM   candidates c
+       JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+         ON ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY points_inside DESC
+LIMIT 2;
+```
+
+These queries progress from basic exploration of tags through spatial filtering, counting points inside polygons, and finally retrieving the two multipolygons (without a ‘wikidata’ tag) that contain the most points inside the same geographic area as the Wikidata Q191 polygon.
+[Exploration]
+2025-05-01 01:21:24 - Thread-291 (execute) - INFO - [Try to execute]
+-- 1. Quick look at how 'wikidata' is stored in multipolygons’ all_tags
+SELECT pf."osm_way_id",
+       f.value:"key"::STRING  AS tag_key,
+       f.value:"value"::STRING AS tag_val
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       LATERAL FLATTEN(input => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING ILIKE '%wikidata%'
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:22:00 - Thread-291 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Quick look at how 'wikidata' is stored in multipolygons’ all_tags
+SELECT pf."osm_way_id",
+       f.value:"key"::STRING  AS tag_key,
+       f.value:"value"::STRING AS tag_val
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       LATERAL FLATTEN(input => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING ILIKE '%wikidata%'
+LIMIT 20;
+Results:
+osm_way_id,TAG_KEY,TAG_VAL
+826103614,brand:wikidata,Q259340
+915915706,brand:wikidata,Q13218434
+927363044,brand:wikidata,Q5048645
+712375420,brand:wikidata,Q259340
+,wikidata,Q32007929
+,wikidata,Q3114666
+891204333,brand:wikidata,Q4970966
+975045678,wikidata,Q22572286
+903105624,brand:wikidata,Q151954
+653240052,wikidata,Q17853833
+,wikidata,Q5899756
+927051751,wikidata,Q8074945
+653409129,wikidata,Q26618910
+653409131,wikidata,Q26504758
+
+[Successfully executed]
+2025-05-01 01:22:00 - Thread-291 (execute) - INFO - [Try to execute]
+-- 2. Find the multipolygon that has wikidata = 'Q191'
+SELECT pf."osm_way_id",
+       TO_GEOGRAPHY(pf."geometry")               AS q191_geom,
+       f_name.value:"value"::STRING              AS q191_name
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+       ,LATERAL FLATTEN(input => pf."all_tags") f_wd
+       ,LATERAL FLATTEN(input => pf."all_tags") f_name
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f_wd.value:"key"::STRING  = 'wikidata'
+  AND  f_wd.value:"value"::STRING = 'Q191'
+  AND  f_name.value:"key"::STRING = 'name'
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:22:21 - Thread-291 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Find the multipolygon that has wikidata = 'Q191'
+SELECT pf."osm_way_id",
+       TO_GEOGRAPHY(pf."geometry")               AS q191_geom,
+       f_name.value:"value"::STRING              AS q191_name
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+       ,LATERAL FLATTEN(input => pf."all_tags") f_wd
+       ,LATERAL FLATTEN(input => pf."all_tags") f_name
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f_wd.value:"key"::STRING  = 'wikidata'
+  AND  f_wd.value:"value"::STRING = 'Q191'
+  AND  f_name.value:"key"::STRING = 'name'
+LIMIT 20;
+Results:
+osm_way_id,Q191_GEOM,Q191_NAME
+,"{
+  ""coordinates"": [
+    [
+      [
+        2.780954900000000e+01,
+        5.787258230000000e+01
+      ],
+      [
+        2.780957620000000e+01,
+        5.787266660000001e+01
+      ],
+      [
+        2.780969820000000e+01,
+        5.787279660000000e+01
+      ],
+      [
+        2.780998550000000e+01,
+        5.787289850000000e+01
+      ],
+      [
+        2.781040820000000e+01,
+        5.787297509999999e+01
+      ],
+      [
+        2.781067250000000e+01,
+        
+
+[Successfully executed]
+2025-05-01 01:22:21 - Thread-291 (execute) - INFO - [Try to execute]
+-- 3. Inspect the bounding box (envelope) of that Q191 geometry
+SELECT ST_ASWKT(ST_ENVELOPE(TO_GEOGRAPHY("geometry"))) AS bbox_wkt
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+WHERE  "feature_type" = 'multipolygons'
+  AND  EXISTS (
+        SELECT 1
+        FROM   LATERAL FLATTEN(input => "all_tags") f
+        WHERE  f.value:"key"::STRING = 'wikidata'
+          AND  f.value:"value"::STRING = 'Q191')
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:22:22 - Thread-291 (execute) - INFO - [Error occurred]
+002031 (42601): SQL compilation error:
+Unsupported subquery type cannot be evaluated
+[Error occurred]
+2025-05-01 01:23:23 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- 1) Scan PLANET_FEATURES for rows where feature_type = 'multipolygons'.
+-- 2) Flatten the JSON array "all_tags" so each tag becomes a row; this
+--    allows direct filtering without a sub‑query (avoids the previous error).
+-- 3) Keep the row whose tag key = 'wikidata' and tag value = 'Q191'.
+-- 4) Convert the WKB "geometry" into a GEOGRAPHY object, take its envelope
+--    (the minimal bounding rectangle), and output the result as WKT.
+--    LIMIT 1 is enough because there should be only one such multipolygon.
+SELECT ST_ASWKT(
+         ST_ENVELOPE(
+           TO_GEOGRAPHY(pf."geometry")
+         )
+       ) AS bbox_wkt
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       LATERAL FLATTEN(input => pf."all_tags") f
+WHERE  pf."feature_type"      = 'multipolygons'
+  AND  f.value:"key"::STRING   = 'wikidata'
+  AND  f.value:"value"::STRING = 'Q191'
+LIMIT 1;
+```
+[Corrected SQL]
+2025-05-01 01:24:06 - Thread-291 (execute) - INFO - [Results for corrected sql]
+BBOX_WKT
+"POLYGON((21.3826069 57.5092997,28.2100175 57.5092997,28.2100175 59.9383754,21.3826069 59.9383754,21.3826069 57.5092997))"
+
+[Results for corrected sql]
+2025-05-01 01:26:04 - Thread-291 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:
+-- 4. List multipolygons that spatially intersect the Q191 multipolygon.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1                      -- there should be exactly one Q191 geom
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 5. Same as #4, but exclude any polygon that already carries a wikidata tag.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+  AND  NOT EXISTS (
+        SELECT 1
+        FROM   LATERAL FLATTEN(input => pf."all_tags") f_wd
+        WHERE  f_wd.value:"key"::STRING = 'wikidata')
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 6. Retrieve the names of the candidate polygons (intersecting Q191, no wikidata).
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1
+)
+SELECT pf."osm_way_id",
+       f_name.value:"value"::STRING AS candidate_name
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191,
+       LATERAL FLATTEN(input => pf."all_tags") f_name
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+  AND  NOT EXISTS (      -- exclude polygons already tagged with wikidata
+        SELECT 1
+        FROM   LATERAL FLATTEN(input => pf."all_tags") f_wd
+        WHERE  f_wd.value:"key"::STRING = 'wikidata')
+  AND  f_name.value:"key"::STRING = 'name'
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 7. Sample the first 20 points that fall inside one chosen candidate polygon.
+--    Replace <REPLACE_WITH_ONE_ID> by a real "osm_way_id" from previous results.
+WITH one_polygon AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id"   = <REPLACE_WITH_ONE_ID>
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp,
+       one_polygon p
+WHERE  ST_CONTAINS( p.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 8. Count how many points lie inside every candidate multipolygon.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+      AND  NOT EXISTS (
+            SELECT 1
+            FROM   LATERAL FLATTEN(input => pf."all_tags") f
+            WHERE  f.value:"key"::STRING = 'wikidata')
+)
+SELECT c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+       JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+         ON ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 9. Retrieve each candidate’s name along with the number of interior points
+--    (top 10 by count).
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry") AS poly_geom,
+           ( SELECT f_name.value:"value"::STRING
+             FROM   LATERAL FLATTEN(input => pf."all_tags") f_name
+             WHERE  f_name.value:"key"::STRING = 'name'
+             LIMIT 1) AS poly_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+      AND  NOT EXISTS (
+            SELECT 1
+            FROM   LATERAL FLATTEN(input => pf."all_tags") f2
+            WHERE  f2.value:"key"::STRING = 'wikidata')
+)
+SELECT c."poly_name",
+       c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+       JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+         ON ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 10;
+```
+
+```sql
+--Description:
+-- 10. Final answer: two candidate polygons with the highest number of interior points.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry") AS poly_geom,
+           ( SELECT f_name.value:"value"::STRING
+             FROM   LATERAL FLATTEN(input => pf."all_tags") f_name
+             WHERE  f_name.value:"key"::STRING = 'name'
+             LIMIT 1) AS poly_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+      AND  NOT EXISTS (           -- ensure no wikidata tag
+            SELECT 1
+            FROM   LATERAL FLATTEN(input => pf."all_tags") f2
+            WHERE  f2.value:"key"::STRING = 'wikidata')
+)
+SELECT c."poly_name"  AS target_polygon_name,
+       c."osm_way_id" AS target_way_id,
+       COUNT(*)       AS points_inside
+FROM   candidates c
+       JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+         ON ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY points_inside DESC
+LIMIT 2;
+```
+[Corrected other sqls]
+2025-05-01 01:26:04 - Thread-291 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+-- 1) Scan PLANET_FEATURES for rows where feature_type = 'multipolygons'.
+-- 2) Flatten the JSON array "all_tags" so each tag becomes a row; this
+--    allows direct filtering without a sub‑query (avoids the previous error).
+-- 3) Keep the row whose tag key = 'wikidata' and tag value = 'Q191'.
+-- 4) Convert the WKB "geometry" into a GEOGRAPHY object, take its envelope
+--    (the minimal bounding rectangle), and output the result as WKT.
+--    LIMIT 1 is enough because there should be only one such multipolygon.
+SELECT ST_ASWKT(
+         ST_ENVELOPE(
+           TO_GEOGRAPHY(pf."geometry")
+         )
+       ) AS bbox_wkt
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       LATERAL FLATTEN(input => pf."all_tags") f
+WHERE  pf."feature_type"      = 'multipolygons'
+  AND  f.value:"key"::STRING   = 'wikidata'
+  AND  f.value:"value"::STRING = 'Q191'
+LIMIT 1;
+Results:
+BBOX_WKT
+"POLYGON((21.3826069 57.5092997,28.2100175 57.5092997,28.2100175 59.9383754,21.3826069 59.9383754,21.3826069 57.5092997))"
+
+[Successfully corrected]
+2025-05-01 01:26:04 - Thread-291 (execute) - INFO - [Try to execute]
+--Description:
+-- 4. List multipolygons that spatially intersect the Q191 multipolygon.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1                      -- there should be exactly one Q191 geom
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+LIMIT 20
+[Try to execute]
+2025-05-01 01:26:10 - Thread-291 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:
+-- 4. List multipolygons that spatially intersect the Q191 multipolygon.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1                      -- there should be exactly one Q191 geom
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+LIMIT 20
+Results:
+osm_way_id
+179270389
+919684128
+199151697
+664820017
+191174726
+30644308
+258919955
+44770142
+207093530
+554203552
+30615314
+456440680
+832669951
+903928806
+456447460
+363143221
+816445824
+956111077
+910146787
+891022487
+
+[Successfully executed]
+2025-05-01 01:26:10 - Thread-291 (execute) - INFO - [Try to execute]
+--Description:
+-- 5. Same as #4, but exclude any polygon that already carries a wikidata tag.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  f.value:"key"::STRING   = 'wikidata'
+      AND  f.value:"value"::STRING = 'Q191'
+    LIMIT 1
+)
+SELECT pf."osm_way_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+       q191
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+  AND  NOT EXISTS (
+        SELECT 1
+        FROM   LATERAL FLATTEN(input => pf."all_tags") f_wd
+        WHERE  f_wd.value:"key"::STRING = 'wikidata')
+LIMIT 20
+[Try to execute]
+2025-05-01 01:26:10 - Thread-291 (execute) - INFO - [Error occurred]
+002031 (42601): SQL compilation error:
+Unsupported subquery type cannot be evaluated
+[Error occurred]
+2025-05-01 01:28:53 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Find up to 20 multipolygons that
+--   1) spatially intersect the reference multipolygon whose tag wikidata = 'Q191'
+--   2) do NOT possess any tag with key = 'wikidata' themselves.
+-- Approach
+--   A. CTE q191: fetch the GEOGRAPHY geometry of the single multipolygon carrying wikidata = Q191.
+--      We expose tags via LATERAL FLATTEN (avoids a correlated sub‑query).
+--   B. CTE candidates: keep every multipolygon that intersects q191.geom.
+--   C. Final SELECT: flatten each candidate’s tags, group by polygon, and
+--      retain only those whose flattened rows contain zero wikidata tags.
+
+WITH q191 AS (   -- A. reference geometry
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"          = 'multipolygons'
+      AND  t.value:"key"::STRING       = 'wikidata'
+      AND  t.value:"value"::STRING     = 'Q191'
+    LIMIT 1
+),
+candidates AS (  -- B. multipolygons intersecting that geometry
+    SELECT pf."osm_way_id",
+           pf."all_tags"
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+)
+-- C. exclude polygons that already have a wikidata tag
+SELECT c."osm_way_id"
+FROM   candidates c,
+       LATERAL FLATTEN(input => c."all_tags") f
+GROUP  BY c."osm_way_id"
+HAVING SUM( IFF( f.value:"key"::STRING = 'wikidata', 1, 0) ) = 0
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:29:19 - Thread-291 (execute) - INFO - [Results for corrected sql]
+osm_way_id
+564028111
+464589715
+229194100
+740493883
+73882639
+703465163
+241586950
+744718737
+251443354
+712007216
+227137433
+215130209
+211725441
+215221073
+229142135
+45551317
+229766246
+249478630
+230743012
+247873880
+
+[Results for corrected sql]
+2025-05-01 01:30:48 - Thread-291 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:
+-- 6. Retrieve the names of multipolygons that
+--    a) intersect the Q191 multipolygon, and
+--    b) have NO ‘wikidata’ tag themselves.
+WITH q191 AS (
+    -- geometry of the reference multipolygon (wikidata = Q191)
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) t
+    WHERE  pf."feature_type"        = 'multipolygons'
+      AND  t.value:"key"::STRING     = 'wikidata'
+      AND  t.value:"value"::STRING   = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    -- multipolygons that intersect q191.geom (tags flattened)
+    SELECT pf."osm_way_id",
+           MAX( IFF( f.value:"key"::STRING = 'name'
+                   , f.value:"value"::STRING
+                   , NULL) ) AS candidate_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           q191 ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+    GROUP  BY pf."osm_way_id"
+    HAVING SUM( IFF( f.value:"key"::STRING = 'wikidata', 1, 0) ) = 0
+)
+SELECT *
+FROM   candidates
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 7. Sample the first 20 points that lie inside a chosen candidate polygon.
+--    Replace <REPLACE_WITH_ONE_ID> with an actual OSM way ID obtained from query 6.
+WITH one_polygon AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id"   = <REPLACE_WITH_ONE_ID>
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp ,
+       one_polygon p
+WHERE  ST_CONTAINS( p.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 8. Count how many points fall inside every candidate multipolygon
+--    (intersecting Q191 and lacking a wikidata tag).
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),                                -- flatten tags to filter out wikidata
+filtered AS (
+    SELECT c."osm_way_id",
+           c."poly_geom"
+    FROM   candidates c ,
+           LATERAL FLATTEN ( input => (
+               SELECT pf."all_tags"
+               FROM GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+               WHERE pf."osm_way_id" = c."osm_way_id"
+           )) f
+    GROUP  BY c."osm_way_id", c."poly_geom"
+    HAVING SUM( IFF( f.value:"key"::STRING = 'wikidata', 1, 0) ) = 0
+)
+SELECT f."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   filtered f
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_CONTAINS( f."poly_geom", TO_GEOGRAPHY(pp."geometry") )
+GROUP BY f."osm_way_id"
+ORDER BY pt_in_poly DESC
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 9. Return each candidate’s name and the number of interior points
+--    (top 10 by count).
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (
+    -- intersecting polys & all their tags
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           f.value:"key"::STRING                 AS tag_key,
+           f.value:"value"::STRING               AS tag_val
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           q191 ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (
+    -- keep only polygons without wikidata; collect name
+    SELECT r."osm_way_id",
+           MAX( IFF( r.tag_key = 'name', r.tag_val, NULL) ) AS poly_name,
+           MAX( r.poly_geom )                              AS poly_geom
+    FROM   raw r
+    GROUP  BY r."osm_way_id"
+    HAVING SUM( IFF( r.tag_key = 'wikidata', 1, 0) ) = 0
+)
+SELECT c."poly_name",
+       c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 10;
+```
+
+```sql
+--Description:
+-- 10. Final query – return the two multipolygons (no wikidata tag) that
+--     intersect Q191 and contain the largest number of points.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           f.value:"key"::STRING                 AS tag_key,
+           f.value:"value"::STRING               AS tag_val
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           q191 ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (
+    SELECT r."osm_way_id",
+           MAX( IFF( r.tag_key = 'name', r.tag_val, NULL) ) AS poly_name,
+           MAX( r.poly_geom )                              AS poly_geom
+    FROM   raw r
+    GROUP  BY r."osm_way_id"
+    HAVING SUM( IFF( r.tag_key = 'wikidata', 1, 0) ) = 0
+)
+SELECT c."poly_name"  AS target_polygon_name,
+       c."osm_way_id" AS target_way_id,
+       COUNT(*)       AS points_inside
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_CONTAINS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY points_inside DESC
+LIMIT 2;
+```
+[Corrected other sqls]
+2025-05-01 01:30:48 - Thread-291 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+-- Find up to 20 multipolygons that
+--   1) spatially intersect the reference multipolygon whose tag wikidata = 'Q191'
+--   2) do NOT possess any tag with key = 'wikidata' themselves.
+-- Approach
+--   A. CTE q191: fetch the GEOGRAPHY geometry of the single multipolygon carrying wikidata = Q191.
+--      We expose tags via LATERAL FLATTEN (avoids a correlated sub‑query).
+--   B. CTE candidates: keep every multipolygon that intersects q191.geom.
+--   C. Final SELECT: flatten each candidate’s tags, group by polygon, and
+--      retain only those whose flattened rows contain zero wikidata tags.
+
+WITH q191 AS (   -- A. reference geometry
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"          = 'multipolygons'
+      AND  t.value:"key"::STRING       = 'wikidata'
+      AND  t.value:"value"::STRING     = 'Q191'
+    LIMIT 1
+),
+candidates AS (  -- B. multipolygons intersecting that geometry
+    SELECT pf."osm_way_id",
+           pf."all_tags"
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+)
+-- C. exclude polygons that already have a wikidata tag
+SELECT c."osm_way_id"
+FROM   candidates c,
+       LATERAL FLATTEN(input => c."all_tags") f
+GROUP  BY c."osm_way_id"
+HAVING SUM( IFF( f.value:"key"::STRING = 'wikidata', 1, 0) ) = 0
+LIMIT 20;
+Results:
+osm_way_id
+564028111
+464589715
+229194100
+740493883
+73882639
+703465163
+241586950
+744718737
+251443354
+712007216
+227137433
+215130209
+211725441
+215221073
+229142135
+45551317
+229766246
+249478630
+230743012
+247873880
+
+[Successfully corrected]
+2025-05-01 01:30:48 - Thread-291 (execute) - INFO - [Try to execute]
+--Description:
+-- 6. Retrieve the names of multipolygons that
+--    a) intersect the Q191 multipolygon, and
+--    b) have NO ‘wikidata’ tag themselves.
+WITH q191 AS (
+    -- geometry of the reference multipolygon (wikidata = Q191)
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) t
+    WHERE  pf."feature_type"        = 'multipolygons'
+      AND  t.value:"key"::STRING     = 'wikidata'
+      AND  t.value:"value"::STRING   = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    -- multipolygons that intersect q191.geom (tags flattened)
+    SELECT pf."osm_way_id",
+           MAX( IFF( f.value:"key"::STRING = 'name'
+                   , f.value:"value"::STRING
+                   , NULL) ) AS candidate_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           q191 ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+    GROUP  BY pf."osm_way_id"
+    HAVING SUM( IFF( f.value:"key"::STRING = 'wikidata', 1, 0) ) = 0
+)
+SELECT *
+FROM   candidates
+LIMIT 20
+[Try to execute]
+2025-05-01 01:31:00 - Thread-291 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:
+-- 6. Retrieve the names of multipolygons that
+--    a) intersect the Q191 multipolygon, and
+--    b) have NO ‘wikidata’ tag themselves.
+WITH q191 AS (
+    -- geometry of the reference multipolygon (wikidata = Q191)
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) t
+    WHERE  pf."feature_type"        = 'multipolygons'
+      AND  t.value:"key"::STRING     = 'wikidata'
+      AND  t.value:"value"::STRING   = 'Q191'
+    LIMIT 1
+),
+candidates AS (
+    -- multipolygons that intersect q191.geom (tags flattened)
+    SELECT pf."osm_way_id",
+           MAX( IFF( f.value:"key"::STRING = 'name'
+                   , f.value:"value"::STRING
+                   , NULL) ) AS candidate_name
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf ,
+           q191 ,
+           LATERAL FLATTEN ( input => pf."all_tags" ) f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+    GROUP  BY pf."osm_way_id"
+    HAVING SUM( IFF( f.value:"key"::STRING = 'wikidata', 1, 0) ) = 0
+)
+SELECT *
+FROM   candidates
+LIMIT 20
+Results:
+osm_way_id,CANDIDATE_NAME
+741594803,
+711809703,
+238409372,
+269143496,
+213073500,
+247873388,
+236738178,
+745364822,
+214479946,
+213548143,
+226033591,
+229142362,
+228957653,
+727242856,
+249183072,
+231924926,
+249686858,
+228928071,
+234535070,
+744977674,
+
+[Successfully executed]
+2025-05-01 01:31:00 - Thread-291 (execute) - INFO - [Try to execute]
+--Description:
+-- 7. Sample the first 20 points that lie inside a chosen candidate polygon.
+--    Replace <REPLACE_WITH_ONE_ID> with an actual OSM way ID obtained from query 6.
+WITH one_polygon AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id"   = <REPLACE_WITH_ONE_ID>
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp ,
+       one_polygon p
+WHERE  ST_CONTAINS( p.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+LIMIT 20
+[Try to execute]
+2025-05-01 01:31:01 - Thread-291 (execute) - INFO - [Error occurred]
+001003 (42000): SQL compilation error:
+syntax error line 5 at position 31 unexpected '<'.
+syntax error line 6 at position 0 unexpected ')'.
+[Error occurred]
+2025-05-01 01:32:09 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Display up to 20 point features that fall inside candidate multipolygon
+-- 741594803 (a polygon returned by the “no‑wikidata” query).  
+-- Steps:
+-- 1. CTE one_polygon: fetch the polygon row, convert its WKB geometry to
+--    GEOGRAPHY for spatial operations.  
+-- 2. Join that single geometry to PLANET_FEATURES_POINTS; for every point
+--    whose geometry is not NULL, test ST_CONTAINS to keep only points located
+--    inside the polygon.  
+-- 3. Return the OSM ids of those points (limit 20 for sampling).
+WITH one_polygon AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS poly_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id"   = 741594803           -- chosen candidate polygon
+    LIMIT 1
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp,
+       one_polygon p
+WHERE  pp."geometry" IS NOT NULL
+  AND  ST_CONTAINS( p.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:32:49 - Thread-291 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-01 01:33:48 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Return up to 20 point features located within 1 km of the centroid of
+-- candidate multipolygon 73882639 (one of the polygons that intersects
+-- the Q191 area and lacks a 'wikidata' tag).  
+-- 1. CTE one_polygon: fetch that polygon’s geometry and compute its
+--    centroid (GEOGRAPHY).  
+-- 2. In the main SELECT, use ST_DWITHIN to find points whose geometries
+--    lie within 1 000 meters of that centroid; this relaxed proximity
+--    filter is more likely to yield sample rows than strict containment.
+WITH one_polygon AS (
+    SELECT ST_CENTROID( TO_GEOGRAPHY(pf."geometry") ) AS center_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id"   = 73882639          -- chosen candidate polygon
+    LIMIT 1
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp,
+       one_polygon p
+WHERE  pp."geometry" IS NOT NULL
+  AND  ST_DWITHIN( p.center_geom , TO_GEOGRAPHY(pp."geometry") , 1000 )
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:35:52 - Thread-291 (execute) - INFO - [Results for corrected sql]
+osm_id
+4632473304
+878842161
+4632475865
+1130174907
+4632475867
+849811678
+415829003
+7004962360
+6266177267
+2305026766
+7004962356
+1059556686
+2670592130
+873548845
+415829010
+8197426585
+4259934328
+873548859
+3876482490
+1130174905
+
+[Results for corrected sql]
+2025-05-01 01:36:22 - Thread-291 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:
+-- 8. Count point features that lie inside each candidate multipolygon
+--    (polygons intersecting Q191 and lacking a ‘wikidata’ tag).  
+--    Uses the same “raw / candidates” pattern as queries 9 & 10 to avoid
+--    correlated sub‑queries.
+WITH q191 AS (                         -- reference multipolygon (wikidata=Q191)
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (                               -- intersecting polys + all tag rows
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           f.value:"key"::STRING                 AS tag_key
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (                        -- retain only polygons with NO wikidata
+    SELECT r."osm_way_id",
+           MAX(r.poly_geom) AS poly_geom
+    FROM   raw r
+    GROUP  BY r."osm_way_id"
+    HAVING SUM( IFF(r.tag_key = 'wikidata', 1, 0) ) = 0
+)
+SELECT c."osm_way_id",
+       COUNT(*) AS pt_in_poly                      -- point count
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_INTERSECTS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 20;
+```
+
+```sql
+--Description:
+-- 9. Return each candidate polygon’s name together with the number of point
+--    features that intersect it (top 10 by count).
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           f.value:"key"::STRING                 AS tag_key,
+           f.value:"value"::STRING               AS tag_val
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (
+    SELECT r."osm_way_id",
+           MAX( IFF(r.tag_key = 'name', r.tag_val, NULL) ) AS poly_name,
+           MAX(r.poly_geom)                               AS poly_geom
+    FROM   raw r
+    GROUP  BY r."osm_way_id"
+    HAVING SUM( IFF(r.tag_key = 'wikidata', 1, 0) ) = 0
+)
+SELECT c."poly_name",
+       c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_INTERSECTS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 10;
+```
+
+```sql
+--Description:
+-- 10. Final query: identify the two multipolygons (no wikidata tag) that
+--      intersect the Q191 area and intersect the largest number of point
+--      features; return their names, IDs, and point counts.
+WITH q191 AS (
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           f.value:"key"::STRING                 AS tag_key,
+           f.value:"value"::STRING               AS tag_val
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (
+    SELECT r."osm_way_id",
+           MAX( IFF(r.tag_key = 'name', r.tag_val, NULL) ) AS poly_name,
+           MAX(r.poly_geom)                               AS poly_geom
+    FROM   raw r
+    GROUP  BY r."osm_way_id"
+    HAVING SUM( IFF(r.tag_key = 'wikidata', 1, 0) ) = 0
+)
+SELECT c."poly_name"  AS target_polygon_name,
+       c."osm_way_id" AS target_way_id,
+       COUNT(*)       AS points_inside
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_INTERSECTS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."poly_name", c."osm_way_id"
+ORDER  BY points_inside DESC
+LIMIT 2;
+```
+[Corrected other sqls]
+2025-05-01 01:36:22 - Thread-291 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+-- Return up to 20 point features located within 1 km of the centroid of
+-- candidate multipolygon 73882639 (one of the polygons that intersects
+-- the Q191 area and lacks a 'wikidata' tag).  
+-- 1. CTE one_polygon: fetch that polygon’s geometry and compute its
+--    centroid (GEOGRAPHY).  
+-- 2. In the main SELECT, use ST_DWITHIN to find points whose geometries
+--    lie within 1 000 meters of that centroid; this relaxed proximity
+--    filter is more likely to yield sample rows than strict containment.
+WITH one_polygon AS (
+    SELECT ST_CENTROID( TO_GEOGRAPHY(pf."geometry") ) AS center_geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  pf."osm_way_id"   = 73882639          -- chosen candidate polygon
+    LIMIT 1
+)
+SELECT pp."osm_id"
+FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp,
+       one_polygon p
+WHERE  pp."geometry" IS NOT NULL
+  AND  ST_DWITHIN( p.center_geom , TO_GEOGRAPHY(pp."geometry") , 1000 )
+LIMIT 20;
+Results:
+osm_id
+4632473304
+878842161
+4632475865
+1130174907
+4632475867
+849811678
+415829003
+7004962360
+6266177267
+2305026766
+7004962356
+1059556686
+2670592130
+873548845
+415829010
+8197426585
+4259934328
+873548859
+3876482490
+1130174905
+
+[Successfully corrected]
+2025-05-01 01:36:22 - Thread-291 (execute) - INFO - [Try to execute]
+--Description:
+-- 8. Count point features that lie inside each candidate multipolygon
+--    (polygons intersecting Q191 and lacking a ‘wikidata’ tag).  
+--    Uses the same “raw / candidates” pattern as queries 9 & 10 to avoid
+--    correlated sub‑queries.
+WITH q191 AS (                         -- reference multipolygon (wikidata=Q191)
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"      = 'multipolygons'
+      AND  t.value:"key"::STRING   = 'wikidata'
+      AND  t.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (                               -- intersecting polys + all tag rows
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           f.value:"key"::STRING                 AS tag_key
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") f
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (                        -- retain only polygons with NO wikidata
+    SELECT r."osm_way_id",
+           MAX(r.poly_geom) AS poly_geom
+    FROM   raw r
+    GROUP  BY r."osm_way_id"
+    HAVING SUM( IFF(r.tag_key = 'wikidata', 1, 0) ) = 0
+)
+SELECT c."osm_way_id",
+       COUNT(*) AS pt_in_poly                      -- point count
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   ST_INTERSECTS( c.poly_geom , TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 01:36:22 - Thread-291 (execute) - INFO - [Error occurred]
+002016 (22000): SQL compilation error:
+Function MAX does not support GEOGRAPHY argument type
+[Error occurred]
+2025-05-01 01:38:53 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Count, for each multipolygon that (a) intersects the multipolygon tagged
+-- wikidata = 'Q191' and (b) does NOT itself have a ‘wikidata’ tag, how many
+-- point features intersect its geometry; list the 20 largest counts.
+--
+-- 1. q191  : grab the GEOGRAPHY geometry of the single multipolygon whose
+--            tag wikidata = Q191.  Using LATERAL FLATTEN avoids a correlated
+--            sub‑query error.
+-- 2. raw   : fetch every multipolygon whose geometry intersects q191.geom,
+--            emitting one row per tag key so we can later test for the
+--            presence of a wikidata tag.
+-- 3. candidates : keep exactly one row per polygon **only if** the windowed
+--            sum of wikidata tags over that polygon equals zero (thus
+--            excluding polygons already tagged with wikidata).
+-- 4. point_counts : spatially join each candidate polygon with
+--            PLANET_FEATURES_POINTS and count the number of points whose
+--            geometries intersect the polygon (ST_INTERSECTS).
+-- 5. Return the 20 polygons with the highest point totals.
+
+WITH q191 AS (      ----------------------------------------------------------
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") tag
+    WHERE  pf."feature_type"        = 'multipolygons'
+      AND  tag.value:"key"::STRING   = 'wikidata'
+      AND  tag.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (           ------------------------------------------------------------
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           tag.value:"key"::STRING               AS tag_key
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") tag
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (    ------------------------------------------------------------
+    SELECT r."osm_way_id",
+           r."poly_geom"
+    FROM   raw r
+    QUALIFY SUM( IFF(r.tag_key = 'wikidata', 1, 0) )
+            OVER (PARTITION BY r."osm_way_id") = 0   -- exclude if wikidata tag
+),
+point_counts AS (  ------------------------------------------------------------
+    SELECT c."osm_way_id",
+           COUNT(*) AS pt_in_poly
+    FROM   candidates c
+           JOIN GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+             ON pp."geometry" IS NOT NULL
+            AND ST_INTERSECTS( c."poly_geom", TO_GEOGRAPHY(pp."geometry") )
+    GROUP  BY c."osm_way_id"
+)
+SELECT *
+FROM   point_counts
+ORDER  BY pt_in_poly DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:38:53 - Thread-291 (execute) - INFO - [Results for corrected sql]
+000904 (42000): SQL compilation error: error line 22 at position 11
+invalid identifier 'R."poly_geom"'
+[Results for corrected sql]
+2025-05-01 01:40:30 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Compute, for every multipolygon that (1) intersects the polygon whose tag
+-- wikidata = 'Q191' and (2) lacks any ‘wikidata’ tag itself, the number of
+-- point features that intersect it.  Show the 20 polygons with the largest
+-- point counts.
+--
+-- Steps
+-- 1. q191       – obtain the GEOGRAPHY geometry of the single multipolygon
+--                 carrying wikidata = Q191 by flattening its all_tags.
+-- 2. raw        – list every multipolygon that intersects q191.geom, emitting
+--                 one row per tag (tag_key) so we can test for wikidata tags.
+-- 3. candidates – keep exactly one geometry row per polygon if the windowed
+--                 SUM of “wikidata” tags is zero; ROW_NUMBER() selects the
+--                 representative geometry without aggregating GEOGRAPHY.
+-- 4. Final SELECT – spatially join each candidate polygon with
+--                 PLANET_FEATURES_POINTS and count intersecting points.
+
+WITH q191 AS (  --------------------------------------------------------------
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") tag
+    WHERE  pf."feature_type"        = 'multipolygons'
+      AND  tag.value:"key"::STRING   = 'wikidata'
+      AND  tag.value:"value"::STRING = 'Q191'
+    LIMIT 1
+),
+raw AS (  --------------------------------------------------------------------
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")           AS poly_geom,
+           tag.value:"key"::STRING               AS tag_key
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") tag
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (  -------------------------------------------------------------
+    SELECT r."osm_way_id",
+           r."poly_geom"
+    FROM   raw r
+    QUALIFY SUM( IFF(r.tag_key = 'wikidata', 1, 0) )
+              OVER (PARTITION BY r."osm_way_id") = 0   -- exclude polygons with wikidata tag
+        AND ROW_NUMBER() OVER (PARTITION BY r."osm_way_id") = 1 -- keep one geometry row
+)
+SELECT c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   pp."geometry" IS NOT NULL
+ AND   ST_INTERSECTS( c."poly_geom", TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:40:31 - Thread-291 (execute) - INFO - [Results for corrected sql]
+000904 (42000): SQL compilation error: error line 22 at position 11
+invalid identifier 'R."poly_geom"'
+[Results for corrected sql]
+2025-05-01 01:42:03 - Thread-291 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Count how many point features intersect each multipolygon that
+--   • intersects the multipolygon whose tag wikidata = 'Q191', and
+--   • has NO own tag with key = 'wikidata'.
+--
+-- Technique
+-- 1. q191 CTE   : obtain GEOGRAPHY of the single multipolygon tagged Q191.
+-- 2. raw CTE    : for every multipolygon intersecting q191.geom, output one
+--                 row per tag so we can check whether it contains a wikidata tag.
+-- 3. candidates : use QUALIFY to keep exactly one geometry row per polygon
+--                 when the windowed SUM of wikidata tags equals zero; the
+--                 ROW_NUMBER() call selects that single row without
+--                 aggregating GEOGRAPHY (avoids earlier MAX error).
+-- 4. Final      : spatially join candidates to point features and count
+--                 intersections; show top‑20 polygons by point count.
+
+WITH q191 AS (                     -- reference multipolygon (wikidata = Q191)
+    SELECT TO_GEOGRAPHY(pf."geometry") AS geom
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           LATERAL FLATTEN(input => pf."all_tags") t
+    WHERE  pf."feature_type"        = 'multipolygons'
+      AND  t.value:"key"::STRING     = 'wikidata'
+      AND  t.value:"value"::STRING   = 'Q191'
+    LIMIT 1
+),
+raw AS (                           -- every tag row for each intersecting poly
+    SELECT pf."osm_way_id",
+           TO_GEOGRAPHY(pf."geometry")            AS poly_geom,
+           tag_row.value:"key"::STRING            AS tag_key
+    FROM   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES pf,
+           q191,
+           LATERAL FLATTEN(input => pf."all_tags") tag_row
+    WHERE  pf."feature_type" = 'multipolygons'
+      AND  ST_INTERSECTS( TO_GEOGRAPHY(pf."geometry"), q191.geom )
+),
+candidates AS (                    -- polygons without wikidata tag (one row)
+    SELECT r."osm_way_id",
+           r."poly_geom"
+    FROM   raw r
+    QUALIFY SUM( IFF(r.tag_key = 'wikidata', 1, 0) )
+              OVER (PARTITION BY r."osm_way_id") = 0      -- lacks wikidata tag
+        AND ROW_NUMBER() OVER (PARTITION BY r."osm_way_id") = 1   -- single row
+)
+SELECT c."osm_way_id",
+       COUNT(*) AS pt_in_poly
+FROM   candidates c
+JOIN   GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS pp
+  ON   pp."geometry" IS NOT NULL
+ AND   ST_INTERSECTS( c."poly_geom", TO_GEOGRAPHY(pp."geometry") )
+GROUP  BY c."osm_way_id"
+ORDER  BY pt_in_poly DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:42:03 - Thread-291 (execute) - INFO - [Results for corrected sql]
+000904 (42000): SQL compilation error: error line 22 at position 11
+invalid identifier 'R."poly_geom"'
+[Results for corrected sql]

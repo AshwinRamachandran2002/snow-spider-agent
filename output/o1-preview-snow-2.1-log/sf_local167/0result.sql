@@ -1,0 +1,8 @@
+SELECT t."state" AS "State", COUNT(*) AS "Count"
+FROM "CITY_LEGISLATION"."CITY_LEGISLATION"."LEGISLATORS" l
+JOIN "CITY_LEGISLATION"."CITY_LEGISLATION"."LEGISLATORS_TERMS" t
+  ON l."id_bioguide" = t."id_bioguide"
+WHERE l."gender" = 'F' AND t."term_end" LIKE '%-12-31'
+GROUP BY t."state"
+ORDER BY COUNT(*) DESC NULLS LAST
+LIMIT 1;

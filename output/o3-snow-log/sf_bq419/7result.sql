@@ -1,0 +1,53 @@
+/*  Five U.S. states with the greatest number of severe-storm events
+    during 1980-1995, counting each year’s 1 000 most-active states only */
+WITH all_events AS (
+      /* bring in every year 1980–1995 explicitly */
+      SELECT '1980' AS "yr", "state"
+      FROM   NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1980"
+      UNION ALL
+      SELECT '1981', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1981"
+      UNION ALL
+      SELECT '1982', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1982"
+      UNION ALL
+      SELECT '1983', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1983"
+      UNION ALL
+      SELECT '1984', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1984"
+      UNION ALL
+      SELECT '1985', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1985"
+      UNION ALL
+      SELECT '1986', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1986"
+      UNION ALL
+      SELECT '1987', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1987"
+      UNION ALL
+      SELECT '1988', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1988"
+      UNION ALL
+      SELECT '1989', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1989"
+      UNION ALL
+      SELECT '1990', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1990"
+      UNION ALL
+      SELECT '1991', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1991"
+      UNION ALL
+      SELECT '1992', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1992"
+      UNION ALL
+      SELECT '1993', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1993"
+      UNION ALL
+      SELECT '1994', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1994"
+      UNION ALL
+      SELECT '1995', "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1995"
+),
+ranked AS (
+      /* per-year counts and rank by frequency */
+      SELECT  "yr",
+              "state",
+              COUNT(*) AS "event_cnt",
+              ROW_NUMBER() OVER (PARTITION BY "yr" ORDER BY COUNT(*) DESC) AS "rn"
+      FROM    all_events
+      GROUP   BY "yr", "state"
+)
+SELECT   "state",
+         SUM("event_cnt") AS "total_events_1980_1995"
+FROM     ranked
+WHERE    "rn" <= 1000            -- keep only each year’s top-1000 states
+GROUP BY "state"
+ORDER BY "total_events_1980_1995" DESC NULLS LAST
+LIMIT 5;

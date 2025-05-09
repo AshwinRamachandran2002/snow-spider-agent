@@ -1,0 +1,2897 @@
+2025-05-01 02:47:50 - Thread-1003 (execute) - INFO - [Answer format]
+```csv
+subject_id,collection,modality,image_type,compression,embedding_medium,tissue_type,cancer_subtype
+```
+[Answer format]
+2025-05-01 02:50:26 - Thread-1003 (execute) - INFO - [Exploration]
+Below is a compact “road‑map” that lists the most promising columns for every logical requirement, followed by ten exploratory Snowflake SQL snippets (simple → progressively complex) that help you verify content, value ranges and nesting levels before writing the definitive extraction query.
+
+────────────────────────
+Candidate columns & their potential usage  
+────────────────────────
+"collection_id" or "collection_name"        : filter to ‘tcga‑luad’ or ‘tcga‑lusc’  
+"Modality"                                   : keep only still–microscopy images ⇒ 'SM'  
+"ImageType" (VARIANT)                        : look for the token ‘VOLUME’ (volume slides)  
+"TransferSyntaxUID"                          : derive compression:  
+                                               • JPEG        → 1.2.840.10008.1.2.4.50, 4.51, …  
+                                               • JPEG2000    → 1.2.840.10008.1.2.4.90, 4.91  
+                                               •  anything else ⇒ “other” (to be excluded)  
+"SpecimenDescriptionSequence" (VARIANT)      : contains nested preparation items;  
+                                               look for an item where  
+                                               value ILIKE '%Tissue%freezing%medium%'  
+"AnatomicRegionSequence" (VARIANT)           : holds SNOMED code values;  
+                                               code ‘17621005’ → normal tissue,  
+                                               code ‘86049000’ → tumor tissue  
+"SeriesInstanceUID"                          : use as digital slide identifier  
+"StudyInstanceUID"                           : case / study identifier  
+"PatientID"                                  : patient identifier  
+"SOPInstanceUID"                             : unique instance identifier  
+"gcs_url"                                    : direct link to the DICOM file in GCS  
+"Rows", "Columns"                            : image height & width (pixels)  
+"PixelSpacing" (VARIANT)                     : pixel size in mm/px (often an array [row,col])  
+
+Basic constant conditions you will most likely apply later
+• "collection_id" IN (‘tcga‑luad’, ‘tcga‑lusc’)      -- case‑insensitive  
+• "Modality" = 'SM'  
+• EXISTS token ‘VOLUME’ in "ImageType"                -- volume slides  
+• "TransferSyntaxUID" IN (<JPEG UIDs>, <JPEG2000 UIDs>)  
+• ‘Tissue freezing medium’ mentioned somewhere in "SpecimenDescriptionSequence"  
+• CodeValue IN (‘17621005’, ‘86049000’) extracted from "AnatomicRegionSequence"  
+
+────────────────────────
+Ten exploratory SQL snippets  
+────────────────────────
+All queries read from one table:  
+IDC.IDC_V17."DICOM_ALL"   
+(Remember to keep every identifier in double quotes to respect Snowflake case‑sensitivity.)
+
+```sql
+-- 1️⃣  Description: List the available collections that start with TCGA‑LU* (quick sanity check)
+SELECT DISTINCT "collection_id"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" ILIKE 'tcga-lu%';
+
+-- 2️⃣  Description: Verify that SM modality exists in the target collections
+SELECT DISTINCT "Modality"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" IN ('tcga-luad','tcga-lusc')
+  AND "Modality" IS NOT NULL
+LIMIT 20;
+
+-- 3️⃣  Description: Show transfer‑syntax values for SM images (helps decide JPEG / JPEG2000 mapping)
+SELECT DISTINCT "TransferSyntaxUID"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" IN ('tcga-luad','tcga-lusc')
+  AND "Modality" = 'SM'
+LIMIT 20;
+
+-- 4️⃣  Description: Inspect ImageType components and look for the word ‘VOLUME’
+SELECT d."SOPInstanceUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."collection_id"  IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"       =  'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+LIMIT 20;
+
+-- 5️⃣  Description: Peek into AnatomicRegionSequence to see available CodeValue(s)
+SELECT d."SOPInstanceUID",
+       ar.value:"CodeValue"::STRING      AS "code_value",
+       ar.value:"CodeMeaning"::STRING    AS "code_meaning"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+  AND d."collection_id" IN ('tcga-luad','tcga-lusc')
+LIMIT 20;
+
+-- 6️⃣  Description: Quick count of slides that already expose desired SNOMED codes (normal / tumor)
+SELECT ar.value:"CodeValue"::STRING AS "code_value",
+       COUNT(*)                     AS "n_instances"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality"       = 'SM'
+  AND d."collection_id"  IN ('tcga-luad','tcga-lusc')
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+GROUP BY 1
+ORDER BY 1;
+
+-- 7️⃣  Description: Explore SpecimenDescriptionSequence for the phrase ‘freezing medium’
+SELECT d."SOPInstanceUID",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE d."Modality"      = 'SM'
+  AND d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20;
+
+-- 8️⃣  Description: Correlate compression & image‑type criteria in one shot (no tissue filter yet)
+SELECT d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."collection_id"   IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"        =  'SM'
+  AND it.value::STRING   ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+
+-- 9️⃣  Description: Produce miniature fact table with preliminary filters (still missing embedding medium)
+SELECT DISTINCT
+       d."SeriesInstanceUID"  AS "digital_slide_id",
+       d."StudyInstanceUID"   AS "case_id",
+       d."PatientID"          AS "patient_id",
+       d."SOPInstanceUID"     AS "instance_id",
+       d."gcs_url",
+       d."Rows"               AS "height_px",
+       d."Columns"            AS "width_px",
+       d."PixelSpacing"       AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"      = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+LIMIT 20;
+
+-- 🔟  Description: Full prototype query – now also requiring embedding medium = “Tissue freezing medium”
+SELECT DISTINCT
+       d."SeriesInstanceUID"                                            AS "digital_slide_id",
+       d."StudyInstanceUID"                                             AS "case_id",
+       d."InstanceNumber"                                               AS "physical_slide_id",
+       d."PatientID"                                                    AS "patient_id",
+       d."collection_id"                                                AS "collection_id",
+       d."SOPInstanceUID"                                               AS "instance_id",
+       d."gcs_url",
+       d."Columns"                                                      AS "width_px",
+       d."Rows"                                                         AS "height_px",
+       d."PixelSpacing"                                                 AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                                              AS "compression_type",
+       CASE WHEN ar.value:"CodeValue"::STRING = '17621005' THEN 'normal'
+            WHEN ar.value:"CodeValue"::STRING = '86049000' THEN 'tumor'
+       END                                                              AS "tissue_type",
+       CASE WHEN d."collection_id" = 'tcga-luad'  THEN 'luad'
+            WHEN d."collection_id" = 'tcga-lusc'  THEN 'lscc'
+       END                                                              AS "cancer_subtype"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType")                    it,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence")       ar,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence")  sd
+WHERE d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"      = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'                                   -- volume slides
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') -- JPEG/J2K
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')             -- normal / tumor
+  AND LOWER(sd.value::STRING) ILIKE '%tissue%freezing%medium%'            -- embedding medium
+ORDER BY d."SOPInstanceUID"
+LIMIT 20;
+```
+
+Feel free to adapt token lists, nesting paths or additional JSON dereferencing once you preview actual values.  When all fields look good, remove `LIMIT` and optional exploratory columns, then save the final query as your production extractor.
+[Exploration]
+2025-05-01 02:50:26 - Thread-1003 (execute) - INFO - [Try to execute]
+-- 1️⃣  Description: List the available collections that start with TCGA‑LU* (quick sanity check)
+SELECT DISTINCT "collection_id"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" ILIKE 'tcga-lu%'
+[Try to execute]
+2025-05-01 02:50:27 - Thread-1003 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 02:51:10 - Thread-1003 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  We could not find any rows with the exact pattern “tcga-lu%”.  
+--To diagnose the mismatch, first verify whether “tcga‑lu” appears at all—regardless
+--of position, case, or separator—inside either the “collection_id” or the
+--“collection_name” columns.  By using the broad substring filter ILIKE '%lu%',
+--we can visually scan the resulting list and determine the exact spelling and
+--capitalisation to employ in subsequent, more specific filters.
+SELECT DISTINCT
+       "collection_id",
+       "collection_name"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE "collection_id"   ILIKE '%lu%'
+   OR "collection_name" ILIKE '%lu%'
+LIMIT 100;
+```
+[Corrected SQL]
+2025-05-01 02:51:11 - Thread-1003 (execute) - INFO - [Results for corrected sql]
+collection_id,collection_name
+lung_fused_ct_pathology,Lung-Fused-CT-Pathology
+lung_pet_ct_dx,Lung-PET-CT-Dx
+lungct_diagnosis,LungCT-Diagnosis
+anti_pd_1_lung,Anti-PD-1_Lung
+tcga_luad,TCGA-LUAD
+spie_aapm_lung_ct_challenge,SPIE-AAPM Lung CT Challenge
+lung_phantom,Lung Phantom
+qin_lung_ct,QIN LUNG CT
+cptac_luad,CPTAC-LUAD
+rider_lung_ct,RIDER Lung CT
+4d_lung,4D-Lung
+rider_lung_pet_ct,RIDER Lung PET-CT
+tcga_lusc,TCGA-LUSC
+
+[Results for corrected sql]
+2025-05-01 02:52:01 - Thread-1003 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 2️⃣  Verify that SM modality exists in LUAD / LUSC collections
+--The collection IDs may not exactly equal 'tcga-luad' or 'tcga-lusc', so
+--match either column by a broad, case‑insensitive substring search.
+SELECT DISTINCT "Modality"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+--Description: 3️⃣  Show transfer‑syntax values for SM images in LUAD / LUSC collections
+SELECT DISTINCT "TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" = 'SM'
+LIMIT 20;
+```
+
+```sql
+--Description: 4️⃣  Inspect ImageType components for the token ‘VOLUME’
+SELECT d."SOPInstanceUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+LIMIT 20;
+```
+
+```sql
+--Description: 5️⃣  Peek into AnatomicRegionSequence to see available CodeValue(s)
+SELECT d."SOPInstanceUID",
+       ar.value:"CodeValue"::STRING   AS "code_value",
+       ar.value:"CodeMeaning"::STRING AS "code_meaning"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+LIMIT 20;
+```
+
+```sql
+--Description: 6️⃣  Count SM slides that expose SNOMED codes 17621005/86049000 (normal/tumor)
+SELECT ar.value:"CodeValue"::STRING AS "code_value",
+       COUNT(*)                     AS "n_instances"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+GROUP BY 1
+ORDER BY 1;
+```
+
+```sql
+--Description: 7️⃣  Explore SpecimenDescriptionSequence for the phrase ‘freezing medium’
+SELECT d."SOPInstanceUID",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20;
+```
+
+```sql
+--Description: 8️⃣  Correlate compression UIDs and ImageType ‘VOLUME’ token
+SELECT d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+
+```sql
+--Description: 9️⃣  Produce miniature fact table, still missing embedding‑medium filter
+SELECT DISTINCT
+       d."SeriesInstanceUID"  AS "digital_slide_id",
+       d."StudyInstanceUID"   AS "case_id",
+       d."PatientID"          AS "patient_id",
+       d."SOPInstanceUID"     AS "instance_id",
+       d."gcs_url",
+       d."Rows"               AS "height_px",
+       d."Columns"            AS "width_px",
+       d."PixelSpacing"       AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType")          it,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+LIMIT 20;
+```
+
+```sql
+--Description: 🔟  Full prototype query with all filters, using broader collection matching
+SELECT DISTINCT
+       d."SeriesInstanceUID"                                           AS "digital_slide_id",
+       d."StudyInstanceUID"                                            AS "case_id",
+       d."InstanceNumber"                                              AS "physical_slide_id",
+       d."PatientID"                                                   AS "patient_id",
+       d."collection_id"                                               AS "collection_id",
+       d."SOPInstanceUID"                                              AS "instance_id",
+       d."gcs_url",
+       d."Columns"                                                     AS "width_px",
+       d."Rows"                                                        AS "height_px",
+       d."PixelSpacing"                                                AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                                             AS "compression_type",
+       CASE
+         WHEN ar.value:"CodeValue"::STRING = '17621005' THEN 'normal'
+         WHEN ar.value:"CodeValue"::STRING = '86049000' THEN 'tumor'
+       END                                                             AS "tissue_type",
+       CASE
+         WHEN LOWER(d."collection_id") LIKE '%luad%' THEN 'luad'
+         WHEN LOWER(d."collection_id") LIKE '%lusc%' THEN 'lscc'
+       END                                                             AS "cancer_subtype"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType")                   it,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence")      ar,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'                                   -- volume slides
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')     -- JPEG / J2K
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')             -- normal / tumor codes
+  AND LOWER(sd.value::STRING) ILIKE '%tissue%freezing%medium%'            -- embedding medium
+ORDER BY d."SOPInstanceUID"
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 02:52:01 - Thread-1003 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  We could not find any rows with the exact pattern “tcga-lu%”.  
+--To diagnose the mismatch, first verify whether “tcga‑lu” appears at all—regardless
+--of position, case, or separator—inside either the “collection_id” or the
+--“collection_name” columns.  By using the broad substring filter ILIKE '%lu%',
+--we can visually scan the resulting list and determine the exact spelling and
+--capitalisation to employ in subsequent, more specific filters.
+SELECT DISTINCT
+       "collection_id",
+       "collection_name"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE "collection_id"   ILIKE '%lu%'
+   OR "collection_name" ILIKE '%lu%'
+LIMIT 100;
+Results:
+collection_id,collection_name
+lung_fused_ct_pathology,Lung-Fused-CT-Pathology
+lung_pet_ct_dx,Lung-PET-CT-Dx
+lungct_diagnosis,LungCT-Diagnosis
+anti_pd_1_lung,Anti-PD-1_Lung
+tcga_luad,TCGA-LUAD
+spie_aapm_lung_ct_challenge,SPIE-AAPM Lung CT Challenge
+lung_phantom,Lung Phantom
+qin_lung_ct,QIN LUNG CT
+cptac_luad,CPTAC-LUAD
+rider_lung_ct,RIDER Lung CT
+4d_lung,4D-Lung
+rider_lung_pet_ct,RIDER Lung PET-CT
+tcga_lusc,TCGA-LUSC
+
+[Successfully corrected]
+2025-05-01 02:52:01 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 2️⃣  Verify that SM modality exists in LUAD / LUSC collections
+--The collection IDs may not exactly equal 'tcga-luad' or 'tcga-lusc', so
+--match either column by a broad, case‑insensitive substring search.
+SELECT DISTINCT "Modality"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" IS NOT NULL
+LIMIT 20
+[Try to execute]
+2025-05-01 02:52:01 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2️⃣  Verify that SM modality exists in LUAD / LUSC collections
+--The collection IDs may not exactly equal 'tcga-luad' or 'tcga-lusc', so
+--match either column by a broad, case‑insensitive substring search.
+SELECT DISTINCT "Modality"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" IS NOT NULL
+LIMIT 20
+Results:
+Modality
+CT
+PT
+MR
+SEG
+SM
+
+[Successfully executed]
+2025-05-01 02:52:01 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 3️⃣  Show transfer‑syntax values for SM images in LUAD / LUSC collections
+SELECT DISTINCT "TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" = 'SM'
+LIMIT 20
+[Try to execute]
+2025-05-01 02:52:02 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3️⃣  Show transfer‑syntax values for SM images in LUAD / LUSC collections
+SELECT DISTINCT "TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" = 'SM'
+LIMIT 20
+Results:
+TransferSyntaxUID
+1.2.840.10008.1.2.1
+1.2.840.10008.1.2.4.91
+1.2.840.10008.1.2.4.50
+
+[Successfully executed]
+2025-05-01 02:52:02 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 4️⃣  Inspect ImageType components for the token ‘VOLUME’
+SELECT d."SOPInstanceUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+LIMIT 20
+[Try to execute]
+2025-05-01 02:52:02 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4️⃣  Inspect ImageType components for the token ‘VOLUME’
+SELECT d."SOPInstanceUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+LIMIT 20
+Results:
+SOPInstanceUID,image_type_component
+1.3.6.1.4.1.5962.99.1.1044922547.1963990777.1637427495091.8.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1108512892.731820643.1637491085436.36.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1047094448.199228720.1637429666992.8.0,VOLUME
+1.3.6.1.4.1.5962.99.1.261465933.10684455.1640939005773.21.0,VOLUME
+1.3.6.1.4.1.5962.99.1.243644310.1665102434.1640921184150.28.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1097002722.192500967.1637479575266.8.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1089046930.396095805.1637
+
+[Successfully executed]
+2025-05-01 02:52:02 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 5️⃣  Peek into AnatomicRegionSequence to see available CodeValue(s)
+SELECT d."SOPInstanceUID",
+       ar.value:"CodeValue"::STRING   AS "code_value",
+       ar.value:"CodeMeaning"::STRING AS "code_meaning"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+LIMIT 20
+[Try to execute]
+2025-05-01 02:52:03 - Thread-1003 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 02:52:40 - Thread-1003 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Earlier flatten attempts yielded no rows, so first verify that
+--“AnatomicRegionSequence” is populated at all.  Pull a small sample of instances
+--(any modality, any collection) where this column is NOT NULL; include the raw
+--VARIANT value so we can inspect its structure before applying more filters or
+--using FLATTEN again.
+SELECT
+    "SOPInstanceUID",
+    "Modality",
+    "AnatomicRegionSequence"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE "AnatomicRegionSequence" IS NOT NULL
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 02:52:40 - Thread-1003 (execute) - INFO - [Results for corrected sql]
+SOPInstanceUID,Modality,AnatomicRegionSequence
+1.3.6.1.4.1.14519.5.2.1.7009.2403.244499728293974910866103172907,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.198545711697687981963807747090,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.100939976082553401977148796569,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.290816661952496057451732883701,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.265877168025940937417280318176,CT,[]
+1.3.6.1.4.1.14519.5.2.1.3320.3273.196879673550982696810248528946,CT,[]
+1.3.6.1.4.1.14519.5.
+
+[Results for corrected sql]
+2025-05-01 02:53:37 - Thread-1003 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 6️⃣  Count SM slides that contain any SNOMED CodeValue in AnatomicRegionSequence
+SELECT
+       ar.value:"CodeValue"::STRING AS "code_value",
+       COUNT(*)                     AS "n_instances"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 7️⃣  Search SpecimenDescriptionSequence across ALL SM images for the phrase “freezing medium”
+SELECT
+       d."SOPInstanceUID",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE d."Modality" = 'SM'
+  AND LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20;
+```
+
+```sql
+--Description: 8️⃣  Correlate compression UIDs with ImageType entries containing “VOLUME” (LUAD / LUSC only)
+SELECT
+       d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+
+```sql
+--Description: 9️⃣  Minimal fact table for LUAD/LUSC SM VOLUME slides with JPEG/JPEG2000 compression (no tissue filter yet)
+SELECT DISTINCT
+       d."SeriesInstanceUID" AS "digital_slide_id",
+       d."StudyInstanceUID"  AS "case_id",
+       d."PatientID"         AS "patient_id",
+       d."SOPInstanceUID"    AS "instance_id",
+       d."gcs_url",
+       d."Rows"              AS "height_px",
+       d."Columns"           AS "width_px",
+       d."PixelSpacing"      AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+
+```sql
+--Description: 🔟  Prototype end‑to‑end query for LUAD/LUSC SM VOLUME JPEG/JPEG2000 slides (no tissue / embedding filters yet)
+SELECT DISTINCT
+       d."SeriesInstanceUID" AS "digital_slide_id",
+       d."StudyInstanceUID"  AS "case_id",
+       d."InstanceNumber"    AS "physical_slide_id",
+       d."PatientID"         AS "patient_id",
+       d."collection_id",
+       d."SOPInstanceUID"    AS "instance_id",
+       d."gcs_url",
+       d."Columns"           AS "width_px",
+       d."Rows"              AS "height_px",
+       d."PixelSpacing"      AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END AS "compression_type"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 02:53:37 - Thread-1003 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Earlier flatten attempts yielded no rows, so first verify that
+--“AnatomicRegionSequence” is populated at all.  Pull a small sample of instances
+--(any modality, any collection) where this column is NOT NULL; include the raw
+--VARIANT value so we can inspect its structure before applying more filters or
+--using FLATTEN again.
+SELECT
+    "SOPInstanceUID",
+    "Modality",
+    "AnatomicRegionSequence"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE "AnatomicRegionSequence" IS NOT NULL
+LIMIT 20;
+Results:
+SOPInstanceUID,Modality,AnatomicRegionSequence
+1.3.6.1.4.1.14519.5.2.1.7009.2403.244499728293974910866103172907,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.198545711697687981963807747090,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.100939976082553401977148796569,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.290816661952496057451732883701,CT,[]
+1.3.6.1.4.1.14519.5.2.1.7009.2403.265877168025940937417280318176,CT,[]
+1.3.6.1.4.1.14519.5.2.1.3320.3273.196879673550982696810248528946,CT,[]
+1.3.6.1.4.1.14519.5.
+
+[Successfully corrected]
+2025-05-01 02:53:37 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 6️⃣  Count SM slides that contain any SNOMED CodeValue in AnatomicRegionSequence
+SELECT
+       ar.value:"CodeValue"::STRING AS "code_value",
+       COUNT(*)                     AS "n_instances"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 02:53:38 - Thread-1003 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 02:54:36 - Thread-1003 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Confirm whether the column “AnatomicRegionSequence” ever contains data.
+--We calculate ARRAY_SIZE for the VARIANT; rows with size > 0 prove the sequence is
+--populated.  A small sample (20 rows) will reveal its content and help decide how
+--to extract CodeValue later.
+SELECT
+       "SOPInstanceUID",
+       "Modality",
+       "collection_id",
+       ARRAY_SIZE("AnatomicRegionSequence") AS seq_length,
+       "AnatomicRegionSequence"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE "AnatomicRegionSequence" IS NOT NULL
+  AND ARRAY_SIZE("AnatomicRegionSequence") > 0
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 02:54:36 - Thread-1003 (execute) - INFO - [Results for corrected sql]
+SOPInstanceUID,Modality,collection_id,SEQ_LENGTH,AnatomicRegionSequence
+1.3.6.1.4.1.14519.5.2.1.1620.1225.189029913342824637153763978693,MR,ea1141,1,"[
+  {
+    ""CodeMeaning"": ""Breast"",
+    ""CodeValue"": ""T-04000"",
+    ""CodingSchemeDesignator"": ""SRT"",
+    ""OtherElements"": []
+  }
+]"
+1.3.6.1.4.1.14519.5.2.1.1620.1225.232205525931467553972089332933,MR,ea1141,1,"[
+  {
+    ""CodeMeaning"": ""Breast"",
+    ""CodeValue"": ""T-04000"",
+    ""CodingSchemeDesignator"": ""SRT"",
+    ""OtherEl
+
+[Results for corrected sql]
+2025-05-01 02:55:20 - Thread-1003 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 7️⃣  Scan EVERY modality (not only SM) for the phrase “freezing medium” inside
+--SpecimenDescriptionSequence to verify the text exists at all; once found, you can
+--re‑add modality or collection filters.  The query shows up to 20 raw JSON elements.
+SELECT
+       d."SOPInstanceUID",
+       d."Modality",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20;
+```
+
+```sql
+--Description: 8️⃣  Correlate compression UIDs with ImageType token “VOLUME” in LUAD / LUSC
+--collections (SM modality only).  This reconfirms that qualifying slides use JPEG
+--or JPEG2000 and that the VOLUME tag appears.
+SELECT
+       d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+     OR d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+
+```sql
+--Description: 9️⃣  Produce a lightweight fact table of LUAD/LUSC SM VOLUME slides with
+--JPEG/JPEG2000 compression; no tissue or embedding filters yet.
+SELECT DISTINCT
+       d."SeriesInstanceUID" AS "digital_slide_id",
+       d."StudyInstanceUID"  AS "case_id",
+       d."PatientID"         AS "patient_id",
+       d."SOPInstanceUID"    AS "instance_id",
+       d."gcs_url",
+       d."Rows"              AS "height_px",
+       d."Columns"           AS "width_px",
+       d."PixelSpacing"      AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+
+```sql
+--Description: 🔟  Prototype end‑to‑end query for LUAD/LUSC SM VOLUME slides with JPEG/JPEG2000;
+--still omits tissue and embedding filters until those fields are confirmed.
+SELECT DISTINCT
+       d."SeriesInstanceUID"                    AS "digital_slide_id",
+       d."StudyInstanceUID"                     AS "case_id",
+       d."InstanceNumber"                       AS "physical_slide_id",
+       d."PatientID"                            AS "patient_id",
+       d."collection_id",
+       d."SOPInstanceUID"                       AS "instance_id",
+       d."gcs_url",
+       d."Columns"                              AS "width_px",
+       d."Rows"                                 AS "height_px",
+       d."PixelSpacing"                         AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                      AS "compression_type"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 02:55:20 - Thread-1003 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Confirm whether the column “AnatomicRegionSequence” ever contains data.
+--We calculate ARRAY_SIZE for the VARIANT; rows with size > 0 prove the sequence is
+--populated.  A small sample (20 rows) will reveal its content and help decide how
+--to extract CodeValue later.
+SELECT
+       "SOPInstanceUID",
+       "Modality",
+       "collection_id",
+       ARRAY_SIZE("AnatomicRegionSequence") AS seq_length,
+       "AnatomicRegionSequence"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE "AnatomicRegionSequence" IS NOT NULL
+  AND ARRAY_SIZE("AnatomicRegionSequence") > 0
+LIMIT 20;
+Results:
+SOPInstanceUID,Modality,collection_id,SEQ_LENGTH,AnatomicRegionSequence
+1.3.6.1.4.1.14519.5.2.1.1620.1225.189029913342824637153763978693,MR,ea1141,1,"[
+  {
+    ""CodeMeaning"": ""Breast"",
+    ""CodeValue"": ""T-04000"",
+    ""CodingSchemeDesignator"": ""SRT"",
+    ""OtherElements"": []
+  }
+]"
+1.3.6.1.4.1.14519.5.2.1.1620.1225.232205525931467553972089332933,MR,ea1141,1,"[
+  {
+    ""CodeMeaning"": ""Breast"",
+    ""CodeValue"": ""T-04000"",
+    ""CodingSchemeDesignator"": ""SRT"",
+    ""OtherEl
+
+[Successfully corrected]
+2025-05-01 02:55:20 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 7️⃣  Scan EVERY modality (not only SM) for the phrase “freezing medium” inside
+--SpecimenDescriptionSequence to verify the text exists at all; once found, you can
+--re‑add modality or collection filters.  The query shows up to 20 raw JSON elements.
+SELECT
+       d."SOPInstanceUID",
+       d."Modality",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20
+[Try to execute]
+2025-05-01 02:55:22 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 7️⃣  Scan EVERY modality (not only SM) for the phrase “freezing medium” inside
+--SpecimenDescriptionSequence to verify the text exists at all; once found, you can
+--re‑add modality or collection filters.  The query shows up to 20 raw JSON elements.
+SELECT
+       d."SOPInstanceUID",
+       d."Modality",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20
+Results:
+SOPInstanceUID,Modality,specimen_description_json
+1.3.6.1.4.1.5962.99.1.1346514630.1626208723.1637729087174.8.0,SM,"{
+  ""PrimaryAnatomicStructureSequence"": [
+    {
+      ""CodeMeaning"": ""Breast"",
+      ""CodeValue"": ""76752008"",
+      ""CodingSchemeDesignator"": ""SCT"",
+      ""PrimaryAnatomicStructureModifierSequence"": [
+        {
+          ""CodeMeaning"": ""Neoplasm, Primary"",
+          ""CodeValue"": ""86049000"",
+          ""CodingSchemeDesignator"": ""SCT""
+        }
+      ]
+   
+
+[Successfully executed]
+2025-05-01 02:55:22 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 8️⃣  Correlate compression UIDs with ImageType token “VOLUME” in LUAD / LUSC
+--collections (SM modality only).  This reconfirms that qualifying slides use JPEG
+--or JPEG2000 and that the VOLUME tag appears.
+SELECT
+       d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+     OR d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+[Try to execute]
+2025-05-01 02:55:22 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 8️⃣  Correlate compression UIDs with ImageType token “VOLUME” in LUAD / LUSC
+--collections (SM modality only).  This reconfirms that qualifying slides use JPEG
+--or JPEG2000 and that the VOLUME tag appears.
+SELECT
+       d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+     OR d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+Results:
+SOPInstanceUID,TransferSyntaxUID,image_type_component
+1.3.6.1.4.1.5962.99.1.249002240.1964169566.1640926542080.7.0,1.2.840.10008.1.2.4.50,VOLUME
+1.3.6.1.4.1.5962.99.1.1101478689.970961463.1637484051233.22.0,1.2.840.10008.1.2.4.50,VOLUME
+1.3.6.1.4.1.5962.99.1.1074896869.1425405933.1637457469413.36.0,1.2.840.10008.1.2.4.91,VOLUME
+1.3.6.1.4.1.5962.99.1.1121960988.1934590288.1637504533532.29.0,1.2.840.10008.1.2.4.91,VOLUME
+1.3.6.1.4.1.5962.99.1.1052967715.1643006843.1637435540259.8.0,1.2.840.10
+
+[Successfully executed]
+2025-05-01 02:55:22 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 9️⃣  Produce a lightweight fact table of LUAD/LUSC SM VOLUME slides with
+--JPEG/JPEG2000 compression; no tissue or embedding filters yet.
+SELECT DISTINCT
+       d."SeriesInstanceUID" AS "digital_slide_id",
+       d."StudyInstanceUID"  AS "case_id",
+       d."PatientID"         AS "patient_id",
+       d."SOPInstanceUID"    AS "instance_id",
+       d."gcs_url",
+       d."Rows"              AS "height_px",
+       d."Columns"           AS "width_px",
+       d."PixelSpacing"      AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+[Try to execute]
+2025-05-01 02:55:23 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 9️⃣  Produce a lightweight fact table of LUAD/LUSC SM VOLUME slides with
+--JPEG/JPEG2000 compression; no tissue or embedding filters yet.
+SELECT DISTINCT
+       d."SeriesInstanceUID" AS "digital_slide_id",
+       d."StudyInstanceUID"  AS "case_id",
+       d."PatientID"         AS "patient_id",
+       d."SOPInstanceUID"    AS "instance_id",
+       d."gcs_url",
+       d."Rows"              AS "height_px",
+       d."Columns"           AS "width_px",
+       d."PixelSpacing"      AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+Results:
+digital_slide_id,case_id,patient_id,instance_id,gcs_url,height_px,width_px,pixel_spacing_var,TransferSyntaxUID
+1.3.6.1.4.1.5962.99.1.1061795037.1317282966.1637444367581.2.0,2.25.116861176680347298079770848680179258516,TCGA-50-5931,1.3.6.1.4.1.5962.99.1.1061795037.1317282966.1637444367581.8.0,gs://public-datasets-idc/bea140c4-0eef-4cea-8768-463cee51efb3/7195a85a-e150-4ca1-906c-fa63b361706f.dcm,256,256,[],1.2.840.10008.1.2.4.91
+1.3.6.1.4.1.5962.99.1.1041110477.1531474151.1637423683021.2.0,2.25.2
+
+[Successfully executed]
+2025-05-01 02:55:23 - Thread-1003 (execute) - INFO - [Try to execute]
+--Description: 🔟  Prototype end‑to‑end query for LUAD/LUSC SM VOLUME slides with JPEG/JPEG2000;
+--still omits tissue and embedding filters until those fields are confirmed.
+SELECT DISTINCT
+       d."SeriesInstanceUID"                    AS "digital_slide_id",
+       d."StudyInstanceUID"                     AS "case_id",
+       d."InstanceNumber"                       AS "physical_slide_id",
+       d."PatientID"                            AS "patient_id",
+       d."collection_id",
+       d."SOPInstanceUID"                       AS "instance_id",
+       d."gcs_url",
+       d."Columns"                              AS "width_px",
+       d."Rows"                                 AS "height_px",
+       d."PixelSpacing"                         AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                      AS "compression_type"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+[Try to execute]
+2025-05-01 02:55:23 - Thread-1003 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 🔟  Prototype end‑to‑end query for LUAD/LUSC SM VOLUME slides with JPEG/JPEG2000;
+--still omits tissue and embedding filters until those fields are confirmed.
+SELECT DISTINCT
+       d."SeriesInstanceUID"                    AS "digital_slide_id",
+       d."StudyInstanceUID"                     AS "case_id",
+       d."InstanceNumber"                       AS "physical_slide_id",
+       d."PatientID"                            AS "patient_id",
+       d."collection_id",
+       d."SOPInstanceUID"                       AS "instance_id",
+       d."gcs_url",
+       d."Columns"                              AS "width_px",
+       d."Rows"                                 AS "height_px",
+       d."PixelSpacing"                         AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                      AS "compression_type"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+Results:
+digital_slide_id,case_id,physical_slide_id,patient_id,collection_id,instance_id,gcs_url,width_px,height_px,pixel_spacing_var,compression_type
+1.3.6.1.4.1.5962.99.1.252665446.1781202268.1640930205286.2.0,2.25.326551812936395406186422178584529112797,3,C3N-00217,cptac_luad,1.3.6.1.4.1.5962.99.1.252665446.1781202268.1640930205286.21.0,gs://public-datasets-idc/53e3b8ae-b7ee-4e40-9aef-f3281cf1ad02/7c22ca4b-a68b-41e3-b4cd-fbc1d2d6aabc.dcm,240,240,[],jpeg
+1.3.6.1.4.1.5962.99.1.1062188680.1771293540.16
+
+[Successfully executed]
+2025-05-01 02:55:23 - Thread-1003 (execute) - INFO - itercount: 0
+2025-05-01 02:55:23 - Thread-1003 (execute) - INFO - [Self-refine]
+Table full name: IDC.IDC_V17.DICOM_ALL
+Column name: DerivationDescription Type: TEXT Description: None
+Column name: BitsAllocated Type: NUMBER Description: None
+Column name: ViewModifierCodeSequence Type: VARIANT Description: None
+Column name: RFEchoTrainLength Type: NUMBER Description: None
+Column name: PhaseVector Type: VARIANT Description: None
+Column name: ReferencedImageSequence Type: VARIANT Description: None
+Column name: StudyPriorityID Type: TEXT Description: None
+Column name: ContrastBolusIngredientConcentration Type: TEXT Description: None
+Column name: AcquisitionMatrix Type: VARIANT Description: None
+Column name: PixelIntensityRelationshipSign Type: NUMBER Description: None
+Column name: CoverageOfKSpace Type: TEXT Description: None
+Column name: DoseType Type: TEXT Description: None
+Column name: FailedSOPInstanceUIDList Type: VARIANT Description: None
+Column name: DiffusionBValueYY Type: FLOAT Description: None
+Column name: StructureSetName Type: TEXT Description: None
+Column name: GradientEchoTrainLength Type: NUMBER Description: None
+Column name: instance_hash Type: TEXT Description: md5 hash of the data in the this version of this instance
+Column name: IssueTimeOfImagingServiceRequest Type: TIME Description: None
+Column name: StudyStatusID Type: TEXT Description: None
+Column name: TimeSliceVector Type: VARIANT Description: None
+Column name: VolumetricProperties Type: TEXT Description: None
+Column name: MedicalAlerts Type: VARIANT Description: None
+Column name: ExposureTime Type: TEXT Description: None
+Column name: ImagePosition Type: VARIANT Description: None
+Column name: PaletteColorLookupTableUID Type: TEXT Description: None
+Column name: collection_timestamp Type: NUMBER Description: Date when the current version of the collection containing this instance was revised
+Column name: DoseCalibrationFactor Type: TEXT Description: None
+Column name: RequestedContrastAgent Type: TEXT Description: None
+Column name: ReferencedStudySequence Type: VARIANT Description: None
+Column name: PatientPosition Type: TEXT Description: None
+Column name: DoseReferenceUID Type: TEXT Description: None
+Column name: FrameType Type: VARIANT Description: None
+Column name: FocalSpots Type: VARIANT Description: None
+Column name: StudyID Type: TEXT Description: None
+Column name: FlowCompensationDirection Type: TEXT Description: None
+Column name: SegmentedKSpaceTraversal Type: TEXT Description: None
+Column name: Location Type: TEXT Description: None
+Column name: EffectiveDuration Type: TEXT Description: None
+Column name: StudyReadDate Type: DATE Description: None
+Column name: EffectiveEchoTime Type: FLOAT Description: None
+Column name: TypeOfData Type: VARIANT Description: None
+Column name: DerivationCodeSequence Type: VARIANT Description: None
+Column name: HighRRValue Type: TEXT Description: None
+Column name: AnodeTargetMaterial Type: TEXT Description: None
+Column name: DateTime Type: NUMBER Description: None
+Column name: TableHeight Type: TEXT Description: None
+Column name: EnergyWindowRangeSequence Type: VARIANT Description: None
+Column name: PartialFourier Type: TEXT Description: None
+Column name: GantryDetectorSlew Type: TEXT Description: None
+Column name: FiducialUID Type: TEXT Description: None
+Column name: CassetteSize Type: TEXT Description: None
+Column name: DataCollectionCenterPatient Type: VARIANT Description: None
+Column name: ContrastFlowRate Type: VARIANT Description: None
+Column name: AcquisitionContextSequence Type: VARIANT Description: None
+Column name: HistogramSequence Type: VARIANT Description: None
+Column name: Tag_00291032 Type: VARIANT Description: None
+Column name: collection_revised_idc_version Type: NUMBER Description: The IDC version in which this version of the collection containing this instance first appeared
+Column name: ContextGroupExtensionCreatorUID Type: TEXT Description: None
+Column name: CodingSchemeDesignator Type: TEXT Description: None
+Column name: SoftwareVersions Type: VARIANT Description: None
+Column name: StrainNomenclature Type: TEXT Description: None
+Column name: LossyImageCompressionRatio Type: VARIANT Description: None
+Column name: TransactionUID Type: TEXT Description: None
+Column name: RevolutionTime Type: FLOAT Description: None
+Column name: FillerOrderNumberImagingServiceRequest Type: TEXT Description: None
+Column name: CTDIvol Type: FLOAT Description: None
+Column name: TriggerTime Type: TEXT Description: None
+Column name: PositionerType Type: TEXT Description: None
+Column name: ReferringPhysicianAddress Type: TEXT Description: None
+Column name: ExposuresOnPlate Type: NUMBER Description: None
+Column name: CTAdditionalXRaySourceSequence Type: VARIANT Description: None
+Column name: SOPClassUID Type: TEXT Description: None
+Column name: StructureSetROISequence Type: VARIANT Description: None
+Column name: ZoomCenter Type: VARIANT Description: None
+Column name: DoseUnits Type: TEXT Description: None
+Column name: XFocusCenter Type: VARIANT Description: None
+Column name: CountsAccumulated Type: TEXT Description: None
+Column name: AnatomicalOrientationType Type: TEXT Description: None
+Column name: DataPointRows Type: NUMBER Description: None
+Column name: TotalCollimationWidth Type: FLOAT Description: None
+Column name: DetectorDescription Type: TEXT Description: None
+Column name: VerifyingObserverName Type: VARIANT Description: None
+Column name: AcquisitionsInSeries Type: TEXT Description: None
+Column name: OperatorsName Type: VARIANT Description: None
+Column name: ScanOptions Type: VARIANT Description: None
+Column name: DimensionOrganizationType Type: TEXT Description: None
+Column name: MRAcquisitionPhaseEncodingStepsOutOfPlane Type: NUMBER Description: None
+Column name: TableSpeed Type: FLOAT Description: None
+Column name: LensSpecification Type: VARIANT Description: None
+Column name: tcia_api_collection_id Type: TEXT Description: DEPRECATED: Duplicate of collection_name
+Column name: NominalPercentageOfCardiacPhase Type: FLOAT Description: None
+Column name: series_gcs_url Type: TEXT Description: URL of the Google Cloud Storage (GCS) folder of the series containing the current version of this instance
+Column name: SpecificAbsorptionRateDefinition Type: TEXT Description: None
+Column name: DetectorLinesOfResponseUsed Type: TEXT Description: None
+Column name: ReasonForStudy Type: TEXT Description: None
+Column name: PerformedProcedureStepEndTime Type: TIME Description: None
+Column name: StudyTime Type: TIME Description: None
+Column name: EnergyWindowVector Type: VARIANT Description: None
+Column name: ChemicalShiftReference Type: VARIANT Description: None
+Column name: RelativeXRayExposure Type: TEXT Description: None
+Column name: StackID Type: TEXT Description: None
+Column name: TransducerType Type: TEXT Description: None
+Column name: WindowWidth Type: VARIANT Description: None
+Column name: CollimatorLeftVerticalEdge Type: TEXT Description: None
+Column name: StudyArrivalTime Type: TIME Description: None
+Column name: SAR Type: TEXT Description: None
+Column name: EchoPlanarPulseSequence Type: TEXT Description: None
+Column name: QualityControlImage Type: TEXT Description: None
+Column name: Grid Type: VARIANT Description: None
+Column name: aws_url Type: TEXT Description: URL of the Amazon Web Services (AWS) object containing the current version of this instance
+Column name: DetectorTimeSinceLastExposure Type: TEXT Description: None
+Column name: ApprovalStatus Type: TEXT Description: None
+Column name: ReceiveCoilType Type: TEXT Description: None
+Column name: idc_webapp_collection_id Type: TEXT Description: DEPRECATED: Duplicate of collection_id
+Column name: PatientID Type: TEXT Description: Patient ID assigned by submitter of this data
+Column name: VOILUTFunction Type: TEXT Description: None
+Column name: RecognizableVisualFeatures Type: TEXT Description: None
+Column name: TransmitCoilType Type: TEXT Description: None
+Column name: RequestedProcedureCodeSequence Type: VARIANT Description: None
+Column name: ScheduledProtocolCodeSequence Type: VARIANT Description: None
+Column name: FieldOfViewDimensions Type: VARIANT Description: None
+Column name: Trim Type: TEXT Description: None
+Column name: PatientOrientation Type: VARIANT Description: None
+Column name: SmokingStatus Type: TEXT Description: None
+Column name: ImagingFrequency Type: TEXT Description: None
+Column name: ParallelReductionFactorOutOfPlane Type: FLOAT Description: None
+Column name: ScanningSequence Type: VARIANT Description: None
+Column name: EchoTime Type: TEXT Description: None
+Column name: UltrasoundColorDataPresent Type: NUMBER Description: None
+Column name: RespiratorySignalSource Type: TEXT Description: None
+Column name: LowRRValue Type: TEXT Description: None
+Column name: ScheduledProcedureStepSequence Type: VARIANT Description: None
+Column name: ShutterShape Type: VARIANT Description: None
+Column name: AcquisitionTerminationConditionData Type: TEXT Description: None
+Column name: SpectrallySelectedSuppression Type: TEXT Description: None
+Column name: ContrastFlowDuration Type: VARIANT Description: None
+Column name: ManufacturerModelName Type: TEXT Description: None
+Column name: RadionuclideTotalDose Type: TEXT Description: None
+Column name: SmallestImagePixelValue Type: NUMBER Description: None
+Column name: RespiratoryIntervalTime Type: FLOAT Description: None
+Column name: YFocusCenter Type: VARIANT Description: None
+Column name: CTExposureSequence Type: VARIANT Description: None
+Column name: DimensionIndexSequence Type: VARIANT Description: None
+Column name: XRayTubeCurrentInuA Type: TEXT Description: None
+Column name: TotalPixelMatrixFocalPlanes Type: NUMBER Description: None
+Column name: RequestedProcedureDescription Type: TEXT Description: None
+Column name: StudyDescription Type: TEXT Description: None
+Column name: VerifyingObserverSequence Type: VARIANT Description: None
+Column name: PaddleDescription Type: TEXT Description: None
+Column name: SliceThickness Type: TEXT Description: None
+Column name: ReconstructionTargetCenterPatient Type: VARIANT Description: None
+Column name: Tag_01171024 Type: VARIANT Description: None
+Column name: OriginalSpecializedSOPClassUID Type: TEXT Description: None
+Column name: FilmOrientation Type: TEXT Description: None
+Column name: PositionReferenceIndicator Type: TEXT Description: None
+Column name: OriginalImageIdentificationNomenclature Type: VARIANT Description: None
+Column name: ContentSequence Type: VARIANT Description: None
+Column name: patient_init_idc_version Type: NUMBER Description: The IDC version in which the patient/case containing this instance first appeared
+Column name: SegmentationType Type: TEXT Description: None
+Column name: DateOfSecondaryCapture Type: DATE Description: None
+Column name: CollimatorShape Type: VARIANT Description: None
+Column name: PatientBreedCodeSequence Type: VARIANT Description: None
+Column name: CollimatorGridName Type: TEXT Description: None
+Column name: ContentQualification Type: TEXT Description: None
+Column name: IconImageSequence Type: VARIANT Description: None
+Column name: NumberOfSeriesRelatedInstances Type: TEXT Description: None
+Column name: ConceptNameCodeSequence Type: VARIANT Description: None
+Column name: ContrastBolusStartTime Type: TIME Description: None
+Column name: AdditionalPatientHistory Type: TEXT Description: None
+Column name: crdc_instance_uuid Type: TEXT Description: UUID of this version of this instance
+Column name: NumberOfPoints Type: VARIANT Description: None
+Column name: collection_tumorLocation Type: TEXT Description: Source assigned tumor location of the collection containing this instance. Duplicate of tcia_tumorLocation
+Column name: EstimatedRadiographicMagnificationFactor Type: TEXT Description: None
+Column name: CompletionFlag Type: TEXT Description: None
+Column name: LastUpdated Type: NUMBER Description: None
+Column name: NumberOfTomosynthesisSourceImages Type: TEXT Description: None
+Column name: ScheduledStationName Type: VARIANT Description: None
+Column name: ContextGroupIdentificationSequence Type: VARIANT Description: None
+Column name: GantryDetectorTilt Type: TEXT Description: None
+Column name: RescaleSlope Type: TEXT Description: None
+Column name: CountRate Type: TEXT Description: None
+Column name: T2Preparation Type: TEXT Description: None
+Column name: PatientOrientationModifierCodeSequence Type: VARIANT Description: None
+Column name: ImageFormat Type: TEXT Description: None
+Column name: FocusMethod Type: TEXT Description: None
+Column name: DetectorManufacturerModelName Type: TEXT Description: None
+Column name: tcia_cancerType Type: TEXT Description: DEPRECATED: Duplicate of collection_cancerType
+Column name: DiffusionDirectionality Type: TEXT Description: None
+Column name: Tag_20051084 Type: VARIANT Description: None
+Column name: QualityControlSubject Type: TEXT Description: None
+Column name: VerticesOfThePolygonalShutter Type: VARIANT Description: None
+Column name: LargestValidPixelValue Type: NUMBER Description: None
+Column name: ScheduledStudyLocationAETitle Type: VARIANT Description: None
+Column name: SteadyStatePulseSequence Type: TEXT Description: None
+Column name: PartialView Type: TEXT Description: None
+Column name: ExposureIndex Type: TEXT Description: None
+Column name: UID Type: TEXT Description: None
+Column name: PlateID Type: TEXT Description: None
+Column name: Modality Type: TEXT Description: None
+Column name: DetectorElementSpacing Type: VARIANT Description: None
+Column name: ReferencedFrameOfReferenceSequence Type: VARIANT Description: None
+Column name: crdc_study_uuid Type: TEXT Description: UUID of this version of study containing this instance
+Column name: ContainerTypeCodeSequence Type: VARIANT Description: None
+Column name: instance_size Type: NUMBER Description: Size in bytes of this version of this instance
+Column name: Tag_011710B0 Type: VARIANT Description: None
+Column name: OverlayColumns Type: VARIANT Description: None
+Column name: Tag_01171022 Type: VARIANT Description: None
+Column name: ImagesInSeries Type: TEXT Description: None
+Column name: DetectorTemperature Type: TEXT Description: None
+Column name: WindowCenter Type: VARIANT Description: None
+Column name: ReceiveCoilName Type: TEXT Description: None
+Column name: IntervalsAcquired Type: TEXT Description: None
+Column name: PhaseInformationSequence Type: VARIANT Description: None
+Column name: StudyDate Type: DATE Description: None
+Column name: MRAcquisitionType Type: TEXT Description: None
+Column name: DetectorActiveDimensions Type: VARIANT Description: None
+Column name: KVP Type: TEXT Description: None
+Column name: TableTopLongitudinalPosition Type: TEXT Description: None
+Column name: XRay3DReconstructionSequence Type: VARIANT Description: None
+Column name: StudiesContainingOtherReferencedInstancesSequence Type: VARIANT Description: None
+Column name: RTPlanGeometry Type: TEXT Description: None
+Column name: FrameReferenceDateTime Type: NUMBER Description: None
+Column name: TomoAngle Type: TEXT Description: None
+Column name: PatientSize Type: TEXT Description: None
+Column name: BeatRejectionFlag Type: TEXT Description: None
+Column name: RequestedProcedureID Type: TEXT Description: None
+Column name: InstitutionAddress Type: TEXT Description: None
+Column name: study_hash Type: TEXT Description: md5 hash of the data in the this version of the study containing this instance
+Column name: AcquisitionComments Type: TEXT Description: None
+Column name: ROIContourSequence Type: VARIANT Description: None
+Column name: DistanceSourceToEntrance Type: TEXT Description: None
+Column name: QuadratureReceiveCoil Type: TEXT Description: None
+Column name: EchoTrainLength Type: TEXT Description: None
+Column name: NumberOfTimeSlices Type: NUMBER Description: None
+Column name: PrimaryPromptsCountsAccumulated Type: TEXT Description: None
+Column name: OrganDose Type: TEXT Description: None
+Column name: ExposureDoseSequence Type: VARIANT Description: None
+Column name: FieldOfViewRotation Type: TEXT Description: None
+Column name: Units Type: TEXT Description: None
+Column name: ScanLength Type: TEXT Description: None
+Column name: RegistrationSequence Type: VARIANT Description: None
+Column name: ClinicalTrialCoordinatingCenterName Type: TEXT Description: None
+Column name: DiffusionBValueXZ Type: FLOAT Description: None
+Column name: SliceLocation Type: TEXT Description: None
+Column name: AveragePulseWidth Type: TEXT Description: None
+Column name: PerformedProcedureStepEndDate Type: DATE Description: None
+Column name: idc_case_id Type: TEXT Description: IDC assigned UUID4 id of this version of the case/patient containing this instance
+Column name: ConvolutionKernel Type: VARIANT Description: None
+Column name: SpecimenDescriptionSequence Type: VARIANT Description: None
+Column name: ReferencedSeriesSequence Type: VARIANT Description: None
+Column name: NumberOfStudyRelatedSeries Type: TEXT Description: None
+Column name: VariableFlipAngleFlag Type: TEXT Description: None
+Column name: gcs_bucket Type: TEXT Description: Name of the Google Cloud Storage (GCS) bucket containing the current version of this instance
+Column name: PresentationCreationTime Type: TIME Description: None
+Column name: TubeAngle Type: FLOAT Description: None
+Column name: DiffusionBValue Type: FLOAT Description: None
+Column name: TableFeedPerRotation Type: FLOAT Description: None
+Column name: ScatterFractionFactor Type: TEXT Description: None
+Column name: DiffusionBValueXX Type: FLOAT Description: None
+Column name: LargestImagePixelValue Type: NUMBER Description: None
+Column name: ContentLabel Type: TEXT Description: None
+Column name: FrameAcquisitionDateTime Type: NUMBER Description: None
+Column name: LensMake Type: TEXT Description: None
+Column name: PresentationLUTShape Type: TEXT Description: None
+Column name: DataPointColumns Type: NUMBER Description: None
+Column name: LastMenstrualDate Type: DATE Description: None
+Column name: PerformedStationAETitle Type: TEXT Description: None
+Column name: ActualFrameDuration Type: TEXT Description: None
+Column name: PreferredPlaybackSequencing Type: NUMBER Description: None
+Column name: ImageGeometryType Type: TEXT Description: None
+Column name: ParallelAcquisitionTechnique Type: TEXT Description: None
+Column name: series_init_idc_version Type: NUMBER Description: The IDC version in which the series containing this instance first appeared
+Column name: ParallelReductionFactorSecondInPlane Type: FLOAT Description: None
+Column name: AcquisitionTimeSynchronized Type: TEXT Description: None
+Column name: AdmittingTime Type: TIME Description: None
+Column name: ClinicalTrialProtocolID Type: TEXT Description: None
+Column name: FieldOfViewOrigin Type: VARIANT Description: None
+Column name: BreastImplantPresent Type: TEXT Description: None
+Column name: study_init_idc_version Type: NUMBER Description: The IDC version in which the study containing this instance first appeared
+Column name: MRAcquisitionFrequencyEncodingSteps Type: NUMBER Description: None
+Column name: RectilinearPhaseEncodeReordering Type: TEXT Description: None
+Column name: collection_init_idc_version Type: NUMBER Description: The IDC version in which the collection containing this instance first appeared
+Column name: LongitudinalTemporalEventType Type: TEXT Description: None
+Column name: PerformedProcedureStepDescription Type: TEXT Description: None
+Column name: OverlayDate Type: DATE Description: None
+Column name: NumberOfRRIntervals Type: NUMBER Description: None
+Column name: GradientOutputType Type: TEXT Description: None
+Column name: tcia_species Type: TEXT Description: DEPRECATED: Duplicate of collection_species
+Column name: SeriesDescription Type: TEXT Description: None
+Column name: SynchronizationTrigger Type: TEXT Description: None
+Column name: FNumber Type: TEXT Description: None
+Column name: ExposureTimeInuS Type: TEXT Description: None
+Column name: RectificationType Type: TEXT Description: None
+Column name: PositionerPrimaryAngleDirection Type: TEXT Description: None
+Column name: RadiationMode Type: TEXT Description: None
+Column name: CassetteOrientation Type: TEXT Description: None
+Column name: series_aws_url Type: TEXT Description: URL of the Amazon Web Services (AWS) folder of the series containing the current version of this instance
+Column name: TomoTime Type: TEXT Description: None
+Column name: ReasonForRequestedProcedureCodeSequence Type: VARIANT Description: None
+Column name: CorrectedImage Type: VARIANT Description: None
+Column name: TomoType Type: TEXT Description: None
+Column name: Planes Type: NUMBER Description: None
+Column name: IntervalsRejected Type: TEXT Description: None
+Column name: AdmittingDate Type: DATE Description: None
+Column name: PatientBirthDate Type: DATE Description: None
+Column name: FractionGroupSequence Type: VARIANT Description: None
+Column name: DateOfLastCalibration Type: VARIANT Description: None
+Column name: PulseSequenceName Type: TEXT Description: None
+Column name: DetectorVector Type: VARIANT Description: None
+Column name: SOPInstanceUID Type: TEXT Description: None
+Column name: PatientIdentityRemoved Type: TEXT Description: None
+Column name: ImageAndFluoroscopyAreaDoseProduct Type: TEXT Description: None
+Column name: PerformedProcedureStepStartDate Type: DATE Description: None
+Column name: PatientComments Type: TEXT Description: None
+Column name: ScheduledProcedureStepID Type: TEXT Description: None
+Column name: series_revised_idc_version Type: NUMBER Description: The IDC version in which this version of the series containing this instance first appeared
+Column name: DataCollectionDiameter Type: TEXT Description: None
+Column name: ScanProgressionDirection Type: TEXT Description: None
+Column name: PostprocessingFunction Type: TEXT Description: None
+Column name: StructureSetTime Type: TIME Description: None
+Column name: ExposureModulationType Type: VARIANT Description: None
+Column name: LengthToEnd Type: NUMBER Description: None
+Column name: NominalRespiratoryTriggerDelayTime Type: FLOAT Description: None
+Column name: FrameTime Type: TEXT Description: None
+Column name: DeviceSerialNumber Type: TEXT Description: None
+Column name: GeneratorPower Type: TEXT Description: None
+Column name: ScheduledProcedureStepDescription Type: TEXT Description: None
+Column name: PercentSampling Type: TEXT Description: None
+Column name: DigitalSignatureUID Type: TEXT Description: None
+Column name: PregnancyStatus Type: NUMBER Description: None
+Column name: ContrastBolusStopTime Type: TIME Description: None
+Column name: RadiopharmaceuticalVolume Type: TEXT Description: None
+Column name: collection_id Type: TEXT Description: The ID of the collection containing this instance as expected by the IDC web app and API. Duplicate of the idc_webapp_collection_id column.
+Column name: PixelSpacingCalibrationDescription Type: TEXT Description: None
+Column name: InstanceNumber Type: TEXT Description: None
+Column name: ImageID Type: TEXT Description: None
+Column name: IssueDateOfImagingServiceRequest Type: DATE Description: None
+Column name: GridFrameOffsetVector Type: VARIANT Description: None
+Column name: CommentsOnThePerformedProcedureStep Type: TEXT Description: None
+Column name: ScanArc Type: TEXT Description: None
+Column name: TimezoneOffsetFromUTC Type: TEXT Description: None
+Column name: FilterMaterial Type: VARIANT Description: None
+Column name: LargePaletteColorLookupTableUID Type: TEXT Description: None
+Column name: LUTLabel Type: TEXT Description: None
+Column name: ReferencedSOPInstanceUIDInFile Type: TEXT Description: None
+Column name: license_short_name Type: TEXT Description: The short name of the license of the collection that contains this instance
+Column name: ClinicalTrialTimePointDescription Type: TEXT Description: None
+Column name: SegmentSequence Type: VARIANT Description: None
+Column name: CardiacNumberOfImages Type: TEXT Description: None
+Column name: AcquisitionStartCondition Type: TEXT Description: None
+Column name: RandomsCorrectionMethod Type: TEXT Description: None
+Column name: ReferencedPatientSequence Type: VARIANT Description: None
+Column name: PreliminaryFlag Type: TEXT Description: None
+Column name: SoftTissueThermalIndex Type: TEXT Description: None
+Column name: patient_hash Type: TEXT Description: md5 hash of this version of the patient/case containing this instance
+Column name: ImageDimensions Type: NUMBER Description: None
+Column name: DetectorConditionsNominalFlag Type: TEXT Description: None
+Column name: ShutterRightVerticalEdge Type: TEXT Description: None
+Column name: DeviationIndex Type: TEXT Description: None
+Column name: ExposureTimeInms Type: FLOAT Description: None
+Column name: VolumeBasedCalculationTechnique Type: TEXT Description: None
+Column name: BloodSignalNulling Type: TEXT Description: None
+Column name: SmallestPixelValueInSeries Type: NUMBER Description: None
+Column name: FocalLength Type: TEXT Description: None
+Column name: ReferencedSOPInstanceUID Type: TEXT Description: None
+Column name: TagSpacingFirstDimension Type: FLOAT Description: None
+Column name: PredecessorDocumentsSequence Type: VARIANT Description: None
+Column name: AngioFlag Type: TEXT Description: None
+Column name: ShutterLowerHorizontalEdge Type: TEXT Description: None
+Column name: ScheduledProcedureStepStartDate Type: DATE Description: None
+Column name: study_revised_idc_version Type: NUMBER Description: The IDC version in which this version of the study containing this instance first appeared
+Column name: MechanicalIndex Type: TEXT Description: None
+Column name: HeartRate Type: TEXT Description: None
+Column name: ImagedVolumeWidth Type: FLOAT Description: None
+Column name: PatientGantryRelationshipCodeSequence Type: VARIANT Description: None
+Column name: Tag_01171020 Type: VARIANT Description: None
+Column name: PixelBandwidth Type: TEXT Description: None
+Column name: PhotometricInterpretation Type: TEXT Description: None
+Column name: DetectorActiveShape Type: TEXT Description: None
+Column name: DeidentificationMethod Type: VARIANT Description: None
+Column name: RepetitionTime Type: TEXT Description: None
+Column name: AcquisitionType Type: TEXT Description: None
+Column name: NominalScannedPixelSpacing Type: VARIANT Description: None
+Column name: RecommendedAbsentPixelCIELabValue Type: VARIANT Description: None
+Column name: VelocityEncodingMinimumValue Type: FLOAT Description: None
+Column name: ReasonForTheImagingServiceRequest Type: TEXT Description: None
+Column name: BlobStorageSize Type: NUMBER Description: None
+Column name: Sensitivity Type: TEXT Description: None
+Column name: WindowCenterWidthExplanation Type: VARIANT Description: None
+Column name: Tag_01F31011 Type: VARIANT Description: None
+Column name: B1rms Type: FLOAT Description: None
+Column name: FrameDelay Type: TEXT Description: None
+Column name: Tag_01F31001 Type: VARIANT Description: None
+Column name: DoseSummationType Type: TEXT Description: None
+Column name: SpecificCharacterSet Type: VARIANT Description: None
+Column name: InterventionDrugInformationSequence Type: VARIANT Description: None
+Column name: AdmittingDiagnosesCodeSequence Type: VARIANT Description: None
+Column name: ExposureControlModeDescription Type: TEXT Description: None
+Column name: PixelIntensityRelationship Type: TEXT Description: None
+Column name: RequestAttributesSequence Type: VARIANT Description: None
+Column name: OverlayBitPosition Type: VARIANT Description: None
+Column name: DetectorSecondaryAngle Type: TEXT Description: None
+Column name: instance_init_idc_version Type: NUMBER Description: The IDC version in which this instance first appeared
+Column name: ViewCodeSequence Type: VARIANT Description: None
+Column name: SecondaryCountsType Type: VARIANT Description: None
+Column name: SpatialResolution Type: TEXT Description: None
+Column name: Tag_00091110 Type: VARIANT Description: None
+Column name: ModalitiesInStudy Type: VARIANT Description: None
+Column name: WholeBodyTechnique Type: VARIANT Description: None
+Column name: VelocityEncodingDirection Type: VARIANT Description: None
+Column name: CurrentRequestedProcedureEvidenceSequence Type: VARIANT Description: None
+Column name: ShutterUpperHorizontalEdge Type: TEXT Description: None
+Column name: InversionTimes Type: VARIANT Description: None
+Column name: VOILUTSequence Type: VARIANT Description: None
+Column name: SequenceName Type: TEXT Description: None
+Column name: collection_cancerType Type: TEXT Description: Source assigned cancer type of the collection containing this instance. Duplicate of tcia_cancerType.
+Column name: ContrastBolusVolume Type: TEXT Description: None
+Column name: ObservationDateTime Type: NUMBER Description: None
+Column name: CollimatorType Type: TEXT Description: None
+Column name: StudyComments Type: TEXT Description: None
+Column name: ImageType Type: VARIANT Description: None
+Column name: IssuerOfAccessionNumberSequence Type: VARIANT Description: None
+Column name: InterpretationStatusID Type: TEXT Description: None
+Column name: ImagesInAcquisition Type: TEXT Description: None
+Column name: ImageLaterality Type: TEXT Description: None
+Column name: ExposedArea Type: VARIANT Description: None
+Column name: NumberOfEnergyWindows Type: NUMBER Description: None
+Column name: ClinicalTrialTimePointID Type: TEXT Description: None
+Column name: PatientSexNeutered Type: TEXT Description: None
+Column name: Tag_00551022 Type: VARIANT Description: None
+Column name: TablePosition Type: FLOAT Description: None
+Column name: CenterOfCircularShutter Type: VARIANT Description: None
+Column name: ImageOrientation Type: VARIANT Description: None
+Column name: DataSetSubtype Type: TEXT Description: None
+Column name: RotationDirection Type: TEXT Description: None
+Column name: RecommendedDisplayFrameRate Type: TEXT Description: None
+Column name: TagThickness Type: FLOAT Description: None
+Column name: OverlayRows Type: VARIANT Description: None
+Column name: LargestPixelValueInSeries Type: NUMBER Description: None
+Column name: RescaleIntercept Type: TEXT Description: None
+Column name: ImagerPixelSpacing Type: VARIANT Description: None
+Column name: Tag_20051132 Type: VARIANT Description: None
+Column name: AcquisitionNumber Type: TEXT Description: None
+Column name: ReferencedStructureSetSequence Type: VARIANT Description: None
+Column name: ProcedureCodeSequence Type: VARIANT Description: None
+Column name: NumberOfOpticalPaths Type: NUMBER Description: None
+Column name: SeriesNumber Type: TEXT Description: None
+Column name: DecayCorrection Type: TEXT Description: None
+Column name: ImagingServiceRequestComments Type: TEXT Description: None
+Column name: PhaseContrast Type: TEXT Description: None
+Column name: GreenPaletteColorLookupTableDescriptor Type: VARIANT Description: None
+Column name: CalciumScoringMassFactorDevice Type: VARIANT Description: None
+Column name: Tag_20019000 Type: VARIANT Description: None
+Column name: PerformedProtocolCodeSequence Type: VARIANT Description: None
+Column name: PatientName Type: VARIANT Description: None
+Column name: RelativeOpacity Type: FLOAT Description: None
+Column name: SecondaryCaptureDeviceSoftwareVersions Type: VARIANT Description: None
+Column name: SourceApplicationEntityTitle Type: TEXT Description: None
+Column name: Radiopharmaceutical Type: TEXT Description: None
+Column name: GradientOutput Type: FLOAT Description: None
+Column name: StartTrim Type: TEXT Description: None
+Column name: StudyCompletionTime Type: TIME Description: None
+Column name: CTDIPhantomTypeCodeSequence Type: VARIANT Description: None
+Column name: CalibrationImage Type: TEXT Description: None
+Column name: PixelSpacing Type: VARIANT Description: None
+Column name: Rows Type: NUMBER Description: None
+Column name: OpticalPathSequence Type: VARIANT Description: None
+Column name: Tag_2001105F Type: VARIANT Description: None
+Column name: PerFrameFunctionalGroupsSequence Type: VARIANT Description: None
+Column name: RedPaletteColorLookupTableDescriptor Type: VARIANT Description: None
+Column name: GraphicLayerSequence Type: VARIANT Description: None
+Column name: ReferringPhysicianName Type: VARIANT Description: None
+Column name: PatientBreedDescription Type: TEXT Description: None
+Column name: VerificationFlag Type: TEXT Description: None
+Column name: ImageRotation Type: NUMBER Description: None
+Column name: RescaleType Type: TEXT Description: None
+Column name: ContrastBolusRoute Type: TEXT Description: None
+Column name: EnergyWindowInformationSequence Type: VARIANT Description: None
+Column name: AxialAcceptance Type: TEXT Description: None
+Column name: SpectrallySelectedExcitation Type: TEXT Description: None
+Column name: access Type: TEXT Description: Collection access status: Public or Limited
+Column name: ImageOrientationSlide Type: VARIANT Description: None
+Column name: TomoClass Type: TEXT Description: None
+Column name: PresentationIntentType Type: TEXT Description: None
+Column name: FrameIncrementPointer Type: VARIANT Description: None
+Column name: EstimatedDoseSaving Type: FLOAT Description: None
+Column name: LossyImageCompressionRetired Type: TEXT Description: None
+Column name: NumberOfSlices Type: NUMBER Description: None
+Column name: NumberOfTemporalPositions Type: TEXT Description: None
+Column name: TemporalPositionIndex Type: NUMBER Description: None
+Column name: PatientSetupSequence Type: VARIANT Description: None
+Column name: ExposuresOnDetectorSinceManufactured Type: TEXT Description: None
+Column name: StructureSetLabel Type: TEXT Description: None
+Column name: EthnicGroup Type: TEXT Description: None
+Column name: SpecificAbsorptionRateValue Type: FLOAT Description: None
+Column name: AcquisitionDateTime Type: NUMBER Description: None
+Column name: NumberOfFrames Type: TEXT Description: None
+Column name: PatientSupportAngle Type: TEXT Description: None
+Column name: DischargeTime Type: TIME Description: None
+Column name: FrequencyCorrection Type: TEXT Description: None
+Column name: AcquisitionDeviceProcessingDescription Type: TEXT Description: None
+Column name: OverlayBitsAllocated Type: VARIANT Description: None
+Column name: ScanVelocity Type: TEXT Description: None
+Column name: Tag_20051085 Type: VARIANT Description: None
+Column name: InstanceCreationTime Type: TIME Description: None
+Column name: SeriesDate Type: DATE Description: None
+Column name: GantryAngle Type: TEXT Description: None
+Column name: DistanceSourceToDetector Type: TEXT Description: None
+Column name: StrainDescription Type: TEXT Description: None
+Column name: ExposureInmAs Type: FLOAT Description: None
+Column name: PlateType Type: TEXT Description: None
+Column name: ContentDescription Type: TEXT Description: None
+Column name: RTPlanLabel Type: TEXT Description: None
+Column name: DetectorBinning Type: VARIANT Description: None
+Column name: DeidentificationMethodCodeSequence Type: VARIANT Description: None
+Column name: XRayTubeCurrentInmA Type: FLOAT Description: None
+Column name: AdvancedBlendingSequence Type: VARIANT Description: None
+Column name: NumberOfAverages Type: TEXT Description: None
+Column name: NumberOfKSpaceTrajectories Type: NUMBER Description: None
+Column name: TissueHeterogeneityCorrection Type: VARIANT Description: None
+Column name: StructureSetDate Type: DATE Description: None
+Column name: TomoLayerHeight Type: TEXT Description: None
+Column name: Tag_2005140F Type: VARIANT Description: None
+Column name: TotalPixelMatrixColumns Type: NUMBER Description: None
+Column name: CollimatorLowerHorizontalEdge Type: TEXT Description: None
+Column name: SliceVector Type: VARIANT Description: None
+Column name: GridAspectRatio Type: VARIANT Description: None
+Column name: SaturationRecovery Type: TEXT Description: None
+Column name: InPlanePhaseEncodingDirection Type: TEXT Description: None
+Column name: CountsSource Type: TEXT Description: None
+Column name: AcquisitionContrast Type: TEXT Description: None
+Column name: CurveDimensions Type: VARIANT Description: None
+Column name: FieldOfViewHorizontalFlip Type: TEXT Description: None
+Column name: ImagedNucleus Type: TEXT Description: None
+Column name: ContrastBolusTotalDose Type: TEXT Description: None
+Column name: SourceImageSequence Type: VARIANT Description: None
+Column name: NumberOfTimeSlots Type: NUMBER Description: None
+Column name: SamplesPerPixel Type: NUMBER Description: None
+Column name: ReferencedRawDataSequence Type: VARIANT Description: None
+Column name: RTPlanName Type: TEXT Description: None
+Column name: LUTExplanation Type: TEXT Description: None
+Column name: StudyReadTime Type: TIME Description: None
+Column name: AccessionNumber Type: TEXT Description: None
+Column name: ExposureInuAs Type: TEXT Description: None
+Column name: DistanceSourceToPatient Type: TEXT Description: None
+Column name: LongitudinalTemporalInformationModified Type: TEXT Description: None
+Column name: PatientBirthTime Type: TIME Description: None
+Column name: SynchronizationFrameOfReferenceUID Type: TEXT Description: None
+Column name: FrameOfReferenceUID Type: TEXT Description: None
+Column name: IssuerOfPatientIDQualifiersSequence Type: VARIANT Description: None
+Column name: BodyPartThickness Type: TEXT Description: None
+Column name: StudyInstanceUID Type: TEXT Description: None
+Column name: ProcessingFunction Type: TEXT Description: None
+Column name: InstanceCreatorUID Type: TEXT Description: None
+Column name: tcia_tumorLocation Type: TEXT Description: DEPRECATED: Duplicate of collection_tumorLocation
+Column name: KSpaceFiltering Type: TEXT Description: None
+Column name: StorageClass Type: TEXT Description: None
+Column name: TotalNumberOfExposures Type: NUMBER Description: None
+Column name: ManipulatedImage Type: VARIANT Description: None
+Column name: NumberOfDetectors Type: NUMBER Description: None
+Column name: PerformingPhysicianName Type: VARIANT Description: None
+Column name: CompressionCode Type: TEXT Description: None
+Column name: Columns Type: NUMBER Description: None
+Column name: MultiPlanarExcitation Type: TEXT Description: None
+Column name: TriggerSourceOrType Type: TEXT Description: None
+Column name: SingleCollimationWidth Type: FLOAT Description: None
+Column name: BeamSequence Type: VARIANT Description: None
+Column name: PlanarConfiguration Type: NUMBER Description: None
+Column name: PatientAge Type: TEXT Description: None
+Column name: LossyImageCompression Type: TEXT Description: None
+Column name: ImageComments Type: TEXT Description: None
+Column name: StrainCodeSequence Type: VARIANT Description: None
+Column name: license_long_name Type: TEXT Description: The long name of the license of the collection that contains this instance
+Column name: InversionRecovery Type: TEXT Description: None
+Column name: SequenceOfUltrasoundRegions Type: VARIANT Description: None
+Column name: DiffusionBValueZZ Type: FLOAT Description: None
+Column name: MRAcquisitionPhaseEncodingStepsInPlane Type: NUMBER Description: None
+Column name: ContentTime Type: TIME Description: None
+Column name: AcquisitionTime Type: TIME Description: None
+Column name: TransmitCoilName Type: TEXT Description: None
+Column name: CineRate Type: TEXT Description: None
+Column name: AcquisitionStartConditionData Type: TEXT Description: None
+Column name: ParallelAcquisition Type: TEXT Description: None
+Column name: RadiationSetting Type: TEXT Description: None
+Column name: OtherPatientIDs Type: VARIANT Description: None
+Column name: PixelPaddingRangeLimit Type: NUMBER Description: None
+Column name: AcquisitionTerminationCondition Type: TEXT Description: None
+Column name: ScatterCorrectionMethod Type: TEXT Description: None
+Column name: CardiacSignalSource Type: TEXT Description: None
+Column name: RTROIObservationsSequence Type: VARIANT Description: None
+Column name: Tag_01171010 Type: VARIANT Description: None
+Column name: OtherElements Type: VARIANT Description: None
+Column name: InstanceCreationDate Type: DATE Description: None
+Column name: ScheduledProcedureStepStartTime Type: TIME Description: None
+Column name: Laterality Type: TEXT Description: None
+Column name: AnatomicRegionSequence Type: VARIANT Description: None
+Column name: ScheduledStudyStartDate Type: DATE Description: None
+Column name: Tag_20051402 Type: VARIANT Description: None
+Column name: AdmittingDiagnosesDescription Type: VARIANT Description: None
+Column name: CurveDate Type: DATE Description: None
+Column name: ContentCreatorName Type: VARIANT Description: None
+Column name: CollimatorUpperHorizontalEdge Type: TEXT Description: None
+Column name: GeometryOfKSpaceTraversal Type: TEXT Description: None
+Column name: BitsStored Type: NUMBER Description: None
+Column name: FilterThicknessMinimum Type: VARIANT Description: None
+Column name: TimeOfFlightContrast Type: TEXT Description: None
+Column name: NumberOfPhases Type: NUMBER Description: None
+Column name: TableTopLateralPosition Type: TEXT Description: None
+Column name: ClinicalTrialSeriesID Type: TEXT Description: None
+Column name: collection_hash Type: TEXT Description: md5 hash of the of this version of the collection containing this instance
+Column name: PatientSpeciesCodeSequence Type: VARIANT Description: None
+Column name: ContributingEquipmentSequence Type: VARIANT Description: None
+Column name: PercentPhaseFieldOfView Type: TEXT Description: None
+Column name: ImageIndex Type: NUMBER Description: None
+Column name: DetectorActiveTime Type: TEXT Description: None
+Column name: OverlayType Type: VARIANT Description: None
+Column name: ReferencedImageEvidenceSequence Type: VARIANT Description: None
+Column name: CodeValue Type: TEXT Description: None
+Column name: TransverseMash Type: TEXT Description: None
+Column name: series_hash Type: TEXT Description: md5 hash of the data in the this version of the series containing this instance
+Column name: RadiusOfCircularShutter Type: TEXT Description: None
+Column name: ImageLocation Type: NUMBER Description: None
+Column name: PatientAddress Type: TEXT Description: None
+Column name: FrameComments Type: TEXT Description: None
+Column name: DetectorType Type: TEXT Description: None
+Column name: DimensionOrganizationUID Type: TEXT Description: None
+Column name: RouteOfAdmissions Type: TEXT Description: None
+Column name: license_url Type: TEXT Description: The URL to the page describing the license of the collection that contains this instance
+Column name: MediaStorageSOPInstanceUID Type: TEXT Description: None
+Column name: Manufacturer Type: TEXT Description: None
+Column name: SpecialNeeds Type: TEXT Description: None
+Column name: TriggerWindow Type: TEXT Description: None
+Column name: ScheduledStudyLocation Type: TEXT Description: None
+Column name: BluePaletteColorLookupTableDescriptor Type: VARIANT Description: None
+Column name: ContributingSourcesSequence Type: VARIANT Description: None
+Column name: PersonName Type: VARIANT Description: None
+Column name: ContinuityOfContent Type: TEXT Description: None
+Column name: StopTrim Type: TEXT Description: None
+Column name: DisplayedAreaSelectionSequence Type: VARIANT Description: None
+Column name: DateOfLastDetectorCalibration Type: DATE Description: None
+Column name: TableTraverse Type: TEXT Description: None
+Column name: FlipAngle Type: TEXT Description: None
+Column name: Tag_2005140E Type: VARIANT Description: None
+Column name: SeriesTime Type: TIME Description: None
+Column name: SegmentationFractionalType Type: TEXT Description: None
+Column name: NumberOfPhaseEncodingSteps Type: TEXT Description: None
+Column name: StorageMediaFileSetUID Type: TEXT Description: None
+Column name: RequestedProcedurePriority Type: TEXT Description: None
+Column name: SourcePatientGroupIdentificationSequence Type: VARIANT Description: None
+Column name: RetrieveAETitle Type: VARIANT Description: None
+Column name: Occupation Type: TEXT Description: None
+Column name: GridFocalDistance Type: TEXT Description: None
+Column name: ReconstructionMethod Type: TEXT Description: None
+Column name: FrameAcquisitionDuration Type: FLOAT Description: None
+Column name: RelatedSeriesSequence Type: VARIANT Description: None
+Column name: MagnetizationTransfer Type: TEXT Description: None
+Column name: AngularPosition Type: TEXT Description: None
+Column name: ApplicableSafetyStandardAgency Type: TEXT Description: None
+Column name: SliceSensitivityFactor Type: TEXT Description: None
+Column name: MIMETypeOfEncapsulatedDocument Type: TEXT Description: None
+Column name: Source_URL Type: TEXT Description: The URL of a page that describes the original collection or analysis result that include this instance
+Column name: TemplateExtensionOrganizationUID Type: TEXT Description: None
+Column name: RadiopharmaceuticalStartTime Type: TIME Description: None
+Column name: DoseComment Type: TEXT Description: None
+Column name: RotationInformationSequence Type: VARIANT Description: None
+Column name: CommentsOnRadiationDose Type: TEXT Description: None
+Column name: PatientOrientationCodeSequence Type: VARIANT Description: None
+Column name: RadiopharmaceuticalInformationSequence Type: VARIANT Description: None
+Column name: collection_name Type: TEXT Description: The ID of the collection containing this instance as expected by the TCIA API
+Column name: SequenceVariant Type: VARIANT Description: None
+Column name: CompressionForce Type: TEXT Description: None
+Column name: MappingResourceIdentificationSequence Type: VARIANT Description: None
+Column name: TemporalPositionIdentifier Type: TEXT Description: None
+Column name: DiffusionBValueYZ Type: FLOAT Description: None
+Column name: EchoNumbers Type: VARIANT Description: None
+Column name: Exposure Type: TEXT Description: None
+Column name: FrameReferenceTime Type: TEXT Description: None
+Column name: NumberOfFramesInOverlay Type: VARIANT Description: None
+Column name: CodingSchemeUID Type: TEXT Description: None
+Column name: EchoPulseSequence Type: TEXT Description: None
+Column name: ImagePositionPatient Type: VARIANT Description: None
+Column name: ComplexImageComponent Type: TEXT Description: None
+Column name: ClinicalTrialProtocolName Type: TEXT Description: None
+Column name: ExposuresOnDetectorSinceLastCalibration Type: TEXT Description: None
+Column name: DimensionIndexValues Type: VARIANT Description: None
+Column name: CreatorVersionUID Type: TEXT Description: None
+Column name: PositionerMotion Type: TEXT Description: None
+Column name: SecondaryCountsAccumulated Type: VARIANT Description: None
+Column name: HighBit Type: NUMBER Description: None
+Column name: DetectorMode Type: TEXT Description: None
+Column name: ReconstructionDiameter Type: TEXT Description: None
+Column name: PositionerPrimaryAngle Type: TEXT Description: None
+Column name: MultiCoilDefinitionSequence Type: VARIANT Description: None
+Column name: ClinicalTrialSponsorName Type: TEXT Description: None
+Column name: PVCRejection Type: TEXT Description: None
+Column name: SpiralPitchFactor Type: FLOAT Description: None
+Column name: DigitalImageFormatAcquired Type: TEXT Description: None
+Column name: BoneThermalIndex Type: TEXT Description: None
+Column name: LensModel Type: TEXT Description: None
+Column name: DoseGridScaling Type: TEXT Description: None
+Column name: MetaboliteMapDescription Type: TEXT Description: None
+Column name: ContentDate Type: DATE Description: None
+Column name: dBdt Type: TEXT Description: None
+Column name: OrganExposed Type: TEXT Description: None
+Column name: PixelPresentation Type: TEXT Description: None
+Column name: DeviceUID Type: TEXT Description: None
+Column name: FrameOfInterestDescription Type: VARIANT Description: None
+Column name: FrameLaterality Type: TEXT Description: None
+Column name: ImageOrientationPatient Type: VARIANT Description: None
+Column name: XRayTubeCurrent Type: TEXT Description: None
+Column name: ItemNumber Type: TEXT Description: None
+Column name: InterpretationTypeID Type: TEXT Description: None
+Column name: OverlayDescription Type: VARIANT Description: None
+Column name: Spoiling Type: TEXT Description: None
+Column name: PatientTelephoneNumbers Type: VARIANT Description: None
+Column name: Tag_20051080 Type: VARIANT Description: None
+Column name: Tag_00291140 Type: VARIANT Description: None
+Column name: ProtocolName Type: TEXT Description: None
+Column name: TypeOfDetectorMotion Type: TEXT Description: None
+Column name: DimensionOrganizationSequence Type: VARIANT Description: None
+Column name: RelatedFrameOfReferenceUID Type: TEXT Description: None
+Column name: BulkMotionCompensationTechnique Type: TEXT Description: None
+Column name: PartialFourierDirection Type: TEXT Description: None
+Column name: CardiacBeatRejectionTechnique Type: TEXT Description: None
+Column name: AxialMash Type: VARIANT Description: None
+Column name: RespiratoryTriggerDelayThreshold Type: FLOAT Description: None
+Column name: TotalPixelMatrixOriginSequence Type: VARIANT Description: None
+Column name: Source_DOI Type: TEXT Description: The DOI of a page that describes the original collection or analysis result that include this instance
+Column name: ImplementationClassUID Type: TEXT Description: None
+Column name: RequestedProcedureComments Type: TEXT Description: None
+Column name: ClinicalTrialSiteID Type: TEXT Description: None
+Column name: ContrastBolusIngredient Type: TEXT Description: None
+Column name: PatientSetupNumber Type: TEXT Description: None
+Column name: SeriesInstanceUID Type: TEXT Description: None
+Column name: TagAngleFirstAxis Type: FLOAT Description: None
+Column name: DetectorID Type: TEXT Description: None
+Column name: DataValueRepresentation Type: VARIANT Description: None
+Column name: instance_revised_idc_version Type: NUMBER Description: The IDC version in which this instance first appeared
+Column name: MaximumFractionalValue Type: NUMBER Description: None
+Column name: DerivationImageSequence Type: VARIANT Description: None
+Column name: PositionerSecondaryAngle Type: TEXT Description: None
+Column name: ReferringPhysicianTelephoneNumbers Type: VARIANT Description: None
+Column name: ClinicalTrialSiteName Type: TEXT Description: None
+Column name: IntensifierSize Type: TEXT Description: None
+Column name: SmallestValidPixelValue Type: NUMBER Description: None
+Column name: AttenuationCorrectionMethod Type: TEXT Description: None
+Column name: ReferencedFrameOfReferenceUID Type: TEXT Description: None
+Column name: SoftcopyVOILUTSequence Type: VARIANT Description: None
+Column name: EnergyWeightingFactor Type: FLOAT Description: None
+Column name: SecondaryCaptureDeviceManufacturer Type: TEXT Description: None
+Column name: DetectorManufacturerName Type: TEXT Description: None
+Column name: SpecimenLabelInImage Type: TEXT Description: None
+Column name: SecondaryCaptureDeviceManufacturerModelName Type: TEXT Description: None
+Column name: XRay3DAcquisitionSequence Type: VARIANT Description: None
+Column name: Tagging Type: TEXT Description: None
+Column name: PatientSpeciesDescription Type: TEXT Description: None
+Column name: ExposureControlMode Type: TEXT Description: None
+Column name: TimeOfLastDetectorCalibration Type: TIME Description: None
+Column name: TransducerData Type: VARIANT Description: None
+Column name: OversamplingPhase Type: TEXT Description: None
+Column name: WaterReferencedPhaseCorrection Type: TEXT Description: None
+Column name: ImplementationVersionName Type: TEXT Description: None
+Column name: RTPlanDescription Type: TEXT Description: None
+Column name: NominalInterval Type: TEXT Description: None
+Column name: ResponsibleOrganization Type: TEXT Description: None
+Column name: RealWorldValueMappingSequence Type: VARIANT Description: None
+Column name: SeriesType Type: VARIANT Description: None
+Column name: FilterType Type: TEXT Description: None
+Column name: PixelSpacingCalibrationType Type: TEXT Description: None
+Column name: PatientSex Type: TEXT Description: None
+Column name: CoincidenceWindowWidth Type: TEXT Description: None
+Column name: PixelPaddingValue Type: NUMBER Description: None
+Column name: PerformedProcedureStepID Type: TEXT Description: None
+Column name: ZoomFactor Type: VARIANT Description: None
+Column name: ClinicalTrialSubjectID Type: TEXT Description: None
+Column name: StationName Type: TEXT Description: None
+Column name: MediaStorageSOPClassUID Type: TEXT Description: None
+Column name: Type Type: TEXT Description: None
+Column name: aws_bucket Type: TEXT Description: Name of the Amazon Web Services (AWS) bucket containing the current version of this instance
+Column name: ValueType Type: TEXT Description: None
+Column name: RepresentativeFrameNumber Type: NUMBER Description: None
+Column name: ContentTemplateSequence Type: VARIANT Description: None
+Column name: AcquisitionDate Type: DATE Description: None
+Column name: OverlayOrigin Type: VARIANT Description: None
+Column name: RecognitionCode Type: TEXT Description: None
+Column name: ViewPosition Type: TEXT Description: None
+Column name: ReprojectionMethod Type: TEXT Description: None
+Column name: BodyPartExamined Type: TEXT Description: None
+Column name: ContainerIdentifier Type: TEXT Description: None
+Column name: PatientState Type: TEXT Description: None
+Column name: TypeOfPatientID Type: TEXT Description: None
+Column name: HalfValueLayer Type: TEXT Description: None
+Column name: ReferencedGeneralPurposeScheduledProcedureStepTransactionUID Type: TEXT Description: None
+Column name: TimeOfLastCalibration Type: VARIANT Description: None
+Column name: TransferSyntaxUID Type: TEXT Description: None
+Column name: RTPlanDate Type: DATE Description: None
+Column name: SpatialPresaturation Type: TEXT Description: None
+Column name: ReferencedRTPlanSequence Type: VARIANT Description: None
+Column name: CardiacSynchronizationTechnique Type: TEXT Description: None
+Column name: EncapsulatedDocumentLength Type: NUMBER Description: None
+Column name: DecayFactor Type: TEXT Description: None
+Column name: SecondaryCaptureDeviceID Type: TEXT Description: None
+Column name: AcquisitionDeviceProcessingCode Type: TEXT Description: None
+Column name: DroppedTags Type: VARIANT Description: None
+Column name: ShutterPresentationValue Type: NUMBER Description: None
+Column name: ClinicalTrialSubjectReadingID Type: TEXT Description: None
+Column name: VerticesOfThePolygonalCollimator Type: VARIANT Description: None
+Column name: TableTopRollAngle Type: FLOAT Description: None
+Column name: Tag_01191180 Type: VARIANT Description: None
+Column name: SpacingBetweenSlices Type: TEXT Description: None
+Column name: NumberOfStudyRelatedInstances Type: TEXT Description: None
+Column name: ImageBoxPosition Type: NUMBER Description: None
+Column name: ReferencedRequestSequence Type: VARIANT Description: None
+Column name: StudyArrivalDate Type: DATE Description: None
+Column name: ContextIdentifier Type: TEXT Description: None
+Column name: ExposureStatus Type: TEXT Description: None
+Column name: TimeOfSecondaryCapture Type: TIME Description: None
+Column name: FieldOfViewShape Type: TEXT Description: None
+Column name: SharedFunctionalGroupsSequence Type: VARIANT Description: None
+Column name: CardiacFramingType Type: TEXT Description: None
+Column name: FilterThicknessMaximum Type: VARIANT Description: None
+Column name: DataSetType Type: NUMBER Description: None
+Column name: TemporalResolution Type: TEXT Description: None
+Column name: MultipleSpinEcho Type: TEXT Description: None
+Column name: ImageFrameOrigin Type: VARIANT Description: None
+Column name: IssuerOfPatientID Type: TEXT Description: None
+Column name: Tag_00551012 Type: VARIANT Description: None
+Column name: DoseReferenceSequence Type: VARIANT Description: None
+Column name: collection_species Type: TEXT Description: Source assigned species of the collection containing this instance. Duplicate of tcia_species.
+Column name: PixelAspectRatio Type: VARIANT Description: None
+Column name: RespiratoryMotionCompensationTechnique Type: TEXT Description: None
+Column name: ImagedVolumeDepth Type: FLOAT Description: None
+Column name: PerformedProcedureStepStartTime Type: TIME Description: None
+Column name: DiffusionBValueXY Type: FLOAT Description: None
+Column name: BlendingDisplaySequence Type: VARIANT Description: None
+Column name: ReferencedFileID Type: VARIANT Description: None
+Column name: ScheduledStudyStartTime Type: TIME Description: None
+Column name: InStackPositionNumber Type: NUMBER Description: None
+Column name: DeadTimeFactor Type: TEXT Description: None
+Column name: ConfidentialityCode Type: TEXT Description: None
+Column name: OriginalImageIdentification Type: VARIANT Description: None
+Column name: ImageDisplayFormat Type: TEXT Description: None
+Column name: IrradiationEventUID Type: VARIANT Description: None
+Column name: MagneticFieldStrength Type: TEXT Description: None
+Column name: patient_revised_idc_version Type: NUMBER Description: The IDC version in which this version of the patient/case containing this instance first appeared
+Column name: DetectorConfiguration Type: TEXT Description: None
+Column name: ReferencedSOPClassUID Type: TEXT Description: None
+Column name: CodingSchemeIdentificationSequence Type: VARIANT Description: None
+Column name: ParallelReductionFactorInPlane Type: FLOAT Description: None
+Column name: Allergies Type: VARIANT Description: None
+Column name: ReferencedPerformedProcedureStepSequence Type: VARIANT Description: None
+Column name: TemplateExtensionCreatorUID Type: TEXT Description: None
+Column name: GantryID Type: TEXT Description: None
+Column name: InstitutionName Type: TEXT Description: None
+Column name: SkipBeats Type: TEXT Description: None
+Column name: LongitudinalTemporalOffsetFromEvent Type: FLOAT Description: None
+Column name: ScheduledProcedureStepEndTime Type: TIME Description: None
+Column name: ExtendedDepthOfField Type: TEXT Description: None
+Column name: SegmentsOverlap Type: TEXT Description: None
+Column name: AcquisitionDuration Type: FLOAT Description: None
+Column name: FluoroscopyFlag Type: TEXT Description: None
+Column name: VideoImageFormatAcquired Type: TEXT Description: None
+Column name: crdc_series_uuid Type: TEXT Description: UUID of this version of series containing this instance
+Column name: EntranceDose Type: NUMBER Description: None
+Column name: DetectorElementPhysicalSize Type: VARIANT Description: None
+Column name: ContrastBolusAgent Type: TEXT Description: None
+Column name: DiffusionGradientOrientation Type: VARIANT Description: None
+Column name: PresentationCreationDate Type: DATE Description: None
+Column name: TargetExposureIndex Type: TEXT Description: None
+Column name: Decoupling Type: TEXT Description: None
+Column name: PatientWeight Type: TEXT Description: None
+Column name: PixelRepresentation Type: NUMBER Description: None
+Column name: PerformedProcedureCodeSequence Type: VARIANT Description: None
+Column name: AnnotationDisplayFormatID Type: TEXT Description: None
+Column name: CollimatorRightVerticalEdge Type: TEXT Description: None
+Column name: MultiCoilElementName Type: TEXT Description: None
+Column name: PerformedStationName Type: TEXT Description: None
+Column name: EntranceDoseInmGy Type: TEXT Description: None
+Column name: gcs_url Type: TEXT Description: URL of the Google Cloud Storage (GCS) object containing the current version of this instance
+Column name: ReferencedImageRealWorldValueMappingSequence Type: VARIANT Description: None
+Column name: TableTopPitchAngle Type: FLOAT Description: None
+Column name: ShutterLeftVerticalEdge Type: TEXT Description: None
+Column name: ConcatenationUID Type: TEXT Description: None
+Column name: ReasonForTheRequestedProcedure Type: TEXT Description: None
+Column name: SourceIrradiationEventSequence Type: VARIANT Description: None
+Column name: TotalPixelMatrixRows Type: NUMBER Description: None
+Column name: ConversionType Type: TEXT Description: None
+Column name: DetectorInformationSequence Type: VARIANT Description: None
+Column name: LossyImageCompressionMethod Type: VARIANT Description: None
+Column name: BurnedInAnnotation Type: TEXT Description: None
+Column name: InstitutionalDepartmentName Type: TEXT Description: None
+Column name: StudyCompletionDate Type: DATE Description: None
+Column name: ScheduledProcedureStepEndDate Type: DATE Description: None
+Column name: ImagedVolumeHeight Type: FLOAT Description: None
+Column name: InversionTime Type: TEXT Description: None
+Column name: BorderDensity Type: TEXT Description: None
+Column name: NumberOfRotations Type: NUMBER Description: None
+Sample rows:
+[{'collection_name': 'NLST', 'collection_id': 'nlst', 'collection_timestamp': 1699840975225675, 'collection_hash': '5bb7734c5f3d293df52fe691952680e9', 'collection_init_idc_version': 4, 'collection_revised_idc_version': 15, 'collection_tumorLocation': 'Chest', 'collection_species': 'Human', 'collection_cancerType': 'Lung Cancer', 'access': 'Public', 'PatientID': '115644', 'idc_case_id': 'f999d808-731d-4c65-b1b1-a462e80c4e0d', 'patient_hash': 'baa2f5c1bcee0537cf72a05a77fe01a3', 'patient_init_idc_version': 4, 'patient_revised_idc_version': 4, 'StudyInstanceUID': '1.2.840.113654.2.55.62621785606309318595425188615995118704', 'crdc_study_uuid': '2548cceb-112c-4e57-9345-67ab1cba9eac', 'study_hash': '0eafc6f78c7c318e1ed2ba208e8f2710', 'study_init_idc_version': 4, 'study_revised_idc_version': 4, 'SeriesInstanceUID': '1.2.840.113654.2.55.286585074629136673697149467703631406338', 'crdc_series_uuid': '46f9c801-aff7-4c6c-af45-23827e1a9c85', 'series_gcs_url': 'gs://public-datasets-idc/46f9c801-aff7-
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+Detailed requirements include:
+- The slides must belong to the TCGA-LUAD or TCGA-LUSC collections;
+- The slides must be JPEG or JPEG2000 compressed;
+- The slides must be digital images and exclude non-volume ones;
+- The slides must contain either normal (`17621005`) or tumor (`86049000`) tissue, identified by specific DICOM codes;
+- The slides must be prepared using the "Tissue freezing medium" embedding method;
+
+With respect to the output, it should contain the following basic metadata and attributes related to slide microscopy images. Concretely,
+- digital slide ID: unique numeric identifier of a digital slide, i.e., a digital image of a physical slide;
+- case ID: unique numeric identifier of the study in the context of which the ditial slide was created;
+- physical slide ID: unique numeric identifier of the physical slide as prepared in the wet lab; 
+- patient ID: unique numeric identifier of the patient from whose tissue the physical slide was obtained;
+- collection ID: numeric or character sequence describing the dataset the physical slide is part of;
+- instance ID: universally unique identifier of the DICOM instance;
+- GCS URL: how to access the DICOM file;
+- width/height: image width and height in pixels, respectively;
+- pixel spacing: image pixel spacing in mm/px;
+- compression type (either value `jpeg`, `jpeg2000`, or `other`).
+
+And the target two labels are:
+- tissue_type: either `normal` or `tumor`;
+- cancer_subtype: either `luad` or `lscc`.
+Sort the results according to instance ID in ascending order.
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'IDC': {'IDC_V17': ['DICOM_ALL']}}
+Begin Exploring Related Columns
+Below is a compact “road‑map” that lists the most promising columns for every logical requirement, followed by ten exploratory Snowflake SQL snippets (simple → progressively complex) that help you verify content, value ranges and nesting levels before writing the definitive extraction query.
+
+────────────────────────
+Candidate columns & their potential usage  
+────────────────────────
+"collection_id" or "collection_name"        : filter to ‘tcga‑luad’ or ‘tcga‑lusc’  
+"Modality"                                   : keep only still–microscopy images ⇒ 'SM'  
+"ImageType" (VARIANT)                        : look for the token ‘VOLUME’ (volume slides)  
+"TransferSyntaxUID"                          : derive compression:  
+                                               • JPEG        → 1.2.840.10008.1.2.4.50, 4.51, …  
+                                               • JPEG2000    → 1.2.840.10008.1.2.4.90, 4.91  
+                                               •  anything else ⇒ “other” (to be excluded)  
+"SpecimenDescriptionSequence" (VARIANT)      : contains nested preparation items;  
+                                               look for an item where  
+                                               value ILIKE '%Tissue%freezing%medium%'  
+"AnatomicRegionSequence" (VARIANT)           : holds SNOMED code values;  
+                                               code ‘17621005’ → normal tissue,  
+                                               code ‘86049000’ → tumor tissue  
+"SeriesInstanceUID"                          : use as digital slide identifier  
+"StudyInstanceUID"                           : case / study identifier  
+"PatientID"                                  : patient identifier  
+"SOPInstanceUID"                             : unique instance identifier  
+"gcs_url"                                    : direct link to the DICOM file in GCS  
+"Rows", "Columns"                            : image height & width (pixels)  
+"PixelSpacing" (VARIANT)                     : pixel size in mm/px (often an array [row,col])  
+
+Basic constant conditions you will most likely apply later
+• "collection_id" IN (‘tcga‑luad’, ‘tcga‑lusc’)      -- case‑insensitive  
+• "Modality" = 'SM'  
+• EXISTS token ‘VOLUME’ in "ImageType"                -- volume slides  
+• "TransferSyntaxUID" IN (<JPEG UIDs>, <JPEG2000 UIDs>)  
+• ‘Tissue freezing medium’ mentioned somewhere in "SpecimenDescriptionSequence"  
+• CodeValue IN (‘17621005’, ‘86049000’) extracted from "AnatomicRegionSequence"  
+
+────────────────────────
+Ten exploratory SQL snippets  
+────────────────────────
+All queries read from one table:  
+IDC.IDC_V17."DICOM_ALL"   
+(Remember to keep every identifier in double quotes to respect Snowflake case‑sensitivity.)
+
+```sql
+-- 1️⃣  Description: List the available collections that start with TCGA‑LU* (quick sanity check)
+SELECT DISTINCT "collection_id"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" ILIKE 'tcga-lu%';
+
+-- 2️⃣  Description: Verify that SM modality exists in the target collections
+SELECT DISTINCT "Modality"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" IN ('tcga-luad','tcga-lusc')
+  AND "Modality" IS NOT NULL
+LIMIT 20;
+
+-- 3️⃣  Description: Show transfer‑syntax values for SM images (helps decide JPEG / JPEG2000 mapping)
+SELECT DISTINCT "TransferSyntaxUID"
+FROM IDC.IDC_V17."DICOM_ALL"
+WHERE "collection_id" IN ('tcga-luad','tcga-lusc')
+  AND "Modality" = 'SM'
+LIMIT 20;
+
+-- 4️⃣  Description: Inspect ImageType components and look for the word ‘VOLUME’
+SELECT d."SOPInstanceUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."collection_id"  IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"       =  'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+LIMIT 20;
+
+-- 5️⃣  Description: Peek into AnatomicRegionSequence to see available CodeValue(s)
+SELECT d."SOPInstanceUID",
+       ar.value:"CodeValue"::STRING      AS "code_value",
+       ar.value:"CodeMeaning"::STRING    AS "code_meaning"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality" = 'SM'
+  AND d."collection_id" IN ('tcga-luad','tcga-lusc')
+LIMIT 20;
+
+-- 6️⃣  Description: Quick count of slides that already expose desired SNOMED codes (normal / tumor)
+SELECT ar.value:"CodeValue"::STRING AS "code_value",
+       COUNT(*)                     AS "n_instances"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."Modality"       = 'SM'
+  AND d."collection_id"  IN ('tcga-luad','tcga-lusc')
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+GROUP BY 1
+ORDER BY 1;
+
+-- 7️⃣  Description: Explore SpecimenDescriptionSequence for the phrase ‘freezing medium’
+SELECT d."SOPInstanceUID",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE d."Modality"      = 'SM'
+  AND d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20;
+
+-- 8️⃣  Description: Correlate compression & image‑type criteria in one shot (no tissue filter yet)
+SELECT d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."collection_id"   IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"        =  'SM'
+  AND it.value::STRING   ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20;
+
+-- 9️⃣  Description: Produce miniature fact table with preliminary filters (still missing embedding medium)
+SELECT DISTINCT
+       d."SeriesInstanceUID"  AS "digital_slide_id",
+       d."StudyInstanceUID"   AS "case_id",
+       d."PatientID"          AS "patient_id",
+       d."SOPInstanceUID"     AS "instance_id",
+       d."gcs_url",
+       d."Rows"               AS "height_px",
+       d."Columns"            AS "width_px",
+       d."PixelSpacing"       AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar
+WHERE d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"      = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+LIMIT 20;
+
+-- 🔟  Description: Full prototype query – now also requiring embedding medium = “Tissue freezing medium”
+SELECT DISTINCT
+       d."SeriesInstanceUID"                                            AS "digital_slide_id",
+       d."StudyInstanceUID"                                             AS "case_id",
+       d."InstanceNumber"                                               AS "physical_slide_id",
+       d."PatientID"                                                    AS "patient_id",
+       d."collection_id"                                                AS "collection_id",
+       d."SOPInstanceUID"                                               AS "instance_id",
+       d."gcs_url",
+       d."Columns"                                                      AS "width_px",
+       d."Rows"                                                         AS "height_px",
+       d."PixelSpacing"                                                 AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                                              AS "compression_type",
+       CASE WHEN ar.value:"CodeValue"::STRING = '17621005' THEN 'normal'
+            WHEN ar.value:"CodeValue"::STRING = '86049000' THEN 'tumor'
+       END                                                              AS "tissue_type",
+       CASE WHEN d."collection_id" = 'tcga-luad'  THEN 'luad'
+            WHEN d."collection_id" = 'tcga-lusc'  THEN 'lscc'
+       END                                                              AS "cancer_subtype"
+FROM IDC.IDC_V17."DICOM_ALL" d,
+     LATERAL FLATTEN(INPUT => d."ImageType")                    it,
+     LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence")       ar,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence")  sd
+WHERE d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND d."Modality"      = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'                                   -- volume slides
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') -- JPEG/J2K
+  AND ar.value:"CodeValue"::STRING IN ('17621005','86049000')             -- normal / tumor
+  AND LOWER(sd.value::STRING) ILIKE '%tissue%freezing%medium%'            -- embedding medium
+ORDER BY d."SOPInstanceUID"
+LIMIT 20;
+```
+
+Feel free to adapt token lists, nesting paths or additional JSON dereferencing once you preview actual values.  When all fields look good, remove `LIMIT` and optional exploratory columns, then save the final query as your production extractor.
+Refined SQLs and results:
+Query:
+--Description: 2️⃣  Verify that SM modality exists in LUAD / LUSC collections
+--The collection IDs may not exactly equal 'tcga-luad' or 'tcga-lusc', so
+--match either column by a broad, case‑insensitive substring search.
+SELECT DISTINCT "Modality"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" IS NOT NULL
+LIMIT 20
+Answer:
+Modality
+CT
+PT
+MR
+SEG
+SM
+Query:
+--Description: 3️⃣  Show transfer‑syntax values for SM images in LUAD / LUSC collections
+SELECT DISTINCT "TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL
+WHERE ("collection_id"   ILIKE '%luad%' OR "collection_name" ILIKE '%luad%'
+    OR  "collection_id"   ILIKE '%lusc%' OR "collection_name" ILIKE '%lusc%')
+  AND "Modality" = 'SM'
+LIMIT 20
+Answer:
+TransferSyntaxUID
+1.2.840.10008.1.2.1
+1.2.840.10008.1.2.4.91
+1.2.840.10008.1.2.4.50
+Query:
+--Description: 4️⃣  Inspect ImageType components for the token ‘VOLUME’
+SELECT d."SOPInstanceUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+    OR  d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND d."Modality" = 'SM'
+  AND it.value::STRING ILIKE '%VOLUME%'
+LIMIT 20
+Answer:
+SOPInstanceUID,image_type_component
+1.3.6.1.4.1.5962.99.1.1044922547.1963990777.1637427495091.8.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1108512892.731820643.1637491085436.36.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1047094448.199228720.1637429666992.8.0,VOLUME
+1.3.6.1.4.1.5962.99.1.261465933.10684455.1640939005773.21.0,VOLUME
+1.3.6.1.4.1.5962.99.1.243644310.1665102434.1640921184150.28.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1097002722.192500967.1637479575266.8.0,VOLUME
+1.3.6.1.4.1.5962.99.1.1089046930.396095805.1637
+Query:
+--Description: 7️⃣  Scan EVERY modality (not only SM) for the phrase “freezing medium” inside
+--SpecimenDescriptionSequence to verify the text exists at all; once found, you can
+--re‑add modality or collection filters.  The query shows up to 20 raw JSON elements.
+SELECT
+       d."SOPInstanceUID",
+       d."Modality",
+       sd.value AS "specimen_description_json"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd
+WHERE LOWER(sd.value::STRING) ILIKE '%freezing%medium%'
+LIMIT 20
+Answer:
+SOPInstanceUID,Modality,specimen_description_json
+1.3.6.1.4.1.5962.99.1.1346514630.1626208723.1637729087174.8.0,SM,"{
+  ""PrimaryAnatomicStructureSequence"": [
+    {
+      ""CodeMeaning"": ""Breast"",
+      ""CodeValue"": ""76752008"",
+      ""CodingSchemeDesignator"": ""SCT"",
+      ""PrimaryAnatomicStructureModifierSequence"": [
+        {
+          ""CodeMeaning"": ""Neoplasm, Primary"",
+          ""CodeValue"": ""86049000"",
+          ""CodingSchemeDesignator"": ""SCT""
+        }
+      ]
+   
+Query:
+--Description: 8️⃣  Correlate compression UIDs with ImageType token “VOLUME” in LUAD / LUSC
+--collections (SM modality only).  This reconfirms that qualifying slides use JPEG
+--or JPEG2000 and that the VOLUME tag appears.
+SELECT
+       d."SOPInstanceUID",
+       d."TransferSyntaxUID",
+       it.value::STRING AS "image_type_component"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_name" ILIKE '%luad%'
+     OR d."collection_id"   ILIKE '%lusc%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+Answer:
+SOPInstanceUID,TransferSyntaxUID,image_type_component
+1.3.6.1.4.1.5962.99.1.249002240.1964169566.1640926542080.7.0,1.2.840.10008.1.2.4.50,VOLUME
+1.3.6.1.4.1.5962.99.1.1101478689.970961463.1637484051233.22.0,1.2.840.10008.1.2.4.50,VOLUME
+1.3.6.1.4.1.5962.99.1.1074896869.1425405933.1637457469413.36.0,1.2.840.10008.1.2.4.91,VOLUME
+1.3.6.1.4.1.5962.99.1.1121960988.1934590288.1637504533532.29.0,1.2.840.10008.1.2.4.91,VOLUME
+1.3.6.1.4.1.5962.99.1.1052967715.1643006843.1637435540259.8.0,1.2.840.10
+Query:
+--Description: 9️⃣  Produce a lightweight fact table of LUAD/LUSC SM VOLUME slides with
+--JPEG/JPEG2000 compression; no tissue or embedding filters yet.
+SELECT DISTINCT
+       d."SeriesInstanceUID" AS "digital_slide_id",
+       d."StudyInstanceUID"  AS "case_id",
+       d."PatientID"         AS "patient_id",
+       d."SOPInstanceUID"    AS "instance_id",
+       d."gcs_url",
+       d."Rows"              AS "height_px",
+       d."Columns"           AS "width_px",
+       d."PixelSpacing"      AS "pixel_spacing_var",
+       d."TransferSyntaxUID"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+Answer:
+digital_slide_id,case_id,patient_id,instance_id,gcs_url,height_px,width_px,pixel_spacing_var,TransferSyntaxUID
+1.3.6.1.4.1.5962.99.1.1061795037.1317282966.1637444367581.2.0,2.25.116861176680347298079770848680179258516,TCGA-50-5931,1.3.6.1.4.1.5962.99.1.1061795037.1317282966.1637444367581.8.0,gs://public-datasets-idc/bea140c4-0eef-4cea-8768-463cee51efb3/7195a85a-e150-4ca1-906c-fa63b361706f.dcm,256,256,[],1.2.840.10008.1.2.4.91
+1.3.6.1.4.1.5962.99.1.1041110477.1531474151.1637423683021.2.0,2.25.2
+Query:
+--Description: 🔟  Prototype end‑to‑end query for LUAD/LUSC SM VOLUME slides with JPEG/JPEG2000;
+--still omits tissue and embedding filters until those fields are confirmed.
+SELECT DISTINCT
+       d."SeriesInstanceUID"                    AS "digital_slide_id",
+       d."StudyInstanceUID"                     AS "case_id",
+       d."InstanceNumber"                       AS "physical_slide_id",
+       d."PatientID"                            AS "patient_id",
+       d."collection_id",
+       d."SOPInstanceUID"                       AS "instance_id",
+       d."gcs_url",
+       d."Columns"                              AS "width_px",
+       d."Rows"                                 AS "height_px",
+       d."PixelSpacing"                         AS "pixel_spacing_var",
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+         ELSE 'other'
+       END                                      AS "compression_type"
+FROM IDC.IDC_V17.DICOM_ALL d,
+     LATERAL FLATTEN(INPUT => d."ImageType") it
+WHERE d."Modality" = 'SM'
+  AND (d."collection_id"   ILIKE '%luad%' OR d."collection_id"   ILIKE '%lusc%'
+     OR d."collection_name" ILIKE '%luad%' OR d."collection_name" ILIKE '%lusc%')
+  AND it.value::STRING ILIKE '%VOLUME%'
+  AND d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50','1.2.840.10008.1.2.4.51',
+                                '1.2.840.10008.1.2.4.90','1.2.840.10008.1.2.4.91')
+LIMIT 20
+Answer:
+digital_slide_id,case_id,physical_slide_id,patient_id,collection_id,instance_id,gcs_url,width_px,height_px,pixel_spacing_var,compression_type
+1.3.6.1.4.1.5962.99.1.252665446.1781202268.1640930205286.2.0,2.25.326551812936395406186422178584529112797,3,C3N-00217,cptac_luad,1.3.6.1.4.1.5962.99.1.252665446.1781202268.1640930205286.21.0,gs://public-datasets-idc/53e3b8ae-b7ee-4e40-9aef-f3281cf1ad02/7c22ca4b-a68b-41e3-b4cd-fbc1d2d6aabc.dcm,240,240,[],jpeg
+1.3.6.1.4.1.5962.99.1.1062188680.1771293540.16
+End Exploring Related Columns
+Task: Could you provide a clean, structured dataset from dicom_all table that only includes SM images marked as VOLUME from the TCGA-LUAD and TCGA-LUSC collections, excluding any slides with compression type “other,” where the specimen preparation step explicitly has “Embedding medium” set to “Tissue freezing medium,” and ensuring that the tissue type is only “normal” or “tumor” and the cancer subtype is reported accordingly?
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+subject_id,collection,modality,image_type,compression,embedding_medium,tissue_type,cancer_subtype
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'IDC': {'IDC_V17': ['DICOM_ALL']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 02:56:44 - Thread-1003 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Digital slides from TCGA‑LUAD and TCGA‑LUSC that
+    – are SM / VOLUME images,
+    – are JPEG or JPEG2000 compressed,
+    – have “Tissue freezing medium” as embedding medium,
+    – contain normal (17621005) or tumor (86049000) tissue                */
+
+SELECT
+    d."SeriesInstanceUID"                                            AS digital_slide_id,     -- slide (= series) UID
+    d."StudyInstanceUID"                                             AS case_id,              -- study UID
+    d."InstanceNumber"                                               AS physical_slide_id,    -- laboratory slide number
+    d."PatientID"                                                    AS patient_id,           -- submitter‑provided
+    d."collection_id"                                                AS collection_id,        -- tcga-luad / tcga-lusc
+    d."SOPInstanceUID"                                               AS instance_id,          -- instance UID
+    d."gcs_url"                                                      AS gcs_url,              -- GCS location
+    d."Columns"                                                      AS width_px,             -- pixel width
+    d."Rows"                                                         AS height_px,            -- pixel height
+    d."PixelSpacing"::STRING                                         AS pixel_spacing_mm_per_px,
+    CASE                                                             -- compression label
+        WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                       '1.2.840.10008.1.2.4.51',
+                                       '1.2.840.10008.1.2.4.57',
+                                       '1.2.840.10008.1.2.4.70')    THEN 'jpeg'
+        WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                       '1.2.840.10008.1.2.4.91')    THEN 'jpeg2000'
+    END                                                              AS compression_type,
+    CASE ar.code_value
+        WHEN '17621005' THEN 'normal'
+        WHEN '86049000' THEN 'tumor'
+    END                                                              AS tissue_type,
+    CASE LOWER(d."collection_id")
+        WHEN 'tcga-luad' THEN 'luad'
+        WHEN 'tcga-lusc' THEN 'lscc'
+    END                                                              AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       /* one matching anatomy code (normal / tumor) */
+       , LATERAL (
+           SELECT  ar.value:"CodeValue"::STRING AS code_value
+           FROM   TABLE(FLATTEN(INPUT => d."AnatomicRegionSequence")) ar
+           WHERE  ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+           LIMIT 1
+         ) ar
+WHERE  d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND  d."Modality" = 'SM'
+  /* image is a VOLUME slide */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."ImageType")) it
+         WHERE  it.value::STRING ILIKE '%VOLUME%'
+       )
+  /* embedding medium = Tissue freezing medium */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."SpecimenDescriptionSequence")) sd
+         WHERE  LOWER(sd.value::STRING) ILIKE '%tissue freezing medium%'
+       )
+  /* JPEG / JPEG2000 transfer syntaxes only */
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:56:45 - Thread-1003 (execute) - INFO - itercount: 1
+2025-05-01 02:56:45 - Thread-1003 (execute) - INFO - [Self-refine]
+Input sql:
+/*  Digital slides from TCGA‑LUAD and TCGA‑LUSC that
+    – are SM / VOLUME images,
+    – are JPEG or JPEG2000 compressed,
+    – have “Tissue freezing medium” as embedding medium,
+    – contain normal (17621005) or tumor (86049000) tissue                */
+
+SELECT
+    d."SeriesInstanceUID"                                            AS digital_slide_id,     -- slide (= series) UID
+    d."StudyInstanceUID"                                             AS case_id,              -- study UID
+    d."InstanceNumber"                                               AS physical_slide_id,    -- laboratory slide number
+    d."PatientID"                                                    AS patient_id,           -- submitter‑provided
+    d."collection_id"                                                AS collection_id,        -- tcga-luad / tcga-lusc
+    d."SOPInstanceUID"                                               AS instance_id,          -- instance UID
+    d."gcs_url"                                                      AS gcs_url,              -- GCS location
+    d."Columns"                                                      AS width_px,             -- pixel width
+    d."Rows"                                                         AS height_px,            -- pixel height
+    d."PixelSpacing"::STRING                                         AS pixel_spacing_mm_per_px,
+    CASE                                                             -- compression label
+        WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                       '1.2.840.10008.1.2.4.51',
+                                       '1.2.840.10008.1.2.4.57',
+                                       '1.2.840.10008.1.2.4.70')    THEN 'jpeg'
+        WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                       '1.2.840.10008.1.2.4.91')    THEN 'jpeg2000'
+    END                                                              AS compression_type,
+    CASE ar.code_value
+        WHEN '17621005' THEN 'normal'
+        WHEN '86049000' THEN 'tumor'
+    END                                                              AS tissue_type,
+    CASE LOWER(d."collection_id")
+        WHEN 'tcga-luad' THEN 'luad'
+        WHEN 'tcga-lusc' THEN 'lscc'
+    END                                                              AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       /* one matching anatomy code (normal / tumor) */
+       , LATERAL (
+           SELECT  ar.value:"CodeValue"::STRING AS code_value
+           FROM   TABLE(FLATTEN(INPUT => d."AnatomicRegionSequence")) ar
+           WHERE  ar.value:"CodeValue"::STRING IN ('17621005','86049000')
+           LIMIT 1
+         ) ar
+WHERE  d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND  d."Modality" = 'SM'
+  /* image is a VOLUME slide */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."ImageType")) it
+         WHERE  it.value::STRING ILIKE '%VOLUME%'
+       )
+  /* embedding medium = Tissue freezing medium */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."SpecimenDescriptionSequence")) sd
+         WHERE  LOWER(sd.value::STRING) ILIKE '%tissue freezing medium%'
+       )
+  /* JPEG / JPEG2000 transfer syntaxes only */
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+The error information is:
+002031 (42601): SQL compilation error:
+Unsupported subquery type cannot be evaluated
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 02:57:10 - Thread-1003 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Digital slides from TCGA‑LUAD and TCGA‑LUSC that
+    – are SM / VOLUME images,
+    – are JPEG or JPEG2000 compressed,
+    – have “Tissue freezing medium” as embedding medium,
+    – contain normal (17621005) or tumor (86049000) tissue                */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                                            AS digital_slide_id,      -- slide (= series) UID
+       d."StudyInstanceUID"                                             AS case_id,               -- study UID
+       d."InstanceNumber"                                               AS physical_slide_id,     -- lab slide number
+       d."PatientID"                                                    AS patient_id,
+       d."collection_id"                                                AS collection_id,         -- tcga‑luad / tcga‑lusc
+       d."SOPInstanceUID"                                               AS instance_id,           -- DICOM instance UID
+       d."gcs_url"                                                      AS gcs_url,               -- GCS location
+       d."Columns"                                                      AS width_px,
+       d."Rows"                                                         AS height_px,
+       d."PixelSpacing"::STRING                                         AS pixel_spacing_mm_per_px,
+       CASE
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70')  THEN 'jpeg'
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91')  THEN 'jpeg2000'
+       END                                                              AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+           WHEN '17621005' THEN 'normal'
+           WHEN '86049000' THEN 'tumor'
+       END                                                              AS tissue_type,
+       CASE LOWER(d."collection_id")
+           WHEN 'tcga-luad' THEN 'luad'
+           WHEN 'tcga-lusc' THEN 'lscc'
+       END                                                              AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       /* flatten anatomy sequence and keep rows with desired codes */
+       CROSS JOIN LATERAL TABLE(FLATTEN(INPUT => d."AnatomicRegionSequence")) ar
+WHERE  d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND  d."Modality" = 'SM'
+  AND  ar.value:"CodeValue"::STRING IN ('17621005','86049000')          -- normal / tumor
+  /* image is a VOLUME slide */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."ImageType")) it
+         WHERE  it.value::STRING ILIKE '%VOLUME%'
+       )
+  /* embedding medium = Tissue freezing medium */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."SpecimenDescriptionSequence")) sd
+         WHERE  LOWER(sd.value::STRING) ILIKE '%tissue freezing medium%'
+       )
+  /* JPEG or JPEG2000 only */
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:57:11 - Thread-1003 (execute) - INFO - itercount: 2
+2025-05-01 02:57:11 - Thread-1003 (execute) - INFO - [Self-refine]
+Input sql:
+/*  Digital slides from TCGA‑LUAD and TCGA‑LUSC that
+    – are SM / VOLUME images,
+    – are JPEG or JPEG2000 compressed,
+    – have “Tissue freezing medium” as embedding medium,
+    – contain normal (17621005) or tumor (86049000) tissue                */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                                            AS digital_slide_id,      -- slide (= series) UID
+       d."StudyInstanceUID"                                             AS case_id,               -- study UID
+       d."InstanceNumber"                                               AS physical_slide_id,     -- lab slide number
+       d."PatientID"                                                    AS patient_id,
+       d."collection_id"                                                AS collection_id,         -- tcga‑luad / tcga‑lusc
+       d."SOPInstanceUID"                                               AS instance_id,           -- DICOM instance UID
+       d."gcs_url"                                                      AS gcs_url,               -- GCS location
+       d."Columns"                                                      AS width_px,
+       d."Rows"                                                         AS height_px,
+       d."PixelSpacing"::STRING                                         AS pixel_spacing_mm_per_px,
+       CASE
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70')  THEN 'jpeg'
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91')  THEN 'jpeg2000'
+       END                                                              AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+           WHEN '17621005' THEN 'normal'
+           WHEN '86049000' THEN 'tumor'
+       END                                                              AS tissue_type,
+       CASE LOWER(d."collection_id")
+           WHEN 'tcga-luad' THEN 'luad'
+           WHEN 'tcga-lusc' THEN 'lscc'
+       END                                                              AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       /* flatten anatomy sequence and keep rows with desired codes */
+       CROSS JOIN LATERAL TABLE(FLATTEN(INPUT => d."AnatomicRegionSequence")) ar
+WHERE  d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND  d."Modality" = 'SM'
+  AND  ar.value:"CodeValue"::STRING IN ('17621005','86049000')          -- normal / tumor
+  /* image is a VOLUME slide */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."ImageType")) it
+         WHERE  it.value::STRING ILIKE '%VOLUME%'
+       )
+  /* embedding medium = Tissue freezing medium */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."SpecimenDescriptionSequence")) sd
+         WHERE  LOWER(sd.value::STRING) ILIKE '%tissue freezing medium%'
+       )
+  /* JPEG or JPEG2000 only */
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+The error information is:
+001003 (42000): SQL compilation error:
+syntax error line 30 at position 26 unexpected 'TABLE'.
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 02:57:40 - Thread-1003 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Digital slides from TCGA‑LUAD and TCGA‑LUSC that
+    – are SM / VOLUME images,
+    – are JPEG or JPEG2000 compressed,
+    – have “Tissue freezing medium” as embedding medium,
+    – contain normal (17621005) or tumor (86049000) tissue                */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                               AS digital_slide_id,      -- slide (= series) UID
+       d."StudyInstanceUID"                                AS case_id,               -- study UID
+       d."InstanceNumber"                                  AS physical_slide_id,     -- lab slide number
+       d."PatientID"                                       AS patient_id,
+       d."collection_id"                                   AS collection_id,         -- tcga‑luad / tcga‑lusc
+       d."SOPInstanceUID"                                  AS instance_id,           -- DICOM instance UID
+       d."gcs_url"                                         AS gcs_url,               -- GCS location
+       d."Columns"                                         AS width_px,
+       d."Rows"                                            AS height_px,
+       d."PixelSpacing"::STRING                            AS pixel_spacing_mm_per_px,
+       CASE
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70') THEN 'jpeg'
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+       END                                               AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+           WHEN '17621005' THEN 'normal'
+           WHEN '86049000' THEN 'tumor'
+       END                                               AS tissue_type,
+       CASE LOWER(d."collection_id")
+           WHEN 'tcga-luad' THEN 'luad'
+           WHEN 'tcga-lusc' THEN 'lscc'
+       END                                               AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d,
+       LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar          -- tissue codes
+WHERE  d."collection_id" IN ('tcga-luad', 'tcga-lusc')
+  AND  d."Modality" = 'SM'
+  AND  ar.value:"CodeValue"::STRING IN ('17621005','86049000')          -- keep normal / tumor
+  /* must be a “VOLUME” slide                                            */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."ImageType")) it
+         WHERE  it.value::STRING ILIKE '%VOLUME%'
+       )
+  /* embedding medium must be Tissue freezing medium                     */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."SpecimenDescriptionSequence")) sd
+         WHERE  LOWER(sd.value::STRING) ILIKE '%tissue freezing medium%'
+       )
+  /* accept JPEG / JPEG2000 compression only                              */
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:57:40 - Thread-1003 (execute) - INFO - itercount: 3
+2025-05-01 02:57:40 - Thread-1003 (execute) - INFO - [Self-refine]
+Input sql:
+/*  Digital slides from TCGA‑LUAD and TCGA‑LUSC that
+    – are SM / VOLUME images,
+    – are JPEG or JPEG2000 compressed,
+    – have “Tissue freezing medium” as embedding medium,
+    – contain normal (17621005) or tumor (86049000) tissue                */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                               AS digital_slide_id,      -- slide (= series) UID
+       d."StudyInstanceUID"                                AS case_id,               -- study UID
+       d."InstanceNumber"                                  AS physical_slide_id,     -- lab slide number
+       d."PatientID"                                       AS patient_id,
+       d."collection_id"                                   AS collection_id,         -- tcga‑luad / tcga‑lusc
+       d."SOPInstanceUID"                                  AS instance_id,           -- DICOM instance UID
+       d."gcs_url"                                         AS gcs_url,               -- GCS location
+       d."Columns"                                         AS width_px,
+       d."Rows"                                            AS height_px,
+       d."PixelSpacing"::STRING                            AS pixel_spacing_mm_per_px,
+       CASE
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70') THEN 'jpeg'
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+       END                                               AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+           WHEN '17621005' THEN 'normal'
+           WHEN '86049000' THEN 'tumor'
+       END                                               AS tissue_type,
+       CASE LOWER(d."collection_id")
+           WHEN 'tcga-luad' THEN 'luad'
+           WHEN 'tcga-lusc' THEN 'lscc'
+       END                                               AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d,
+       LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar          -- tissue codes
+WHERE  d."collection_id" IN ('tcga-luad', 'tcga-lusc')
+  AND  d."Modality" = 'SM'
+  AND  ar.value:"CodeValue"::STRING IN ('17621005','86049000')          -- keep normal / tumor
+  /* must be a “VOLUME” slide                                            */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."ImageType")) it
+         WHERE  it.value::STRING ILIKE '%VOLUME%'
+       )
+  /* embedding medium must be Tissue freezing medium                     */
+  AND  EXISTS (
+         SELECT 1
+         FROM   TABLE(FLATTEN(INPUT => d."SpecimenDescriptionSequence")) sd
+         WHERE  LOWER(sd.value::STRING) ILIKE '%tissue freezing medium%'
+       )
+  /* accept JPEG / JPEG2000 compression only                              */
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+The error information is:
+002031 (42601): SQL compilation error:
+Unsupported subquery type cannot be evaluated
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 02:58:13 - Thread-1003 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  TCGA‑LUAD / TCGA‑LUSC digital slides
+    – SM modality & VOLUME images
+    – JPEG or JPEG2000 compression
+    – embedding medium “Tissue freezing medium”
+    – tissue type normal (17621005) or tumor (86049000)                 */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                         AS digital_slide_id,
+       d."StudyInstanceUID"                          AS case_id,
+       d."InstanceNumber"                            AS physical_slide_id,
+       d."PatientID"                                 AS patient_id,
+       d."collection_id"                             AS collection_id,
+       d."SOPInstanceUID"                            AS instance_id,
+       d."gcs_url"                                   AS gcs_url,
+       d."Columns"                                   AS width_px,
+       d."Rows"                                      AS height_px,
+       d."PixelSpacing"::STRING                      AS pixel_spacing_mm_per_px,
+       CASE
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70') THEN 'jpeg'
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+       END                                           AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+           WHEN '17621005' THEN 'normal'
+           WHEN '86049000' THEN 'tumor'
+       END                                           AS tissue_type,
+       CASE LOWER(d."collection_id")
+           WHEN 'tcga-luad' THEN 'luad'
+           WHEN 'tcga-lusc' THEN 'lscc'
+       END                                           AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       , LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar      -- tissue code
+WHERE  d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND  d."Modality" = 'SM'
+  AND  ar.value:"CodeValue"::STRING IN ('17621005','86049000')       -- keep normal / tumor
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')           -- JPEG / JPEG2000
+  AND  d."ImageType"::STRING ILIKE '%VOLUME%'                         -- volume slides
+  AND  d."SpecimenDescriptionSequence"::STRING
+           ILIKE '%tissue freezing medium%'                           -- embedding medium
+ORDER BY instance_id ASC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:58:14 - Thread-1003 (execute) - INFO - itercount: 4
+2025-05-01 02:58:14 - Thread-1003 (execute) - INFO - [Self-refine]
+Input sql:
+/*  TCGA‑LUAD / TCGA‑LUSC digital slides
+    – SM modality & VOLUME images
+    – JPEG or JPEG2000 compression
+    – embedding medium “Tissue freezing medium”
+    – tissue type normal (17621005) or tumor (86049000)                 */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                         AS digital_slide_id,
+       d."StudyInstanceUID"                          AS case_id,
+       d."InstanceNumber"                            AS physical_slide_id,
+       d."PatientID"                                 AS patient_id,
+       d."collection_id"                             AS collection_id,
+       d."SOPInstanceUID"                            AS instance_id,
+       d."gcs_url"                                   AS gcs_url,
+       d."Columns"                                   AS width_px,
+       d."Rows"                                      AS height_px,
+       d."PixelSpacing"::STRING                      AS pixel_spacing_mm_per_px,
+       CASE
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70') THEN 'jpeg'
+           WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+       END                                           AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+           WHEN '17621005' THEN 'normal'
+           WHEN '86049000' THEN 'tumor'
+       END                                           AS tissue_type,
+       CASE LOWER(d."collection_id")
+           WHEN 'tcga-luad' THEN 'luad'
+           WHEN 'tcga-lusc' THEN 'lscc'
+       END                                           AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       , LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence") ar      -- tissue code
+WHERE  d."collection_id" IN ('tcga-luad','tcga-lusc')
+  AND  d."Modality" = 'SM'
+  AND  ar.value:"CodeValue"::STRING IN ('17621005','86049000')       -- keep normal / tumor
+  AND  d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                 '1.2.840.10008.1.2.4.51',
+                                 '1.2.840.10008.1.2.4.57',
+                                 '1.2.840.10008.1.2.4.70',
+                                 '1.2.840.10008.1.2.4.90',
+                                 '1.2.840.10008.1.2.4.91')           -- JPEG / JPEG2000
+  AND  d."ImageType"::STRING ILIKE '%VOLUME%'                         -- volume slides
+  AND  d."SpecimenDescriptionSequence"::STRING
+           ILIKE '%tissue freezing medium%'                           -- embedding medium
+ORDER BY instance_id ASC;
+The error information is:
+No data found for the specified query.
+
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 02:58:33 - Thread-1003 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  TCGA‑LUAD / TCGA‑LUSC SM VOLUME slides
+    JPEG / JPEG2000 only, embedding medium = “Tissue freezing medium”,
+    tissue type = normal (17621005) or tumor (86049000)               */
+
+SELECT DISTINCT
+       d."SeriesInstanceUID"                         AS digital_slide_id,
+       d."StudyInstanceUID"                          AS case_id,
+       d."InstanceNumber"                            AS physical_slide_id,
+       d."PatientID"                                 AS patient_id,
+       d."collection_id"                             AS collection_id,
+       d."SOPInstanceUID"                            AS instance_id,
+       d."gcs_url"                                   AS gcs_url,
+       d."Columns"                                   AS width_px,
+       d."Rows"                                      AS height_px,
+       d."PixelSpacing"::STRING                      AS pixel_spacing_mm_per_px,
+       CASE
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.50',
+                                        '1.2.840.10008.1.2.4.51',
+                                        '1.2.840.10008.1.2.4.57',
+                                        '1.2.840.10008.1.2.4.70') THEN 'jpeg'
+         WHEN d."TransferSyntaxUID" IN ('1.2.840.10008.1.2.4.90',
+                                        '1.2.840.10008.1.2.4.91') THEN 'jpeg2000'
+       END                                           AS compression_type,
+       CASE ar.value:"CodeValue"::STRING
+         WHEN '17621005' THEN 'normal'
+         WHEN '86049000' THEN 'tumor'
+       END                                           AS tissue_type,
+       CASE LOWER(d."collection_id")
+         WHEN 'tcga-luad' THEN 'luad'
+         WHEN 'tcga-lusc' THEN 'lscc'
+       END                                           AS cancer_subtype
+FROM   IDC.IDC_V17."DICOM_ALL" d
+       , LATERAL FLATTEN(INPUT => d."ImageType")                it   -- ensure VOLUME
+       , LATERAL FLATTEN(INPUT => d."AnatomicRegionSequence")   ar   -- tissue code
+       , LATERAL FLATTEN(INPUT => d."SpecimenDescriptionSequence") sd -- embedding medium
+WHERE  d."collection_id"              IN ('tcga-luad', 'tcga-lusc')
+  AND  d."Modality"                   =  'SM'
+  AND  it.value::STRING               ILIKE '%VOLUME%'
+  AND  ar.value:"CodeValue"::STRING   IN ('17621005','86049000')
+  AND  LOWER(sd.value::STRING)        ILIKE '%tissue freezing medium%'
+  AND  d."TransferSyntaxUID"          IN ('1.2.840.10008.1.2.4.50',
+                                          '1.2.840.10008.1.2.4.51',
+                                          '1.2.840.10008.1.2.4.57',
+                                          '1.2.840.10008.1.2.4.70',
+                                          '1.2.840.10008.1.2.4.90',
+                                          '1.2.840.10008.1.2.4.91')
+ORDER BY instance_id ASC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:58:33 - Thread-1003 (execute) - INFO - Total iteration counts: 5
+2025-05-01 02:58:33 - Thread-1003 (execute) - INFO - Max Iter, remove file

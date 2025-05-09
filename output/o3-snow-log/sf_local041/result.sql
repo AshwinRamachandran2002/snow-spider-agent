@@ -1,0 +1,7 @@
+SELECT
+    ROUND(
+        (SUM(CASE WHEN "health" = 'Good' THEN 1 ELSE 0 END) / COUNT(*)::FLOAT) * 100,
+        4
+    ) AS "PERCENTAGE_GOOD_HEALTH_BRONX"
+FROM MODERN_DATA.MODERN_DATA.TREES
+WHERE "boroname" = 'Bronx';

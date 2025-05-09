@@ -1,0 +1,2281 @@
+2025-05-05 04:10:37 - Thread-2721 (execute) - INFO - [Exploration]
+```sql
+-- 1.  Look‐up all Targetome drug synonyms that contain the string “sorafenib”
+--     so we know which drugID(s) to use downstream.
+SELECT DISTINCT
+  `drugID`,
+  `synonym`
+FROM `isb-cgc-bq.targetome_versioned.drug_synonyms_v1`
+WHERE LOWER(`synonym`) LIKE '%sorafenib%'
+LIMIT 20;
+```
+
+```sql
+-- 2.  Retrieve every Targetome interaction row for the sorafenib drugID(s)
+--     together with its experiment meta-data so that assay filters can be applied.
+SELECT
+  i.`interactionID`,
+  i.`drugID`,
+  i.`targetID`,
+  i.`target_uniprotID`,
+  i.`targetSpecies`,
+  e.`expID`,
+  e.`exp_assayType`,
+  e.`exp_assayValueLow`,
+  e.`exp_assayValueMedian`,
+  e.`exp_assayValueHigh`,
+  e.`exp_assayUnits`
+FROM `isb-cgc-bq.targetome_versioned.interactions_v1`  AS i
+JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`   AS e
+  ON i.`expID` = e.`expID`
+WHERE i.`drugID` IN (/* drugID(s) for sorafenib from query-1 */)
+  AND LOWER(i.`targetSpecies`) = 'homo sapiens'
+  AND e.`exp_assayUnits` = 'nM'
+  AND e.`exp_assayValueMedian`  <= 100
+  AND (e.`exp_assayValueLow`    <= 100 OR e.`exp_assayValueLow`  IS NULL)
+  AND (e.`exp_assayValueHigh`   <= 100 OR e.`exp_assayValueHigh` IS NULL)
+LIMIT 20;
+```
+
+```sql
+-- 3.  Derive the de-duplicated list of Homo sapiens sorafenib targets that pass
+--     the potency filters in query-2.
+SELECT DISTINCT
+  `targetID`,
+  `target_uniprotID`
+FROM (
+  /* paste query-2 here without the LIMIT */
+) AS filt;
+```
+
+```sql
+-- 4.  Map those sorafenib targets (via UniProt) to Reactome physical entities
+--     so we can later traverse to pathways.
+SELECT DISTINCT
+  pe.`stable_id`       AS pe_stable_id,
+  pe.`uniprot_id`,
+  pe.`name`            AS pe_name
+FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+JOIN (
+  /* query-3 without LIMIT */
+) AS t
+  ON pe.`uniprot_id` = t.`target_uniprotID`
+LIMIT 20;
+```
+
+```sql
+-- 5.  Link the sorafenib physical entities to Reactome pathways that have TAS
+--     (Traceable Author Statement) evidence.
+SELECT DISTINCT
+  p2p.`pe_stable_id`,
+  p2p.`pathway_stable_id`
+FROM (
+  /* query-4 without LIMIT */
+) AS pe_tgt
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON pe_tgt.`pe_stable_id` = p2p.`pe_stable_id`
+WHERE p2p.`evidence_code` = 'TAS'
+LIMIT 20;
+```
+
+```sql
+-- 6.  Keep only lowest-level Homo sapiens pathways from query-5.
+SELECT DISTINCT
+  ph.`pathway_stable_id`     AS pathway_id,
+  pv.`name`                  AS pathway_name
+FROM (
+  /* query-5 without LIMIT */
+) AS ph
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON ph.`pathway_stable_id` = pv.`stable_id`
+WHERE pv.`species` = 'Homo sapiens'
+  AND pv.`lowest_level` = TRUE
+LIMIT 20;
+```
+
+```sql
+-- 7.  Build the universe of all Homo sapiens physical entities that have TAS
+--     evidence for ANY lowest-level pathway (needed for the “non-target” counts).
+SELECT DISTINCT
+  p2p.`pe_stable_id`
+FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+  ON p2p.`pathway_stable_id` = pv.`stable_id`
+WHERE pv.`species` = 'Homo sapiens'
+  AND pv.`lowest_level` = TRUE
+  AND p2p.`evidence_code` = 'TAS'
+LIMIT 20;
+```
+
+```sql
+-- 8.  For every candidate lowest-level pathway, count:
+--       a = # sorafenib targets inside the pathway
+--       b = # sorafenib targets outside the pathway
+--       c = # non-target entities inside the pathway
+--       d = # non-target entities outside the pathway
+--     and compute the chi-squared statistic.
+WITH
+targets AS ( /* query-4 without LIMIT */ ),
+universe AS ( /* query-7 without LIMIT */ ),
+path_pe AS (
+  SELECT
+    p2p.`pathway_stable_id` AS pathway_id,
+    p2p.`pe_stable_id`
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.`pathway_stable_id` = pv.`stable_id`
+  WHERE pv.`species` = 'Homo sapiens'
+    AND pv.`lowest_level` = TRUE
+    AND p2p.`evidence_code` = 'TAS'
+),
+stats AS (
+  SELECT
+    pp.`pathway_id`,
+    COUNTIF(pp.`pe_stable_id` IN (SELECT pe_stable_id FROM targets))             AS a,
+    (SELECT COUNT(*) FROM targets) - COUNTIF(pp.`pe_stable_id` IN (SELECT pe_stable_id FROM targets)) AS b,
+    COUNTIF(pp.`pe_stable_id` NOT IN (SELECT pe_stable_id FROM targets))         AS c,
+    (SELECT COUNT(*) FROM universe) - COUNTIF(pp.`pe_stable_id` IN (SELECT pe_stable_id FROM universe)) 
+      - ( (SELECT COUNT(*) FROM targets) - COUNTIF(pp.`pe_stable_id` IN (SELECT pe_stable_id FROM targets)) ) AS d
+  FROM path_pe AS pp
+  GROUP BY pp.`pathway_id`
+),
+chi AS (
+  SELECT
+    s.*,
+    /* chi-squared for 1 d.f.  𝜒² = Σ ( (O-E)² / E ) over the 4 cells */
+    SAFE_DIVIDE( (POW(a - ( (a+b)*(a+c)/(a+b+c+d) ), 2)) ,   ( (a+b)*(a+c)/(a+b+c+d) ) )
+  + SAFE_DIVIDE( (POW(b - ( (a+b)*(b+d)/(a+b+c+d) ), 2)) ,   ( (a+b)*(b+d)/(a+b+c+d) ) )
+  + SAFE_DIVIDE( (POW(c - ( (c+d)*(a+c)/(a+b+c+d) ), 2)) ,   ( (c+d)*(a+c)/(a+b+c+d) ) )
+  + SAFE_DIVIDE( (POW(d - ( (c+d)*(b+d)/(a+b+c+d) ), 2)) ,   ( (c+d)*(b+d)/(a+b+c+d) ) ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  c.`pathway_id`,
+  pv.`name`,
+  a, b, c, d,
+  chi_sq
+FROM chi  AS c
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON c.`pathway_id` = pv.`stable_id`
+ORDER BY chi_sq DESC
+LIMIT 10;
+```
+
+```sql
+-- 9.  Show the final 3 pathways with the highest chi-squared values and the 2×2
+--     contingency table for each (numbers already computed in query-8).
+SELECT *
+FROM ( /* query-8 without LIMIT */ )
+ORDER BY chi_sq DESC
+LIMIT 3;
+```
+
+```sql
+--10.  (Optional sanity check)  For one of the top pathways, list the actual
+--     sorafenib target physical entities that sit inside that pathway.
+SELECT DISTINCT
+  pe.`stable_id` AS pe_id,
+  pe.`name`
+FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+JOIN (
+  /* query-4 without LIMIT */
+) AS t
+  ON pe.`stable_id` = t.`pe_stable_id`
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON p2p.`pe_stable_id` = pe.`stable_id`
+WHERE p2p.`pathway_stable_id` = 'R-HSA-XXXXXX'   -- replace with one pathway_id from query-9
+  AND p2p.`evidence_code` = 'TAS'
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 04:10:37 - Thread-2721 (execute) - INFO - [Try to execute]
+-- 1.  Look‐up all Targetome drug synonyms that contain the string “sorafenib”
+--     so we know which drugID(s) to use downstream.
+SELECT DISTINCT
+  `drugID`,
+  `synonym`
+FROM `isb-cgc-bq.targetome_versioned.drug_synonyms_v1`
+WHERE LOWER(`synonym`) LIKE '%sorafenib%'
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:10:39 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1.  Look‐up all Targetome drug synonyms that contain the string “sorafenib”
+--     so we know which drugID(s) to use downstream.
+SELECT DISTINCT
+  `drugID`,
+  `synonym`
+FROM `isb-cgc-bq.targetome_versioned.drug_synonyms_v1`
+WHERE LOWER(`synonym`) LIKE '%sorafenib%'
+LIMIT 20;
+Results:
+drugID,synonym
+157,sorafenib tosylate
+157,Sorafenib Tosylate
+157,sorafenib
+157,SORAFENIB TOSYLATE
+157,Sorafenib
+157,SORAFENIB
+
+[Successfully executed]
+2025-05-05 04:10:39 - Thread-2721 (execute) - INFO - [Try to execute]
+-- 2.  Retrieve every Targetome interaction row for the sorafenib drugID(s)
+--     together with its experiment meta-data so that assay filters can be applied.
+SELECT
+  i.`interactionID`,
+  i.`drugID`,
+  i.`targetID`,
+  i.`target_uniprotID`,
+  i.`targetSpecies`,
+  e.`expID`,
+  e.`exp_assayType`,
+  e.`exp_assayValueLow`,
+  e.`exp_assayValueMedian`,
+  e.`exp_assayValueHigh`,
+  e.`exp_assayUnits`
+FROM `isb-cgc-bq.targetome_versioned.interactions_v1`  AS i
+JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`   AS e
+  ON i.`expID` = e.`expID`
+WHERE i.`drugID` IN (/* drugID(s) for sorafenib from query-1 */)
+  AND LOWER(i.`targetSpecies`) = 'homo sapiens'
+  AND e.`exp_assayUnits` = 'nM'
+  AND e.`exp_assayValueMedian`  <= 100
+  AND (e.`exp_assayValueLow`    <= 100 OR e.`exp_assayValueLow`  IS NULL)
+  AND (e.`exp_assayValueHigh`   <= 100 OR e.`exp_assayValueHigh` IS NULL)
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:10:40 - Thread-2721 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##400 Syntax error: Unexpected ")" at [18:64]; reason: invalidQuery, location: query, message: Syntax error: Unexpected ")" at [18:64]\n\nLocation: US\nJob ID: 6c3f5bae-d212-4319-9b0b-e31378be9b91\n'}
+[Error occurred]
+2025-05-05 04:11:28 - Thread-2721 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build a clean, de-duplicated list of Homo sapiens sorafenib targets
+--             that satisfy the potency filters (median ≤ 100 nM and low/high ≤ 100 nM
+--             or NULL).  We first collect all qualifying interactions in the CTE
+--             `sorafenib_hits`, then SELECT DISTINCT targetID and UniProt ID so
+--             the result can be fed directly into Reactome mapping in the next step.
+WITH sorafenib_hits AS (
+  SELECT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157                                   -- sorafenib
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  targetID,
+  target_uniprotID
+FROM sorafenib_hits
+ORDER BY target_uniprotID
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:11:30 - Thread-2721 (execute) - INFO - [Results for corrected sql]
+targetID,target_uniprotID
+416,O14757
+357,O43293
+334,O75582
+333,O75676
+3,P00519
+36,P00533
+104,P04049
+24,P07333
+109,P07949
+95,P09619
+77,P10721
+
+[Results for corrected sql]
+2025-05-05 04:12:51 - Thread-2721 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: (3)  Re-derive a DISTINCT list of Homo sapiens sorafenib targets
+--               (targetID & UniProt) that meet the potency criteria.  
+WITH sorafenib_hits AS (           -- same filter logic as in the corrected step-2
+  SELECT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157                                   -- sorafenib
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  targetID,
+  target_uniprotID
+FROM sorafenib_hits
+ORDER BY target_uniprotID
+LIMIT 20;
+```
+
+```sql
+--Description: (4)  Map those sorafenib targets (via UniProt) to Reactome
+--               physical entities and preview 20 of them.
+WITH sorafenib_targets AS (      -- step-3 without the LIMIT
+  SELECT DISTINCT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  pe.stable_id AS pe_stable_id,
+  pe.uniprot_id,
+  pe.name       AS pe_name
+FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+JOIN sorafenib_targets AS t
+  ON pe.uniprot_id = t.target_uniprotID
+LIMIT 20;
+```
+
+```sql
+--Description: (5)  Link the sorafenib physical entities to Reactome pathways
+--               that have TAS evidence.
+WITH sorafenib_pe AS (                 -- step-4 without LIMIT
+  SELECT DISTINCT
+    pe.stable_id AS pe_stable_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+)
+SELECT DISTINCT
+  p2p.pe_stable_id,
+  p2p.pathway_stable_id
+FROM sorafenib_pe            AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON sp.pe_stable_id = p2p.pe_stable_id
+WHERE p2p.evidence_code = 'TAS'
+LIMIT 20;
+```
+
+```sql
+--Description: (6)  Keep only lowest-level Homo sapiens pathways tied to the
+--               sorafenib physical entities (step-5) and preview 20.
+WITH sorafenib_path_pe AS (        -- step-5 without LIMIT
+  SELECT DISTINCT
+    p2p.pe_stable_id,
+    p2p.pathway_stable_id
+  FROM (
+    SELECT DISTINCT pe.stable_id AS pe_stable_id
+    FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+    JOIN (
+      SELECT DISTINCT target_uniprotID
+      FROM (
+        SELECT i.target_uniprotID
+        FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+        JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+          ON i.expID = e.expID
+        WHERE i.drugID = 157
+          AND LOWER(i.targetSpecies) = 'homo sapiens'
+          AND e.exp_assayUnits = 'nM'
+          AND e.exp_assayValueMedian <= 100
+          AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+          AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+      )
+    ) AS t
+    ON pe.uniprot_id = t.target_uniprotID
+  ) AS sp
+  JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+    ON sp.pe_stable_id = p2p.pe_stable_id
+  WHERE p2p.evidence_code = 'TAS'
+)
+SELECT DISTINCT
+  sp.pathway_stable_id AS pathway_id,
+  pv.name              AS pathway_name
+FROM sorafenib_path_pe AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON sp.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+LIMIT 20;
+```
+
+```sql
+--Description: (7)  Build a universe of ALL Homo sapiens physical entities
+--               associated (via TAS) with any lowest-level pathway.
+SELECT DISTINCT
+  p2p.pe_stable_id
+FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+  ON p2p.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20;
+```
+
+```sql
+--Description: (8)  Compute the 2×2 contingency counts (a, b, c, d) for every
+--               candidate pathway and its sorafenib targets, then calculate
+--               the chi-squared statistic.  Return the top 10 pathways.
+WITH targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+),
+universe AS (
+  SELECT DISTINCT pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+totals AS (
+  SELECT
+    (SELECT COUNT(*) FROM targets)  AS tgt_total,
+    (SELECT COUNT(*) FROM universe WHERE pe_id NOT IN (SELECT pe_id FROM targets)) AS non_tgt_total
+),
+counts AS (
+  SELECT
+    pp.pathway_id,
+    COUNTIF(pp.pe_id IN (SELECT pe_id FROM targets))                         AS a,
+    COUNTIF(pp.pe_id NOT IN (SELECT pe_id FROM targets))                     AS c
+  FROM path_pe AS pp
+  GROUP BY pp.pathway_id
+),
+chi AS (
+  SELECT
+    c.pathway_id,
+    a,
+    (SELECT tgt_total       FROM totals) - a                                 AS b,
+    c,
+    (SELECT non_tgt_total   FROM totals) - c                                 AS d,
+    -- χ² calculation
+    (
+      SAFE_DIVIDE(POW(a - ((a + b) * (a + c) / (a + b + c + d)), 2),
+                  ((a + b) * (a + c) / (a + b + c + d)))
+    + SAFE_DIVIDE(POW(b - ((a + b) * (b + d) / (a + b + c + d)), 2),
+                  ((a + b) * (b + d) / (a + b + c + d)))
+    + SAFE_DIVIDE(POW(c - ((c + d) * (a + c) / (a + b + c + d)), 2),
+                  ((c + d) * (a + c) / (a + b + c + d)))
+    + SAFE_DIVIDE(POW(d - ((c + d) * (b + d) / (a + b + c + d)), 2),
+                  ((c + d) * (b + d) / (a + b + c + d)))
+    ) AS chi_sq
+  FROM counts AS c
+  CROSS JOIN totals
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a, b, c, d,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 10;
+```
+
+```sql
+--Description: (9)  Retrieve the 3 pathways with the largest chi-squared values,
+--               displaying their contingency counts and chi-squared statistic.
+WITH chi_table AS (   -- include step-8 query without the final LIMIT
+  WITH targets AS (
+    SELECT DISTINCT pe.stable_id AS pe_id
+    FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+    JOIN (
+      SELECT DISTINCT target_uniprotID
+      FROM (
+        SELECT i.target_uniprotID
+        FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+        JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+          ON i.expID = e.expID
+        WHERE i.drugID = 157
+          AND LOWER(i.targetSpecies) = 'homo sapiens'
+          AND e.exp_assayUnits = 'nM'
+          AND e.exp_assayValueMedian <= 100
+          AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+          AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+      )
+    ) AS t
+    ON pe.uniprot_id = t.target_uniprotID
+  ),
+  universe AS (
+    SELECT DISTINCT pe_stable_id AS pe_id
+    FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+    JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+      ON p2p.pathway_stable_id = pv.stable_id
+    WHERE pv.species = 'Homo sapiens'
+      AND pv.lowest_level = TRUE
+      AND p2p.evidence_code = 'TAS'
+  ),
+  path_pe AS (
+    SELECT
+      p2p.pathway_stable_id AS pathway_id,
+      p2p.pe_stable_id      AS pe_id
+    FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+    JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+      ON p2p.pathway_stable_id = pv.stable_id
+    WHERE pv.species = 'Homo sapiens'
+      AND pv.lowest_level = TRUE
+      AND p2p.evidence_code = 'TAS'
+  ),
+  totals AS (
+    SELECT
+      (SELECT COUNT(*) FROM targets)  AS tgt_total,
+      (SELECT COUNT(*) FROM universe WHERE pe_id NOT IN (SELECT pe_id FROM targets)) AS non_tgt_total
+  ),
+  counts AS (
+    SELECT
+      pp.pathway_id,
+      COUNTIF(pp.pe_id IN (SELECT pe_id FROM targets))             AS a,
+      COUNTIF(pp.pe_id NOT IN (SELECT pe_id FROM targets))         AS c
+    FROM path_pe AS pp
+    GROUP BY pp.pathway_id
+  ),
+  chi AS (
+    SELECT
+      c.pathway_id,
+      a,
+      (SELECT tgt_total     FROM totals) - a                       AS b,
+      c,
+      (SELECT non_tgt_total FROM totals) - c                       AS d,
+      (
+        SAFE_DIVIDE(POW(a - ((a + b) * (a + c) / (a + b + c + d)), 2),
+                    ((a + b) * (a + c) / (a + b + c + d)))
+      + SAFE_DIVIDE(POW(b - ((a + b) * (b + d) / (a + b + c + d)), 2),
+                    ((a + b) * (b + d) / (a + b + c + d)))
+      + SAFE_DIVIDE(POW(c - ((c + d) * (a + c) / (a + b + c + d)), 2),
+                    ((c + d) * (a + c) / (a + b + c + d)))
+      + SAFE_DIVIDE(POW(d - ((c + d) * (b + d) / (a + b + c + d)), 2),
+                    ((c + d) * (b + d) / (a + b + c + d)))
+      ) AS chi_sq
+    FROM counts AS c
+    CROSS JOIN totals
+  )
+  SELECT
+    chi.pathway_id,
+    pv.name,
+    a, b, c, d,
+    chi_sq
+  FROM chi
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+    ON chi.pathway_id = pv.stable_id
+)
+SELECT *
+FROM chi_table
+ORDER BY chi_sq DESC
+LIMIT 3;
+```
+
+```sql
+--Description: (10)  Sanity-check: list the sorafenib target physical entities
+--                located inside a specific top pathway (replace PATH_ID).
+WITH sorafenib_targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id, pe.name
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+)
+SELECT DISTINCT
+  st.pe_id,
+  st.name
+FROM sorafenib_targets AS st
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON p2p.pe_stable_id = st.pe_id
+WHERE p2p.pathway_stable_id = 'PATH_ID'      -- replace with a pathway_id from step-9
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 04:12:51 - Thread-2721 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Build a clean, de-duplicated list of Homo sapiens sorafenib targets
+--             that satisfy the potency filters (median ≤ 100 nM and low/high ≤ 100 nM
+--             or NULL).  We first collect all qualifying interactions in the CTE
+--             `sorafenib_hits`, then SELECT DISTINCT targetID and UniProt ID so
+--             the result can be fed directly into Reactome mapping in the next step.
+WITH sorafenib_hits AS (
+  SELECT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157                                   -- sorafenib
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  targetID,
+  target_uniprotID
+FROM sorafenib_hits
+ORDER BY target_uniprotID
+LIMIT 20;
+Results:
+targetID,target_uniprotID
+416,O14757
+357,O43293
+334,O75582
+333,O75676
+3,P00519
+36,P00533
+104,P04049
+24,P07333
+109,P07949
+95,P09619
+77,P10721
+
+[Successfully corrected]
+2025-05-05 04:12:51 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (3)  Re-derive a DISTINCT list of Homo sapiens sorafenib targets
+--               (targetID & UniProt) that meet the potency criteria.  
+WITH sorafenib_hits AS (           -- same filter logic as in the corrected step-2
+  SELECT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157                                   -- sorafenib
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  targetID,
+  target_uniprotID
+FROM sorafenib_hits
+ORDER BY target_uniprotID
+LIMIT 20
+[Try to execute]
+2025-05-05 04:12:53 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (3)  Re-derive a DISTINCT list of Homo sapiens sorafenib targets
+--               (targetID & UniProt) that meet the potency criteria.  
+WITH sorafenib_hits AS (           -- same filter logic as in the corrected step-2
+  SELECT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157                                   -- sorafenib
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  targetID,
+  target_uniprotID
+FROM sorafenib_hits
+ORDER BY target_uniprotID
+LIMIT 20
+Results:
+targetID,target_uniprotID
+416,O14757
+357,O43293
+334,O75582
+333,O75676
+3,P00519
+36,P00533
+104,P04049
+24,P07333
+109,P07949
+95,P09619
+77,P10721
+
+[Successfully executed]
+2025-05-05 04:12:53 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (4)  Map those sorafenib targets (via UniProt) to Reactome
+--               physical entities and preview 20 of them.
+WITH sorafenib_targets AS (      -- step-3 without the LIMIT
+  SELECT DISTINCT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  pe.stable_id AS pe_stable_id,
+  pe.uniprot_id,
+  pe.name       AS pe_name
+FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+JOIN sorafenib_targets AS t
+  ON pe.uniprot_id = t.target_uniprotID
+LIMIT 20
+[Try to execute]
+2025-05-05 04:12:55 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (4)  Map those sorafenib targets (via UniProt) to Reactome
+--               physical entities and preview 20 of them.
+WITH sorafenib_targets AS (      -- step-3 without the LIMIT
+  SELECT DISTINCT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  pe.stable_id AS pe_stable_id,
+  pe.uniprot_id,
+  pe.name       AS pe_name
+FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+JOIN sorafenib_targets AS t
+  ON pe.uniprot_id = t.target_uniprotID
+LIMIT 20
+Results:
+pe_stable_id,uniprot_id,pe_name
+R-HSA-109786,P04049,"p-S259,S621-RAF1"
+R-HSA-113826,O14757,CHEK1
+R-HSA-113838,O14757,"p-S317,S345-CHEK1"
+R-HSA-1169417,P00533,p-6Y-EGFR G719S
+R-HSA-1169418,P00533,EGFR G719S
+R-HSA-1173211,P00533,p-6Y-EGFR L858R
+
+[Successfully executed]
+2025-05-05 04:12:55 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (5)  Link the sorafenib physical entities to Reactome pathways
+--               that have TAS evidence.
+WITH sorafenib_pe AS (                 -- step-4 without LIMIT
+  SELECT DISTINCT
+    pe.stable_id AS pe_stable_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+)
+SELECT DISTINCT
+  p2p.pe_stable_id,
+  p2p.pathway_stable_id
+FROM sorafenib_pe            AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON sp.pe_stable_id = p2p.pe_stable_id
+WHERE p2p.evidence_code = 'TAS'
+LIMIT 20
+[Try to execute]
+2025-05-05 04:12:58 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (5)  Link the sorafenib physical entities to Reactome pathways
+--               that have TAS evidence.
+WITH sorafenib_pe AS (                 -- step-4 without LIMIT
+  SELECT DISTINCT
+    pe.stable_id AS pe_stable_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+)
+SELECT DISTINCT
+  p2p.pe_stable_id,
+  p2p.pathway_stable_id
+FROM sorafenib_pe            AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON sp.pe_stable_id = p2p.pe_stable_id
+WHERE p2p.evidence_code = 'TAS'
+LIMIT 20
+Results:
+pe_stable_id,pathway_stable_id
+R-HSA-174231,R-HSA-68877
+R-HSA-174231,R-HSA-68882
+R-HSA-174231,R-HSA-68886
+R-HSA-8942610,R-HSA-69231
+R-HSA-8942610,R-HSA-69236
+R-HSA-8942610,R-HSA-69278
+R-HSA-174231,R-HSA-69278
+R-HSA-113838,R-HSA-69473
+
+[Successfully executed]
+2025-05-05 04:12:58 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (6)  Keep only lowest-level Homo sapiens pathways tied to the
+--               sorafenib physical entities (step-5) and preview 20.
+WITH sorafenib_path_pe AS (        -- step-5 without LIMIT
+  SELECT DISTINCT
+    p2p.pe_stable_id,
+    p2p.pathway_stable_id
+  FROM (
+    SELECT DISTINCT pe.stable_id AS pe_stable_id
+    FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+    JOIN (
+      SELECT DISTINCT target_uniprotID
+      FROM (
+        SELECT i.target_uniprotID
+        FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+        JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+          ON i.expID = e.expID
+        WHERE i.drugID = 157
+          AND LOWER(i.targetSpecies) = 'homo sapiens'
+          AND e.exp_assayUnits = 'nM'
+          AND e.exp_assayValueMedian <= 100
+          AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+          AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+      )
+    ) AS t
+    ON pe.uniprot_id = t.target_uniprotID
+  ) AS sp
+  JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+    ON sp.pe_stable_id = p2p.pe_stable_id
+  WHERE p2p.evidence_code = 'TAS'
+)
+SELECT DISTINCT
+  sp.pathway_stable_id AS pathway_id,
+  pv.name              AS pathway_name
+FROM sorafenib_path_pe AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON sp.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+LIMIT 20
+[Try to execute]
+2025-05-05 04:13:01 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (6)  Keep only lowest-level Homo sapiens pathways tied to the
+--               sorafenib physical entities (step-5) and preview 20.
+WITH sorafenib_path_pe AS (        -- step-5 without LIMIT
+  SELECT DISTINCT
+    p2p.pe_stable_id,
+    p2p.pathway_stable_id
+  FROM (
+    SELECT DISTINCT pe.stable_id AS pe_stable_id
+    FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+    JOIN (
+      SELECT DISTINCT target_uniprotID
+      FROM (
+        SELECT i.target_uniprotID
+        FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+        JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+          ON i.expID = e.expID
+        WHERE i.drugID = 157
+          AND LOWER(i.targetSpecies) = 'homo sapiens'
+          AND e.exp_assayUnits = 'nM'
+          AND e.exp_assayValueMedian <= 100
+          AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+          AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+      )
+    ) AS t
+    ON pe.uniprot_id = t.target_uniprotID
+  ) AS sp
+  JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+    ON sp.pe_stable_id = p2p.pe_stable_id
+  WHERE p2p.evidence_code = 'TAS'
+)
+SELECT DISTINCT
+  sp.pathway_stable_id AS pathway_id,
+  pv.name              AS pathway_name
+FROM sorafenib_path_pe AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON sp.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+LIMIT 20
+Results:
+pathway_id,pathway_name
+R-HSA-9702636,tandutinib-resistant FLT3 mutants
+R-HSA-202424,Downstream TCR signaling
+R-HSA-6785631,ERBB2 Regulates Cell Motility
+R-HSA-180292,GAB1 signalosome
+R-HSA-381340,Transcriptional regulation of white adipocyte differentiation
+R-HSA-445144,Signal transduction by L1
+R-HSA-9702620,quizartinib-resistant FLT3 mutants
+
+[Successfully executed]
+2025-05-05 04:13:01 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (7)  Build a universe of ALL Homo sapiens physical entities
+--               associated (via TAS) with any lowest-level pathway.
+SELECT DISTINCT
+  p2p.pe_stable_id
+FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+  ON p2p.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20
+[Try to execute]
+2025-05-05 04:13:03 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (7)  Build a universe of ALL Homo sapiens physical entities
+--               associated (via TAS) with any lowest-level pathway.
+SELECT DISTINCT
+  p2p.pe_stable_id
+FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+  ON p2p.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20
+Results:
+pe_stable_id
+R-HSA-68516
+R-HSA-68539
+R-HSA-68519
+R-HSA-68513
+R-HSA-68522
+R-HSA-68405
+R-HSA-68542
+R-HSA-3006646
+R-HSA-68655
+R-HSA-68649
+R-HSA-68639
+R-HSA-939184
+R-HSA-8866674
+R-HSA-947610
+R-HSA-68812
+R-HSA-68747
+
+[Successfully executed]
+2025-05-05 04:13:03 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (8)  Compute the 2×2 contingency counts (a, b, c, d) for every
+--               candidate pathway and its sorafenib targets, then calculate
+--               the chi-squared statistic.  Return the top 10 pathways.
+WITH targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+),
+universe AS (
+  SELECT DISTINCT pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+totals AS (
+  SELECT
+    (SELECT COUNT(*) FROM targets)  AS tgt_total,
+    (SELECT COUNT(*) FROM universe WHERE pe_id NOT IN (SELECT pe_id FROM targets)) AS non_tgt_total
+),
+counts AS (
+  SELECT
+    pp.pathway_id,
+    COUNTIF(pp.pe_id IN (SELECT pe_id FROM targets))                         AS a,
+    COUNTIF(pp.pe_id NOT IN (SELECT pe_id FROM targets))                     AS c
+  FROM path_pe AS pp
+  GROUP BY pp.pathway_id
+),
+chi AS (
+  SELECT
+    c.pathway_id,
+    a,
+    (SELECT tgt_total       FROM totals) - a                                 AS b,
+    c,
+    (SELECT non_tgt_total   FROM totals) - c                                 AS d,
+    -- χ² calculation
+    (
+      SAFE_DIVIDE(POW(a - ((a + b) * (a + c) / (a + b + c + d)), 2),
+                  ((a + b) * (a + c) / (a + b + c + d)))
+    + SAFE_DIVIDE(POW(b - ((a + b) * (b + d) / (a + b + c + d)), 2),
+                  ((a + b) * (b + d) / (a + b + c + d)))
+    + SAFE_DIVIDE(POW(c - ((c + d) * (a + c) / (a + b + c + d)), 2),
+                  ((c + d) * (a + c) / (a + b + c + d)))
+    + SAFE_DIVIDE(POW(d - ((c + d) * (b + d) / (a + b + c + d)), 2),
+                  ((c + d) * (b + d) / (a + b + c + d)))
+    ) AS chi_sq
+  FROM counts AS c
+  CROSS JOIN totals
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a, b, c, d,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 10
+[Try to execute]
+2025-05-05 04:13:05 - Thread-2721 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##400 No matching signature for operator -\n  Argument types: INT64, STRUCT<pathway_id STRING, a INT64, c INT64>\n  Signature: INT64 - INT64\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type INT64\n  Signature: NUMERIC - NUMERIC\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type NUMERIC\n  Signature: BIGNUMERIC - BIGNUMERIC\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type BIGNUMERIC\n  Signature: FLOAT64 - FLOAT64\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type FLOAT64\n  Signature: DATE - INT64\n    Argument 1: Unable to coerce type INT64 to expected type DATE\n  Signature: DATE - DATE\n    Argument 1: Unable to coerce type INT64 to expected type DATE\n  Signature: TIMESTAMP - TIMESTAMP\n    Argument 1: Unable to coerce type INT64 to expected type TIMESTAMP\n  Signature: DATETIME - DATETIME\n    Argument 1: Unable to coerce type INT64 to expected type DATETIME\n  Signature: TIME - TIME\n    Argument 1: Unable to coerce type INT64 to expected type TIME\n  Signature: TIMESTAMP - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type TIMESTAMP\n  Signature: DATE - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type DATE\n  Signature: DATETIME - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type DATETIME\n  Signature: INTERVAL - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type INTERVAL at [63:5]; reason: invalidQuery, location: query, message: No matching signature for operator -\n  Argument types: INT64, STRUCT<pathway_id STRING, a INT64, c INT64>\n  Signature: INT64 - INT64\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type INT64\n  Signature: NUMERIC - NUMERIC\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type NUMERIC\n  Signature: BIGNUMERIC - BIGNUMERIC\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type BIGNUMERIC\n  Signature: FLOAT64 - FLOAT64\n    Argument 2: Unable to coerce type STRUCT<pathway_id STRING, a INT64, c INT64> to expected type FLOAT64\n  Signature: DATE - INT64\n    Argument 1: Unable to coerce type INT64 to expected type DATE\n  Signature: DATE - DATE\n    Argument 1: Unable to coerce type INT64 to expected type DATE\n  Signature: TIMESTAMP - TIMESTAMP\n    Argument 1: Unable to coerce type INT64 to expected type TIMESTAMP\n  Signature: DATETIME - DATETIME\n    Argument 1: Unable to coerce type INT64 to expected type DATETIME\n  Signature: TIME - TIME\n    Argument 1: Unable to coerce type INT64 to expected type TIME\n  Signature: TIMESTAMP - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type TIMESTAMP\n  Signature: DATE - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type DATE\n  Signature: DATETIME - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type DATETIME\n  Signature: INTERVAL - INTERVAL\n    Argument 1: Unable to coerce type INT64 to expected type INTERVAL at [63:5]\n\nLocation: US\nJob ID: dbdaa6fa-6236-4fbf-8f73-d417aee74b50\n'}
+[Error occurred]
+2025-05-05 04:15:03 - Thread-2721 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Build a 2×2 contingency table for every lowest-level Homo sapiens
+--              Reactome pathway (TAS evidence) versus sorafenib-target physical
+--              entities that meet ≤100 nM potency.  Compute
+--                  χ² = ((ad − bc)² · N) / ((a+b)(c+d)(a+c)(b+d))
+--              and return the 10 pathways with the largest χ² statistics.
+WITH
+/* 1 ─ Sorafenib physical entities (targets) that satisfy potency filters */
+targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies) = 'homo sapiens'
+      AND e.exp_assayUnits      = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit
+  ON pe.uniprot_id = hit.target_uniprotID
+),
+/* 2 ─ Universe of PEs in any TAS-supported lowest-level H.s. pathway */
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+/* 3 ─ Counts of total targets and non-targets in the universe */
+totals AS (
+  SELECT
+    COUNT(*)                                           AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets))  AS non_tgt_total
+  FROM universe
+),
+/* 4 ─ PE ↔ pathway pairs restricted to TAS / lowest-level / H.s. */
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+/* 5 ─ a (targets in) and c (non-targets in) for each pathway */
+in_counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM targets)) AS a,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets)) AS c
+  FROM path_pe
+  GROUP BY pathway_id
+),
+/* 6 ─ add b and d using totals; compute χ² */
+stats AS (
+  SELECT
+    ic.pathway_id,
+    ic.a,
+    (tot.tgt_total     - ic.a) AS b,
+    ic.c,
+    (tot.non_tgt_total - ic.c) AS d
+  FROM in_counts AS ic
+  CROSS JOIN totals AS tot
+),
+chi AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW( (s.a * s.d) - (s.b * s.c), 2 ) * (s.a + s.b + s.c + s.d),
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a   AS in_targets,
+  b   AS out_targets,
+  c   AS in_non_targets,
+  d   AS out_non_targets,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 10;
+```
+[Corrected SQL]
+2025-05-05 04:15:07 - Thread-2721 (execute) - INFO - [Results for corrected sql]
+pathway_id,name,in_targets,out_targets,in_non_targets,out_non_targets,chi_sq
+R-HSA-9723905,Loss of function of TP53 in cancer due to loss of tetramerization ability,0,25433,1301,23618,1363.0542384583396
+R-HSA-6798695,Neutrophil degranulation,3,25430,1286,23633,1337.737949574124
+R-HSA-1442490,Collagen degradation,0,25433,1043,23876,1087.0307263444083
+
+[Results for corrected sql]
+2025-05-05 04:15:34 - Thread-2721 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: (9)  Re-compute the χ² statistics with the corrected column
+--               references (no alias/column name clash) and return the
+--               three pathways with the highest values.
+WITH
+targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies) = 'homo sapiens'
+      AND e.exp_assayUnits      = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit ON pe.uniprot_id = hit.target_uniprotID
+),
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+totals AS (
+  SELECT
+    COUNT(*)                                           AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets))  AS non_tgt_total
+  FROM universe
+),
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM targets)) AS a,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets)) AS c
+  FROM path_pe
+  GROUP BY pathway_id
+),
+stats AS (
+  SELECT
+    cnt.pathway_id,
+    cnt.a,
+    (tot.tgt_total     - cnt.a) AS b,
+    cnt.c,
+    (tot.non_tgt_total - cnt.c) AS d
+  FROM counts AS cnt
+  CROSS JOIN totals AS tot
+),
+chi AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW((s.a * s.d) - (s.b * s.c), 2) * (s.a + s.b + s.c + s.d),
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a AS in_targets,
+  b AS out_targets,
+  c AS in_non_targets,
+  d AS out_non_targets,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 3;
+```
+
+```sql
+--Description: (10)  List the sorafenib-target physical entities found in a
+--               specific pathway returned by query-9.  Replace PATH_ID with
+--               one of those three pathway IDs.
+WITH sorafenib_targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id,
+                  pe.name
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies)  = 'homo sapiens'
+      AND e.exp_assayUnits        = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit ON pe.uniprot_id = hit.target_uniprotID
+)
+SELECT DISTINCT
+  st.pe_id,
+  st.name
+FROM sorafenib_targets AS st
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON p2p.pe_stable_id = st.pe_id
+WHERE p2p.pathway_stable_id = 'PATH_ID'   -- <-- replace with actual pathway_id
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 04:15:34 - Thread-2721 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Build a 2×2 contingency table for every lowest-level Homo sapiens
+--              Reactome pathway (TAS evidence) versus sorafenib-target physical
+--              entities that meet ≤100 nM potency.  Compute
+--                  χ² = ((ad − bc)² · N) / ((a+b)(c+d)(a+c)(b+d))
+--              and return the 10 pathways with the largest χ² statistics.
+WITH
+/* 1 ─ Sorafenib physical entities (targets) that satisfy potency filters */
+targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies) = 'homo sapiens'
+      AND e.exp_assayUnits      = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit
+  ON pe.uniprot_id = hit.target_uniprotID
+),
+/* 2 ─ Universe of PEs in any TAS-supported lowest-level H.s. pathway */
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+/* 3 ─ Counts of total targets and non-targets in the universe */
+totals AS (
+  SELECT
+    COUNT(*)                                           AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets))  AS non_tgt_total
+  FROM universe
+),
+/* 4 ─ PE ↔ pathway pairs restricted to TAS / lowest-level / H.s. */
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+/* 5 ─ a (targets in) and c (non-targets in) for each pathway */
+in_counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM targets)) AS a,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets)) AS c
+  FROM path_pe
+  GROUP BY pathway_id
+),
+/* 6 ─ add b and d using totals; compute χ² */
+stats AS (
+  SELECT
+    ic.pathway_id,
+    ic.a,
+    (tot.tgt_total     - ic.a) AS b,
+    ic.c,
+    (tot.non_tgt_total - ic.c) AS d
+  FROM in_counts AS ic
+  CROSS JOIN totals AS tot
+),
+chi AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW( (s.a * s.d) - (s.b * s.c), 2 ) * (s.a + s.b + s.c + s.d),
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a   AS in_targets,
+  b   AS out_targets,
+  c   AS in_non_targets,
+  d   AS out_non_targets,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 10;
+Results:
+pathway_id,name,in_targets,out_targets,in_non_targets,out_non_targets,chi_sq
+R-HSA-9723905,Loss of function of TP53 in cancer due to loss of tetramerization ability,0,25433,1301,23618,1363.0542384583396
+R-HSA-6798695,Neutrophil degranulation,3,25430,1286,23633,1337.737949574124
+R-HSA-1442490,Collagen degradation,0,25433,1043,23876,1087.0307263444083
+
+[Successfully corrected]
+2025-05-05 04:15:34 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (9)  Re-compute the χ² statistics with the corrected column
+--               references (no alias/column name clash) and return the
+--               three pathways with the highest values.
+WITH
+targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies) = 'homo sapiens'
+      AND e.exp_assayUnits      = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit ON pe.uniprot_id = hit.target_uniprotID
+),
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+totals AS (
+  SELECT
+    COUNT(*)                                           AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets))  AS non_tgt_total
+  FROM universe
+),
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM targets)) AS a,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets)) AS c
+  FROM path_pe
+  GROUP BY pathway_id
+),
+stats AS (
+  SELECT
+    cnt.pathway_id,
+    cnt.a,
+    (tot.tgt_total     - cnt.a) AS b,
+    cnt.c,
+    (tot.non_tgt_total - cnt.c) AS d
+  FROM counts AS cnt
+  CROSS JOIN totals AS tot
+),
+chi AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW((s.a * s.d) - (s.b * s.c), 2) * (s.a + s.b + s.c + s.d),
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a AS in_targets,
+  b AS out_targets,
+  c AS in_non_targets,
+  d AS out_non_targets,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 3
+[Try to execute]
+2025-05-05 04:15:39 - Thread-2721 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (9)  Re-compute the χ² statistics with the corrected column
+--               references (no alias/column name clash) and return the
+--               three pathways with the highest values.
+WITH
+targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies) = 'homo sapiens'
+      AND e.exp_assayUnits      = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit ON pe.uniprot_id = hit.target_uniprotID
+),
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+totals AS (
+  SELECT
+    COUNT(*)                                           AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets))  AS non_tgt_total
+  FROM universe
+),
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM targets)) AS a,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets)) AS c
+  FROM path_pe
+  GROUP BY pathway_id
+),
+stats AS (
+  SELECT
+    cnt.pathway_id,
+    cnt.a,
+    (tot.tgt_total     - cnt.a) AS b,
+    cnt.c,
+    (tot.non_tgt_total - cnt.c) AS d
+  FROM counts AS cnt
+  CROSS JOIN totals AS tot
+),
+chi AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW((s.a * s.d) - (s.b * s.c), 2) * (s.a + s.b + s.c + s.d),
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a AS in_targets,
+  b AS out_targets,
+  c AS in_non_targets,
+  d AS out_non_targets,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 3
+Results:
+pathway_id,name,in_targets,out_targets,in_non_targets,out_non_targets,chi_sq
+R-HSA-9723905,Loss of function of TP53 in cancer due to loss of tetramerization ability,0,25433,1301,23618,1363.0542384583396
+R-HSA-6798695,Neutrophil degranulation,3,25430,1286,23633,1337.737949574124
+R-HSA-1442490,Collagen degradation,0,25433,1043,23876,1087.0307263444083
+
+[Successfully executed]
+2025-05-05 04:15:39 - Thread-2721 (execute) - INFO - [Try to execute]
+--Description: (10)  List the sorafenib-target physical entities found in a
+--               specific pathway returned by query-9.  Replace PATH_ID with
+--               one of those three pathway IDs.
+WITH sorafenib_targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id,
+                  pe.name
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies)  = 'homo sapiens'
+      AND e.exp_assayUnits        = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit ON pe.uniprot_id = hit.target_uniprotID
+)
+SELECT DISTINCT
+  st.pe_id,
+  st.name
+FROM sorafenib_targets AS st
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON p2p.pe_stable_id = st.pe_id
+WHERE p2p.pathway_stable_id = 'PATH_ID'   -- <-- replace with actual pathway_id
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20
+[Try to execute]
+2025-05-05 04:15:44 - Thread-2721 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 04:16:47 - Thread-2721 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Fetch sorafenib-target physical entities (PEs) that belong to the
+--              Reactome pathway “Neutrophil degranulation” (R-HSA-6798695).
+--              We keep only two simple filters:
+--                 • drugID = 157 (sorafenib)
+--                 • median assay value ≤ 100 (nM or any unit)
+--              All other assay-value and evidence-code restrictions are removed
+--              to maximise the chance of finding matches.
+WITH sorafenib_pe AS (
+  SELECT DISTINCT
+         pe.stable_id AS pe_id,
+         pe.name
+  FROM  `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN  (
+          SELECT DISTINCT i.target_uniprotID
+          FROM   `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+          JOIN   `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+                 ON i.expID = e.expID
+          WHERE  i.drugID = 157                     -- sorafenib
+            AND  LOWER(i.targetSpecies) = 'homo sapiens'
+            AND  e.exp_assayValueMedian <= 100      -- potency ≤ 100 (any units)
+        ) AS hit
+    ON pe.uniprot_id = hit.target_uniprotID
+)
+SELECT DISTINCT
+       sp.pe_id,
+       sp.name
+FROM   sorafenib_pe AS sp
+JOIN   `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+       ON p2p.pe_stable_id = sp.pe_id
+WHERE  p2p.pathway_stable_id = 'R-HSA-6798695'           -- Neutrophil degranulation
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:16:50 - Thread-2721 (execute) - INFO - [Results for corrected sql]
+pe_id,name
+R-HSA-6803280,MAPK14
+R-HSA-6803300,MAPK14
+R-HSA-6806453,MAPK14
+
+[Results for corrected sql]
+2025-05-05 04:16:50 - Thread-2721 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Fetch sorafenib-target physical entities (PEs) that belong to the
+--              Reactome pathway “Neutrophil degranulation” (R-HSA-6798695).
+--              We keep only two simple filters:
+--                 • drugID = 157 (sorafenib)
+--                 • median assay value ≤ 100 (nM or any unit)
+--              All other assay-value and evidence-code restrictions are removed
+--              to maximise the chance of finding matches.
+WITH sorafenib_pe AS (
+  SELECT DISTINCT
+         pe.stable_id AS pe_id,
+         pe.name
+  FROM  `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN  (
+          SELECT DISTINCT i.target_uniprotID
+          FROM   `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+          JOIN   `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+                 ON i.expID = e.expID
+          WHERE  i.drugID = 157                     -- sorafenib
+            AND  LOWER(i.targetSpecies) = 'homo sapiens'
+            AND  e.exp_assayValueMedian <= 100      -- potency ≤ 100 (any units)
+        ) AS hit
+    ON pe.uniprot_id = hit.target_uniprotID
+)
+SELECT DISTINCT
+       sp.pe_id,
+       sp.name
+FROM   sorafenib_pe AS sp
+JOIN   `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+       ON p2p.pe_stable_id = sp.pe_id
+WHERE  p2p.pathway_stable_id = 'R-HSA-6798695'           -- Neutrophil degranulation
+LIMIT 20;
+Results:
+pe_id,name
+R-HSA-6803280,MAPK14
+R-HSA-6803300,MAPK14
+R-HSA-6806453,MAPK14
+
+[Successfully corrected]
+2025-05-05 04:16:50 - Thread-2721 (execute) - INFO - itercount: 0
+2025-05-05 04:16:50 - Thread-2721 (execute) - INFO - [Self-refine]
+Table full name: isb-cgc-bq.reactome_versioned.pathway_hierarchy_v77
+Column name: parent_id Type: STRING Description: Reactome pathway stable identifier associated with 'child' pathways
+Column name: child_id Type: STRING Description: Reactome pathway stable identifier associated with 'parent' pathways
+Sample rows:
+[{'parent_id': 'R-HSA-15869', 'child_id': 'R-HSA-8956319'}, {'parent_id': 'R-HSA-15869', 'child_id': 'R-HSA-499943'}, {'parent_id': 'R-HSA-15869', 'child_id': 'R-HSA-8956320'}, {'parent_id': 'R-HSA-15869', 'child_id': 'R-HSA-8956321'}, {'parent_id': 'R-HSA-68867', 'child_id': 'R-HSA-68616'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.reactome_versioned.pe_to_pathway_v77
+Column name: pe_stable_id Type: STRING Description: Reactome physical entity stable identifier
+Column name: pathway_stable_id Type: STRING Description: Reactome pathway stable identifier
+Column name: evidence_code Type: STRING Description: Code that indicates the type of evidence supporting physical entity relation to pathway
+Sample rows:
+[{'pe_stable_id': 'R-HSA-904852', 'pathway_stable_id': 'R-HSA-15869', 'evidence_code': 'IEA'}, {'pe_stable_id': 'R-HSA-6786263', 'pathway_stable_id': 'R-HSA-15869', 'evidence_code': 'IEA'}, {'pe_stable_id': 'R-HSA-2311338', 'pathway_stable_id': 'R-HSA-68875', 'evidence_code': 'IEA'}, {'pe_stable_id': 'R-HSA-165978', 'pathway_stable_id': 'R-HSA-68875', 'evidence_code': 'IEA'}, {'pe_stable_id': 'R-HSA-2168081', 'pathway_stable_id': 'R-HSA-68875', 'evidence_code': 'IEA'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.reactome_versioned.physical_entity_v77
+Column name: ensembl_id Type: STRING Description: Ensembl database identifier
+Column name: uniprot_id Type: STRING Description: UniProt database identifier
+Column name: stable_id Type: STRING Description: Reactome physical entity stable identifier
+Column name: name Type: STRING Description: Reactome physical entity name
+Column name: location Type: STRING Description: Reactome physical entity location
+Sample rows:
+[{'ensembl_id': 'ENSP00000494175', 'uniprot_id': 'P68871', 'stable_id': 'R-HSA-1008196', 'name': 'HBB', 'location': 'cytosol'}, {'ensembl_id': 'ENST00000647020', 'uniprot_id': 'P68871', 'stable_id': 'R-HSA-1008196', 'name': 'HBB', 'location': 'cytosol'}, {'ensembl_id': 'ENSP00000333994', 'uniprot_id': 'P68871', 'stable_id': 'R-HSA-1008196', 'name': 'HBB', 'location': 'cytosol'}, {'ensembl_id': 'ENSG00000244734', 'uniprot_id': 'P68871', 'stable_id': 'R-HSA-1008196', 'name': 'HBB', 'location': 'cytosol'}, {'ensembl_id': 'ENST00000335295', 'uniprot_id': 'P68871', 'stable_id': 'R-HSA-1008196', 'name': 'HBB', 'location': 'cytosol'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.reactome_versioned.pathway_v77
+Column name: stable_id Type: STRING Description: Reactome pathway stable identifier
+Column name: url Type: STRING Description: URL to pathway on the Reactome website
+Column name: name Type: STRING Description: Reactome pathway name
+Column name: species Type: STRING Description: Reactome pathway species
+Column name: lowest_level Type: BOOL Description: Indicates if pathway is at the lowest level in the hierarchy, i.e., not a parent
+Sample rows:
+[{'stable_id': 'R-HSA-8956319', 'url': 'https://reactome.org/PathwayBrowser/#/R-HSA-8956319', 'name': 'Nucleobase catabolism', 'species': 'Homo sapiens', 'lowest_level': False}, {'stable_id': 'R-HSA-5654743', 'url': 'https://reactome.org/PathwayBrowser/#/R-HSA-5654743', 'name': 'Signaling by FGFR4', 'species': 'Homo sapiens', 'lowest_level': False}, {'stable_id': 'R-HSA-3296482', 'url': 'https://reactome.org/PathwayBrowser/#/R-HSA-3296482', 'name': 'Defects in vitamin and cofactor metabolism', 'species': 'Homo sapiens', 'lowest_level': False}, {'stable_id': 'R-HSA-5684996', 'url': 'https://reactome.org/PathwayBrowser/#/R-HSA-5684996', 'name': 'MAPK1/MAPK3 signaling', 'species': 'Homo sapiens', 'lowest_level': False}, {'stable_id': 'R-HSA-5654732', 'url': 'https://reactome.org/PathwayBrowser/#/R-HSA-5654732', 'name': 'Negative regulation of FGFR3 signaling', 'species': 'Homo sapiens', 'lowest_level': False}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.targetome_versioned.target_synonyms_v1
+Column name: targetID Type: INT64 Description: ID for Targetome target
+Column name: synonym Type: STRING Description: Synonym or alias for Targetome target
+Sample rows:
+[{'targetID': 256, 'synonym': 'Tyrosine-protein kinase HCK'}, {'targetID': 512, 'synonym': 'nuclear receptor coactivator 3 isoform a'}, {'targetID': 768, 'synonym': 'Serine/threonine-protein kinase Nek3'}, {'targetID': 1, 'synonym': 'HTR3A'}, {'targetID': 1, 'synonym': '5-hydroxytryptamine receptor 3A'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.targetome_versioned.sources_v1
+Column name: sourceID Type: INT64 Description: ID for source supporting Targetome interaction
+Column name: PubMedID Type: STRING Description: PubMedID identifying literature
+Column name: databaseName Type: STRING Description: Name of database from which supporting evidence and literature are obtained
+Column name: db_version Type: STRING Description: Database version
+Column name: db_downloadURL Type: STRING Description: URL from which database was downloaded
+Column name: db_downloadDate Type: STRING Description: Date on which database was downloaded
+Sample rows:
+[{'sourceID': 1, 'PubMedID': '7565620', 'databaseName': 'IUPHAR', 'db_version': None, 'db_downloadURL': None, 'db_downloadDate': '06.15.2016'}, {'sourceID': 2, 'PubMedID': '11489465', 'databaseName': 'IUPHAR', 'db_version': None, 'db_downloadURL': None, 'db_downloadDate': '06.15.2016'}, {'sourceID': 3, 'PubMedID': '8818349', 'databaseName': 'IUPHAR', 'db_version': None, 'db_downloadURL': None, 'db_downloadDate': '06.15.2016'}, {'sourceID': 4, 'PubMedID': '20724042', 'databaseName': 'IUPHAR', 'db_version': None, 'db_downloadURL': None, 'db_downloadDate': '06.15.2016'}, {'sourceID': 5, 'PubMedID': '12543790', 'databaseName': 'IUPHAR', 'db_version': None, 'db_downloadURL': None, 'db_downloadDate': '06.15.2016'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.targetome_versioned.interactions_v1
+Column name: interactionID Type: INT64 Description: ID for Targetome drug to target interaction
+Column name: drugID Type: INT64 Description: ID of drug involved in interaction
+Column name: targetID Type: INT64 Description: ID of target (e.g., protein, DNA, RNA) involved in interaction
+Column name: interactionType Type: STRING Description: Type of Targetome interaction, e.g., Antagonist, Inhibition, etc.
+Column name: drugName Type: STRING Description: Name of the Targetome drug
+Column name: drug_approvalDate Type: STRING Description: Date drug was approved for use
+Column name: drug_atcClassID Type: STRING Description: Anatomical Therapeutic Chemical (ATC) drug classification ID
+Column name: drug_atcClassName Type: STRING Description: Anatomical Therapeutic Chemical (ATC) drug classification name
+Column name: drug_atcClassStatus Type: STRING Description: Anatomical Therapeutic Chemical (ATC) approval status
+Column name: drug_epcClassID Type: STRING Description: FDA Established Pharmacologic Class (EPC) drug classification ID
+Column name: drug_epcClassName Type: STRING Description: FDA Established Pharmacologic Class (EPC) drug classification name
+Column name: targetName Type: STRING Description: Name of Targetome target
+Column name: targetType Type: STRING Description: Type of Targetome target (e.g., protein, DNA, or RNA)
+Column name: target_uniprotID Type: STRING Description: Uniprot ID of Targetome target
+Column name: targetSpecies Type: STRING Description: Species of Targetome target
+Column name: sourceID Type: INT64 Description: ID for source supporting Targetome interaction
+Column name: expID Type: INT64 Description: ID for experimental evidence supporting Targetome interaction
+Sample rows:
+[{'interactionID': 77, 'drugID': 119, 'targetID': 40, 'interactionType': 'Inhibition', 'drugName': 'Pamidronate Disodium', 'drug_approvalDate': '1991-10-31', 'drug_atcClassID': None, 'drug_atcClassName': None, 'drug_atcClassStatus': None, 'drug_epcClassID': 'N0000175579', 'drug_epcClassName': 'Bisphosphonate', 'targetName': 'FDPS', 'targetType': 'Protein', 'target_uniprotID': 'P14324', 'targetSpecies': 'Homo sapiens', 'sourceID': 139, 'expID': 68}, {'interactionID': 77, 'drugID': 119, 'targetID': 40, 'interactionType': 'Inhibition', 'drugName': 'Pamidronate Disodium', 'drug_approvalDate': '1991-10-31', 'drug_atcClassID': None, 'drug_atcClassName': None, 'drug_atcClassStatus': None, 'drug_epcClassID': 'N0000175579', 'drug_epcClassName': 'Bisphosphonate', 'targetName': 'FDPS', 'targetType': 'Protein', 'target_uniprotID': 'P14324', 'targetSpecies': 'Homo sapiens', 'sourceID': 277, 'expID': 68}, {'interactionID': 77, 'drugID': 119, 'targetID': 40, 'interactionType': 'Inhibition', 'drugName': 'Pamidronate Disodium', 'drug_approvalDate': '1991-10-31', 'drug_atcClassID': None, 'drug_atcClassName': None, 'drug_atcClassStatus': None, 'drug_epcClassID': 'N0000175579', 'drug_epcClassName': 'Bisphosphonate', 'targetName': 'FDPS', 'targetType': 'Protein', 'target_uniprotID': 'P14324', 'targetSpecies': 'Homo sapiens', 'sourceID': 278, 'expID': 68}, {'interactionID': 77, 'drugID': 119, 'targetID': 40, 'interactionType': 'Inhibition', 'drugName': 'Pamidronate Disodium', 'drug_approvalDate': '1991-10-31', 'drug_atcClassID': None, 'drug_atcClassName': None, 'drug_atcClassStatus': None, 'drug_epcClassID': 'N0000175579', 'drug_epcClassName': 'Bisphosphonate', 'targetName': 'FDPS', 'targetType': 'Protein', 'target_uniprotID': 'P14324', 'targetSpecies': 'Homo sapiens', 'sourceID': 279, 'expID': 68}, {'interactionID': 77, 'drugID': 119, 'targetID': 40, 'interactionType': 'Inhibition', 'drugName': 'Pamidronate Disodium', 'drug_approvalDate': '1991-10-31', 'drug_atcClassID': None, 'drug_atcClassName': None, 'drug_atcClassStatus': None, 'drug_epcClassID': 'N0000175579', 'drug_epcClassName': 'Bisphosphonate', 'targetName': 'FDPS', 'targetType': 'Protein', 'target_uniprotID': 'P14324', 'targetSpecies': 'Homo sapiens', 'sourceID': 280, 'expID': 68}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.targetome_versioned.experiments_v1
+Column name: expID Type: INT64 Description: ID for experimental evidence supporting Targetome interactions
+Column name: exp_assayType Type: STRING Description: Assay type used for experimental evidence
+Column name: exp_assayValueLow Type: FLOAT64 Description: Low value for experimental assay
+Column name: exp_assayValueMedian Type: FLOAT64 Description: Median value for experimental assay
+Column name: exp_assayValueHigh Type: FLOAT64 Description: High value for experimental assay
+Column name: exp_assayUnits Type: STRING Description: Units of measurement for experimental assay
+Column name: exp_assayRelation Type: STRING Description: Relation of values for experimental assay
+Column name: exp_assayDescription Type: STRING Description: Experimental assay description
+Column name: exp_assaySpecies Type: STRING Description: Species used in experimental assay
+Column name: exp_parentSource Type: STRING Description: Source from which experimental assay was obtained
+Column name: sourceID Type: INT64 Description: ID for source of supporting Targetome evidence
+Column name: PubMedID Type: STRING Description: PubMedID identifying literature
+Column name: databaseName Type: STRING Description: Name of database from which supporting evidence and literature are obtained
+Column name: db_version Type: STRING Description: Database version
+Column name: db_downloadURL Type: STRING Description: URL from which database was downloaded
+Column name: db_downloadDate Type: STRING Description: Date on which database was downloaded
+Sample rows:
+[{'expID': 342, 'exp_assayType': None, 'exp_assayValueLow': nan, 'exp_assayValueMedian': nan, 'exp_assayValueHigh': nan, 'exp_assayUnits': 'nM', 'exp_assayRelation': '=', 'exp_assayDescription': None, 'exp_assaySpecies': None, 'exp_parentSource': 'Curated from the literature by BindingDB', 'sourceID': 1027, 'PubMedID': '18370373', 'databaseName': 'BindingDB', 'db_version': '2016_m6', 'db_downloadURL': 'https://www.bindingdb.org/bind/chemsearch/marvin/SDFdownload.jsp?all_download=yes', 'db_downloadDate': '07.03.2016'}, {'expID': 348, 'exp_assayType': None, 'exp_assayValueLow': nan, 'exp_assayValueMedian': nan, 'exp_assayValueHigh': nan, 'exp_assayUnits': 'nM', 'exp_assayRelation': '=', 'exp_assayDescription': None, 'exp_assaySpecies': None, 'exp_parentSource': 'Curated from the literature by BindingDB', 'sourceID': 1028, 'PubMedID': '18308563', 'databaseName': 'BindingDB', 'db_version': '2016_m6', 'db_downloadURL': 'https://www.bindingdb.org/bind/chemsearch/marvin/SDFdownload.jsp?all_download=yes', 'db_downloadDate': '07.03.2016'}, {'expID': 349, 'exp_assayType': None, 'exp_assayValueLow': nan, 'exp_assayValueMedian': nan, 'exp_assayValueHigh': nan, 'exp_assayUnits': 'nM', 'exp_assayRelation': '=', 'exp_assayDescription': None, 'exp_assaySpecies': None, 'exp_parentSource': 'Curated from the literature by BindingDB', 'sourceID': 1028, 'PubMedID': '18308563', 'databaseName': 'BindingDB', 'db_version': '2016_m6', 'db_downloadURL': 'https://www.bindingdb.org/bind/chemsearch/marvin/SDFdownload.jsp?all_download=yes', 'db_downloadDate': '07.03.2016'}, {'expID': 3873, 'exp_assayType': 'KD', 'exp_assayValueLow': nan, 'exp_assayValueMedian': 1.0, 'exp_assayValueHigh': nan, 'exp_assayUnits': 'nM', 'exp_assayRelation': '<', 'exp_assayDescription': None, 'exp_assaySpecies': None, 'exp_parentSource': 'ChEMBL', 'sourceID': 1346, 'PubMedID': '15081026', 'databaseName': 'BindingDB', 'db_version': '2016_m6', 'db_downloadURL': 'https://www.bindingdb.org/bind/chemsearch/marvin/SDFdownload.jsp?all_download=yes', 'db_downloadDate': '07.03.2016'}, {'expID': 358, 'exp_assayType': 'KD', 'exp_assayValueLow': nan, 'exp_assayValueMedian': 53.5, 'exp_assayValueHigh': nan, 'exp_assayUnits': 'nM', 'exp_assayRelation': '=', 'exp_assayDescription': None, 'exp_assaySpecies': None, 'exp_parentSource': 'Curated from the literature by BindingDB', 'sourceID': 1032, 'PubMedID': '17349580', 'databaseName': 'BindingDB', 'db_version': '2016_m6', 'db_downloadURL': 'https://www.bindingdb.org/bind/chemsearch/marvin/SDFdownload.jsp?all_download=yes', 'db_downloadDate': '07.03.2016'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.targetome_versioned.drug_synonyms_v1
+Column name: drugID Type: INT64 Description: Unique ID of the Targetome drug
+Column name: synonym Type: STRING Description: Synonym or alias for the Targetome drug
+Sample rows:
+[{'drugID': 1, 'synonym': 'Vemurafenib'}, {'drugID': 1, 'synonym': 'BRAF(V600E) Kinase Inhibitor RO5185426'}, {'drugID': 1, 'synonym': 'RO 5185426'}, {'drugID': 1, 'synonym': 'PLX4032'}, {'drugID': 1, 'synonym': 'PLX-4032'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'isb-cgc-bq': {'reactome_versioned': ['pathway_hierarchy_v77', 'pe_to_pathway_v77', 'physical_entity_v77', 'pathway_v77'], 'targetome_versioned': ['target_synonyms_v1', 'sources_v1', 'interactions_v1', 'experiments_v1', 'drug_synonyms_v1']}}
+Some few-shot examples may be useful:
+Query:
+-- 1.  Look‐up all Targetome drug synonyms that contain the string “sorafenib”
+--     so we know which drugID(s) to use downstream.
+SELECT DISTINCT
+  `drugID`,
+  `synonym`
+FROM `isb-cgc-bq.targetome_versioned.drug_synonyms_v1`
+WHERE LOWER(`synonym`) LIKE '%sorafenib%'
+LIMIT 20;
+Answer:
+drugID,synonym
+157,sorafenib tosylate
+157,Sorafenib Tosylate
+157,sorafenib
+157,SORAFENIB TOSYLATE
+157,Sorafenib
+157,SORAFENIB
+Query:
+--Description: (3)  Re-derive a DISTINCT list of Homo sapiens sorafenib targets
+--               (targetID & UniProt) that meet the potency criteria.  
+WITH sorafenib_hits AS (           -- same filter logic as in the corrected step-2
+  SELECT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157                                   -- sorafenib
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  targetID,
+  target_uniprotID
+FROM sorafenib_hits
+ORDER BY target_uniprotID
+LIMIT 20
+Answer:
+targetID,target_uniprotID
+416,O14757
+357,O43293
+334,O75582
+333,O75676
+3,P00519
+36,P00533
+104,P04049
+24,P07333
+109,P07949
+95,P09619
+77,P10721
+Query:
+--Description: (4)  Map those sorafenib targets (via UniProt) to Reactome
+--               physical entities and preview 20 of them.
+WITH sorafenib_targets AS (      -- step-3 without the LIMIT
+  SELECT DISTINCT
+    i.targetID,
+    i.target_uniprotID
+  FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+    ON i.expID = e.expID
+  WHERE i.drugID = 157
+    AND LOWER(i.targetSpecies) = 'homo sapiens'
+    AND e.exp_assayUnits = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+)
+SELECT DISTINCT
+  pe.stable_id AS pe_stable_id,
+  pe.uniprot_id,
+  pe.name       AS pe_name
+FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+JOIN sorafenib_targets AS t
+  ON pe.uniprot_id = t.target_uniprotID
+LIMIT 20
+Answer:
+pe_stable_id,uniprot_id,pe_name
+R-HSA-109786,P04049,"p-S259,S621-RAF1"
+R-HSA-113826,O14757,CHEK1
+R-HSA-113838,O14757,"p-S317,S345-CHEK1"
+R-HSA-1169417,P00533,p-6Y-EGFR G719S
+R-HSA-1169418,P00533,EGFR G719S
+R-HSA-1173211,P00533,p-6Y-EGFR L858R
+Query:
+--Description: (5)  Link the sorafenib physical entities to Reactome pathways
+--               that have TAS evidence.
+WITH sorafenib_pe AS (                 -- step-4 without LIMIT
+  SELECT DISTINCT
+    pe.stable_id AS pe_stable_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT target_uniprotID
+    FROM (
+      SELECT i.target_uniprotID
+      FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+      JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+        ON i.expID = e.expID
+      WHERE i.drugID = 157
+        AND LOWER(i.targetSpecies) = 'homo sapiens'
+        AND e.exp_assayUnits = 'nM'
+        AND e.exp_assayValueMedian <= 100
+        AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+        AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+    )
+  ) AS t
+  ON pe.uniprot_id = t.target_uniprotID
+)
+SELECT DISTINCT
+  p2p.pe_stable_id,
+  p2p.pathway_stable_id
+FROM sorafenib_pe            AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  ON sp.pe_stable_id = p2p.pe_stable_id
+WHERE p2p.evidence_code = 'TAS'
+LIMIT 20
+Answer:
+pe_stable_id,pathway_stable_id
+R-HSA-174231,R-HSA-68877
+R-HSA-174231,R-HSA-68882
+R-HSA-174231,R-HSA-68886
+R-HSA-8942610,R-HSA-69231
+R-HSA-8942610,R-HSA-69236
+R-HSA-8942610,R-HSA-69278
+R-HSA-174231,R-HSA-69278
+R-HSA-113838,R-HSA-69473
+Query:
+--Description: (6)  Keep only lowest-level Homo sapiens pathways tied to the
+--               sorafenib physical entities (step-5) and preview 20.
+WITH sorafenib_path_pe AS (        -- step-5 without LIMIT
+  SELECT DISTINCT
+    p2p.pe_stable_id,
+    p2p.pathway_stable_id
+  FROM (
+    SELECT DISTINCT pe.stable_id AS pe_stable_id
+    FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+    JOIN (
+      SELECT DISTINCT target_uniprotID
+      FROM (
+        SELECT i.target_uniprotID
+        FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+        JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+          ON i.expID = e.expID
+        WHERE i.drugID = 157
+          AND LOWER(i.targetSpecies) = 'homo sapiens'
+          AND e.exp_assayUnits = 'nM'
+          AND e.exp_assayValueMedian <= 100
+          AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+          AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+      )
+    ) AS t
+    ON pe.uniprot_id = t.target_uniprotID
+  ) AS sp
+  JOIN `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+    ON sp.pe_stable_id = p2p.pe_stable_id
+  WHERE p2p.evidence_code = 'TAS'
+)
+SELECT DISTINCT
+  sp.pathway_stable_id AS pathway_id,
+  pv.name              AS pathway_name
+FROM sorafenib_path_pe AS sp
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON sp.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+LIMIT 20
+Answer:
+pathway_id,pathway_name
+R-HSA-9702636,tandutinib-resistant FLT3 mutants
+R-HSA-202424,Downstream TCR signaling
+R-HSA-6785631,ERBB2 Regulates Cell Motility
+R-HSA-180292,GAB1 signalosome
+R-HSA-381340,Transcriptional regulation of white adipocyte differentiation
+R-HSA-445144,Signal transduction by L1
+R-HSA-9702620,quizartinib-resistant FLT3 mutants
+Query:
+--Description: (7)  Build a universe of ALL Homo sapiens physical entities
+--               associated (via TAS) with any lowest-level pathway.
+SELECT DISTINCT
+  p2p.pe_stable_id
+FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+  ON p2p.pathway_stable_id = pv.stable_id
+WHERE pv.species = 'Homo sapiens'
+  AND pv.lowest_level = TRUE
+  AND p2p.evidence_code = 'TAS'
+LIMIT 20
+Answer:
+pe_stable_id
+R-HSA-68516
+R-HSA-68539
+R-HSA-68519
+R-HSA-68513
+R-HSA-68522
+R-HSA-68405
+R-HSA-68542
+R-HSA-3006646
+R-HSA-68655
+R-HSA-68649
+R-HSA-68639
+R-HSA-939184
+R-HSA-8866674
+R-HSA-947610
+R-HSA-68812
+R-HSA-68747
+Query:
+--Description: (9)  Re-compute the χ² statistics with the corrected column
+--               references (no alias/column name clash) and return the
+--               three pathways with the highest values.
+WITH
+targets AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN (
+    SELECT DISTINCT i.target_uniprotID
+    FROM `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+    JOIN `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+      ON i.expID = e.expID
+    WHERE i.drugID = 157
+      AND LOWER(i.targetSpecies) = 'homo sapiens'
+      AND e.exp_assayUnits      = 'nM'
+      AND e.exp_assayValueMedian <= 100
+      AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+      AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+  ) AS hit ON pe.uniprot_id = hit.target_uniprotID
+),
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+totals AS (
+  SELECT
+    COUNT(*)                                           AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets))  AS non_tgt_total
+  FROM universe
+),
+path_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+    ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM targets)) AS a,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM targets)) AS c
+  FROM path_pe
+  GROUP BY pathway_id
+),
+stats AS (
+  SELECT
+    cnt.pathway_id,
+    cnt.a,
+    (tot.tgt_total     - cnt.a) AS b,
+    cnt.c,
+    (tot.non_tgt_total - cnt.c) AS d
+  FROM counts AS cnt
+  CROSS JOIN totals AS tot
+),
+chi AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW((s.a * s.d) - (s.b * s.c), 2) * (s.a + s.b + s.c + s.d),
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_sq
+  FROM stats AS s
+)
+SELECT
+  chi.pathway_id,
+  pv.name,
+  a AS in_targets,
+  b AS out_targets,
+  c AS in_non_targets,
+  d AS out_non_targets,
+  chi_sq
+FROM chi
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON chi.pathway_id = pv.stable_id
+ORDER BY chi_sq DESC
+LIMIT 3
+Answer:
+pathway_id,name,in_targets,out_targets,in_non_targets,out_non_targets,chi_sq
+R-HSA-9723905,Loss of function of TP53 in cancer due to loss of tetramerization ability,0,25433,1301,23618,1363.0542384583396
+R-HSA-6798695,Neutrophil degranulation,3,25430,1286,23633,1337.737949574124
+R-HSA-1442490,Collagen degradation,0,25433,1043,23876,1087.0307263444083
+Task: Determine which three lowest-level Reactome pathways (with TAS evidence) have the highest chi-squared statistics, considering only Homo sapiens targets associated with sorafenib under the conditions that the median assay value is ≤ 100 and both low and high assay values are ≤ 100 or null. For each of these three pathways, how many of these targets and non-targets lie within the pathway and outside it?
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables with similar prefix, you can use a wildcard table to simplify your query. e.g., SELECT col1, col2 FROM `project_id.dataset_id.table_prefix*` WHERE _TABLE_SUFFIX IN ('table1_suffix', 'table2_suffix');. Avoid manually listing tables unless absolutely necessary.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 04:17:59 - Thread-2721 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+-- Top three lowest-level Homo sapiens Reactome pathways (TAS evidence)
+-- with the highest χ² enrichment for potent sorafenib targets
+WITH
+/* 1.  Potent Homo sapiens sorafenib targets (UniProt IDs)              */
+sorafenib_targets AS (
+  SELECT DISTINCT i.target_uniprotID
+  FROM  `isb-cgc-bq.targetome_versioned.interactions_v1` AS i
+  JOIN  `isb-cgc-bq.targetome_versioned.experiments_v1`  AS e
+         ON i.expID = e.expID
+  WHERE i.drugID = 157                             -- sorafenib
+    AND LOWER(i.targetSpecies)  = 'homo sapiens'
+    AND e.exp_assayUnits        = 'nM'
+    AND e.exp_assayValueMedian <= 100
+    AND (e.exp_assayValueLow  <= 100 OR e.exp_assayValueLow  IS NULL)
+    AND (e.exp_assayValueHigh <= 100 OR e.exp_assayValueHigh IS NULL)
+),
+/* 2.  Reactome physical entities corresponding to those targets        */
+target_pe AS (
+  SELECT DISTINCT pe.stable_id AS pe_id
+  FROM  `isb-cgc-bq.reactome_versioned.physical_entity_v77` AS pe
+  JOIN  sorafenib_targets AS st
+         ON pe.uniprot_id = st.target_uniprotID
+),
+/* 3.  Universe = every PE found (via TAS) in any lowest-level
+        Homo sapiens pathway                                           */
+universe AS (
+  SELECT DISTINCT p2p.pe_stable_id AS pe_id
+  FROM  `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN  `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+         ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species      = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+/* 4.  Totals needed for the 2×2 tables                                */
+totals AS (
+  SELECT
+    COUNT(*)                                                AS universe_total,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM target_pe))        AS tgt_total,
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM target_pe))     AS non_tgt_total
+  FROM universe
+),
+/* 5.  PE-to-pathway mapping (restricted to same scope as ‘universe’)   */
+pathway_pe AS (
+  SELECT
+    p2p.pathway_stable_id AS pathway_id,
+    p2p.pe_stable_id      AS pe_id
+  FROM  `isb-cgc-bq.reactome_versioned.pe_to_pathway_v77` AS p2p
+  JOIN  `isb-cgc-bq.reactome_versioned.pathway_v77`       AS pv
+         ON p2p.pathway_stable_id = pv.stable_id
+  WHERE pv.species      = 'Homo sapiens'
+    AND pv.lowest_level = TRUE
+    AND p2p.evidence_code = 'TAS'
+),
+/* 6.  Build contingency-table counts for every pathway                 */
+counts AS (
+  SELECT
+    pathway_id,
+    COUNTIF(pe_id IN  (SELECT pe_id FROM target_pe))    AS a,  -- targets  in pathway
+    COUNTIF(pe_id NOT IN (SELECT pe_id FROM target_pe)) AS c   -- non-tgt in pathway
+  FROM pathway_pe
+  GROUP BY pathway_id
+),
+stats AS (
+  SELECT
+    c.pathway_id,
+    c.a,
+    t.tgt_total      - c.a AS b,   -- targets    outside pathway
+    c.c,
+    t.non_tgt_total  - c.c AS d,   -- non-targets outside pathway
+    t.universe_total       AS n
+  FROM counts  AS c
+  CROSS JOIN totals AS t
+),
+/* 7.  χ² statistic (1-degree of freedom)                               */
+chi_sq AS (
+  SELECT
+    s.*,
+    SAFE_DIVIDE(
+      POW((s.a * s.d) - (s.b * s.c), 2) * s.n,
+      (s.a + s.b) * (s.c + s.d) * (s.a + s.c) * (s.b + s.d)
+    ) AS chi_val
+  FROM stats AS s
+)
+SELECT
+  cs.pathway_id,
+  pv.name,
+  cs.a AS in_targets,
+  cs.b AS out_targets,
+  cs.c AS in_non_targets,
+  cs.d AS out_non_targets,
+  cs.chi_val AS chi_squared
+FROM chi_sq AS cs
+JOIN `isb-cgc-bq.reactome_versioned.pathway_v77` AS pv
+  ON cs.pathway_id = pv.stable_id
+ORDER BY chi_squared DESC
+LIMIT 3;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:18:02 - Thread-2721 (execute) - INFO - Total iteration counts: 0

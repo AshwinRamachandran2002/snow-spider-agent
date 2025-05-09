@@ -1,0 +1,3332 @@
+2025-02-12 20:33:16 - openai._base_client - INFO - Retrying request to /chat/completions in 0.393273 seconds
+2025-02-12 20:33:52 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:33:52 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:33:52 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:33:52 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:33:54 - snowflake.connector.cursor - INFO - Number of results in first chunk: 0
+2025-02-12 20:33:55 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:33:55 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:33:56 - root - INFO - SQL:
+SELECT "content"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   LIMIT 100;
+Results:
+Too long, hard cut:
+content
+"/*
+ * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips
+ *
+ * Copyright (C) 2008 David Brownell
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/bcd.h>
+#include <linux/slab.h>
+#include <linux/rtc.h>
+#include <linux/workqueue.h>
+
+#include <linux/spi/spi.h>
+#include <linux/spi/ds1305.h>
+#include <linux/module.h>
+
+
+/*
+ * Registers ... mask DS1305_WRITE into register address to write,
+ * otherwise you're reading it.  All non-bitmask values are BCD.
+ */
+#define DS1305_WRITE		0x80
+
+
+/* RTC date/time ... the main special cases are that we:
+ *  - Need fancy ""hours"" encoding in 12hour mode
+ *  - Don't rely on the ""day-of-week"" field (or tm_wday)
+ *  - Are a 21st-century clock (2000 <= year < 2100)
+ */
+#define DS1305_RTC_LEN		7		/* bytes for RTC regs */
+
+#define DS1305_SEC		0x00		/* register addresses */
+#define DS1305_MIN		0x01
+#define DS1305_HOUR		0x02
+#	define DS1305_HR_12		0x40	/* set == 12 hr mode */
+#	define DS1305_HR_PM		0x20	/* set == PM (12hr mode) */
+#define DS1305_WDAY		0x03
+#define DS1305_MDAY		0x04
+#define DS1305_MON		0x05
+#define DS1305_YEAR		0x06
+
+
+/* The two alarms have only sec/min/hour/wday fields (ALM_LEN).
+ * DS1305_ALM_DISABLE disables a match field (some combos are bad).
+ *
+ * NOTE that since we don't use WDAY, we limit ourselves to alarms
+ * only one day into the future (vs potentially up to a week).
+ *
+ * NOTE ALSO that while we could generate once-a-second IRQs (UIE), we
+ * don't currently support them.  We'd either need to do it only when
+ * no alarm is pending (not the standard model), or to use the second
+ * alarm (implying that this is a DS1305 not DS1306, *and* that either
+ * it's wired up a second IRQ we know, or that INTCN is set)
+ */
+#define DS1305_ALM_LEN		4		/* bytes for ALM regs */
+#define DS1305_ALM_DISABLE	0x80
+
+#define DS1305_ALM0(r)		(0x07 + (r))	/* register addresses */
+#define DS1305_ALM1(r)		(0x0b + (r))
+
+
+/* three control registers */
+#define DS1305_CONTROL_LEN	3		/* bytes of control regs */
+
+#define DS1305_CONTROL		0x0f		/* register addresses */
+#	define DS1305_nEOSC		0x80	/* low enables oscillator */
+#	define DS1305_WP		0x40	/* write protect */
+#	define DS1305_INTCN		0x04	/* clear == only int0 used */
+#	define DS1306_1HZ		0x04	/* enable 1Hz output */
+#	define DS1305_AEI1		0x02	/* enable ALM1 IRQ */
+#	define DS1305_AEI0		0x01	/* enable ALM0 IRQ */
+#define DS1305_STATUS		0x10
+/* status has just AEIx bits, mirrored as IRQFx */
+#define DS1305_TRICKLE		0x11
+/* trickle bits are defined in <linux/spi/ds1305.h> */
+
+/* a bunch of NVRAM */
+#define DS1305_NVRAM_LEN	96		/* bytes of NVRAM */
+
+#define DS1305_NVRAM		0x20		/* register addresses */
+
+
+struct ds1305 {
+	struct spi_device	*spi;
+	struct rtc_device	*rtc;
+
+	struct work_struct	work;
+
+	unsigned long		flags;
+#define FLAG_EXITING	0
+
+	bool			hr12;
+	u8			ctrl[DS1305_CONTROL_LEN];
+};
+
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Utilities ...  tolerate 12-hour AM/PM notation in case of non-Linux
+ * software (like a bootloader) which may require it.
+ */
+
+static unsigned bcd2hour(u8 bcd)
+{
+	if (bcd & DS1305_HR_12) {
+		unsigned	hour = 0;
+
+		bcd &= ~DS1305_HR_12;
+		if (bcd & DS1305_HR_PM) {
+			hour = 12;
+			bcd &= ~DS1305_HR_PM;
+		}
+		hour += bcd2bin(bcd);
+		return hour - 1;
+	}
+	return bcd2bin(bcd);
+}
+
+static u8 hour2bcd(bool hr12, int hour)
+{
+	if (hr12) {
+		hour++;
+		if (hour <= 12)
+			return DS1305_HR_12 | bin2bcd(hour);
+		hour -= 12;
+		return DS1305_HR_12 | DS1305_HR_PM | bin2bcd(hour);
+	}
+	return bin2bcd(hour);
+}
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Interface to RTC framework
+ */
+
+static int ds1305_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		buf[2];
+	long		err = -EINVAL;
+
+	buf[0] = DS1305_WRITE | DS1305_CONTROL;
+	buf[1] = ds1305->ctrl[0];
+
+	if (enabled) {
+		if (ds1305->ctrl[0] & DS1305_AEI0)
+			goto done;
+		buf[1] |= DS1305_AEI0;
+	} else {
+		if (!(buf[1] & DS1305_AEI0))
+			goto done;
+		buf[1] &= ~DS1305_AEI0;
+	}
+	err = spi_write_then_read(ds1305->spi, buf, sizeof(buf), NULL, 0);
+	if (err >= 0)
+		ds1305->ctrl[0] = buf[1];
+done:
+	return err;
+
+}
+
+
+/*
+ * Get/set of date and time is pretty normal.
+ */
+
+static int ds1305_get_time(struct device *dev, struct rtc_time *time)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		addr = DS1305_SEC;
+	u8		buf[DS1305_RTC_LEN];
+	int		status;
+
+	/* Use write-then-read to get all the date/time registers
+	 * since dma from stack is nonportable
+	 */
+	status = spi_write_then_read(ds1305->spi, &addr, sizeof(addr),
+			buf, sizeof(buf));
+	if (status < 0)
+		return status;
+
+	dev_vdbg(dev, ""%s: %02x %02x %02x, %02x %02x %02x %02x\n"",
+		""read"", buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5], buf[6]);
+
+	/* Decode the registers
+
+2025-02-12 20:33:56 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:33:56 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:33:56 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:33:59 - snowflake.connector.cursor - INFO - Number of results in first chunk: 17
+2025-02-12 20:34:00 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:00 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:00 - root - INFO - SQL:
+SELECT "content", "sample_repo_name"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "binary" = FALSE
+   LIMIT 100;
+Results:
+Too long, hard cut:
+content,sample_repo_name
+"#pragma once
+/*
+ *      Copyright (C) 2005-2012 Team XBMC
+ *      http://xbmc.org
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with XBMC; see the file COPYING.  If not, see
+ *  <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include ""utils/StdString.h""
+#include <vector>
+
+#include ""pictures/PictureScalingAlgorithm.h""
+#include ""utils/GlobalsHandling.h""
+
+class TiXmlElement;
+
+class DatabaseSettings
+{
+public:
+  void Reset()
+  {
+    type.clear();
+    host.clear();
+    port.clear();
+    user.clear();
+    pass.clear();
+    name.clear();
+  };
+  CStdString type;
+  CStdString host;
+  CStdString port;
+  CStdString user;
+  CStdString pass;
+  CStdString name;
+};
+
+struct TVShowRegexp
+{
+  bool byDate;
+  CStdString regexp;
+  int defaultSeason;
+  TVShowRegexp(bool d, const CStdString& r, int s = 1)
+  {
+    byDate = d;
+    regexp = r;
+    defaultSeason = s;
+  }
+};
+
+struct RefreshOverride
+{
+  float fpsmin;
+  float fpsmax;
+
+  float refreshmin;
+  float refreshmax;
+
+  bool  fallback;
+};
+
+
+struct RefreshVideoLatency
+{
+  float refreshmin;
+  float refreshmax;
+
+  float delay;
+};
+
+typedef std::vector<TVShowRegexp> SETTINGS_TVSHOWLIST;
+
+class CAdvancedSettings
+{
+  public:
+    CAdvancedSettings();
+
+    static CAdvancedSettings* getInstance();
+
+    void Initialize();
+    bool Initialized() { return m_initialized; };
+    void AddSettingsFile(const CStdString &filename);
+    bool Load();
+    void Clear();
+
+    static void GetCustomTVRegexps(TiXmlElement *pRootElement, SETTINGS_TVSHOWLIST& settings);
+    static void GetCustomRegexps(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomRegexpReplacers(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomExtensions(TiXmlElement *pRootElement, CStdString& extensions);
+
+    bool CanLogComponent(int component) const;
+
+    int m_audioHeadRoom;
+#ifdef TARGET_OPENELEC
+    // OpenELEC workaround for minimum sample Rate
+    int m_minimumSampleRate;
+#endif
+    float m_ac3Gain;
+    int m_maxPllAdjust;
+    CStdString m_audioDefaultPlayer;
+    float m_audioPlayCountMinimumPercent;
+    bool m_dvdplayerIgnoreDTSinWAV;
+    float m_limiterHold;
+    float m_limiterRelease;
+
+    bool  m_omxHWAudioDecode;
+    bool  m_omxDecodeStartWithValidFrame;
+
+    float m_videoSubsDelayRange;
+    float m_videoAudioDelayRange;
+    int m_videoSmallStepBackSeconds;
+    int m_videoSmallStepBackTries;
+    int m_videoSmallStepBackDelay;
+    bool m_videoUseTimeSeeking;
+    int m_videoTimeSeekForward;
+    int m_videoTimeSeekBackward;
+    int m_videoTimeSeekForwardBig;
+    int m_videoTimeSeekBackwardBig;
+    int m_videoPercentSeekForward;
+    int m_videoPercentSeekBackward;
+    int m_videoPercentSeekForwardBig;
+    int m_videoPercentSeekBackwardBig;
+    CStdString m_videoPPFFmpegDeint;
+    CStdString m_videoPPFFmpegPostProc;
+    bool m_videoVDPAUtelecine;
+    bool m_videoVDPAUdeintSkipChromaHD;
+    bool m_musicUseTimeSeeking;
+    int m_musicTimeSeekForward;
+    int m_musicTimeSeekBackward;
+    int m_musicTimeSeekForwardBig;
+    int m_musicTimeSeekBackwardBig;
+    int m_musicPercentSeekForward;
+    int m_musicPercentSeekBackward;
+    int m_musicPercentSeekForwardBig;
+    int m_musicPercentSeekBackwardBig;
+    int m_videoBlackBarColour;
+    int m_videoIgnoreSecondsAtStart;
+    float m_videoIgnorePercentAtEnd;
+    float m_audioApplyDrc;
+    bool m_useFfmpegVda;
+
+    int   m_videoVDPAUScaling;
+    bool  m_videoVAAPIforced;
+    float m_videoNonLinStretchRatio;
+    bool  m_videoEnableHighQualityHwScalers;
+    float m_videoAutoScaleMaxFps;
+    std::vector<RefreshOverride> m_videoAdjustRefreshOverrides;
+    std::vector<RefreshVideoLatency> m_videoRefreshLatency;
+    float m_videoDefaultLatency;
+    bool m_videoDisableBackgroundDeinterlace;
+    int  m_videoCaptureUseOcclusionQuery;
+    bool m_DXVACheckCompatibility;
+    bool m_DXVACheckCompatibilityPresent;
+    bool m_DXVAForceProcessorRenderer;
+    bool m_DXVANoDeintProcForProgressive;
+    bool m_DXVAAllowHqScaling;
+    int  m_videoFpsDetect;
+    int  m_videoBusyDialogDelay_ms;
+
+    CStdString m_videoDefaultPlayer;
+    CStdString m_videoDefaultDVDPlayer;
+    float m_videoPlayCountMinimumPercent;
+
+    float m_slideshowBlackBarCompensation;
+    float m_slideshowZoomAmount;
+    float m_slideshowPanAmount;
+
+    bool m_lcdHeartbeat;
+    bool m_lcdDimOnScreenSave;
+    int m_lcdScrolldelay;
+    CStdString m_lcdHostName;
+
+    int m_songInfoDuration;
+    int m_logLevel;
+    int m_logLevelHint;
+  
+
+2025-02-12 20:34:00 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:00 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:00 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:02 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-02-12 20:34:02 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:02 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:02 - root - INFO - SQL:
+SELECT DISTINCT "sample_repo_name"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   LIMIT 100;
+Results:
+sample_repo_name
+pelya/commandergenius
+cloudera/impala-kudu
+khasang/SmartForecast
+urjaman/flashrom
+velo/flexmojos
+SnappyDataInc/snappy-store
+XyrusWorx/apophysis7x
+drdaeman/accel-ppp
+tokee/lucene
+webscalesql/webscalesql-5.6
+CONNECT-Solution/CONNECT
+DoSomething/voting-app
+apache/sqoop
+AbiWord/abiword
+meta-debian/meta-debian
+Cerberuss/GofPatterns
+cloudmatrix/esky
+Mygod/Skylark
+JHUAPL/AccumuloGraph
+vmesel/GeoMath
+mapbender/mapbender
+sfmskywalker/Orchard
+ovh/overthebox-openwrt
+Caltech-IPAC/firefly
+Kunena/Kunena-Forum
+nickkolok/chas-ege
+apache/uima-uimaj
+apache/sis
+bombmanual/bombmanual.github.io
+pplante/droidtowers
+Nexus-Mods/Nexus-Mod-Manager
+jmaih/RISE_toolbox
+headwirecom/aem-solr-search
+glmcdona/strings2
+anycmd/anycmd
+linuxdeepin/deepin-wm
+mempo/mempo-kernel
+apache/qpid-java
+ImmobilienScout24/yum-repo-server
+gorescript/gorescript
+oehf/ipf
+findsorguk/findsorguk
+garyKeorkunian/squants
+Sitecore/Habitat
+StefanoFiumara/Harry-Potter-Unity
+gr8pefish/IronBackpacks
+iridium-browser/iridium-browser-ubuntu
+sam408130/Ionic-Demos
+Glimpse/Glimpse.Prototype
+coinkite/cloudfire
+b3dgs/lionengine
+Incubaid/arakoon
+aspnetboilerplate/aspnetboilerplate
+jaquadro/StorageDrawers
+Job-Yang/YTZImageComparison
+awslabs/aws-sdk-cpp
+ghxiao/drew
+aasensio/pySIR
+epiSurg/EpiSurg
+googlei18n/language-resources
+crossbario/crossbarexamples
+ezScrum/ezScrum
+fxos-components/bridge
+LibreOffice/core
+KDE/krita
+mdaniel/virtualbox-org-svn-vbox-trunk
+hroptatyr/dateutils
+espadrine/opera
+digama0/mmj2
+nathansttt/hog2
+google/binexport
+biocaml/biocaml
+tatsuhiro-t/aria2
+albertz/openlierox
+Open-Transport/synthese
+danielnaber/openthesaurus
+scrollback/io.scrollback.neighborhoods
+project-store/theme
+sileht/check_mk
+umbraco/Umbraco-CMS
+nigelsmall/py2neo
+Esteemed-Innovation/Flaxbeards-Steam-Power
+TheTechnobear/EigenD
+sonata-project/sandbox-build
+koala-framework/koala-framework
+ligaDATA/Kamanja
+hiloteam/Hilo
+oivva/boxy
+ChildrenOfUr/coUclient
+timduru/tf300t-katkernel
+ChildrenOfUr/coUserver
+draios/sysdig
+bosonic/bosonic
+Ulauncher/Ulauncher
+DynamoRIO/drk
+google/ktsan
+apache/tomcat-native
+erasaur/binary
+jdahlstrom/vaadin.react
+pfirmstone/river-internet
+
+2025-02-12 20:34:02 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:02 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:02 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:03 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-02-12 20:34:03 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:03 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:04 - root - INFO - SQL:
+SELECT "sample_path"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "content" IS NOT NULL AND "binary" = FALSE
+   LIMIT 100;
+Results:
+sample_path
+xbmc/settings/AdvancedSettings.h
+project/jni/application/ja2/AndroidAppSettings.cfg
+src/pyudev/_ctypeslib/__init__.py
+common/thrift/CatalogService.thrift
+deprecated/stomp/test/paper_experiments/maze_num_rollouts_test_nona.yaml
+socketcan_interface/CMakeLists.txt
+.gitignore
+src/pocketmine/block/Sugarcane.php
+src/main/resources/assets/ironbackpacks/models/item/backpackBasic.json
+nicintel.c
+src/dashboard/src/templates/ingest/as/resource_component.html
+src/prpltwtr/prpltwtr_endpoint_im.c
+Synergy Editor TGC/Synergy Editor/WelcomePages.h
+Install/Help/commands/3dmaths/SCALE VECTOR2.htm
+Install/Help/commands/basic3d/TLVERTEXSYSTEMMEMORY AVAILABLE.htm
+Synergy Editor TGC/Synergy Editor/Synergy Editor.cpp
+alpha/lib/model/entry.php
+api_v3/lib/KalturaBaseService.php
+deb/kaltura-php/debian/kaltura-php7-xmlrpc/DEBIAN/preinst
+src/shared/SeqReader.cpp
+src/BCR/BCRexternalBWT.cpp
+src/frontends/BeetlExtend.hh
+src/cinder/app/linux/WindowImplLinuxEgl.cpp
+flexmojos-testing/flexmojos-test-harness/src/test/java/net/flexmojos/oss/tests/concept/AttachAsdocTest.java
+src/Mapbender/CoreBundle/Command/TemplateGenerator.php
+src/Mapbender/WmsBundle/Form/Type/VendorSpecificType.php
+gemfirexd/client/src/main/java/io/snappydata/thrift/internal/ClientParameterMetaData.java
+third_party/skia/src/gpu/gl/GrGLProgram.cpp
+third_party/crashpad/crashpad/snapshot/win/process_reader_win.h
+third_party/skia/src/gpu/effects/GrConfigConversionEffect.cpp
+kbe/src/lib/cstdkbe/cstdkbe.hpp
+accel-pppd/shaper/shaper.c
+libjava/javax/naming/spi/NamingManager.java
+util/robodoc/Source/robodoc.c
+maven-install-all.bat
+lionengine-network/src/main/java/com/b3dgs/lionengine/network/Networker.java
+lionengine-core/src/main/java/com/b3dgs/lionengine/drawable/Image.java
+fs/namespace.c
+src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java
+xorg-server/present/present_screen.c
+libxcb/xcb-sync.pc.in
+sql/log_event.cc
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/orchestration/NhinAggregator.java
+Product/Production/Services/PatientDiscoveryCore/src/main/java/gov/hhs/fha/nhinc/patientdiscovery/model/builder/impl/PatientSearchResultsModelBuilderImpl.java
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/messaging/client/CONNECTCXFClientFactory.java
+DICOMcloud.Dicom/Media/Factories/IDicomMediaReaderFactory.cs
+mysql-test/suite/rocksdb/t/bloomfilter3.test
+mysql-test/suite/innodb_stress/t/innodb_bigstress_docstore_nocompress.test
+src/Orchard.Web/Themes/TheAdmin/Views/Breadcrumb.cshtml
+top_down_classifier/data/gender/fold2005/val.txt
+top_down_classifier/src/top_down_classifier/volume_visualizer.h
+networking_cisco/neutronclient/policyprofile.py
+ioniclub-master/node_modules/bower/node_modules/request/node_modules/tough-cookie/node_modules/punycode/package.json
+deps/icu4c/source/i18n/hebrwcal.cpp
+tools/sstrip/src/sstrip.c
+pcap4j-core/src/main/java/org/pcap4j/core/NativePacketDllMappings.java
+files/usr/local/admin_scripts/nagios/centreon_plugins/src/check_meta_service
+debian/shlibs.local
+framework/src/java/org/apache/tapestry/coerce/BooleanArrayToIteratorConverter.java
+myblockchain-test/suite/memcached/t/memc221_get.test
+storage/myisam/mi_write.c
+myblockchain-test/suite/rpl/r/rpl_loaddata_s.result
+myblockchain-test/suite/ndb_rpl/t/ndb_rpl_slave_replay.test
+block/rpl_binlog_sender.h
+myblockchain-test/suite/ndb_rpl/r/ndb_rpl_mixed_tables.result
+myblockchain-test/suite/ndb_binlog/r/ndb_binlog_unique_epoch.result
+base_contact/__openerp__.py
+interface/x_trace.h
+src/firefly/java/edu/caltech/ipac/firefly/resources/DataSetSearchUI.prop
+appveyor.yml
+app/Providers/EventServiceProvider.php
+resources/views/candidates/edit.blade.php
+pack.cmd
+app/main/routes.php
+svg/MIL_STD_2525D_Symbols/Legacy/2525C/S-G-UUSRW-_0.svg
+tests/baselines/reference/parserComputedPropertyName24.js
+test/VisualStudio.Test/VisualStudio.Test.csproj
+t/lib/KohaTest/Scripts/longoverdue.pm
+src/administrator/components/com_kunena/template/tools/report.php
+src/components/com_kunena/template/crypsis/assets/less/mediaqueries.less
+portals/TrustDashBoard/src/main/webapp/Scripts/Register.js
+metric2/ProductMetric.v
+mapfishapp/src/main/java/org/georchestra/mapfishapp/ws/upload/FeatureGeoFileReader.java
+wrapper/Mol/AtomName.pypp.hpp
+GPy/testing/state_space_main_tests.py
+zdn/mat2014/C3/main.js
+corelib/src/libs/SireBase/errors.cpp
+WARZONE_ASSETS/models/players/jedi_stkotor_aliens_1/head_a1.skin
+tooling/support/provisioning-model/pom.xml
+src/test/org/apache/sqoop/hcat/HCatalogImportTest.java
+velocity-tools-generic/src/test/java/org/apache/velocity/tools/generic/DateToolTests.java
+jca/src/main/java/org/apache/qpid/ra/tm/WLSTransactionManagerLocator.java
+src/text/fmt/xp/fl_AutoLists.h
+src/java/org/apache/cassandra/db/commitlog/ReplayPosition.java
+chrome/browser/signin/about_signin_internals.cc
+asmcomp/printcmm.mli
+testsuite/tests/lib-threads/sockets.ml
+uimaj-json/src/main/java/org/apache/uima/json/impl/MetaDataObjectSerializer_json.java
+otherlibs/num/num.ml
+asmrun/i386nt.asm
+
+2025-02-12 20:34:04 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:04 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:04 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:05 - snowflake.connector.cursor - INFO - Number of results in first chunk: 2
+2025-02-12 20:34:07 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:07 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:07 - root - INFO - SQL:
+SELECT "content"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "binary" = FALSE AND "content" ILIKE '%import%(%'
+   LIMIT 100;
+Results:
+Too long, hard cut:
+content
+"#pragma once
+/*
+ *      Copyright (C) 2005-2012 Team XBMC
+ *      http://xbmc.org
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with XBMC; see the file COPYING.  If not, see
+ *  <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include ""utils/StdString.h""
+#include <vector>
+
+#include ""pictures/PictureScalingAlgorithm.h""
+#include ""utils/GlobalsHandling.h""
+
+class TiXmlElement;
+
+class DatabaseSettings
+{
+public:
+  void Reset()
+  {
+    type.clear();
+    host.clear();
+    port.clear();
+    user.clear();
+    pass.clear();
+    name.clear();
+  };
+  CStdString type;
+  CStdString host;
+  CStdString port;
+  CStdString user;
+  CStdString pass;
+  CStdString name;
+};
+
+struct TVShowRegexp
+{
+  bool byDate;
+  CStdString regexp;
+  int defaultSeason;
+  TVShowRegexp(bool d, const CStdString& r, int s = 1)
+  {
+    byDate = d;
+    regexp = r;
+    defaultSeason = s;
+  }
+};
+
+struct RefreshOverride
+{
+  float fpsmin;
+  float fpsmax;
+
+  float refreshmin;
+  float refreshmax;
+
+  bool  fallback;
+};
+
+
+struct RefreshVideoLatency
+{
+  float refreshmin;
+  float refreshmax;
+
+  float delay;
+};
+
+typedef std::vector<TVShowRegexp> SETTINGS_TVSHOWLIST;
+
+class CAdvancedSettings
+{
+  public:
+    CAdvancedSettings();
+
+    static CAdvancedSettings* getInstance();
+
+    void Initialize();
+    bool Initialized() { return m_initialized; };
+    void AddSettingsFile(const CStdString &filename);
+    bool Load();
+    void Clear();
+
+    static void GetCustomTVRegexps(TiXmlElement *pRootElement, SETTINGS_TVSHOWLIST& settings);
+    static void GetCustomRegexps(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomRegexpReplacers(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomExtensions(TiXmlElement *pRootElement, CStdString& extensions);
+
+    bool CanLogComponent(int component) const;
+
+    int m_audioHeadRoom;
+#ifdef TARGET_OPENELEC
+    // OpenELEC workaround for minimum sample Rate
+    int m_minimumSampleRate;
+#endif
+    float m_ac3Gain;
+    int m_maxPllAdjust;
+    CStdString m_audioDefaultPlayer;
+    float m_audioPlayCountMinimumPercent;
+    bool m_dvdplayerIgnoreDTSinWAV;
+    float m_limiterHold;
+    float m_limiterRelease;
+
+    bool  m_omxHWAudioDecode;
+    bool  m_omxDecodeStartWithValidFrame;
+
+    float m_videoSubsDelayRange;
+    float m_videoAudioDelayRange;
+    int m_videoSmallStepBackSeconds;
+    int m_videoSmallStepBackTries;
+    int m_videoSmallStepBackDelay;
+    bool m_videoUseTimeSeeking;
+    int m_videoTimeSeekForward;
+    int m_videoTimeSeekBackward;
+    int m_videoTimeSeekForwardBig;
+    int m_videoTimeSeekBackwardBig;
+    int m_videoPercentSeekForward;
+    int m_videoPercentSeekBackward;
+    int m_videoPercentSeekForwardBig;
+    int m_videoPercentSeekBackwardBig;
+    CStdString m_videoPPFFmpegDeint;
+    CStdString m_videoPPFFmpegPostProc;
+    bool m_videoVDPAUtelecine;
+    bool m_videoVDPAUdeintSkipChromaHD;
+    bool m_musicUseTimeSeeking;
+    int m_musicTimeSeekForward;
+    int m_musicTimeSeekBackward;
+    int m_musicTimeSeekForwardBig;
+    int m_musicTimeSeekBackwardBig;
+    int m_musicPercentSeekForward;
+    int m_musicPercentSeekBackward;
+    int m_musicPercentSeekForwardBig;
+    int m_musicPercentSeekBackwardBig;
+    int m_videoBlackBarColour;
+    int m_videoIgnoreSecondsAtStart;
+    float m_videoIgnorePercentAtEnd;
+    float m_audioApplyDrc;
+    bool m_useFfmpegVda;
+
+    int   m_videoVDPAUScaling;
+    bool  m_videoVAAPIforced;
+    float m_videoNonLinStretchRatio;
+    bool  m_videoEnableHighQualityHwScalers;
+    float m_videoAutoScaleMaxFps;
+    std::vector<RefreshOverride> m_videoAdjustRefreshOverrides;
+    std::vector<RefreshVideoLatency> m_videoRefreshLatency;
+    float m_videoDefaultLatency;
+    bool m_videoDisableBackgroundDeinterlace;
+    int  m_videoCaptureUseOcclusionQuery;
+    bool m_DXVACheckCompatibility;
+    bool m_DXVACheckCompatibilityPresent;
+    bool m_DXVAForceProcessorRenderer;
+    bool m_DXVANoDeintProcForProgressive;
+    bool m_DXVAAllowHqScaling;
+    int  m_videoFpsDetect;
+    int  m_videoBusyDialogDelay_ms;
+
+    CStdString m_videoDefaultPlayer;
+    CStdString m_videoDefaultDVDPlayer;
+    float m_videoPlayCountMinimumPercent;
+
+    float m_slideshowBlackBarCompensation;
+    float m_slideshowZoomAmount;
+    float m_slideshowPanAmount;
+
+    bool m_lcdHeartbeat;
+    bool m_lcdDimOnScreenSave;
+    int m_lcdScrolldelay;
+    CStdString m_lcdHostName;
+
+    int m_songInfoDuration;
+    int m_logLevel;
+    int m_logLevelHint;
+    CStdString m_cd
+
+2025-02-12 20:34:07 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:07 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:07 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:09 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-02-12 20:34:09 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:09 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:09 - root - INFO - SQL:
+SELECT s.value AS "import_line"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%'
+   LIMIT 100;
+Results:
+Too long, hard cut:
+import_line
+"import(""//build/config/ui.gni"")"
+"import(""//testing/test.gni"")"
+"  <Import Project=""$(VCTargetsPath)\Microsoft.Cpp.Default.props"" />"
+"  <Import Project=""$(VCTargetsPath)\Microsoft.Cpp.props"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Release|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Release_QT_backend|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Debug|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Debug_QT_backend|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <Import Project=""$(VCTargetsPath)\Microsoft.Cpp.targets"" />"
+"from test.support import (run_unittest, rmtree,"
+	public function getImportInfo ()
+	 	  	$import =  BatchJobPeer::doSelectOne ( $c );
+    important; for example there are some my_malloc() in constructors
+"  <Import Project=""$(MSBuildBinPath)\Microsoft.CSharp.targets"" />"
+            #import pdb; pdb.set_trace()
+        #import pdb; pdb.set_trace()
+        #import pdb; pdb.set_trace()
+#    #import pdb; pdb.set_trace()
+"  protected void runImport(SqoopTool tool, String[] argv) throws IOException {"
+"      LOG.error(""Got exception running import: "" + e.toString());"
+"  protected void runHCatImport(List<String> addlArgsArray,"
+"    runHCatImport(addlArgsArray, totalRecords, table, cols,"
+"  protected void runHCatQueryImport(List<String> addlArgsArray,"
+"    runHCatImport(addlArgsArray, totalRecords, table, cols,"
+"  protected void runHCatImport(List<String> addlArgsArray,"
+"      importArgs = getQueryArgv(true, colNames, new Configuration());"
+"      importArgs = getArgv(true, colNames, new Configuration());"
+"    LOG.debug(""Import args = "" + Arrays.toString(importArgs));"
+"    runImport(new ImportTool(), importArgs);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, colNames);"
+"      runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, colNames);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols,"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null, true, false);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null, true, false);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null, true, false);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+  public void testQueryImport() throws Exception {
+@import url(https://fonts.googleapis.com/css?family=Roboto:300)
+"  <Import Project=""..\CouchbaseConnect2014.Tests\CouchbaseConnect2014.Tests.projitems"" Label=""Shared"" Condition=""Exists('..\CouchbaseConnect2014.Tests\CouchbaseConnect2014.Tests.projitems')"" />"
+"  <Import Project=""..\Shared.Back\Shared.Back.projitems"" Label=""Shared"" Condition=""Exists('..\Shared.Back\Shared.Back.projitems')"" />"
+"  <Import Project=""..\Shared.Front\Shared.Front.projitems"" Label=""Shared"" Condition=""Exists('..\Shared.Front\Shared.Front.projitems')"" />"
+"  <Import Project=""..\Platform.Android\Platform.Android.projitems"" Label=""Shared"" Condition=""Exists('..\Platform.Android\Pl
+
+2025-02-12 20:34:09 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:09 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:09 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:11 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-02-12 20:34:11 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:11 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:12 - root - INFO - SQL:
+SELECT REGEXP_SUBSTR(s.value, '"([^"]+)"') AS "package"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   LIMIT 100;
+Results:
+Too long, hard cut:
+package
+"""//build/config/ui.gni"""
+"""//testing/test.gni"""
+"""$(VCTargetsPath)\Microsoft.Cpp.Default.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.props"""
+"""'$(Configuration)|$(Platform)'=='Release|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Release_QT_backend|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug_QT_backend|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.targets"""
+"""$(MSBuildBinPath)\Microsoft.CSharp.targets"""
+"""Got exception running import: """
+"""Import args = """
+"""$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"""
+"""$(MSBuildToolsPath)\Microsoft.CSharp.targets"""
+"""$(SolutionDir)\.nuget\NuGet.targets"""
+"""$(VCTargetsPath)\Microsoft.Cpp.Default.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.targets"""
+"""ft2-auto_hinter.html#glyph-to-script-map"""
+"""ScaleToPagesX"""
+"""ScaleToPagesY"""
+"""$(MSBuildExtensionsPath)\Microsoft\Silverlight for Phone\$(TargetFrameworkVersion)\Microsoft.Silverlight.$(TargetFrameworkProfile).Overrides.targets"""
+"""$(MSBuildExtensionsPath)\Microsoft\Silverlight for Phone\$(TargetFrameworkVersion)\Microsoft.Silverlight.CSharp.targets"""
+""";position:absolute;z-index:11;top:13px;left:4px;-moz-transition:all .1s ease;-webkit-transition:all .1s ease;-o-transition:all .1s ease;-ms-transition:all .1s ease;transition:all .1s ease}#menu-toggler:after{border-top:1px solid #ffa24d;border-bottom:1px solid #d15b47;content:"""
+"""$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"""
+"""$(MSBuildToolsPath)\Microsoft.CSharp.targets"""
+"""$(SolutionDir)\.nuget\NuGet.targets"""
+"""M:System.Web.Razor.Generator.AddImportCodeGenerator.#ctor(System.String,System.Int32)"""
+"""M:System.Web.Razor.Generator.AddImportCodeGenerator.Equals(System.Object)"""
+"""M:System.Web.Razor.Generator.AddImportCodeGenerator.GenerateCode(System.Web.Razor.Parser.SyntaxTree.Span,System.Web.Razor.Generator.CodeGeneratorContext)"""
+""
+"""..\CouchbaseConnect2014.Tests\CouchbaseConnect2014.Tests.projitems"""
+"""..\Shared.Back\Shared.Back.projitems"""
+"""..\Shared.Front\Shared.Front.projitems"""
+"""..\Platform.Android\Platform.Android.projitems"""
+"""$(MSBuildExtensionsPath)\Novell\Novell.MonoDroid.CSharp.targets"""
+"""$(VCTargetsPath)\Microsoft.Cpp.Default.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.props"""
+"""'$(Configuration)|$(Platform)'=='Release|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Release|x64'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug|x64'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.targets"""
+"""L9"""
+"""L16"""
+"""$(MSBuildExtensionsPath)\Microsoft\$(TargetFrameworkIdentifier)\$(TargetFrameworkVersion)\Microsoft.$(TargetFrameworkIdentifier).$(TargetFrameworkVersion).Overrides.targets"""
+"""$(MSBuildExtensionsPath)\Microsoft\$(TargetFrameworkIdentifier)\$(TargetFrameworkVersion)\Microsoft.$(TargetFrameworkIdentifier).CSharp.targets"""
+"""..\..\packages\Xamarin.Forms.2.0.0.6482\build\portable-win+net45+wp80+win81+wpa81+MonoAndroid10+MonoTouch10+Xamarin.iOS10\Xamarin.Forms.targets"""
+"""bad save filename: \"""
+"""[l]ong confidence intervals (CIs) will soon let us know if our experiment is weak and can give only imprecise estimates"""
+""";display:table;clear:both}.block,.show{display:block!important}table.show{display:table!important}tr.show{display:table-row!important}td.show,th.show{display:table-cell!important}.hide,[hidden]{display:none!important}.inline{display:inline-block!important}.visible{visibility:visible!important}.invisible{visibility:hidden!important}.overflow-auto{overflow:auto}.close{float:right;line-height:1;text-align:center;font-size:20px;font-size:1.25rem;font-weight:700;color:inherit;opacity:.4}[data-device=desktop] .close:hover{opacity:.8}.disabled,[disabled]{pointer-events:none;opacity:.5;color:grey;cursor:not-allowed}.fix-height{height:1px;padding-top:1px;visibility:hidden}.empty-hide:empty{clear:both;display:none!important}.empty-tip{padding:100px 20px;text-align:center;font-size:14px;font-size:.875rem;color:grey;background-color:#e6e6e6}.text-note{font-size:13px;font-size:.8125rem}@media (min-width:768px){.text-note{font-s
+
+2025-02-12 20:34:12 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:12 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:12 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:13 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-02-12 20:34:13 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:13 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:14 - root - INFO - SQL:
+SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "package",
+          COUNT(*) AS "frequency"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   GROUP BY "package"
+   LIMIT 100;
+Results:
+Too long, hard cut:
+package,frequency
+']global[,1
+[,1
+"That doesn&#x27;t really refute the article. Anyone with access to the DNS server could change the email records for a few minutes to intercept mail. A hacker wouldn&#x27;t have to wait for propagation in that case. And who would notice? This has me thinking, it would be nice to get alerted if a) my DNS records change at registrar level and more importantly if b) my DNS records change at the DNS host level.<p>I think DNS hosts should offer a waiting period option or approval system (with warning alert) for changing email records. Obviously you want website records to change instantly for failover, but I don&#x27;t want a hacker changing email records in the middle of the night without anyone knowing. I use Linode and DNSMadeEasy and I don&#x27;t remember either service sending me a notification when an email record was changed.<p>Also, seems like you could sell a 3rd party service to monitor DNS hosts. (I didn&#x27;t bother to Google if that service exists already.) I&#x27;m assuming &quot;dnshistory.org&quot; only pings once per day--pretty much useless info from a security standpoint.",1
+M:System.Web.Razor.Generator.AddImportCodeGenerator.Equals(System.Object),1
+Windows8SDK_x64.props,3
+$(MSBuildExtensionsPath)\Novell\Novell.MonoDroid.CSharp.targets,1
+"Make notes on dates and any details pertaining to the dates of creation, publication, or distribution, of the unit being described that are not included in the Date(s) of creation, including publication, distribution, etc., area and that are considered to be important.",1
+permaurl,1
+../mixins,1
+overload,1
+]|(import|module)\s+[^,1
+"Use canvas if performance is important. Use SVG if it&#x27;s important to assign functionality to specific graphical elements (as opposed to rolling your own hit detection). See my comment above in this thread for more.<p>[Usual caveats apply...this is general advice, and I don&#x27;t know your situation, etc.]",1
+//build/config/chromecast_build.gni,1
+content,32
+$(VSToolsPath)\WebApplications\Microsoft.WebApplication.targets,1
+"),e=c.valuePrefix||",1
+Too many !important declarations (,1
+"<i>>You just have to look at all of the crazy responses to Target (a US retailer) removing the gender-specific labelling of toys (from &quot;Girl Toys&quot; and &quot;Boy Toys&quot; to just &quot;Toys&quot;) to see how as a society we are not at a point where &quot;we&quot; aren&#x27;t trying to impose a particular ideal (e.g. &quot;Barbies are girl toys&quot;) on children as they grow up.</i><p>It&#x27;s not about what they <i>should</i> prefer but about what they are <i>more likely to prefer</i>. We have studies that show this isn&#x27;t merely a human social phenomenon [0] [1] [2]. There are gender preferences for toys and to <i>most people</i> it&#x27;s silly to take offence at the idea that genders have different preferences. Now whether we should <i>nurture</i> these differences is a slightly different argument. The phrasing difference is important - and starting with something more people can understand (which color for &quot;boys&quot; has changed not only over time, but varies across populations) would help the discussion. If girls and boys are attracted to [type] of toy, can we nurture their interests in a different direction? The answer is &quot;probably, yes&quot;. But that&#x27;s a different debate.<p>The &quot;crazy responses&quot; you see are people irritated that a group of hyper-sensitive people who have placed a disturbing level of importance on their gender identity (and the gender identity of others) harped on about this non-issue until Target felt forced to change it to get them to shut up and leave them alone.<p>The constant bullying and what boils down to online smear campaigns done by these extremist self-identity-crisis groups annoys most people who don&#x27;t place nearly as much importance on their (or others&#x27;) racial/gender/sexual identities.<p>[0] <a href=",1
+$(MSBuildToolsPath)\Microsoft.VisualBasic.targets,1
+"This is so funny, I was just watching &quot;Modern Marvels - Weird Weapons of WWII (The Axis)&quot;. Turns out, a similar approach was discussed by Werner von Braun (the father of modern rocket science, basically the most important guy other than Goddard in that whole field) to create a &quot;space plane&quot; with the capability of quickly dropping a (radioactive, but not atomic) bomb on a target anywhere in the world, but more specifically major US cities. One major difference was that the track to launch the space plane was straight, and not curved. Given it was curved, would they have still been able to launch the lightweight space plane with just enough fuel it needs to get up to LEO, or would they still have run into the issue that they can&#x27;t get the plane to go fast enough and point upward enough to break the atmosphere?<p>Source: <a href=",1
+//build/config/arm.gni,1
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(MSBuildExtensionsPath)\Microsoft\Silverlight for Phone
+
+2025-02-12 20:34:14 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:14 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:14 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:15 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-02-12 20:34:15 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:15 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:16 - root - INFO - SQL:
+SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "package",
+          COUNT(*) AS "frequency"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   GROUP BY "package"
+   ORDER BY "frequency" DESC
+   LIMIT 100;
+Results:
+Too long, hard cut:
+package,frequency
+$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props,82
+PropertySheets,40
+content,32
+$(VCTargetsPath)\Microsoft.Cpp.Default.props,22
+$(VCTargetsPath)\Microsoft.Cpp.targets,22
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props,16
+libgio-2.0-0.dll,12
+"$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.targets))\dir.targets",12
+$(MSBuildToolsPath)\Microsoft.CSharp.targets,12
+"$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.props))\dir.props",12
+avifil32.dll,11
+'$(Configuration)|$(Platform)'=='Debug|Win32',9
+'$(Configuration)|$(Platform)'=='Release|Win32',9
+'$(Configuration)|$(Platform)'=='Debug|x64',8
+spacer,8
+Urho3D::Matrix3x4(@),8
+'$(Configuration)|$(Platform)'=='Release|x64',8
+exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props'),8
+(# * #),6
+$(SolutionDir)\.nuget\NuGet.targets,5
+$(VCTargetsPath)Microsoft.CPP.UpgradeFromVC70.props,4
+text,4
+$(VCTargetsPath)Microsoft.CPP.UpgradeFromVC60.props,4
+import,4
+use strict,4
+$(MSBuildBinPath)\Microsoft.CSharp.targets,4
+User32,4
+$(IntDir)\OpenAL32.lib,4
+%s,4
+_,4
+Windows8SDK_x64.props,3
+object,3
+version,3
+kernel32.dll,3
+ace/mode/doc_comment_highlight_rules,3
+\n    // assume ms is a previously created MetadataStore\n    var metadataAsString = ms.exportMetadata();\n    window.localStorage.setItem(\,3
+.class,3
+npm,3
+Windows81SDK_x64.props,3
+Windows81SDK_x86.props,3
+label label-danger,3
+,3
+Windows8SDK_x86.props,3
+//testing/test.gni,3
+//build/config/ui.gni,2
+$(MSBuildExtensionsPath)\Xamarin\Android\Xamarin.Android.CSharp.targets,2
+Open Sans,2
+//mojo/public/mojo_application_manifest.gni,2
+ source=\,2
+user32.dll,2
+..\..\packages\Xamarin.Forms.2.0.0.6482\build\portable-win+net45+wp80+win81+wpa81+MonoAndroid10+MonoTouch10+Xamarin.iOS10\Xamarin.Forms.targets,2
+<style>*{ cursor: ,2
+$(FSharpTargetsPath),2
+button,2
+$(SolutionDir)\XBMC.defaults.props,2
+ok_cert.pem,2
+$(TPath),2
+airlines.hex,2
+$(WebKit_Libraries)\tools\vsprops\debugsuffix.props,2
+$(MSBuildExtensionsPath32)\Microsoft\Portable\$(TargetFrameworkVersion)\Microsoft.Portable.CSharp.targets,2
+1,2
+$(OUTDIR)/emission.lib,2
+body,2
+//build/config/android/config.gni,2
+~/lol.css,2
+stats,2
+ace/mode/java,1
+height: 1.00em;,1
+Continuar,1
+"M:System.Web.Razor.Generator.AddImportCodeGenerator.#ctor(System.String,System.Int32)",1
+btn btn-important,1
+../../../types,1
+(.*?)\,1
+"Article seemed to make a quantum leap here<p>> But most importantly, our work revives that age-old fantasy of learning during our sleep<p>Can someone elaborate on how responding to preconditioned stimuli (a voice repeating the same question over and over) can translate to learning things while we are asleep?",1
+http://test,1
+$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v10.0\WebApplications\Microsoft.WebApplication.targets,1
+//build/config/chromecast_build.gni,1
+$(VSToolsPath)\WebApplications\Microsoft.WebApplication.targets,1
+185-lda-5,1
+">It&#x27;s very important to be allowed to say publicly that things suck. I would argue that more people should do it... His comments in the video were harsh and opinionated and the questioner was disappointed with the answer, but as the same time he was being asked for an opinion and gave a fair one.<p>I totally agree about the need for honest criticism. If Jonathan Blow had started the reply, and Phil Fish had followed up with his apt comparison involving the Zelda games, they wouldn&#x27;t have come across negatively to me at all. Seriously though, how can you not see how rude (and even mildly racist) his opening remarks are, especially when given to someone who is not fluent in the English language (and is thus likely to take what he says even more seriously)?<p>&quot;They suck. I&#x27;m sorry, but <i>you guys</i> need to get with the times and make better interfaces and like update your technology... <i>we&#x27;re</i> totally kicking <i>your ass</i>... back then <i>you guys</i> were the king of the world, but <i>your time has passed.</i>&quot;<p>What the fuck? How can people on here get bent out of shape over the mildest use of unnecessarily gendered language, but let something like that pass?<p>To the sibling comment from PavlovCat&#x27;s, obviously I can&#x27;t get into their heads, but the impression I got was that the people on the panel were laughing at Phil&#x27;s complete lack of tact. Listen again and hear Edmund exclaiming &quot;oh wow&quot; just before he bursts into laughter.",1
+").split(/\s+/);for(t=0;n.length>t;t++)a.call(this,n[t])}}function t(e,t){e.className=t.join(",1
+text/javascript,1
+Prevel Framework (JS). Convenience in 5 Kb,1
+"import json,sys;print json.loads(sys.stdin.read())[0]['version'];",1
+com-tecnick-tcexam-admin/XMLUserImporter.html#methodsegContentHandler,1
+hxuy,1
+zombiezen.com/go/capnproto2/std/capnp/cxx,1
+Imported,1
+tpck,1
+-many                    générer le code pour n'importe quelle architecture (PWR/PWRX/PPC)\n,1
+M:System.Web.Razor.Generator.AddImportCodeGene
+
+2025-02-12 20:34:16 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:34:16 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:34:16 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:34:17 - snowflake.connector.cursor - INFO - Number of results in first chunk: 10
+2025-02-12 20:34:17 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:34:18 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:34:18 - root - INFO - SQL:
+SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "Package",
+           COUNT(*) AS "Frequency"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+    GROUP BY "Package"
+    ORDER BY "Frequency" DESC
+    LIMIT 10;
+Results:
+Package,Frequency
+$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props,82
+PropertySheets,40
+content,32
+$(VCTargetsPath)\Microsoft.Cpp.Default.props,22
+$(VCTargetsPath)\Microsoft.Cpp.targets,22
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props,16
+libgio-2.0-0.dll,12
+"$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.targets))\dir.targets",12
+$(MSBuildToolsPath)\Microsoft.CSharp.targets,12
+
+2025-02-12 20:34:18 - root - INFO - itercount: 0
+2025-02-12 20:34:18 - root - INFO - Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+,0
+table_name,SAMPLE_FILES
+description,
+DDL,"create or replace TABLE SAMPLE_FILES (
+	""repo_name"" VARCHAR(16777216),
+	""ref"" VARCHAR(16777216),
+	""path"" VARCHAR(16777216),
+	""mode"" NUMBER(38,0),
+	""id"" VARCHAR(16777216),
+	""symlink_target"" VARCHAR(16777216)
+);"
+
+Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+,1
+table_name,LANGUAGES
+description,
+DDL,"create or replace TABLE LANGUAGES (
+	""repo_name"" VARCHAR(16777216),
+	""language"" VARIANT
+);"
+
+Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+,2
+table_name,LICENSES
+description,
+DDL,"create or replace TABLE LICENSES (
+	""repo_name"" VARCHAR(16777216),
+	""license"" VARCHAR(16777216)
+);"
+
+Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+,3
+table_name,SAMPLE_COMMITS
+description,
+DDL,"create or replace TABLE SAMPLE_COMMITS (
+	""commit"" VARCHAR(16777216),
+	""tree"" VARCHAR(16777216),
+	""parent"" VARIANT,
+	""author"" VARIANT,
+	""committer"" VARIANT,
+	""subject"" VARCHAR(16777216),
+	""message"" VARCHAR(16777216),
+	""trailer"" VARIANT,
+	""difference"" VARIANT,
+	""difference_truncated"" BOOLEAN,
+	""repo_name"" VARCHAR(16777216),
+	""encoding"" VARCHAR(16777216)
+);"
+
+Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+,4
+table_name,SAMPLE_CONTENTS
+description,
+DDL,"create or replace TABLE SAMPLE_CONTENTS (
+	""id"" VARCHAR(16777216),
+	""size"" NUMBER(38,0),
+	""content"" VARCHAR(16777216),
+	""binary"" BOOLEAN,
+	""copies"" NUMBER(38,0),
+	""sample_repo_name"" VARCHAR(16777216),
+	""sample_ref"" VARCHAR(16777216),
+	""sample_path"" VARCHAR(16777216),
+	""sample_mode"" NUMBER(38,0),
+	""sample_symlink_target"" VARCHAR(16777216)
+);"
+
+Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+,5
+table_name,SAMPLE_REPOS
+description,
+DDL,"create or replace TABLE SAMPLE_REPOS (
+	""repo_name"" VARCHAR(16777216),
+	""watch_count"" NUMBER(38,0)
+);"
+
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['SAMPLE_FILES', 'LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_REPOS']}}
+Begin Exploring Related Columns
+**Relevant Columns and Potential Usage:**
+
+- `"content"`: Contains the file content; used to search for import statements enclosed in parentheses.
+- `"binary"`: Indicates if the file is binary; used to exclude binary files (`"binary" = FALSE`).
+- `"sample_repo_name"`: Name of the repository; can be used for reference.
+- `"sample_path"`: Path of the file; could help in filtering specific file types or directories.
+
+**Conditions That May Be Used:**
+
+- Exclude binary files: `WHERE "binary" = FALSE`
+- Exclude NULL or empty content: `WHERE "content" IS NOT NULL`
+- Search for import statements: `WHERE "content" ILIKE '%import%(%'`
+- Split multi-line imports by newlines using `SPLIT_TO_TABLE`
+- Extract package names within double quotes using regular expressions
+
+**SQL Queries:**
+
+1. **Select the content of the first 100 files to inspect the data:**
+   ```sql
+   SELECT "content"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   LIMIT 100;
+   ```
+
+2. **Select the content and repository name, excluding binary files:**
+   ```sql
+   SELECT "content", "sample_repo_name"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "binary" = FALSE
+   LIMIT 100;
+   ```
+
+3. **Select distinct repository names to see the repositories available:**
+   ```sql
+   SELECT DISTINCT "sample_repo_name"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   LIMIT 100;
+   ```
+
+4. **Select file paths where content is not NULL, excluding binary files:**
+   ```sql
+   SELECT "sample_path"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "content" IS NOT NULL AND "binary" = FALSE
+   LIMIT 100;
+   ```
+
+5. **Select content that likely contains import statements enclosed in parentheses:**
+   ```sql
+   SELECT "content"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "binary" = FALSE AND "content" ILIKE '%import%(%'
+   LIMIT 100;
+   ```
+
+6. **Select lines from content that contain 'import' statements enclosed in parentheses:**
+   ```sql
+   SELECT s.value AS "import_line"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%'
+   LIMIT 100;
+   ```
+
+7. **Extract package names within double quotes from import statements:**
+   ```sql
+   SELECT REGEXP_SUBSTR(s.value, '"([^"]+)"') AS "package"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   LIMIT 100;
+   ```
+
+8. **Count how often each package appears in import statements:**
+   ```sql
+   SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "package",
+          COUNT(*) AS "frequency"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   GROUP BY "package"
+   LIMIT 100;
+   ```
+
+9. **Order the packages by frequency in descending order:**
+   ```sql
+   SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "package",
+          COUNT(*) AS "frequency"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   GROUP BY "package"
+   ORDER BY "frequency" DESC
+   LIMIT 100;
+   ```
+
+10. **Identify the top 10 most frequently used packages:**
+    ```sql
+    SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "Package",
+           COUNT(*) AS "Frequency"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+    GROUP BY "Package"
+    ORDER BY "Frequency" DESC
+    LIMIT 10;
+    ```
+
+**Note:** Each query progressively builds upon the previous one to achieve the task of identifying the top 10 most frequently used packages by analyzing import statements in the repository contents.Query:
+SELECT "content"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+content
+"/*
+ * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips
+ *
+ * Copyright (C) 2008 David Brownell
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/bcd.h>
+#include <linux/slab.h>
+#include <linux/rtc.h>
+#include <linux/workqueue.h>
+
+#include <linux/spi/spi.h>
+#include <linux/spi/ds1305.h>
+#include <linux/module.h>
+
+
+/*
+ * Registers ... mask DS1305_WRITE into register address to write,
+ * otherwise you're reading it.  All non-bitmask values are BCD.
+ */
+#define DS1305_WRITE		0x80
+
+
+/* RTC date/time ... the main special cases are that we:
+ *  - Need fancy ""hours"" encoding in 12hour mode
+ *  - Don't rely on the ""day-of-week"" field (or tm_wday)
+ *  - Are a 21st-century clock (2000 <= year < 2100)
+ */
+#define DS1305_RTC_LEN		7		/* bytes for RTC regs */
+
+#define DS1305_SEC		0x00		/* register addresses */
+#define DS1305_MIN		0x01
+#define DS1305_HOUR		0x02
+#	define DS1305_HR_12		0x40	/* set == 12 hr mode */
+#	define DS1305_HR_PM		0x20	/* set == PM (12hr mode) */
+#define DS1305_WDAY		0x03
+#define DS1305_MDAY		0x04
+#define DS1305_MON		0x05
+#define DS1305_YEAR		0x06
+
+
+/* The two alarms have only sec/min/hour/wday fields (ALM_LEN).
+ * DS1305_ALM_DISABLE disables a match field (some combos are bad).
+ *
+ * NOTE that since we don't use WDAY, we limit ourselves to alarms
+ * only one day into the future (vs potentially up to a week).
+ *
+ * NOTE ALSO that while we could generate once-a-second IRQs (UIE), we
+ * don't currently support them.  We'd either need to do it only when
+ * no alarm is pending (not the standard model), or to use the second
+ * alarm (implying that this is a DS1305 not DS1306, *and* that either
+ * it's wired up a second IRQ we know, or that INTCN is set)
+ */
+#define DS1305_ALM_LEN		4		/* bytes for ALM regs */
+#define DS1305_ALM_DISABLE	0x80
+
+#define DS1305_ALM0(r)		(0x07 + (r))	/* register addresses */
+#define DS1305_ALM1(r)		(0x0b + (r))
+
+
+/* three control registers */
+#define DS1305_CONTROL_LEN	3		/* bytes of control regs */
+
+#define DS1305_CONTROL		0x0f		/* register addresses */
+#	define DS1305_nEOSC		0x80	/* low enables oscillator */
+#	define DS1305_WP		0x40	/* write protect */
+#	define DS1305_INTCN		0x04	/* clear == only int0 used */
+#	define DS1306_1HZ		0x04	/* enable 1Hz output */
+#	define DS1305_AEI1		0x02	/* enable ALM1 IRQ */
+#	define DS1305_AEI0		0x01	/* enable ALM0 IRQ */
+#define DS1305_STATUS		0x10
+/* status has just AEIx bits, mirrored as IRQFx */
+#define DS1305_TRICKLE		0x11
+/* trickle bits are defined in <linux/spi/ds1305.h> */
+
+/* a bunch of NVRAM */
+#define DS1305_NVRAM_LEN	96		/* bytes of NVRAM */
+
+#define DS1305_NVRAM		0x20		/* register addresses */
+
+
+struct ds1305 {
+	struct spi_device	*spi;
+	struct rtc_device	*rtc;
+
+	struct work_struct	work;
+
+	unsigned long		flags;
+#define FLAG_EXITING	0
+
+	bool			hr12;
+	u8			ctrl[DS1305_CONTROL_LEN];
+};
+
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Utilities ...  tolerate 12-hour AM/PM notation in case of non-Linux
+ * software (like a bootloader) which may require it.
+ */
+
+static unsigned bcd2hour(u8 bcd)
+{
+	if (bcd & DS1305_HR_12) {
+		unsigned	hour = 0;
+
+		bcd &= ~DS1305_HR_12;
+		if (bcd & DS1305_HR_PM) {
+			hour = 12;
+			bcd &= ~DS1305_HR_PM;
+		}
+		hour += bcd2bin(bcd);
+		return hour - 1;
+	}
+	return bcd2bin(bcd);
+}
+
+static u8 hour2bcd(bool hr12, int hour)
+{
+	if (hr12) {
+		hour++;
+		if (hour <= 12)
+			return DS1305_HR_12 | bin2bcd(hour);
+		hour -= 12;
+		return DS1305_HR_12 | DS1305_HR_PM | bin2bcd(hour);
+	}
+	return bin2bcd(hour);
+}
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Interface to RTC framework
+ */
+
+static int ds1305_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		buf[2];
+	long		err = -EINVAL;
+
+	buf[0] = DS1305_WRITE | DS1305_CONTROL;
+	buf[1] = ds1305->ctrl[0];
+
+	if (enabled) {
+		if (ds1305->ctrl[0] & DS1305_AEI0)
+			goto done;
+		buf[1] |= DS1305_AEI0;
+	} else {
+		if (!(buf[1] & DS1305_AEI0))
+			goto done;
+		buf[1] &= ~DS1305_AEI0;
+	}
+	err = spi_write_then_read(ds1305->spi, buf, sizeof(buf), NULL, 0);
+	if (err >= 0)
+		ds1305->ctrl[0] = buf[1];
+done:
+	return err;
+
+}
+
+
+/*
+ * Get/set of date and time is pretty normal.
+ */
+
+static int ds1305_get_time(struct device *dev, struct rtc_time *time)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		addr = DS1305_SEC;
+	u8		buf[DS1305_RTC_LEN];
+	int		status;
+
+	/* Use write-then-read to get all the date/time registers
+	 * since dma from stack is nonportable
+	 */
+	status = spi_write_then_read(ds1305->spi, &addr, sizeof(addr),
+			buf, sizeof(buf));
+	if (status < 0)
+		return status;
+
+	dev_vdbg(dev, ""%s: %02x %02x %02x, %02x %02x %02x %02x\n"",
+		""read"", buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5], buf[6]);
+
+	/* Decode the registers
+Query:
+SELECT "content", "sample_repo_name"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "binary" = FALSE
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+content,sample_repo_name
+"#pragma once
+/*
+ *      Copyright (C) 2005-2012 Team XBMC
+ *      http://xbmc.org
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with XBMC; see the file COPYING.  If not, see
+ *  <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include ""utils/StdString.h""
+#include <vector>
+
+#include ""pictures/PictureScalingAlgorithm.h""
+#include ""utils/GlobalsHandling.h""
+
+class TiXmlElement;
+
+class DatabaseSettings
+{
+public:
+  void Reset()
+  {
+    type.clear();
+    host.clear();
+    port.clear();
+    user.clear();
+    pass.clear();
+    name.clear();
+  };
+  CStdString type;
+  CStdString host;
+  CStdString port;
+  CStdString user;
+  CStdString pass;
+  CStdString name;
+};
+
+struct TVShowRegexp
+{
+  bool byDate;
+  CStdString regexp;
+  int defaultSeason;
+  TVShowRegexp(bool d, const CStdString& r, int s = 1)
+  {
+    byDate = d;
+    regexp = r;
+    defaultSeason = s;
+  }
+};
+
+struct RefreshOverride
+{
+  float fpsmin;
+  float fpsmax;
+
+  float refreshmin;
+  float refreshmax;
+
+  bool  fallback;
+};
+
+
+struct RefreshVideoLatency
+{
+  float refreshmin;
+  float refreshmax;
+
+  float delay;
+};
+
+typedef std::vector<TVShowRegexp> SETTINGS_TVSHOWLIST;
+
+class CAdvancedSettings
+{
+  public:
+    CAdvancedSettings();
+
+    static CAdvancedSettings* getInstance();
+
+    void Initialize();
+    bool Initialized() { return m_initialized; };
+    void AddSettingsFile(const CStdString &filename);
+    bool Load();
+    void Clear();
+
+    static void GetCustomTVRegexps(TiXmlElement *pRootElement, SETTINGS_TVSHOWLIST& settings);
+    static void GetCustomRegexps(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomRegexpReplacers(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomExtensions(TiXmlElement *pRootElement, CStdString& extensions);
+
+    bool CanLogComponent(int component) const;
+
+    int m_audioHeadRoom;
+#ifdef TARGET_OPENELEC
+    // OpenELEC workaround for minimum sample Rate
+    int m_minimumSampleRate;
+#endif
+    float m_ac3Gain;
+    int m_maxPllAdjust;
+    CStdString m_audioDefaultPlayer;
+    float m_audioPlayCountMinimumPercent;
+    bool m_dvdplayerIgnoreDTSinWAV;
+    float m_limiterHold;
+    float m_limiterRelease;
+
+    bool  m_omxHWAudioDecode;
+    bool  m_omxDecodeStartWithValidFrame;
+
+    float m_videoSubsDelayRange;
+    float m_videoAudioDelayRange;
+    int m_videoSmallStepBackSeconds;
+    int m_videoSmallStepBackTries;
+    int m_videoSmallStepBackDelay;
+    bool m_videoUseTimeSeeking;
+    int m_videoTimeSeekForward;
+    int m_videoTimeSeekBackward;
+    int m_videoTimeSeekForwardBig;
+    int m_videoTimeSeekBackwardBig;
+    int m_videoPercentSeekForward;
+    int m_videoPercentSeekBackward;
+    int m_videoPercentSeekForwardBig;
+    int m_videoPercentSeekBackwardBig;
+    CStdString m_videoPPFFmpegDeint;
+    CStdString m_videoPPFFmpegPostProc;
+    bool m_videoVDPAUtelecine;
+    bool m_videoVDPAUdeintSkipChromaHD;
+    bool m_musicUseTimeSeeking;
+    int m_musicTimeSeekForward;
+    int m_musicTimeSeekBackward;
+    int m_musicTimeSeekForwardBig;
+    int m_musicTimeSeekBackwardBig;
+    int m_musicPercentSeekForward;
+    int m_musicPercentSeekBackward;
+    int m_musicPercentSeekForwardBig;
+    int m_musicPercentSeekBackwardBig;
+    int m_videoBlackBarColour;
+    int m_videoIgnoreSecondsAtStart;
+    float m_videoIgnorePercentAtEnd;
+    float m_audioApplyDrc;
+    bool m_useFfmpegVda;
+
+    int   m_videoVDPAUScaling;
+    bool  m_videoVAAPIforced;
+    float m_videoNonLinStretchRatio;
+    bool  m_videoEnableHighQualityHwScalers;
+    float m_videoAutoScaleMaxFps;
+    std::vector<RefreshOverride> m_videoAdjustRefreshOverrides;
+    std::vector<RefreshVideoLatency> m_videoRefreshLatency;
+    float m_videoDefaultLatency;
+    bool m_videoDisableBackgroundDeinterlace;
+    int  m_videoCaptureUseOcclusionQuery;
+    bool m_DXVACheckCompatibility;
+    bool m_DXVACheckCompatibilityPresent;
+    bool m_DXVAForceProcessorRenderer;
+    bool m_DXVANoDeintProcForProgressive;
+    bool m_DXVAAllowHqScaling;
+    int  m_videoFpsDetect;
+    int  m_videoBusyDialogDelay_ms;
+
+    CStdString m_videoDefaultPlayer;
+    CStdString m_videoDefaultDVDPlayer;
+    float m_videoPlayCountMinimumPercent;
+
+    float m_slideshowBlackBarCompensation;
+    float m_slideshowZoomAmount;
+    float m_slideshowPanAmount;
+
+    bool m_lcdHeartbeat;
+    bool m_lcdDimOnScreenSave;
+    int m_lcdScrolldelay;
+    CStdString m_lcdHostName;
+
+    int m_songInfoDuration;
+    int m_logLevel;
+    int m_logLevelHint;
+  
+Query:
+SELECT DISTINCT "sample_repo_name"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   LIMIT 100;
+Answer:
+sample_repo_name
+pelya/commandergenius
+cloudera/impala-kudu
+khasang/SmartForecast
+urjaman/flashrom
+velo/flexmojos
+SnappyDataInc/snappy-store
+XyrusWorx/apophysis7x
+drdaeman/accel-ppp
+tokee/lucene
+webscalesql/webscalesql-5.6
+CONNECT-Solution/CONNECT
+DoSomething/voting-app
+apache/sqoop
+AbiWord/abiword
+meta-debian/meta-debian
+Cerberuss/GofPatterns
+cloudmatrix/esky
+Mygod/Skylark
+JHUAPL/AccumuloGraph
+vmesel/GeoMath
+mapbender/mapbender
+sfmskywalker/Orchard
+ovh/overthebox-openwrt
+Caltech-IPAC/firefly
+Kunena/Kunena-Forum
+nickkolok/chas-ege
+apache/uima-uimaj
+apache/sis
+bombmanual/bombmanual.github.io
+pplante/droidtowers
+Nexus-Mods/Nexus-Mod-Manager
+jmaih/RISE_toolbox
+headwirecom/aem-solr-search
+glmcdona/strings2
+anycmd/anycmd
+linuxdeepin/deepin-wm
+mempo/mempo-kernel
+apache/qpid-java
+ImmobilienScout24/yum-repo-server
+gorescript/gorescript
+oehf/ipf
+findsorguk/findsorguk
+garyKeorkunian/squants
+Sitecore/Habitat
+StefanoFiumara/Harry-Potter-Unity
+gr8pefish/IronBackpacks
+iridium-browser/iridium-browser-ubuntu
+sam408130/Ionic-Demos
+Glimpse/Glimpse.Prototype
+coinkite/cloudfire
+b3dgs/lionengine
+Incubaid/arakoon
+aspnetboilerplate/aspnetboilerplate
+jaquadro/StorageDrawers
+Job-Yang/YTZImageComparison
+awslabs/aws-sdk-cpp
+ghxiao/drew
+aasensio/pySIR
+epiSurg/EpiSurg
+googlei18n/language-resources
+crossbario/crossbarexamples
+ezScrum/ezScrum
+fxos-components/bridge
+LibreOffice/core
+KDE/krita
+mdaniel/virtualbox-org-svn-vbox-trunk
+hroptatyr/dateutils
+espadrine/opera
+digama0/mmj2
+nathansttt/hog2
+google/binexport
+biocaml/biocaml
+tatsuhiro-t/aria2
+albertz/openlierox
+Open-Transport/synthese
+danielnaber/openthesaurus
+scrollback/io.scrollback.neighborhoods
+project-store/theme
+sileht/check_mk
+umbraco/Umbraco-CMS
+nigelsmall/py2neo
+Esteemed-Innovation/Flaxbeards-Steam-Power
+TheTechnobear/EigenD
+sonata-project/sandbox-build
+koala-framework/koala-framework
+ligaDATA/Kamanja
+hiloteam/Hilo
+oivva/boxy
+ChildrenOfUr/coUclient
+timduru/tf300t-katkernel
+ChildrenOfUr/coUserver
+draios/sysdig
+bosonic/bosonic
+Ulauncher/Ulauncher
+DynamoRIO/drk
+google/ktsan
+apache/tomcat-native
+erasaur/binary
+jdahlstrom/vaadin.react
+pfirmstone/river-internet
+Query:
+SELECT "sample_path"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "content" IS NOT NULL AND "binary" = FALSE
+   LIMIT 100;
+Answer:
+sample_path
+xbmc/settings/AdvancedSettings.h
+project/jni/application/ja2/AndroidAppSettings.cfg
+src/pyudev/_ctypeslib/__init__.py
+common/thrift/CatalogService.thrift
+deprecated/stomp/test/paper_experiments/maze_num_rollouts_test_nona.yaml
+socketcan_interface/CMakeLists.txt
+.gitignore
+src/pocketmine/block/Sugarcane.php
+src/main/resources/assets/ironbackpacks/models/item/backpackBasic.json
+nicintel.c
+src/dashboard/src/templates/ingest/as/resource_component.html
+src/prpltwtr/prpltwtr_endpoint_im.c
+Synergy Editor TGC/Synergy Editor/WelcomePages.h
+Install/Help/commands/3dmaths/SCALE VECTOR2.htm
+Install/Help/commands/basic3d/TLVERTEXSYSTEMMEMORY AVAILABLE.htm
+Synergy Editor TGC/Synergy Editor/Synergy Editor.cpp
+alpha/lib/model/entry.php
+api_v3/lib/KalturaBaseService.php
+deb/kaltura-php/debian/kaltura-php7-xmlrpc/DEBIAN/preinst
+src/shared/SeqReader.cpp
+src/BCR/BCRexternalBWT.cpp
+src/frontends/BeetlExtend.hh
+src/cinder/app/linux/WindowImplLinuxEgl.cpp
+flexmojos-testing/flexmojos-test-harness/src/test/java/net/flexmojos/oss/tests/concept/AttachAsdocTest.java
+src/Mapbender/CoreBundle/Command/TemplateGenerator.php
+src/Mapbender/WmsBundle/Form/Type/VendorSpecificType.php
+gemfirexd/client/src/main/java/io/snappydata/thrift/internal/ClientParameterMetaData.java
+third_party/skia/src/gpu/gl/GrGLProgram.cpp
+third_party/crashpad/crashpad/snapshot/win/process_reader_win.h
+third_party/skia/src/gpu/effects/GrConfigConversionEffect.cpp
+kbe/src/lib/cstdkbe/cstdkbe.hpp
+accel-pppd/shaper/shaper.c
+libjava/javax/naming/spi/NamingManager.java
+util/robodoc/Source/robodoc.c
+maven-install-all.bat
+lionengine-network/src/main/java/com/b3dgs/lionengine/network/Networker.java
+lionengine-core/src/main/java/com/b3dgs/lionengine/drawable/Image.java
+fs/namespace.c
+src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java
+xorg-server/present/present_screen.c
+libxcb/xcb-sync.pc.in
+sql/log_event.cc
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/orchestration/NhinAggregator.java
+Product/Production/Services/PatientDiscoveryCore/src/main/java/gov/hhs/fha/nhinc/patientdiscovery/model/builder/impl/PatientSearchResultsModelBuilderImpl.java
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/messaging/client/CONNECTCXFClientFactory.java
+DICOMcloud.Dicom/Media/Factories/IDicomMediaReaderFactory.cs
+mysql-test/suite/rocksdb/t/bloomfilter3.test
+mysql-test/suite/innodb_stress/t/innodb_bigstress_docstore_nocompress.test
+src/Orchard.Web/Themes/TheAdmin/Views/Breadcrumb.cshtml
+top_down_classifier/data/gender/fold2005/val.txt
+top_down_classifier/src/top_down_classifier/volume_visualizer.h
+networking_cisco/neutronclient/policyprofile.py
+ioniclub-master/node_modules/bower/node_modules/request/node_modules/tough-cookie/node_modules/punycode/package.json
+deps/icu4c/source/i18n/hebrwcal.cpp
+tools/sstrip/src/sstrip.c
+pcap4j-core/src/main/java/org/pcap4j/core/NativePacketDllMappings.java
+files/usr/local/admin_scripts/nagios/centreon_plugins/src/check_meta_service
+debian/shlibs.local
+framework/src/java/org/apache/tapestry/coerce/BooleanArrayToIteratorConverter.java
+myblockchain-test/suite/memcached/t/memc221_get.test
+storage/myisam/mi_write.c
+myblockchain-test/suite/rpl/r/rpl_loaddata_s.result
+myblockchain-test/suite/ndb_rpl/t/ndb_rpl_slave_replay.test
+block/rpl_binlog_sender.h
+myblockchain-test/suite/ndb_rpl/r/ndb_rpl_mixed_tables.result
+myblockchain-test/suite/ndb_binlog/r/ndb_binlog_unique_epoch.result
+base_contact/__openerp__.py
+interface/x_trace.h
+src/firefly/java/edu/caltech/ipac/firefly/resources/DataSetSearchUI.prop
+appveyor.yml
+app/Providers/EventServiceProvider.php
+resources/views/candidates/edit.blade.php
+pack.cmd
+app/main/routes.php
+svg/MIL_STD_2525D_Symbols/Legacy/2525C/S-G-UUSRW-_0.svg
+tests/baselines/reference/parserComputedPropertyName24.js
+test/VisualStudio.Test/VisualStudio.Test.csproj
+t/lib/KohaTest/Scripts/longoverdue.pm
+src/administrator/components/com_kunena/template/tools/report.php
+src/components/com_kunena/template/crypsis/assets/less/mediaqueries.less
+portals/TrustDashBoard/src/main/webapp/Scripts/Register.js
+metric2/ProductMetric.v
+mapfishapp/src/main/java/org/georchestra/mapfishapp/ws/upload/FeatureGeoFileReader.java
+wrapper/Mol/AtomName.pypp.hpp
+GPy/testing/state_space_main_tests.py
+zdn/mat2014/C3/main.js
+corelib/src/libs/SireBase/errors.cpp
+WARZONE_ASSETS/models/players/jedi_stkotor_aliens_1/head_a1.skin
+tooling/support/provisioning-model/pom.xml
+src/test/org/apache/sqoop/hcat/HCatalogImportTest.java
+velocity-tools-generic/src/test/java/org/apache/velocity/tools/generic/DateToolTests.java
+jca/src/main/java/org/apache/qpid/ra/tm/WLSTransactionManagerLocator.java
+src/text/fmt/xp/fl_AutoLists.h
+src/java/org/apache/cassandra/db/commitlog/ReplayPosition.java
+chrome/browser/signin/about_signin_internals.cc
+asmcomp/printcmm.mli
+testsuite/tests/lib-threads/sockets.ml
+uimaj-json/src/main/java/org/apache/uima/json/impl/MetaDataObjectSerializer_json.java
+otherlibs/num/num.ml
+asmrun/i386nt.asm
+Query:
+SELECT "content"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+   WHERE "binary" = FALSE AND "content" ILIKE '%import%(%'
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+content
+"#pragma once
+/*
+ *      Copyright (C) 2005-2012 Team XBMC
+ *      http://xbmc.org
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with XBMC; see the file COPYING.  If not, see
+ *  <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include ""utils/StdString.h""
+#include <vector>
+
+#include ""pictures/PictureScalingAlgorithm.h""
+#include ""utils/GlobalsHandling.h""
+
+class TiXmlElement;
+
+class DatabaseSettings
+{
+public:
+  void Reset()
+  {
+    type.clear();
+    host.clear();
+    port.clear();
+    user.clear();
+    pass.clear();
+    name.clear();
+  };
+  CStdString type;
+  CStdString host;
+  CStdString port;
+  CStdString user;
+  CStdString pass;
+  CStdString name;
+};
+
+struct TVShowRegexp
+{
+  bool byDate;
+  CStdString regexp;
+  int defaultSeason;
+  TVShowRegexp(bool d, const CStdString& r, int s = 1)
+  {
+    byDate = d;
+    regexp = r;
+    defaultSeason = s;
+  }
+};
+
+struct RefreshOverride
+{
+  float fpsmin;
+  float fpsmax;
+
+  float refreshmin;
+  float refreshmax;
+
+  bool  fallback;
+};
+
+
+struct RefreshVideoLatency
+{
+  float refreshmin;
+  float refreshmax;
+
+  float delay;
+};
+
+typedef std::vector<TVShowRegexp> SETTINGS_TVSHOWLIST;
+
+class CAdvancedSettings
+{
+  public:
+    CAdvancedSettings();
+
+    static CAdvancedSettings* getInstance();
+
+    void Initialize();
+    bool Initialized() { return m_initialized; };
+    void AddSettingsFile(const CStdString &filename);
+    bool Load();
+    void Clear();
+
+    static void GetCustomTVRegexps(TiXmlElement *pRootElement, SETTINGS_TVSHOWLIST& settings);
+    static void GetCustomRegexps(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomRegexpReplacers(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomExtensions(TiXmlElement *pRootElement, CStdString& extensions);
+
+    bool CanLogComponent(int component) const;
+
+    int m_audioHeadRoom;
+#ifdef TARGET_OPENELEC
+    // OpenELEC workaround for minimum sample Rate
+    int m_minimumSampleRate;
+#endif
+    float m_ac3Gain;
+    int m_maxPllAdjust;
+    CStdString m_audioDefaultPlayer;
+    float m_audioPlayCountMinimumPercent;
+    bool m_dvdplayerIgnoreDTSinWAV;
+    float m_limiterHold;
+    float m_limiterRelease;
+
+    bool  m_omxHWAudioDecode;
+    bool  m_omxDecodeStartWithValidFrame;
+
+    float m_videoSubsDelayRange;
+    float m_videoAudioDelayRange;
+    int m_videoSmallStepBackSeconds;
+    int m_videoSmallStepBackTries;
+    int m_videoSmallStepBackDelay;
+    bool m_videoUseTimeSeeking;
+    int m_videoTimeSeekForward;
+    int m_videoTimeSeekBackward;
+    int m_videoTimeSeekForwardBig;
+    int m_videoTimeSeekBackwardBig;
+    int m_videoPercentSeekForward;
+    int m_videoPercentSeekBackward;
+    int m_videoPercentSeekForwardBig;
+    int m_videoPercentSeekBackwardBig;
+    CStdString m_videoPPFFmpegDeint;
+    CStdString m_videoPPFFmpegPostProc;
+    bool m_videoVDPAUtelecine;
+    bool m_videoVDPAUdeintSkipChromaHD;
+    bool m_musicUseTimeSeeking;
+    int m_musicTimeSeekForward;
+    int m_musicTimeSeekBackward;
+    int m_musicTimeSeekForwardBig;
+    int m_musicTimeSeekBackwardBig;
+    int m_musicPercentSeekForward;
+    int m_musicPercentSeekBackward;
+    int m_musicPercentSeekForwardBig;
+    int m_musicPercentSeekBackwardBig;
+    int m_videoBlackBarColour;
+    int m_videoIgnoreSecondsAtStart;
+    float m_videoIgnorePercentAtEnd;
+    float m_audioApplyDrc;
+    bool m_useFfmpegVda;
+
+    int   m_videoVDPAUScaling;
+    bool  m_videoVAAPIforced;
+    float m_videoNonLinStretchRatio;
+    bool  m_videoEnableHighQualityHwScalers;
+    float m_videoAutoScaleMaxFps;
+    std::vector<RefreshOverride> m_videoAdjustRefreshOverrides;
+    std::vector<RefreshVideoLatency> m_videoRefreshLatency;
+    float m_videoDefaultLatency;
+    bool m_videoDisableBackgroundDeinterlace;
+    int  m_videoCaptureUseOcclusionQuery;
+    bool m_DXVACheckCompatibility;
+    bool m_DXVACheckCompatibilityPresent;
+    bool m_DXVAForceProcessorRenderer;
+    bool m_DXVANoDeintProcForProgressive;
+    bool m_DXVAAllowHqScaling;
+    int  m_videoFpsDetect;
+    int  m_videoBusyDialogDelay_ms;
+
+    CStdString m_videoDefaultPlayer;
+    CStdString m_videoDefaultDVDPlayer;
+    float m_videoPlayCountMinimumPercent;
+
+    float m_slideshowBlackBarCompensation;
+    float m_slideshowZoomAmount;
+    float m_slideshowPanAmount;
+
+    bool m_lcdHeartbeat;
+    bool m_lcdDimOnScreenSave;
+    int m_lcdScrolldelay;
+    CStdString m_lcdHostName;
+
+    int m_songInfoDuration;
+    int m_logLevel;
+    int m_logLevelHint;
+    CStdString m_cd
+Query:
+SELECT s.value AS "import_line"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%'
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+import_line
+"import(""//build/config/ui.gni"")"
+"import(""//testing/test.gni"")"
+"  <Import Project=""$(VCTargetsPath)\Microsoft.Cpp.Default.props"" />"
+"  <Import Project=""$(VCTargetsPath)\Microsoft.Cpp.props"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Release|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Release_QT_backend|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Debug|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <ImportGroup Condition=""'$(Configuration)|$(Platform)'=='Debug_QT_backend|Win32'"" Label=""PropertySheets"">"
+"    <Import Project=""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"" Condition=""exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')"" Label=""LocalAppDataPlatform"" />"
+"  <Import Project=""$(VCTargetsPath)\Microsoft.Cpp.targets"" />"
+"from test.support import (run_unittest, rmtree,"
+	public function getImportInfo ()
+	 	  	$import =  BatchJobPeer::doSelectOne ( $c );
+    important; for example there are some my_malloc() in constructors
+"  <Import Project=""$(MSBuildBinPath)\Microsoft.CSharp.targets"" />"
+            #import pdb; pdb.set_trace()
+        #import pdb; pdb.set_trace()
+        #import pdb; pdb.set_trace()
+#    #import pdb; pdb.set_trace()
+"  protected void runImport(SqoopTool tool, String[] argv) throws IOException {"
+"      LOG.error(""Got exception running import: "" + e.toString());"
+"  protected void runHCatImport(List<String> addlArgsArray,"
+"    runHCatImport(addlArgsArray, totalRecords, table, cols,"
+"  protected void runHCatQueryImport(List<String> addlArgsArray,"
+"    runHCatImport(addlArgsArray, totalRecords, table, cols,"
+"  protected void runHCatImport(List<String> addlArgsArray,"
+"      importArgs = getQueryArgv(true, colNames, new Configuration());"
+"      importArgs = getArgv(true, colNames, new Configuration());"
+"    LOG.debug(""Import args = "" + Arrays.toString(importArgs));"
+"    runImport(new ImportTool(), importArgs);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, colNames);"
+"      runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, colNames);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols,"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null, true, false);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null, true, false);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null, true, false);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+"    runHCatImport(addlArgsArray, TOTAL_RECORDS, table, cols, null);"
+  public void testQueryImport() throws Exception {
+@import url(https://fonts.googleapis.com/css?family=Roboto:300)
+"  <Import Project=""..\CouchbaseConnect2014.Tests\CouchbaseConnect2014.Tests.projitems"" Label=""Shared"" Condition=""Exists('..\CouchbaseConnect2014.Tests\CouchbaseConnect2014.Tests.projitems')"" />"
+"  <Import Project=""..\Shared.Back\Shared.Back.projitems"" Label=""Shared"" Condition=""Exists('..\Shared.Back\Shared.Back.projitems')"" />"
+"  <Import Project=""..\Shared.Front\Shared.Front.projitems"" Label=""Shared"" Condition=""Exists('..\Shared.Front\Shared.Front.projitems')"" />"
+"  <Import Project=""..\Platform.Android\Platform.Android.projitems"" Label=""Shared"" Condition=""Exists('..\Platform.Android\Pl
+Query:
+SELECT REGEXP_SUBSTR(s.value, '"([^"]+)"') AS "package"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+package
+"""//build/config/ui.gni"""
+"""//testing/test.gni"""
+"""$(VCTargetsPath)\Microsoft.Cpp.Default.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.props"""
+"""'$(Configuration)|$(Platform)'=='Release|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Release_QT_backend|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug_QT_backend|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.targets"""
+"""$(MSBuildBinPath)\Microsoft.CSharp.targets"""
+"""Got exception running import: """
+"""Import args = """
+"""$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"""
+"""$(MSBuildToolsPath)\Microsoft.CSharp.targets"""
+"""$(SolutionDir)\.nuget\NuGet.targets"""
+"""$(VCTargetsPath)\Microsoft.Cpp.Default.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""PropertySheets"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.targets"""
+"""ft2-auto_hinter.html#glyph-to-script-map"""
+"""ScaleToPagesX"""
+"""ScaleToPagesY"""
+"""$(MSBuildExtensionsPath)\Microsoft\Silverlight for Phone\$(TargetFrameworkVersion)\Microsoft.Silverlight.$(TargetFrameworkProfile).Overrides.targets"""
+"""$(MSBuildExtensionsPath)\Microsoft\Silverlight for Phone\$(TargetFrameworkVersion)\Microsoft.Silverlight.CSharp.targets"""
+""";position:absolute;z-index:11;top:13px;left:4px;-moz-transition:all .1s ease;-webkit-transition:all .1s ease;-o-transition:all .1s ease;-ms-transition:all .1s ease;transition:all .1s ease}#menu-toggler:after{border-top:1px solid #ffa24d;border-bottom:1px solid #d15b47;content:"""
+"""$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props"""
+"""$(MSBuildToolsPath)\Microsoft.CSharp.targets"""
+"""$(SolutionDir)\.nuget\NuGet.targets"""
+"""M:System.Web.Razor.Generator.AddImportCodeGenerator.#ctor(System.String,System.Int32)"""
+"""M:System.Web.Razor.Generator.AddImportCodeGenerator.Equals(System.Object)"""
+"""M:System.Web.Razor.Generator.AddImportCodeGenerator.GenerateCode(System.Web.Razor.Parser.SyntaxTree.Span,System.Web.Razor.Generator.CodeGeneratorContext)"""
+""
+"""..\CouchbaseConnect2014.Tests\CouchbaseConnect2014.Tests.projitems"""
+"""..\Shared.Back\Shared.Back.projitems"""
+"""..\Shared.Front\Shared.Front.projitems"""
+"""..\Platform.Android\Platform.Android.projitems"""
+"""$(MSBuildExtensionsPath)\Novell\Novell.MonoDroid.CSharp.targets"""
+"""$(VCTargetsPath)\Microsoft.Cpp.Default.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.props"""
+"""'$(Configuration)|$(Platform)'=='Release|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug|Win32'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Release|x64'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""'$(Configuration)|$(Platform)'=='Debug|x64'"""
+"""$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props"""
+"""$(VCTargetsPath)\Microsoft.Cpp.targets"""
+"""L9"""
+"""L16"""
+"""$(MSBuildExtensionsPath)\Microsoft\$(TargetFrameworkIdentifier)\$(TargetFrameworkVersion)\Microsoft.$(TargetFrameworkIdentifier).$(TargetFrameworkVersion).Overrides.targets"""
+"""$(MSBuildExtensionsPath)\Microsoft\$(TargetFrameworkIdentifier)\$(TargetFrameworkVersion)\Microsoft.$(TargetFrameworkIdentifier).CSharp.targets"""
+"""..\..\packages\Xamarin.Forms.2.0.0.6482\build\portable-win+net45+wp80+win81+wpa81+MonoAndroid10+MonoTouch10+Xamarin.iOS10\Xamarin.Forms.targets"""
+"""bad save filename: \"""
+"""[l]ong confidence intervals (CIs) will soon let us know if our experiment is weak and can give only imprecise estimates"""
+""";display:table;clear:both}.block,.show{display:block!important}table.show{display:table!important}tr.show{display:table-row!important}td.show,th.show{display:table-cell!important}.hide,[hidden]{display:none!important}.inline{display:inline-block!important}.visible{visibility:visible!important}.invisible{visibility:hidden!important}.overflow-auto{overflow:auto}.close{float:right;line-height:1;text-align:center;font-size:20px;font-size:1.25rem;font-weight:700;color:inherit;opacity:.4}[data-device=desktop] .close:hover{opacity:.8}.disabled,[disabled]{pointer-events:none;opacity:.5;color:grey;cursor:not-allowed}.fix-height{height:1px;padding-top:1px;visibility:hidden}.empty-hide:empty{clear:both;display:none!important}.empty-tip{padding:100px 20px;text-align:center;font-size:14px;font-size:.875rem;color:grey;background-color:#e6e6e6}.text-note{font-size:13px;font-size:.8125rem}@media (min-width:768px){.text-note{font-s
+Query:
+SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "package",
+          COUNT(*) AS "frequency"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   GROUP BY "package"
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+package,frequency
+']global[,1
+[,1
+"That doesn&#x27;t really refute the article. Anyone with access to the DNS server could change the email records for a few minutes to intercept mail. A hacker wouldn&#x27;t have to wait for propagation in that case. And who would notice? This has me thinking, it would be nice to get alerted if a) my DNS records change at registrar level and more importantly if b) my DNS records change at the DNS host level.<p>I think DNS hosts should offer a waiting period option or approval system (with warning alert) for changing email records. Obviously you want website records to change instantly for failover, but I don&#x27;t want a hacker changing email records in the middle of the night without anyone knowing. I use Linode and DNSMadeEasy and I don&#x27;t remember either service sending me a notification when an email record was changed.<p>Also, seems like you could sell a 3rd party service to monitor DNS hosts. (I didn&#x27;t bother to Google if that service exists already.) I&#x27;m assuming &quot;dnshistory.org&quot; only pings once per day--pretty much useless info from a security standpoint.",1
+M:System.Web.Razor.Generator.AddImportCodeGenerator.Equals(System.Object),1
+Windows8SDK_x64.props,3
+$(MSBuildExtensionsPath)\Novell\Novell.MonoDroid.CSharp.targets,1
+"Make notes on dates and any details pertaining to the dates of creation, publication, or distribution, of the unit being described that are not included in the Date(s) of creation, including publication, distribution, etc., area and that are considered to be important.",1
+permaurl,1
+../mixins,1
+overload,1
+]|(import|module)\s+[^,1
+"Use canvas if performance is important. Use SVG if it&#x27;s important to assign functionality to specific graphical elements (as opposed to rolling your own hit detection). See my comment above in this thread for more.<p>[Usual caveats apply...this is general advice, and I don&#x27;t know your situation, etc.]",1
+//build/config/chromecast_build.gni,1
+content,32
+$(VSToolsPath)\WebApplications\Microsoft.WebApplication.targets,1
+"),e=c.valuePrefix||",1
+Too many !important declarations (,1
+"<i>>You just have to look at all of the crazy responses to Target (a US retailer) removing the gender-specific labelling of toys (from &quot;Girl Toys&quot; and &quot;Boy Toys&quot; to just &quot;Toys&quot;) to see how as a society we are not at a point where &quot;we&quot; aren&#x27;t trying to impose a particular ideal (e.g. &quot;Barbies are girl toys&quot;) on children as they grow up.</i><p>It&#x27;s not about what they <i>should</i> prefer but about what they are <i>more likely to prefer</i>. We have studies that show this isn&#x27;t merely a human social phenomenon [0] [1] [2]. There are gender preferences for toys and to <i>most people</i> it&#x27;s silly to take offence at the idea that genders have different preferences. Now whether we should <i>nurture</i> these differences is a slightly different argument. The phrasing difference is important - and starting with something more people can understand (which color for &quot;boys&quot; has changed not only over time, but varies across populations) would help the discussion. If girls and boys are attracted to [type] of toy, can we nurture their interests in a different direction? The answer is &quot;probably, yes&quot;. But that&#x27;s a different debate.<p>The &quot;crazy responses&quot; you see are people irritated that a group of hyper-sensitive people who have placed a disturbing level of importance on their gender identity (and the gender identity of others) harped on about this non-issue until Target felt forced to change it to get them to shut up and leave them alone.<p>The constant bullying and what boils down to online smear campaigns done by these extremist self-identity-crisis groups annoys most people who don&#x27;t place nearly as much importance on their (or others&#x27;) racial/gender/sexual identities.<p>[0] <a href=",1
+$(MSBuildToolsPath)\Microsoft.VisualBasic.targets,1
+"This is so funny, I was just watching &quot;Modern Marvels - Weird Weapons of WWII (The Axis)&quot;. Turns out, a similar approach was discussed by Werner von Braun (the father of modern rocket science, basically the most important guy other than Goddard in that whole field) to create a &quot;space plane&quot; with the capability of quickly dropping a (radioactive, but not atomic) bomb on a target anywhere in the world, but more specifically major US cities. One major difference was that the track to launch the space plane was straight, and not curved. Given it was curved, would they have still been able to launch the lightweight space plane with just enough fuel it needs to get up to LEO, or would they still have run into the issue that they can&#x27;t get the plane to go fast enough and point upward enough to break the atmosphere?<p>Source: <a href=",1
+//build/config/arm.gni,1
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(MSBuildExtensionsPath)\Microsoft\Silverlight for Phone
+Query:
+SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "package",
+          COUNT(*) AS "frequency"
+   FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+        LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+   WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+   GROUP BY "package"
+   ORDER BY "frequency" DESC
+   LIMIT 100;
+Answer:
+Too long, hard cut:
+package,frequency
+$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props,82
+PropertySheets,40
+content,32
+$(VCTargetsPath)\Microsoft.Cpp.Default.props,22
+$(VCTargetsPath)\Microsoft.Cpp.targets,22
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props,16
+libgio-2.0-0.dll,12
+"$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.targets))\dir.targets",12
+$(MSBuildToolsPath)\Microsoft.CSharp.targets,12
+"$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.props))\dir.props",12
+avifil32.dll,11
+'$(Configuration)|$(Platform)'=='Debug|Win32',9
+'$(Configuration)|$(Platform)'=='Release|Win32',9
+'$(Configuration)|$(Platform)'=='Debug|x64',8
+spacer,8
+Urho3D::Matrix3x4(@),8
+'$(Configuration)|$(Platform)'=='Release|x64',8
+exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props'),8
+(# * #),6
+$(SolutionDir)\.nuget\NuGet.targets,5
+$(VCTargetsPath)Microsoft.CPP.UpgradeFromVC70.props,4
+text,4
+$(VCTargetsPath)Microsoft.CPP.UpgradeFromVC60.props,4
+import,4
+use strict,4
+$(MSBuildBinPath)\Microsoft.CSharp.targets,4
+User32,4
+$(IntDir)\OpenAL32.lib,4
+%s,4
+_,4
+Windows8SDK_x64.props,3
+object,3
+version,3
+kernel32.dll,3
+ace/mode/doc_comment_highlight_rules,3
+\n    // assume ms is a previously created MetadataStore\n    var metadataAsString = ms.exportMetadata();\n    window.localStorage.setItem(\,3
+.class,3
+npm,3
+Windows81SDK_x64.props,3
+Windows81SDK_x86.props,3
+label label-danger,3
+,3
+Windows8SDK_x86.props,3
+//testing/test.gni,3
+//build/config/ui.gni,2
+$(MSBuildExtensionsPath)\Xamarin\Android\Xamarin.Android.CSharp.targets,2
+Open Sans,2
+//mojo/public/mojo_application_manifest.gni,2
+ source=\,2
+user32.dll,2
+..\..\packages\Xamarin.Forms.2.0.0.6482\build\portable-win+net45+wp80+win81+wpa81+MonoAndroid10+MonoTouch10+Xamarin.iOS10\Xamarin.Forms.targets,2
+<style>*{ cursor: ,2
+$(FSharpTargetsPath),2
+button,2
+$(SolutionDir)\XBMC.defaults.props,2
+ok_cert.pem,2
+$(TPath),2
+airlines.hex,2
+$(WebKit_Libraries)\tools\vsprops\debugsuffix.props,2
+$(MSBuildExtensionsPath32)\Microsoft\Portable\$(TargetFrameworkVersion)\Microsoft.Portable.CSharp.targets,2
+1,2
+$(OUTDIR)/emission.lib,2
+body,2
+//build/config/android/config.gni,2
+~/lol.css,2
+stats,2
+ace/mode/java,1
+height: 1.00em;,1
+Continuar,1
+"M:System.Web.Razor.Generator.AddImportCodeGenerator.#ctor(System.String,System.Int32)",1
+btn btn-important,1
+../../../types,1
+(.*?)\,1
+"Article seemed to make a quantum leap here<p>> But most importantly, our work revives that age-old fantasy of learning during our sleep<p>Can someone elaborate on how responding to preconditioned stimuli (a voice repeating the same question over and over) can translate to learning things while we are asleep?",1
+http://test,1
+$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v10.0\WebApplications\Microsoft.WebApplication.targets,1
+//build/config/chromecast_build.gni,1
+$(VSToolsPath)\WebApplications\Microsoft.WebApplication.targets,1
+185-lda-5,1
+">It&#x27;s very important to be allowed to say publicly that things suck. I would argue that more people should do it... His comments in the video were harsh and opinionated and the questioner was disappointed with the answer, but as the same time he was being asked for an opinion and gave a fair one.<p>I totally agree about the need for honest criticism. If Jonathan Blow had started the reply, and Phil Fish had followed up with his apt comparison involving the Zelda games, they wouldn&#x27;t have come across negatively to me at all. Seriously though, how can you not see how rude (and even mildly racist) his opening remarks are, especially when given to someone who is not fluent in the English language (and is thus likely to take what he says even more seriously)?<p>&quot;They suck. I&#x27;m sorry, but <i>you guys</i> need to get with the times and make better interfaces and like update your technology... <i>we&#x27;re</i> totally kicking <i>your ass</i>... back then <i>you guys</i> were the king of the world, but <i>your time has passed.</i>&quot;<p>What the fuck? How can people on here get bent out of shape over the mildest use of unnecessarily gendered language, but let something like that pass?<p>To the sibling comment from PavlovCat&#x27;s, obviously I can&#x27;t get into their heads, but the impression I got was that the people on the panel were laughing at Phil&#x27;s complete lack of tact. Listen again and hear Edmund exclaiming &quot;oh wow&quot; just before he bursts into laughter.",1
+").split(/\s+/);for(t=0;n.length>t;t++)a.call(this,n[t])}}function t(e,t){e.className=t.join(",1
+text/javascript,1
+Prevel Framework (JS). Convenience in 5 Kb,1
+"import json,sys;print json.loads(sys.stdin.read())[0]['version'];",1
+com-tecnick-tcexam-admin/XMLUserImporter.html#methodsegContentHandler,1
+hxuy,1
+zombiezen.com/go/capnproto2/std/capnp/cxx,1
+Imported,1
+tpck,1
+-many                    générer le code pour n'importe quelle architecture (PWR/PWRX/PPC)\n,1
+M:System.Web.Razor.Generator.AddImportCodeGene
+Query:
+SELECT REGEXP_REPLACE(REGEXP_SUBSTR(s.value, '"([^"]+)"'), '"', '') AS "Package",
+           COUNT(*) AS "Frequency"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE AND s.value ILIKE '%import%(%' AND s.value ILIKE '%"%"%'
+    GROUP BY "Package"
+    ORDER BY "Frequency" DESC
+    LIMIT 10;
+Answer:
+Package,Frequency
+$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props,82
+PropertySheets,40
+content,32
+$(VCTargetsPath)\Microsoft.Cpp.Default.props,22
+$(VCTargetsPath)\Microsoft.Cpp.targets,22
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props,16
+libgio-2.0-0.dll,12
+"$([MSBuild]::GetDirectoryNameOfFileAbove($(MSBuildThisFileDirectory), dir.targets))\dir.targets",12
+$(MSBuildToolsPath)\Microsoft.CSharp.targets,12
+End Exploring Related Columns
+Task: How can we identify the top 10 most frequently used packages in GitHub repository contents by looking for import statements enclosed in parentheses, splitting any multi-line imports by newlines, extracting package names that appear within double quotes, counting how often these packages appear, ignoring any null results, and finally ordering them in descending order of their frequency? The final answer should remove the quotation marks.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```csv
+Package,Frequency
+package1:str,count1:int
+package2:str,count2:int
+package3:str,count3:int
+package4:str,count4:int
+package5:str,count5:int
+package6:str,count6:int
+package7:str,count7:int
+package8:str,count8:int
+package9:str,count9:int
+package10:str,count10:int
+(Attention: answer in ten rows)
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['SAMPLE_FILES', 'LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_REPOS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.If the task description does not specify the number of decimal places, retain all decimals to four places.
+Be careful of information in nested columns. e.g. When it comes to completed purchase, `hits.eCommerceAction.action_type` Indicates the type of ecommerce action and '6' represents completed purchases.
+Be careful one country may have different country_name and country_region in different columns in a database.
+Don't be misled by examples. For instance, a question related to Android development on StackOverflow might include tags like 'android-layout,' 'android-activity,' or 'android-intent.' However, you should not limit your analysis to just these three tags; instead, consider all tags related to Android: "tags" LIKE '%android%'.
+
+2025-02-12 20:35:01 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:35:01 - root - INFO - ```sql
+WITH imports AS (
+    SELECT
+        SUBSTR(s.value,
+            CHARINDEX('(', s.value) + 1,
+            CHARINDEX(')', s.value) - CHARINDEX('(', s.value) - 1
+        ) AS import_list
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+      AND CHARINDEX('(', s.value) > 0
+      AND CHARINDEX(')', s.value) > CHARINDEX('(', s.value)
+)
+SELECT TRIM(BOTH '"' FROM TRIM(e.value)) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM imports,
+     LATERAL SPLIT_TO_TABLE(imports.import_list, ',') e
+WHERE TRIM(BOTH '"' FROM TRIM(e.value)) IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:35:01 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:35:01 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:35:01 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:35:02 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:35:02 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:35:02 - root - INFO - itercount: 1
+2025-02-12 20:35:02 - root - INFO - 001003 (42000): 01ba59b3-0004-9c22-0001-11c30112ec46: SQL compilation error:
+syntax error line 14 at position 17 unexpected ''"''.
+syntax error line 14 at position 17 unexpected ''"''.
+2025-02-12 20:35:02 - root - INFO - Input sql:
+WITH imports AS (
+    SELECT
+        SUBSTR(s.value,
+            CHARINDEX('(', s.value) + 1,
+            CHARINDEX(')', s.value) - CHARINDEX('(', s.value) - 1
+        ) AS import_list
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+      AND CHARINDEX('(', s.value) > 0
+      AND CHARINDEX(')', s.value) > CHARINDEX('(', s.value)
+)
+SELECT TRIM(BOTH '"' FROM TRIM(e.value)) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM imports,
+     LATERAL SPLIT_TO_TABLE(imports.import_list, ',') e
+WHERE TRIM(BOTH '"' FROM TRIM(e.value)) IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+The error information is:
+001003 (42000): 01ba59b3-0004-9c22-0001-11c30112ec46: SQL compilation error:
+syntax error line 14 at position 17 unexpected ''"''.
+syntax error line 14 at position 17 unexpected ''"''.
+Please correct it and output only 1 complete SQL query.
+2025-02-12 20:36:02 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:36:02 - root - INFO - ```sql
+WITH imports AS (
+    SELECT
+        SUBSTR(s.value,
+            CHARINDEX('(', s.value) + 1,
+            CHARINDEX(')', s.value) - CHARINDEX('(', s.value) - 1
+        ) AS import_list
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+      AND CHARINDEX('(', s.value) > 0
+      AND CHARINDEX(')', s.value) > CHARINDEX('(', s.value)
+)
+SELECT TRIM(BOTH CHR(34) FROM e.value) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM imports,
+     LATERAL SPLIT_TO_TABLE(imports.import_list, ',') e
+WHERE TRIM(BOTH CHR(34) FROM e.value) IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:36:02 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:36:02 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:36:02 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:36:04 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:36:05 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:36:05 - root - INFO - itercount: 2
+2025-02-12 20:36:05 - root - INFO - 001003 (42000): 01ba59b4-0004-9c12-0001-11c30112fa7e: SQL compilation error:
+syntax error line 14 at position 17 unexpected 'CHR'.
+syntax error line 14 at position 17 unexpected 'CHR'.
+2025-02-12 20:36:05 - root - INFO - Input sql:
+WITH imports AS (
+    SELECT
+        SUBSTR(s.value,
+            CHARINDEX('(', s.value) + 1,
+            CHARINDEX(')', s.value) - CHARINDEX('(', s.value) - 1
+        ) AS import_list
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+      AND CHARINDEX('(', s.value) > 0
+      AND CHARINDEX(')', s.value) > CHARINDEX('(', s.value)
+)
+SELECT TRIM(BOTH CHR(34) FROM e.value) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM imports,
+     LATERAL SPLIT_TO_TABLE(imports.import_list, ',') e
+WHERE TRIM(BOTH CHR(34) FROM e.value) IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+The error information is:
+001003 (42000): 01ba59b4-0004-9c12-0001-11c30112fa7e: SQL compilation error:
+syntax error line 14 at position 17 unexpected 'CHR'.
+syntax error line 14 at position 17 unexpected 'CHR'.
+Please correct it and output only 1 complete SQL query.
+2025-02-12 20:36:29 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:36:29 - root - INFO - ```sql
+WITH imports AS (
+    SELECT
+        SUBSTR(s.value,
+            CHARINDEX('(', s.value) + 1,
+            CHARINDEX(')', s.value) - CHARINDEX('(', s.value) - 1
+        ) AS import_list
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+      AND CHARINDEX('(', s.value) > 0
+      AND CHARINDEX(')', s.value) > CHARINDEX('(', s.value)
+)
+SELECT TRIM(REPLACE(e.value, '"', '')) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM imports,
+     LATERAL SPLIT_TO_TABLE(imports.import_list, ',') e
+WHERE TRIM(REPLACE(e.value, '"', '')) IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:36:29 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:36:29 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:36:29 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:36:30 - snowflake.connector.cursor - INFO - Number of results in first chunk: 10
+2025-02-12 20:36:30 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:36:30 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:36:31 - root - INFO - itercount: 3
+2025-02-12 20:36:31 - root - INFO - 0
+2025-02-12 20:36:31 - root - INFO - results: 
+Package,Frequency
+,171
+Configuration,90
+UserRootDir,82
+VCTargetsPath,74
+0,35
+at your option,27
+MSBuildExtensionsPath,26
+null,25
+table,24
+TOTAL_RECORDS,24
+
+
+2025-02-12 20:36:31 - root - INFO - Please check the answer again by reviewing How can we identify the top 10 most frequently used packages in GitHub repository contents by looking for import statements enclosed in parentheses, splitting any multi-line imports by newlines, extracting package names that appear within double quotes, counting how often these packages appear, ignoring any null results, and finally ordering them in descending order of their frequency? The final answer should remove the quotation marks., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```csv
+Package,Frequency
+package1:str,count1:int
+package2:str,count2:int
+package3:str,count3:int
+package4:str,count4:int
+package5:str,count5:int
+package6:str,count6:int
+package7:str,count7:int
+package8:str,count8:int
+package9:str,count9:int
+package10:str,count10:int
+(Attention: answer in ten rows)
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+Package,Frequency
+,171
+Configuration,90
+UserRootDir,82
+VCTargetsPath,74
+0,35
+at your option,27
+MSBuildExtensionsPath,26
+null,25
+table,24
+TOTAL_RECORDS,24
+Current sql:
+WITH imports AS (
+    SELECT
+        SUBSTR(s.value,
+            CHARINDEX('(', s.value) + 1,
+            CHARINDEX(')', s.value) - CHARINDEX('(', s.value) - 1
+        ) AS import_list
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+      AND CHARINDEX('(', s.value) > 0
+      AND CHARINDEX(')', s.value) > CHARINDEX('(', s.value)
+)
+SELECT TRIM(REPLACE(e.value, '"', '')) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM imports,
+     LATERAL SPLIT_TO_TABLE(imports.import_list, ',') e
+WHERE TRIM(REPLACE(e.value, '"', '')) IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+2025-02-12 20:37:18 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:37:18 - root - INFO - To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```sql
+WITH import_lines AS (
+    SELECT s.value AS import_line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+extracted_packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_line, '"([^"]+)"', 1, seq) AS package
+    FROM import_lines,
+         LATERAL (SELECT ROW_NUMBER() OVER (ORDER BY TRUE) AS seq FROM TABLE(GENERATOR(ROWCOUNT => 10)))
+    WHERE REGEXP_SUBSTR(import_line, '"([^"]+)"', 1, seq) IS NOT NULL
+)
+SELECT REPLACE(package, '"', '') AS "Package",
+       COUNT(*) AS "Frequency"
+FROM extracted_packages
+WHERE package IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:37:18 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:37:18 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:37:18 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:37:20 - snowflake.connector.cursor - INFO - Number of results in first chunk: 10
+2025-02-12 20:37:20 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:37:20 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:37:20 - root - INFO - itercount: 4
+2025-02-12 20:37:20 - root - INFO - 0
+2025-02-12 20:37:20 - root - INFO - results: 
+Package,Frequency
+PropertySheets,92
+exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props'),90
+$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props,90
+LocalAppDataPlatform,86
+content,32
+$(VCTargetsPath)\Microsoft.Cpp.Default.props,22
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(VCTargetsPath)\Microsoft.Cpp.targets,22
+'$(Configuration)|$(Platform)'=='Debug|Win32',18
+'$(Configuration)|$(Platform)'=='Release|Win32',18
+
+
+2025-02-12 20:37:20 - root - INFO - Please check the answer again by reviewing How can we identify the top 10 most frequently used packages in GitHub repository contents by looking for import statements enclosed in parentheses, splitting any multi-line imports by newlines, extracting package names that appear within double quotes, counting how often these packages appear, ignoring any null results, and finally ordering them in descending order of their frequency? The final answer should remove the quotation marks., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```csv
+Package,Frequency
+package1:str,count1:int
+package2:str,count2:int
+package3:str,count3:int
+package4:str,count4:int
+package5:str,count5:int
+package6:str,count6:int
+package7:str,count7:int
+package8:str,count8:int
+package9:str,count9:int
+package10:str,count10:int
+(Attention: answer in ten rows)
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+Package,Frequency
+PropertySheets,92
+exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props'),90
+$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props,90
+LocalAppDataPlatform,86
+content,32
+$(VCTargetsPath)\Microsoft.Cpp.Default.props,22
+$(VCTargetsPath)\Microsoft.Cpp.props,22
+$(VCTargetsPath)\Microsoft.Cpp.targets,22
+'$(Configuration)|$(Platform)'=='Debug|Win32',18
+'$(Configuration)|$(Platform)'=='Release|Win32',18
+Current sql:
+WITH import_lines AS (
+    SELECT s.value AS import_line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+extracted_packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_line, '"([^"]+)"', 1, seq) AS package
+    FROM import_lines,
+         LATERAL (SELECT ROW_NUMBER() OVER (ORDER BY TRUE) AS seq FROM TABLE(GENERATOR(ROWCOUNT => 10)))
+    WHERE REGEXP_SUBSTR(import_line, '"([^"]+)"', 1, seq) IS NOT NULL
+)
+SELECT REPLACE(package, '"', '') AS "Package",
+       COUNT(*) AS "Frequency"
+FROM extracted_packages
+WHERE package IS NOT NULL
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;Be careful of using GENERATOR. Don't use seq4(), use ROW_NUMBER().
+
+2025-02-12 20:37:55 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:37:55 - root - INFO - To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```sql
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+packages AS (
+    SELECT
+        REPLACE(f.value, '"', '') AS "Package"
+    FROM import_lines,
+         LATERAL FLATTEN(input => REGEXP_SUBSTR_ALL(line, '"[^"]+"')) f
+    WHERE f.value IS NOT NULL
+)
+SELECT "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:37:55 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:37:55 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:37:55 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:37:57 - snowflake.connector.cursor - INFO - Number of results in first chunk: 10
+2025-02-12 20:37:57 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:37:57 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:37:57 - root - INFO - itercount: 5
+2025-02-12 20:37:57 - root - INFO - 0
+2025-02-12 20:37:57 - root - INFO - results: 
+Package,Frequency
+",",916
+":1,",291
+",regex:",291
+"},{token:",211
+:,191
+",begin:",153
+",next:",149
+",end:",107
+).bases(,106
+).field(,101
+
+
+2025-02-12 20:37:57 - root - INFO - Please check the answer again by reviewing How can we identify the top 10 most frequently used packages in GitHub repository contents by looking for import statements enclosed in parentheses, splitting any multi-line imports by newlines, extracting package names that appear within double quotes, counting how often these packages appear, ignoring any null results, and finally ordering them in descending order of their frequency? The final answer should remove the quotation marks., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```csv
+Package,Frequency
+package1:str,count1:int
+package2:str,count2:int
+package3:str,count3:int
+package4:str,count4:int
+package5:str,count5:int
+package6:str,count6:int
+package7:str,count7:int
+package8:str,count8:int
+package9:str,count9:int
+package10:str,count10:int
+(Attention: answer in ten rows)
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+Package,Frequency
+",",916
+":1,",291
+",regex:",291
+"},{token:",211
+:,191
+",begin:",153
+",next:",149
+",end:",107
+).bases(,106
+).field(,101
+Current sql:
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+packages AS (
+    SELECT
+        REPLACE(f.value, '"', '') AS "Package"
+    FROM import_lines,
+         LATERAL FLATTEN(input => REGEXP_SUBSTR_ALL(line, '"[^"]+"')) f
+    WHERE f.value IS NOT NULL
+)
+SELECT "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+2025-02-12 20:38:24 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:38:24 - root - INFO - To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```sql
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, NULL, 1) AS import_content
+    FROM import_lines
+    WHERE REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, NULL, 1) IS NOT NULL
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, NULL, 1) AS package
+    FROM import_items
+    WHERE REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, NULL, 1) IS NOT NULL
+)
+SELECT TRIM(package) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:38:24 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:38:24 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:38:24 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:39:28 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:39:28 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:39:28 - root - INFO - itercount: 6
+2025-02-12 20:39:28 - root - INFO - 000603 (XX000): None: SQL execution internal error:
+Processing aborted due to error 300010:1094633624; incident 4691383.
+2025-02-12 20:39:28 - root - INFO - Input sql:
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, NULL, 1) AS import_content
+    FROM import_lines
+    WHERE REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, NULL, 1) IS NOT NULL
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, NULL, 1) AS package
+    FROM import_items
+    WHERE REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, NULL, 1) IS NOT NULL
+)
+SELECT TRIM(package) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+The error information is:
+000603 (XX000): None: SQL execution internal error:
+Processing aborted due to error 300010:1094633624; incident 4691383.
+Please correct it and output only 1 complete SQL query.
+2025-02-12 20:40:19 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:40:19 - root - INFO - ```sql
+WITH import_lines AS (
+    SELECT
+        s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        REGEXP_REPLACE(line, '.*import\\s*\\(([^)]*)\\).*', '\\1') AS import_content
+    FROM import_lines
+    WHERE REGEXP_LIKE(line, 'import\\s*\\([^)]*\\)')
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+    WHERE import_content IS NOT NULL
+),
+packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'e', 1) AS package
+    FROM import_items
+    WHERE REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'e', 1) IS NOT NULL
+)
+SELECT TRIM(package) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:40:19 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:40:19 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:40:19 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:41:20 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:41:21 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:41:21 - root - INFO - itercount: 7
+2025-02-12 20:41:21 - root - INFO - 000603 (XX000): None: SQL execution internal error:
+Processing aborted due to error 300010:1094633624; incident 3505715.
+2025-02-12 20:41:21 - root - INFO - Input sql:
+WITH import_lines AS (
+    SELECT
+        s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        REGEXP_REPLACE(line, '.*import\\s*\\(([^)]*)\\).*', '\\1') AS import_content
+    FROM import_lines
+    WHERE REGEXP_LIKE(line, 'import\\s*\\([^)]*\\)')
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+    WHERE import_content IS NOT NULL
+),
+packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'e', 1) AS package
+    FROM import_items
+    WHERE REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'e', 1) IS NOT NULL
+)
+SELECT TRIM(package) AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+GROUP BY "Package"
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+The error information is:
+000603 (XX000): None: SQL execution internal error:
+Processing aborted due to error 300010:1094633624; incident 3505715.
+Please correct it and output only 1 complete SQL query.
+2025-02-12 20:42:11 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:42:11 - root - INFO - To identify the top 10 most frequently used packages in GitHub repository contents, we analyze the `content` field in the `SAMPLE_CONTENTS` table. We search for `import` statements enclosed in parentheses, split any multi-line imports by newlines, and extract package names that appear within double quotes. After counting how often these packages appear and removing any null results, we order them in descending order of their frequency. The final result removes the quotation marks from the package names.
+
+```sql
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        SUBSTR(line, start_pos, end_pos - start_pos) AS import_content
+    FROM (
+        SELECT
+            line,
+            REGEXP_INSTR(line, 'import\s*\(', 1, 1, 0, 'i') + CHAR_LENGTH('import(') AS start_pos,
+            REGEXP_INSTR(line, '\)', REGEXP_INSTR(line, 'import\s*\(', 1, 1, 0, 'i') + CHAR_LENGTH('import(')) AS end_pos
+        FROM import_lines
+        WHERE REGEXP_INSTR(line, 'import\s*\(', 1, 1, 0, 'i') > 0
+    )
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_REPLACE(import_item, '.*"([^"]+)".*', '$1') AS package
+    FROM import_items
+    WHERE REGEXP_LIKE(import_item, '.*".*".*')
+)
+SELECT package AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+WHERE package IS NOT NULL
+GROUP BY package
+ORDER BY "Frequency" DESC
+LIMIT 10;
+```
+2025-02-12 20:42:11 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:42:11 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:42:11 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:42:12 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:42:12 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:42:12 - root - INFO - itercount: 8
+2025-02-12 20:42:12 - root - INFO - 002140 (42601): 01ba59ba-0004-9c22-0001-11c3011321ba: SQL compilation error:
+Unknown functions CHAR_LENGTH, CHAR_LENGTH
+2025-02-12 20:42:12 - root - INFO - Input sql:
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        SUBSTR(line, start_pos, end_pos - start_pos) AS import_content
+    FROM (
+        SELECT
+            line,
+            REGEXP_INSTR(line, 'import\s*\(', 1, 1, 0, 'i') + CHAR_LENGTH('import(') AS start_pos,
+            REGEXP_INSTR(line, '\)', REGEXP_INSTR(line, 'import\s*\(', 1, 1, 0, 'i') + CHAR_LENGTH('import(')) AS end_pos
+        FROM import_lines
+        WHERE REGEXP_INSTR(line, 'import\s*\(', 1, 1, 0, 'i') > 0
+    )
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_REPLACE(import_item, '.*"([^"]+)".*', '$1') AS package
+    FROM import_items
+    WHERE REGEXP_LIKE(import_item, '.*".*".*')
+)
+SELECT package AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+WHERE package IS NOT NULL
+GROUP BY package
+ORDER BY "Frequency" DESC
+LIMIT 10;
+The error information is:
+002140 (42601): 01ba59ba-0004-9c22-0001-11c3011321ba: SQL compilation error:
+Unknown functions CHAR_LENGTH, CHAR_LENGTH
+Please correct it and output only 1 complete SQL query.When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+
+2025-02-12 20:42:53 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:42:53 - root - INFO - ```sql
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, 'i', 1) AS import_content
+    FROM import_lines
+    WHERE REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, 'i', 1) IS NOT NULL
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'i', 1) AS package
+    FROM import_items
+    WHERE REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'i', 1) IS NOT NULL
+)
+SELECT package AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+WHERE package IS NOT NULL
+GROUP BY package
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:42:53 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:42:53 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:42:53 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:43:54 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:43:54 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:43:54 - root - INFO - itercount: 9
+2025-02-12 20:43:54 - root - INFO - 000603 (XX000): None: SQL execution internal error:
+Processing aborted due to error 300010:1094633624; incident 6295626.
+2025-02-12 20:43:54 - root - INFO - Input sql:
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import%(%'
+),
+import_contents AS (
+    SELECT
+        REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, 'i', 1) AS import_content
+    FROM import_lines
+    WHERE REGEXP_SUBSTR(line, 'import\\s*\\(([^)]*)\\)', 1, 1, 'i', 1) IS NOT NULL
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+        LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'i', 1) AS package
+    FROM import_items
+    WHERE REGEXP_SUBSTR(import_item, '"([^"]+)"', 1, 1, 'i', 1) IS NOT NULL
+)
+SELECT package AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+WHERE package IS NOT NULL
+GROUP BY package
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+The error information is:
+000603 (XX000): None: SQL execution internal error:
+Processing aborted due to error 300010:1094633624; incident 6295626.
+Please correct it and output only 1 complete SQL query.
+2025-02-12 20:44:38 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com//openai/deployments/o1-preview/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2025-02-12 20:44:38 - root - INFO - ```sql
+WITH import_lines AS (
+    SELECT s.value AS line
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" t,
+         LATERAL SPLIT_TO_TABLE(t."content", '\n') s
+    WHERE t."binary" = FALSE
+      AND s.value ILIKE '%import(%'
+),
+import_positions AS (
+    SELECT
+        line,
+        POSITION('import(', LOWER(line)) AS import_start_pos
+    FROM import_lines
+    WHERE POSITION('import(', LOWER(line)) > 0
+),
+import_contents AS (
+    SELECT
+        SUBSTR(line, import_start_pos + LENGTH('import('), closing_paren_pos - import_start_pos - LENGTH('import(')) AS import_content
+    FROM (
+        SELECT
+            line,
+            import_start_pos,
+            POSITION(')', line, import_start_pos) AS closing_paren_pos
+        FROM import_positions
+    )
+    WHERE closing_paren_pos > import_start_pos
+),
+import_items AS (
+    SELECT
+        TRIM(item) AS import_item
+    FROM import_contents,
+         LATERAL SPLIT_TO_TABLE(import_content, ',') AS t(item)
+),
+packages AS (
+    SELECT
+        REGEXP_REPLACE(import_item, '.*"([^"]+)".*', '$1') AS package
+    FROM import_items
+    WHERE REGEXP_LIKE(import_item, '.*".*".*')
+)
+SELECT package AS "Package",
+       COUNT(*) AS "Frequency"
+FROM packages
+WHERE package IS NOT NULL
+GROUP BY package
+ORDER BY "Frequency" DESC NULLS LAST
+LIMIT 10;
+```
+2025-02-12 20:44:38 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.3, Python Version: 3.10.16, Platform: Linux-6.5.0-45-generic-x86_64-with-glibc2.35
+2025-02-12 20:44:38 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-02-12 20:44:38 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-02-12 20:45:36 - snowflake.connector.connection - INFO - closed
+2025-02-12 20:45:36 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-02-12 20:45:36 - root - INFO - Total iteration counts: 10

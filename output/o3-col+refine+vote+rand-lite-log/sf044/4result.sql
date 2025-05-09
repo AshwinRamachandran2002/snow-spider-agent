@@ -1,0 +1,29 @@
+-- Percentage change in post-market close prices for the Magnificent-7
+WITH price_window AS (
+    SELECT
+        "TICKER",
+        "DATE",
+        "VALUE"
+    FROM FINANCE__ECONOMICS.CYBERSYN."STOCK_PRICE_TIMESERIES"
+    WHERE "VARIABLE" = 'post-market_close'
+      AND "TICKER" IN ('AAPL','MSFT','AMZN','GOOGL','GOOG','META','TSLA','NVDA')
+      AND "DATE" BETWEEN '2024-01-01' AND '2024-06-30'
+),
+first_last AS (
+    SELECT DISTINCT
+        "TICKER",
+        FIRST_VALUE("DATE")  OVER (PARTITION BY "TICKER" ORDER BY "DATE")       AS "START_DATE",
+        FIRST_VALUE("VALUE") OVER (PARTITION BY "TICKER" ORDER BY "DATE")       AS "START_VALUE",
+        FIRST_VALUE("DATE")  OVER (PARTITION BY "TICKER" ORDER BY "DATE" DESC)  AS "END_DATE",
+        FIRST_VALUE("VALUE") OVER (PARTITION BY "TICKER" ORDER BY "DATE" DESC)  AS "END_VALUE"
+    FROM price_window
+)
+SELECT
+    "TICKER",
+    "START_DATE",
+    "START_VALUE",
+    "END_DATE",
+    "END_VALUE",
+    ROUND(100 * ("END_VALUE" - "START_VALUE") / "START_VALUE", 2) AS "PCT_CHANGE"
+FROM first_last
+ORDER BY "TICKER";

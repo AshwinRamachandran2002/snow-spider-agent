@@ -1,0 +1,1956 @@
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Exploration]
+```sql
+-- Description: Take a quick look at a handful of raw rows in the transactions table
+SELECT *
+FROM customer_transactions
+LIMIT 20;
+```
+
+```sql
+-- Description: Check all transaction types that exist (e.g., deposits vs withdrawals)
+SELECT DISTINCT txn_type
+FROM customer_transactions;
+```
+
+```sql
+-- Description: For every customer, find the first and last calendar date we will need to cover
+SELECT customer_id,
+       MIN(txn_date) AS first_txn_date,
+       MAX(txn_date) AS last_txn_date
+FROM customer_transactions
+GROUP BY customer_id
+LIMIT 20;
+```
+
+```sql
+-- Description: Produce a per-customer calendar of every date between their first and last transaction
+WITH spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+)
+, dates (customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT customer_id,
+           DATE(cal_date,'+1 day')
+    FROM dates
+    JOIN spans  USING (customer_id)
+    WHERE DATE(cal_date,'+1 day') <= spans.end_date
+)
+SELECT customer_id, cal_date
+FROM dates
+LIMIT 20;
+```
+
+```sql
+-- Description: Join the calendar to the raw transactions so we can see the net
+-- change (positive for deposits, negative for withdrawals) on each day
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+SELECT d.customer_id,
+       d.cal_date,
+       COALESCE(dc.net_change,0) AS net_change
+FROM (
+    /* calendar built earlier */
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+) AS d
+LEFT JOIN daily_change dc
+       ON dc.customer_id = d.customer_id
+      AND dc.txn_date   = d.cal_date
+LIMIT 20;
+```
+
+```sql
+-- Description: Calculate running balance per customer, turning negative balances to zero
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+, calendar AS (
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+)
+SELECT c.customer_id,
+       c.cal_date,
+       MAX(0,
+           SUM(COALESCE(dc.net_change,0))
+           OVER (PARTITION BY c.customer_id
+                 ORDER BY c.cal_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+       ) AS daily_balance
+FROM calendar c
+LEFT JOIN daily_change dc
+       ON dc.customer_id = c.customer_id
+      AND dc.txn_date   = c.cal_date
+LIMIT 20;
+```
+
+```sql
+-- Description: For every customer & month, capture the single highest balance
+WITH daily_balances AS (
+    /* query from previous step */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+SELECT customer_id,
+       STRFTIME('%Y-%m', cal_date) AS year_month,
+       MAX(daily_balance)          AS max_daily_balance_in_month
+FROM daily_balances
+GROUP BY customer_id, year_month
+LIMIT 20;
+```
+
+```sql
+-- Description: Aggregate the customer-level monthly peaks into the required
+-- “total of monthly maximums” figure
+WITH daily_balances AS (
+    /* same CTE as earlier for daily running balances */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+, customer_month_peaks AS (
+    SELECT customer_id,
+           STRFTIME('%Y-%m', cal_date) AS year_month,
+           MAX(daily_balance)          AS max_daily_balance_in_month
+    FROM daily_balances
+    GROUP BY customer_id, year_month
+)
+SELECT year_month,
+       SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM customer_month_peaks
+GROUP BY year_month
+ORDER BY year_month
+LIMIT 20;
+```
+
+```sql
+-- Description: (Optional) Show the very first few months to verify the numbers look sensible
+SELECT *
+FROM (
+      /* previous query */
+      WITH daily_balances AS (
+          WITH daily_change AS (
+              SELECT customer_id,
+                     txn_date,
+                     SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                              WHEN txn_type='withdrawal'THEN -txn_amount
+                              ELSE 0 END) AS net_change
+              FROM customer_transactions
+              GROUP BY customer_id, txn_date
+          )
+          , calendar AS (
+              WITH spans AS (
+                  SELECT customer_id,
+                         MIN(txn_date) AS start_date,
+                         MAX(txn_date) AS end_date
+                  FROM customer_transactions
+                  GROUP BY customer_id
+              )
+              , dates (customer_id, cal_date) AS (
+                  SELECT customer_id, start_date
+                  FROM spans
+                  UNION ALL
+                  SELECT customer_id,
+                         DATE(cal_date,'+1 day')
+                  FROM dates
+                  JOIN spans  USING (customer_id)
+                  WHERE DATE(cal_date,'+1 day') <= spans.end_date
+              )
+              SELECT * FROM dates
+          )
+          SELECT c.customer_id,
+                 c.cal_date,
+                 MAX(0,
+                     SUM(COALESCE(dc.net_change,0))
+                     OVER (PARTITION BY c.customer_id
+                           ORDER BY c.cal_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                 ) AS daily_balance
+          FROM calendar c
+          LEFT JOIN daily_change dc
+                 ON dc.customer_id = c.customer_id
+                AND dc.txn_date   = c.cal_date
+      )
+      , customer_month_peaks AS (
+          SELECT customer_id,
+                 STRFTIME('%Y-%m', cal_date) AS year_month,
+                 MAX(daily_balance)          AS max_daily_balance_in_month
+          FROM daily_balances
+          GROUP BY customer_id, year_month
+      )
+      SELECT year_month,
+             SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+      FROM customer_month_peaks
+      GROUP BY year_month
+      ORDER BY year_month
+     )
+LIMIT 20;
+```
+
+These eight queries (the last one is purely to display the first few rows) walk from basic inspection all the way to the requested monthly total of the customers’ highest daily balances.
+[Exploration]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: Take a quick look at a handful of raw rows in the transactions table
+SELECT *
+FROM customer_transactions
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: Take a quick look at a handful of raw rows in the transactions table
+SELECT *
+FROM customer_transactions
+LIMIT 20;
+Results:
+customer_id,txn_date,txn_type,txn_amount
+429,2020-01-21,deposit,82
+155,2020-01-10,deposit,712
+398,2020-01-01,deposit,196
+255,2020-01-14,deposit,563
+185,2020-01-29,deposit,626
+309,2020-01-13,deposit,995
+312,2020-01-20,deposit,485
+376,2020-01-03,deposit,706
+188,2020-01-13,deposit,601
+138,2020-01-11,deposit,520
+373,2020-01-18,deposit,596
+361,2020-01-12,deposit,797
+169,2020-01-10,deposit,628
+402,2020-01-05,deposit,435
+60,2020-01-19,deposit,495
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: Check all transaction types that exist (e.g., deposits vs withdrawals)
+SELECT DISTINCT txn_type
+FROM customer_transactions;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: Check all transaction types that exist (e.g., deposits vs withdrawals)
+SELECT DISTINCT txn_type
+FROM customer_transactions;
+Results:
+txn_type
+deposit
+withdrawal
+purchase
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: For every customer, find the first and last calendar date we will need to cover
+SELECT customer_id,
+       MIN(txn_date) AS first_txn_date,
+       MAX(txn_date) AS last_txn_date
+FROM customer_transactions
+GROUP BY customer_id
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: For every customer, find the first and last calendar date we will need to cover
+SELECT customer_id,
+       MIN(txn_date) AS first_txn_date,
+       MAX(txn_date) AS last_txn_date
+FROM customer_transactions
+GROUP BY customer_id
+LIMIT 20;
+Results:
+customer_id,first_txn_date,last_txn_date
+1,2020-01-02,2020-03-19
+2,2020-01-03,2020-03-24
+3,2020-01-27,2020-04-12
+4,2020-01-07,2020-03-25
+5,2020-01-15,2020-04-02
+6,2020-01-11,2020-03-31
+7,2020-01-20,2020-04-17
+8,2020-01-15,2020-04-13
+9,2020-01-21,2020-04-16
+10,2020-01-13,2020-04-10
+11,2020-01-19,2020-04-16
+12,2020-01-13,2020-03-23
+13,2020-01-02,2020-03-16
+14,2020-01-25,2020-04-05
+15,2020-01-25,2020-04-02
+16,2020-01-13,2020-04-11
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: Produce a per-customer calendar of every date between their first and last transaction
+WITH spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+)
+, dates (customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT customer_id,
+           DATE(cal_date,'+1 day')
+    FROM dates
+    JOIN spans  USING (customer_id)
+    WHERE DATE(cal_date,'+1 day') <= spans.end_date
+)
+SELECT customer_id, cal_date
+FROM dates
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: Produce a per-customer calendar of every date between their first and last transaction
+WITH spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+)
+, dates (customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT customer_id,
+           DATE(cal_date,'+1 day')
+    FROM dates
+    JOIN spans  USING (customer_id)
+    WHERE DATE(cal_date,'+1 day') <= spans.end_date
+)
+SELECT customer_id, cal_date
+FROM dates
+LIMIT 20;
+Results:
+customer_id,cal_date
+1,2020-01-02
+2,2020-01-03
+3,2020-01-27
+4,2020-01-07
+5,2020-01-15
+6,2020-01-11
+7,2020-01-20
+8,2020-01-15
+9,2020-01-21
+10,2020-01-13
+11,2020-01-19
+12,2020-01-13
+13,2020-01-02
+14,2020-01-25
+15,2020-01-25
+16,2020-01-13
+17,2020-01-19
+18,2020-01-17
+19,2020-01-17
+20,2020-01-18
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: Join the calendar to the raw transactions so we can see the net
+-- change (positive for deposits, negative for withdrawals) on each day
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+SELECT d.customer_id,
+       d.cal_date,
+       COALESCE(dc.net_change,0) AS net_change
+FROM (
+    /* calendar built earlier */
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+) AS d
+LEFT JOIN daily_change dc
+       ON dc.customer_id = d.customer_id
+      AND dc.txn_date   = d.cal_date
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: Join the calendar to the raw transactions so we can see the net
+-- change (positive for deposits, negative for withdrawals) on each day
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+SELECT d.customer_id,
+       d.cal_date,
+       COALESCE(dc.net_change,0) AS net_change
+FROM (
+    /* calendar built earlier */
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+) AS d
+LEFT JOIN daily_change dc
+       ON dc.customer_id = d.customer_id
+      AND dc.txn_date   = d.cal_date
+LIMIT 20;
+Results:
+customer_id,cal_date,net_change
+1,2020-01-02,312
+2,2020-01-03,549
+3,2020-01-27,144
+4,2020-01-07,458
+5,2020-01-15,974
+6,2020-01-11,831
+7,2020-01-20,964
+8,2020-01-15,207
+9,2020-01-21,669
+10,2020-01-13,556
+11,2020-01-19,60
+12,2020-01-13,202
+13,2020-01-02,566
+14,2020-01-25,205
+15,2020-01-25,379
+16,2020-01-13,421
+17,2020-01-19,465
+18,2020-01-17,757
+19,2020-01-17,47
+20,2020-01-18,868
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: Calculate running balance per customer, turning negative balances to zero
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+, calendar AS (
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+)
+SELECT c.customer_id,
+       c.cal_date,
+       MAX(0,
+           SUM(COALESCE(dc.net_change,0))
+           OVER (PARTITION BY c.customer_id
+                 ORDER BY c.cal_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+       ) AS daily_balance
+FROM calendar c
+LEFT JOIN daily_change dc
+       ON dc.customer_id = c.customer_id
+      AND dc.txn_date   = c.cal_date
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: Calculate running balance per customer, turning negative balances to zero
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+, calendar AS (
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+)
+SELECT c.customer_id,
+       c.cal_date,
+       MAX(0,
+           SUM(COALESCE(dc.net_change,0))
+           OVER (PARTITION BY c.customer_id
+                 ORDER BY c.cal_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+       ) AS daily_balance
+FROM calendar c
+LEFT JOIN daily_change dc
+       ON dc.customer_id = c.customer_id
+      AND dc.txn_date   = c.cal_date
+LIMIT 20;
+Results:
+customer_id,cal_date,daily_balance
+1,2020-01-02,312
+1,2020-01-03,312
+1,2020-01-04,312
+1,2020-01-05,312
+1,2020-01-06,312
+1,2020-01-07,312
+1,2020-01-08,312
+1,2020-01-09,312
+1,2020-01-10,312
+1,2020-01-11,312
+1,2020-01-12,312
+1,2020-01-13,312
+1,2020-01-14,312
+1,2020-01-15,312
+1,2020-01-16,312
+1,2020-01-17,312
+1,2020-01-18,312
+1,2020-01-19,312
+1,2020-01-20,312
+1,2020-01-21,312
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: For every customer & month, capture the single highest balance
+WITH daily_balances AS (
+    /* query from previous step */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+SELECT customer_id,
+       STRFTIME('%Y-%m', cal_date) AS year_month,
+       MAX(daily_balance)          AS max_daily_balance_in_month
+FROM daily_balances
+GROUP BY customer_id, year_month
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: For every customer & month, capture the single highest balance
+WITH daily_balances AS (
+    /* query from previous step */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+SELECT customer_id,
+       STRFTIME('%Y-%m', cal_date) AS year_month,
+       MAX(daily_balance)          AS max_daily_balance_in_month
+FROM daily_balances
+GROUP BY customer_id, year_month
+LIMIT 20;
+Results:
+customer_id,year_month,max_daily_balance_in_month
+1,2020-01,312
+1,2020-02,312
+1,2020-03,636
+2,2020-01,549
+2,2020-02,549
+2,2020-03,610
+3,2020-01,144
+3,2020-02,144
+3,2020-03,144
+3,2020-04,236
+4,2020-01,848
+4,2020-02,848
+4,2020-03,848
+5,2020-01,1780
+5,2020-02,954
+5,2020-03,1672
+5,2020-04,598
+6,2020-01,1627
+6,2020-02,1867
+6,2020-03,4053
+
+[Successfully executed]
+2025-05-05 04:37:54 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: Aggregate the customer-level monthly peaks into the required
+-- “total of monthly maximums” figure
+WITH daily_balances AS (
+    /* same CTE as earlier for daily running balances */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+, customer_month_peaks AS (
+    SELECT customer_id,
+           STRFTIME('%Y-%m', cal_date) AS year_month,
+           MAX(daily_balance)          AS max_daily_balance_in_month
+    FROM daily_balances
+    GROUP BY customer_id, year_month
+)
+SELECT year_month,
+       SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM customer_month_peaks
+GROUP BY year_month
+ORDER BY year_month
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:55 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: Aggregate the customer-level monthly peaks into the required
+-- “total of monthly maximums” figure
+WITH daily_balances AS (
+    /* same CTE as earlier for daily running balances */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+, customer_month_peaks AS (
+    SELECT customer_id,
+           STRFTIME('%Y-%m', cal_date) AS year_month,
+           MAX(daily_balance)          AS max_daily_balance_in_month
+    FROM daily_balances
+    GROUP BY customer_id, year_month
+)
+SELECT year_month,
+       SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM customer_month_peaks
+GROUP BY year_month
+ORDER BY year_month
+LIMIT 20;
+Results:
+year_month,monthly_total_max_balances
+2020-01,389803
+2020-02,573136
+2020-03,703403
+2020-04,479041
+
+[Successfully executed]
+2025-05-05 04:37:55 - Thread-3597 (execute) - INFO - [Try to execute]
+-- Description: (Optional) Show the very first few months to verify the numbers look sensible
+SELECT *
+FROM (
+      /* previous query */
+      WITH daily_balances AS (
+          WITH daily_change AS (
+              SELECT customer_id,
+                     txn_date,
+                     SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                              WHEN txn_type='withdrawal'THEN -txn_amount
+                              ELSE 0 END) AS net_change
+              FROM customer_transactions
+              GROUP BY customer_id, txn_date
+          )
+          , calendar AS (
+              WITH spans AS (
+                  SELECT customer_id,
+                         MIN(txn_date) AS start_date,
+                         MAX(txn_date) AS end_date
+                  FROM customer_transactions
+                  GROUP BY customer_id
+              )
+              , dates (customer_id, cal_date) AS (
+                  SELECT customer_id, start_date
+                  FROM spans
+                  UNION ALL
+                  SELECT customer_id,
+                         DATE(cal_date,'+1 day')
+                  FROM dates
+                  JOIN spans  USING (customer_id)
+                  WHERE DATE(cal_date,'+1 day') <= spans.end_date
+              )
+              SELECT * FROM dates
+          )
+          SELECT c.customer_id,
+                 c.cal_date,
+                 MAX(0,
+                     SUM(COALESCE(dc.net_change,0))
+                     OVER (PARTITION BY c.customer_id
+                           ORDER BY c.cal_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                 ) AS daily_balance
+          FROM calendar c
+          LEFT JOIN daily_change dc
+                 ON dc.customer_id = c.customer_id
+                AND dc.txn_date   = c.cal_date
+      )
+      , customer_month_peaks AS (
+          SELECT customer_id,
+                 STRFTIME('%Y-%m', cal_date) AS year_month,
+                 MAX(daily_balance)          AS max_daily_balance_in_month
+          FROM daily_balances
+          GROUP BY customer_id, year_month
+      )
+      SELECT year_month,
+             SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+      FROM customer_month_peaks
+      GROUP BY year_month
+      ORDER BY year_month
+     )
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:37:55 - Thread-3597 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- Description: (Optional) Show the very first few months to verify the numbers look sensible
+SELECT *
+FROM (
+      /* previous query */
+      WITH daily_balances AS (
+          WITH daily_change AS (
+              SELECT customer_id,
+                     txn_date,
+                     SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                              WHEN txn_type='withdrawal'THEN -txn_amount
+                              ELSE 0 END) AS net_change
+              FROM customer_transactions
+              GROUP BY customer_id, txn_date
+          )
+          , calendar AS (
+              WITH spans AS (
+                  SELECT customer_id,
+                         MIN(txn_date) AS start_date,
+                         MAX(txn_date) AS end_date
+                  FROM customer_transactions
+                  GROUP BY customer_id
+              )
+              , dates (customer_id, cal_date) AS (
+                  SELECT customer_id, start_date
+                  FROM spans
+                  UNION ALL
+                  SELECT customer_id,
+                         DATE(cal_date,'+1 day')
+                  FROM dates
+                  JOIN spans  USING (customer_id)
+                  WHERE DATE(cal_date,'+1 day') <= spans.end_date
+              )
+              SELECT * FROM dates
+          )
+          SELECT c.customer_id,
+                 c.cal_date,
+                 MAX(0,
+                     SUM(COALESCE(dc.net_change,0))
+                     OVER (PARTITION BY c.customer_id
+                           ORDER BY c.cal_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                 ) AS daily_balance
+          FROM calendar c
+          LEFT JOIN daily_change dc
+                 ON dc.customer_id = c.customer_id
+                AND dc.txn_date   = c.cal_date
+      )
+      , customer_month_peaks AS (
+          SELECT customer_id,
+                 STRFTIME('%Y-%m', cal_date) AS year_month,
+                 MAX(daily_balance)          AS max_daily_balance_in_month
+          FROM daily_balances
+          GROUP BY customer_id, year_month
+      )
+      SELECT year_month,
+             SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+      FROM customer_month_peaks
+      GROUP BY year_month
+      ORDER BY year_month
+     )
+LIMIT 20;
+Results:
+year_month,monthly_total_max_balances
+2020-01,389803
+2020-02,573136
+2020-03,703403
+2020-04,479041
+
+[Successfully executed]
+2025-05-05 04:37:55 - Thread-3597 (execute) - INFO - itercount: 0
+2025-05-05 04:37:55 - Thread-3597 (execute) - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: weekly_sales
+Column name: week_date Type: TEXT
+Column name: region Type: TEXT
+Column name: platform Type: TEXT
+Column name: segment Type: TEXT
+Column name: customer_type Type: TEXT
+Column name: transactions Type: INTEGER
+Column name: sales Type: INTEGER
+Sample rows:
+[('31/8/20', 'ASIA', 'Retail', 'C3', 'New', 120631, 3656163), ('31/8/20', 'ASIA', 'Retail', 'F1', 'New', 31574, 996575), ('31/8/20', 'USA', 'Retail', None, 'Guest', 529151, 16509610)]
+
+--------------------------------------------------
+Table full name: shopping_cart_users
+Column name: user_id Type: INTEGER
+Column name: cookie_id Type: TEXT
+Column name: start_date Type: TEXT
+Sample rows:
+[(1, 'c4ca42', '2020-02-04'), (2, 'c81e72', '2020-01-18'), (3, 'eccbc8', '2020-02-21')]
+
+--------------------------------------------------
+Table full name: bitcoin_members
+Column name: member_id Type: TEXT
+Column name: first_name Type: TEXT
+Column name: region Type: TEXT
+Sample rows:
+[('c4ca42', 'Danny', 'Australia'), ('c81e72', 'Vipul', 'United States'), ('eccbc8', 'Charlie', 'United States')]
+
+--------------------------------------------------
+Table full name: interest_metrics
+Column name: _month Type: REAL
+Column name: _year Type: REAL
+Column name: month_year Type: TEXT
+Column name: interest_id Type: REAL
+Column name: composition Type: REAL
+Column name: index_value Type: REAL
+Column name: ranking Type: INTEGER
+Column name: percentile_ranking Type: REAL
+Sample rows:
+[(7.0, 2018.0, '07-2018', 32486.0, 11.89, 6.19, 1, 99.86), (7.0, 2018.0, '07-2018', 6106.0, 9.93, 5.31, 2, 99.73), (7.0, 2018.0, '07-2018', 18923.0, 10.85, 5.29, 3, 99.59)]
+
+--------------------------------------------------
+Table full name: customer_regions
+Column name: region_id Type: INTEGER
+Column name: region_name Type: TEXT
+Sample rows:
+[(1, 'Australia'), (2, 'America'), (3, 'Africa')]
+
+--------------------------------------------------
+Table full name: customer_transactions
+Column name: customer_id Type: INTEGER
+Column name: txn_date Type: TEXT
+Column name: txn_type Type: TEXT
+Column name: txn_amount Type: INTEGER
+Sample rows:
+[(429, '2020-01-21', 'deposit', 82), (155, '2020-01-10', 'deposit', 712), (398, '2020-01-01', 'deposit', 196)]
+
+--------------------------------------------------
+Table full name: bitcoin_transactions
+Column name: txn_id Type: INTEGER
+Column name: member_id Type: TEXT
+Column name: ticker Type: TEXT
+Column name: txn_date Type: TEXT
+Column name: txn_type Type: TEXT
+Column name: quantity Type: REAL
+Column name: percentage_fee Type: REAL
+Column name: txn_time Type: TEXT
+Sample rows:
+[(1, 'c81e72', 'BTC', '01-01-2017', 'BUY', 50.0, 0.3, '2017-01-01T00:00:00.000Z'), (2, 'eccbc8', 'BTC', '01-01-2017', 'BUY', 50.0, 0.3, '2017-01-01T00:00:00.000Z'), (3, 'a87ff6', 'BTC', '01-01-2017', 'BUY', 50.0, 0.0, '2017-01-01T00:00:00.000Z')]
+
+--------------------------------------------------
+Table full name: customer_nodes
+Column name: customer_id Type: INTEGER
+Column name: region_id Type: INTEGER
+Column name: node_id Type: INTEGER
+Column name: start_date Type: TEXT
+Column name: end_date Type: TEXT
+Sample rows:
+[(1, 3, 4, '2020-01-02', '2020-01-03'), (2, 3, 5, '2020-01-03', '2020-01-17'), (3, 5, 4, '2020-01-27', '2020-02-18')]
+
+--------------------------------------------------
+Table full name: cleaned_weekly_sales
+Column name: week_date_formatted Type: TEXT
+Column name: week_date Type: TEXT
+Column name: region Type: TEXT
+Column name: platform Type: TEXT
+Column name: segment Type: TEXT
+Column name: customer_type Type: TEXT
+Column name: transactions Type: INTEGER
+Column name: sales Type: INTEGER
+Column name: week_number Type: INTEGER
+Column name: month_number Type: INTEGER
+Column name: calendar_year Type: INTEGER
+Column name: age_band Type: TEXT
+Column name: demographic Type: TEXT
+Column name: avg_transaction Type: REAL
+Sample rows:
+[('2020-8-31', '2020-08-31', 'ASIA', 'Retail', 'C3', 'New', 120631, 3656163, 36, 8, 2020, 'Retirees', 'Couples', 30.31), ('2020-8-31', '2020-08-31', 'ASIA', 'Retail', 'F1', 'New', 31574, 996575, 36, 8, 2020, 'Young Adults', 'Families', 31.56), ('2020-8-31', '2020-08-31', 'USA', 'Retail', 'unknown', 'Guest', 529151, 16509610, 36, 8, 2020, 'unknown', 'unknown', 31.2)]
+
+--------------------------------------------------
+Table full name: veg_txn_df
+Column name: index Type: INTEGER
+Column name: txn_date Type: TEXT
+Column name: txn_time Type: TEXT
+Column name: item_code Type: INTEGER
+Column name: qty_sold(kg) Type: REAL
+Column name: unit_selling_px_rmb/kg Type: REAL
+Column name: sale/return Type: TEXT
+Column name: discount(%) Type: INTEGER
+Column name: day_of_week Type: TEXT
+Sample rows:
+[(0, '2020-07-01 00:00:00', '09:15:07', 102900005117056, 0.396, 7.6, 'sale', 1, 'Wednesday'), (1, '2020-07-01 00:00:00', '09:17:27', 102900005115960, 0.849, 3.2, 'sale', 1, 'Wednesday'), (2, '2020-07-01 00:00:00', '09:17:33', 102900005117056, 0.409, 7.6, 'sale', 1, 'Wednesday')]
+
+--------------------------------------------------
+Table full name: shopping_cart_events
+Column name: visit_id Type: TEXT
+Column name: cookie_id Type: TEXT
+Column name: page_id Type: INTEGER
+Column name: event_type Type: INTEGER
+Column name: sequence_number Type: INTEGER
+Column name: event_time Type: TEXT
+Sample rows:
+[('ccf365', 'c4ca42', 1, 1, 1, '2020-02-04 19:16:09.182546'), ('ccf365', 'c4ca42', 2, 1, 2, '2020-02-04 19:16:17.358191'), ('ccf365', 'c4ca42', 6, 1, 3, '2020-02-04 19:16:58.454669')]
+
+--------------------------------------------------
+Table full name: shopping_cart_page_hierarchy
+Column name: page_id Type: INTEGER
+Column name: page_name Type: TEXT
+Column name: product_category Type: TEXT
+Column name: product_id Type: REAL
+Sample rows:
+[(1, 'Home Page', None, None), (2, 'All Products', None, None), (3, 'Salmon', 'Fish', 1.0)]
+
+--------------------------------------------------
+Table full name: bitcoin_prices
+Column name: ticker Type: TEXT
+Column name: market_date Type: TEXT
+Column name: price Type: REAL
+Column name: open Type: REAL
+Column name: high Type: REAL
+Column name: low Type: REAL
+Column name: volume Type: TEXT
+Column name: change Type: TEXT
+Sample rows:
+[('ETH', '29-08-2021', 3177.84, 3243.96, 3282.21, 3162.79, '582.04K', '-2.04%'), ('ETH', '28-08-2021', 3243.9, 3273.78, 3284.58, 3212.24, '466.21K', '-0.91%'), ('ETH', '27-08-2021', 3273.58, 3093.78, 3279.93, 3063.37, '839.54K', '5.82%')]
+
+--------------------------------------------------
+Table full name: interest_map
+Column name: id Type: INTEGER
+Column name: interest_name Type: TEXT
+Column name: interest_summary Type: TEXT
+Column name: created_at Type: TEXT
+Column name: last_modified Type: TEXT
+Sample rows:
+[(1, 'Fitness Enthusiasts', 'Consumers using fitness tracking apps and websites.', '2016-05-26 14:57:59', '2018-05-23 11:30:12'), (2, 'Gamers', 'Consumers researching game reviews and cheat codes.', '2016-05-26 14:57:59', '2018-05-23 11:30:12'), (3, 'Car Enthusiasts', 'Readers of automotive news and car reviews.', '2016-05-26 14:57:59', '2018-05-23 11:30:12')]
+
+--------------------------------------------------
+Table full name: veg_loss_rate_df
+Column name: index Type: INTEGER
+Column name: item_code Type: INTEGER
+Column name: item_name Type: TEXT
+Column name: loss_rate_% Type: REAL
+Sample rows:
+[(0, 102900005115168, 'Niushou Shengcai', 4.39), (1, 102900005115199, 'Sichuan Red Cedar', 10.46), (2, 102900005115250, 'Xixia Black Mushroom (1)', 10.8)]
+
+--------------------------------------------------
+Table full name: shopping_cart_campaign_identifier
+Column name: campaign_id Type: INTEGER
+Column name: products Type: TEXT
+Column name: campaign_name Type: TEXT
+Column name: start_date Type: TEXT
+Column name: end_date Type: TEXT
+Sample rows:
+[(1, '1-3', 'BOGOF - Fishing For Compliments', '2020-01-01', '2020-01-14'), (2, '4-5', '25% Off - Living The Lux Life', '2020-01-15', '2020-01-28'), (3, '6-8', 'Half Off - Treat Your Shellf(ish)', '2020-02-01', '2020-03-31')]
+
+--------------------------------------------------
+Table full name: veg_cat
+Column name: index Type: INTEGER
+Column name: item_code Type: INTEGER
+Column name: item_name Type: TEXT
+Column name: category_code Type: INTEGER
+Column name: category_name Type: TEXT
+Sample rows:
+[(0, 102900005115168, 'Niushou Shengcai', 1011010101, 'Flower/Leaf\xa0Vegetables'), (1, 102900005115199, 'Sichuan Red Cedar', 1011010101, 'Flower/Leaf\xa0Vegetables'), (2, 102900005115625, 'Local Xiaomao Cabbage', 1011010101, 'Flower/Leaf\xa0Vegetables')]
+
+--------------------------------------------------
+Table full name: veg_whsle_df
+Column name: index Type: INTEGER
+Column name: whsle_date Type: TEXT
+Column name: item_code Type: INTEGER
+Column name: whsle_px_rmb-kg Type: REAL
+Sample rows:
+[(0, '2020-07-01 00:00:00', 102900005115762, 3.88), (1, '2020-07-01 00:00:00', 102900005115779, 6.72), (2, '2020-07-01 00:00:00', 102900005115786, 3.19)]
+
+--------------------------------------------------
+Table full name: shopping_cart_event_identifier
+Column name: event_type Type: INTEGER
+Column name: event_name Type: TEXT
+Sample rows:
+[(1, 'Page View'), (2, 'Add to Cart'), (3, 'Purchase')]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['weekly_sales', 'shopping_cart_users', 'bitcoin_members', 'interest_metrics', 'customer_regions', 'customer_transactions', 'bitcoin_transactions', 'customer_nodes', 'cleaned_weekly_sales', 'veg_txn_df', 'shopping_cart_events', 'shopping_cart_page_hierarchy', 'bitcoin_prices', 'interest_map', 'veg_loss_rate_df', 'shopping_cart_campaign_identifier', 'veg_cat', 'veg_whsle_df', 'shopping_cart_event_identifier']
+Some few-shot examples may be useful:
+Query:
+-- Description: Take a quick look at a handful of raw rows in the transactions table
+SELECT *
+FROM customer_transactions
+LIMIT 20;
+Answer:
+customer_id,txn_date,txn_type,txn_amount
+429,2020-01-21,deposit,82
+155,2020-01-10,deposit,712
+398,2020-01-01,deposit,196
+255,2020-01-14,deposit,563
+185,2020-01-29,deposit,626
+309,2020-01-13,deposit,995
+312,2020-01-20,deposit,485
+376,2020-01-03,deposit,706
+188,2020-01-13,deposit,601
+138,2020-01-11,deposit,520
+373,2020-01-18,deposit,596
+361,2020-01-12,deposit,797
+169,2020-01-10,deposit,628
+402,2020-01-05,deposit,435
+60,2020-01-19,deposit,495
+Query:
+-- Description: Check all transaction types that exist (e.g., deposits vs withdrawals)
+SELECT DISTINCT txn_type
+FROM customer_transactions;
+Answer:
+txn_type
+deposit
+withdrawal
+purchase
+Query:
+-- Description: For every customer, find the first and last calendar date we will need to cover
+SELECT customer_id,
+       MIN(txn_date) AS first_txn_date,
+       MAX(txn_date) AS last_txn_date
+FROM customer_transactions
+GROUP BY customer_id
+LIMIT 20;
+Answer:
+customer_id,first_txn_date,last_txn_date
+1,2020-01-02,2020-03-19
+2,2020-01-03,2020-03-24
+3,2020-01-27,2020-04-12
+4,2020-01-07,2020-03-25
+5,2020-01-15,2020-04-02
+6,2020-01-11,2020-03-31
+7,2020-01-20,2020-04-17
+8,2020-01-15,2020-04-13
+9,2020-01-21,2020-04-16
+10,2020-01-13,2020-04-10
+11,2020-01-19,2020-04-16
+12,2020-01-13,2020-03-23
+13,2020-01-02,2020-03-16
+14,2020-01-25,2020-04-05
+15,2020-01-25,2020-04-02
+16,2020-01-13,2020-04-11
+Query:
+-- Description: Produce a per-customer calendar of every date between their first and last transaction
+WITH spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+)
+, dates (customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT customer_id,
+           DATE(cal_date,'+1 day')
+    FROM dates
+    JOIN spans  USING (customer_id)
+    WHERE DATE(cal_date,'+1 day') <= spans.end_date
+)
+SELECT customer_id, cal_date
+FROM dates
+LIMIT 20;
+Answer:
+customer_id,cal_date
+1,2020-01-02
+2,2020-01-03
+3,2020-01-27
+4,2020-01-07
+5,2020-01-15
+6,2020-01-11
+7,2020-01-20
+8,2020-01-15
+9,2020-01-21
+10,2020-01-13
+11,2020-01-19
+12,2020-01-13
+13,2020-01-02
+14,2020-01-25
+15,2020-01-25
+16,2020-01-13
+17,2020-01-19
+18,2020-01-17
+19,2020-01-17
+20,2020-01-18
+Query:
+-- Description: Join the calendar to the raw transactions so we can see the net
+-- change (positive for deposits, negative for withdrawals) on each day
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+SELECT d.customer_id,
+       d.cal_date,
+       COALESCE(dc.net_change,0) AS net_change
+FROM (
+    /* calendar built earlier */
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+) AS d
+LEFT JOIN daily_change dc
+       ON dc.customer_id = d.customer_id
+      AND dc.txn_date   = d.cal_date
+LIMIT 20;
+Answer:
+customer_id,cal_date,net_change
+1,2020-01-02,312
+2,2020-01-03,549
+3,2020-01-27,144
+4,2020-01-07,458
+5,2020-01-15,974
+6,2020-01-11,831
+7,2020-01-20,964
+8,2020-01-15,207
+9,2020-01-21,669
+10,2020-01-13,556
+11,2020-01-19,60
+12,2020-01-13,202
+13,2020-01-02,566
+14,2020-01-25,205
+15,2020-01-25,379
+16,2020-01-13,421
+17,2020-01-19,465
+18,2020-01-17,757
+19,2020-01-17,47
+20,2020-01-18,868
+Query:
+-- Description: Calculate running balance per customer, turning negative balances to zero
+WITH daily_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                    WHEN txn_type='withdrawal'THEN -txn_amount
+                    ELSE 0 END) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+)
+, calendar AS (
+    WITH spans AS (
+        SELECT customer_id,
+               MIN(txn_date) AS start_date,
+               MAX(txn_date) AS end_date
+        FROM customer_transactions
+        GROUP BY customer_id
+    )
+    , dates (customer_id, cal_date) AS (
+        SELECT customer_id, start_date
+        FROM spans
+        UNION ALL
+        SELECT customer_id,
+               DATE(cal_date,'+1 day')
+        FROM dates
+        JOIN spans  USING (customer_id)
+        WHERE DATE(cal_date,'+1 day') <= spans.end_date
+    )
+    SELECT * FROM dates
+)
+SELECT c.customer_id,
+       c.cal_date,
+       MAX(0,
+           SUM(COALESCE(dc.net_change,0))
+           OVER (PARTITION BY c.customer_id
+                 ORDER BY c.cal_date
+                 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+       ) AS daily_balance
+FROM calendar c
+LEFT JOIN daily_change dc
+       ON dc.customer_id = c.customer_id
+      AND dc.txn_date   = c.cal_date
+LIMIT 20;
+Answer:
+customer_id,cal_date,daily_balance
+1,2020-01-02,312
+1,2020-01-03,312
+1,2020-01-04,312
+1,2020-01-05,312
+1,2020-01-06,312
+1,2020-01-07,312
+1,2020-01-08,312
+1,2020-01-09,312
+1,2020-01-10,312
+1,2020-01-11,312
+1,2020-01-12,312
+1,2020-01-13,312
+1,2020-01-14,312
+1,2020-01-15,312
+1,2020-01-16,312
+1,2020-01-17,312
+1,2020-01-18,312
+1,2020-01-19,312
+1,2020-01-20,312
+1,2020-01-21,312
+Query:
+-- Description: For every customer & month, capture the single highest balance
+WITH daily_balances AS (
+    /* query from previous step */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+SELECT customer_id,
+       STRFTIME('%Y-%m', cal_date) AS year_month,
+       MAX(daily_balance)          AS max_daily_balance_in_month
+FROM daily_balances
+GROUP BY customer_id, year_month
+LIMIT 20;
+Answer:
+customer_id,year_month,max_daily_balance_in_month
+1,2020-01,312
+1,2020-02,312
+1,2020-03,636
+2,2020-01,549
+2,2020-02,549
+2,2020-03,610
+3,2020-01,144
+3,2020-02,144
+3,2020-03,144
+3,2020-04,236
+4,2020-01,848
+4,2020-02,848
+4,2020-03,848
+5,2020-01,1780
+5,2020-02,954
+5,2020-03,1672
+5,2020-04,598
+6,2020-01,1627
+6,2020-02,1867
+6,2020-03,4053
+Query:
+-- Description: Aggregate the customer-level monthly peaks into the required
+-- “total of monthly maximums” figure
+WITH daily_balances AS (
+    /* same CTE as earlier for daily running balances */
+    WITH daily_change AS (
+        SELECT customer_id,
+               txn_date,
+               SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                        WHEN txn_type='withdrawal'THEN -txn_amount
+                        ELSE 0 END) AS net_change
+        FROM customer_transactions
+        GROUP BY customer_id, txn_date
+    )
+    , calendar AS (
+        WITH spans AS (
+            SELECT customer_id,
+                   MIN(txn_date) AS start_date,
+                   MAX(txn_date) AS end_date
+            FROM customer_transactions
+            GROUP BY customer_id
+        )
+        , dates (customer_id, cal_date) AS (
+            SELECT customer_id, start_date
+            FROM spans
+            UNION ALL
+            SELECT customer_id,
+                   DATE(cal_date,'+1 day')
+            FROM dates
+            JOIN spans  USING (customer_id)
+            WHERE DATE(cal_date,'+1 day') <= spans.end_date
+        )
+        SELECT * FROM dates
+    )
+    SELECT c.customer_id,
+           c.cal_date,
+           MAX(0,
+               SUM(COALESCE(dc.net_change,0))
+               OVER (PARTITION BY c.customer_id
+                     ORDER BY c.cal_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+           ) AS daily_balance
+    FROM calendar c
+    LEFT JOIN daily_change dc
+           ON dc.customer_id = c.customer_id
+          AND dc.txn_date   = c.cal_date
+)
+, customer_month_peaks AS (
+    SELECT customer_id,
+           STRFTIME('%Y-%m', cal_date) AS year_month,
+           MAX(daily_balance)          AS max_daily_balance_in_month
+    FROM daily_balances
+    GROUP BY customer_id, year_month
+)
+SELECT year_month,
+       SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM customer_month_peaks
+GROUP BY year_month
+ORDER BY year_month
+LIMIT 20;
+Answer:
+year_month,monthly_total_max_balances
+2020-01,389803
+2020-02,573136
+2020-03,703403
+2020-04,479041
+Query:
+-- Description: (Optional) Show the very first few months to verify the numbers look sensible
+SELECT *
+FROM (
+      /* previous query */
+      WITH daily_balances AS (
+          WITH daily_change AS (
+              SELECT customer_id,
+                     txn_date,
+                     SUM(CASE WHEN txn_type='deposit'   THEN  txn_amount
+                              WHEN txn_type='withdrawal'THEN -txn_amount
+                              ELSE 0 END) AS net_change
+              FROM customer_transactions
+              GROUP BY customer_id, txn_date
+          )
+          , calendar AS (
+              WITH spans AS (
+                  SELECT customer_id,
+                         MIN(txn_date) AS start_date,
+                         MAX(txn_date) AS end_date
+                  FROM customer_transactions
+                  GROUP BY customer_id
+              )
+              , dates (customer_id, cal_date) AS (
+                  SELECT customer_id, start_date
+                  FROM spans
+                  UNION ALL
+                  SELECT customer_id,
+                         DATE(cal_date,'+1 day')
+                  FROM dates
+                  JOIN spans  USING (customer_id)
+                  WHERE DATE(cal_date,'+1 day') <= spans.end_date
+              )
+              SELECT * FROM dates
+          )
+          SELECT c.customer_id,
+                 c.cal_date,
+                 MAX(0,
+                     SUM(COALESCE(dc.net_change,0))
+                     OVER (PARTITION BY c.customer_id
+                           ORDER BY c.cal_date
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                 ) AS daily_balance
+          FROM calendar c
+          LEFT JOIN daily_change dc
+                 ON dc.customer_id = c.customer_id
+                AND dc.txn_date   = c.cal_date
+      )
+      , customer_month_peaks AS (
+          SELECT customer_id,
+                 STRFTIME('%Y-%m', cal_date) AS year_month,
+                 MAX(daily_balance)          AS max_daily_balance_in_month
+          FROM daily_balances
+          GROUP BY customer_id, year_month
+      )
+      SELECT year_month,
+             SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+      FROM customer_month_peaks
+      GROUP BY year_month
+      ORDER BY year_month
+     )
+LIMIT 20;
+Answer:
+year_month,monthly_total_max_balances
+2020-01,389803
+2020-02,573136
+2020-03,703403
+2020-04,479041
+Task: For each customer, calculate their daily balances for every day between their earliest and latest transaction dates, including days without transactions by carrying forward the previous day's balance. Treat any negative daily balances as zero. Then, for each month, determine the highest daily balance each customer had during that month. Finally, for each month, sum these maximum daily balances across all customers to obtain a monthly total.
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Here are some useful tips for answering:
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 04:38:17 - Thread-3597 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH
+/* 1. Net change (deposit +, withdrawal -) per customer per transaction date */
+txn_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(
+               CASE txn_type
+                    WHEN 'deposit'    THEN  txn_amount
+                    WHEN 'withdrawal' THEN -txn_amount
+                    ELSE 0
+               END
+           ) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+),
+/* 2. Earliest and latest transaction dates for each customer */
+spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+),
+/* 3. Calendar of every day between start_date and end_date (inclusive) */
+RECURSIVE calendar(customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT calendar.customer_id,
+           DATE(calendar.cal_date, '+1 day')
+    FROM calendar
+    JOIN spans USING (customer_id)
+    WHERE DATE(calendar.cal_date, '+1 day') <= spans.end_date
+),
+/* 4. Running daily balance, negative values floored at zero */
+daily_balance AS (
+    SELECT  c.customer_id,
+            c.cal_date,
+            MAX(
+                0,
+                SUM(COALESCE(t.net_change,0))
+                OVER (
+                    PARTITION BY c.customer_id
+                    ORDER BY     c.cal_date
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            ) AS balance
+    FROM calendar c
+    LEFT JOIN txn_change t
+           ON t.customer_id = c.customer_id
+          AND t.txn_date    = c.cal_date
+),
+/* 5. Highest balance each customer reached in every month */
+customer_month_max AS (
+    SELECT  customer_id,
+            STRFTIME('%Y-%m', cal_date)      AS year_month,
+            MAX(balance)                     AS max_daily_balance_in_month
+    FROM    daily_balance
+    GROUP BY customer_id, year_month
+)
+/* 6. Monthly total of those customer-level maximum balances */
+SELECT  year_month,
+        SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM    customer_month_max
+GROUP BY year_month
+ORDER BY year_month;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:38:17 - Thread-3597 (execute) - INFO - itercount: 1
+2025-05-05 04:38:17 - Thread-3597 (execute) - INFO - [Self-refine]
+Input sql:
+WITH
+/* 1. Net change (deposit +, withdrawal -) per customer per transaction date */
+txn_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(
+               CASE txn_type
+                    WHEN 'deposit'    THEN  txn_amount
+                    WHEN 'withdrawal' THEN -txn_amount
+                    ELSE 0
+               END
+           ) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+),
+/* 2. Earliest and latest transaction dates for each customer */
+spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+),
+/* 3. Calendar of every day between start_date and end_date (inclusive) */
+RECURSIVE calendar(customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT calendar.customer_id,
+           DATE(calendar.cal_date, '+1 day')
+    FROM calendar
+    JOIN spans USING (customer_id)
+    WHERE DATE(calendar.cal_date, '+1 day') <= spans.end_date
+),
+/* 4. Running daily balance, negative values floored at zero */
+daily_balance AS (
+    SELECT  c.customer_id,
+            c.cal_date,
+            MAX(
+                0,
+                SUM(COALESCE(t.net_change,0))
+                OVER (
+                    PARTITION BY c.customer_id
+                    ORDER BY     c.cal_date
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            ) AS balance
+    FROM calendar c
+    LEFT JOIN txn_change t
+           ON t.customer_id = c.customer_id
+          AND t.txn_date    = c.cal_date
+),
+/* 5. Highest balance each customer reached in every month */
+customer_month_max AS (
+    SELECT  customer_id,
+            STRFTIME('%Y-%m', cal_date)      AS year_month,
+            MAX(balance)                     AS max_daily_balance_in_month
+    FROM    daily_balance
+    GROUP BY customer_id, year_month
+)
+/* 6. Monthly total of those customer-level maximum balances */
+SELECT  year_month,
+        SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM    customer_month_max
+GROUP BY year_month
+ORDER BY year_month;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##near "calendar": syntax error'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 04:38:44 - Thread-3597 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH RECURSIVE
+/* 1. Net change (deposit +, withdrawal -) per customer per transaction date */
+txn_change AS (
+    SELECT customer_id,
+           txn_date,
+           SUM(
+               CASE txn_type
+                    WHEN 'deposit'    THEN  txn_amount
+                    WHEN 'withdrawal' THEN -txn_amount
+                    ELSE 0
+               END
+           ) AS net_change
+    FROM customer_transactions
+    GROUP BY customer_id, txn_date
+),
+/* 2. Earliest and latest transaction dates for each customer */
+spans AS (
+    SELECT customer_id,
+           MIN(txn_date) AS start_date,
+           MAX(txn_date) AS end_date
+    FROM customer_transactions
+    GROUP BY customer_id
+),
+/* 3. Calendar of every day between start_date and end_date (inclusive) */
+calendar(customer_id, cal_date) AS (
+    SELECT customer_id, start_date
+    FROM spans
+    UNION ALL
+    SELECT customer_id,
+           DATE(cal_date, '+1 day')
+    FROM calendar
+    JOIN spans USING (customer_id)
+    WHERE DATE(cal_date, '+1 day') <= spans.end_date
+),
+/* 4. Running daily balance, negative values replaced with zero */
+daily_balance AS (
+    SELECT  c.customer_id,
+            c.cal_date,
+            MAX(
+                0,
+                SUM(COALESCE(t.net_change,0))
+                OVER (
+                    PARTITION BY c.customer_id
+                    ORDER BY     c.cal_date
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                )
+            ) AS balance
+    FROM calendar c
+    LEFT JOIN txn_change t
+           ON t.customer_id = c.customer_id
+          AND t.txn_date    = c.cal_date
+),
+/* 5. Highest balance each customer reached in every month */
+customer_month_max AS (
+    SELECT  customer_id,
+            STRFTIME('%Y-%m', cal_date)      AS year_month,
+            MAX(balance)                     AS max_daily_balance_in_month
+    FROM    daily_balance
+    GROUP BY customer_id, year_month
+)
+/* 6. Monthly total of those customer-level maximum balances */
+SELECT  year_month,
+        SUM(max_daily_balance_in_month) AS monthly_total_max_balances
+FROM    customer_month_max
+GROUP BY year_month
+ORDER BY year_month;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:38:44 - Thread-3597 (execute) - INFO - Total iteration counts: 1

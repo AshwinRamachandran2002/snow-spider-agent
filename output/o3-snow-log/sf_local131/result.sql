@@ -1,0 +1,10 @@
+SELECT
+    s."StyleName",
+    COALESCE(SUM(CASE WHEN p."PreferenceSeq" = 1 THEN 1 END), 0) AS "Pref_1_Count",
+    COALESCE(SUM(CASE WHEN p."PreferenceSeq" = 2 THEN 1 END), 0) AS "Pref_2_Count",
+    COALESCE(SUM(CASE WHEN p."PreferenceSeq" = 3 THEN 1 END), 0) AS "Pref_3_Count"
+FROM ENTERTAINMENTAGENCY.ENTERTAINMENTAGENCY."MUSICAL_STYLES"   s
+LEFT JOIN ENTERTAINMENTAGENCY.ENTERTAINMENTAGENCY."MUSICAL_PREFERENCES" p
+       ON p."StyleID" = s."StyleID"
+GROUP BY s."StyleID", s."StyleName"
+ORDER BY s."StyleName";

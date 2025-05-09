@@ -1,0 +1,1835 @@
+2025-05-07 07:05:10 - Thread-614 (execute) - INFO - [Exploration]
+```sql
+--1. Description: peek at individual customer transactions
+SELECT 
+  "customer_id",
+  "txn_date",
+  "txn_type",
+  "txn_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+```
+
+```sql
+--2. Description: what distinct transaction types exist?
+SELECT DISTINCT 
+  "txn_type"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+```
+
+```sql
+--3. Description: earliest and latest transaction dates for a few customers
+SELECT 
+  "customer_id",
+  MIN("txn_date") AS "earliest_txn",
+  MAX("txn_date") AS "latest_txn"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+GROUP BY "customer_id"
+ORDER BY "customer_id"
+LIMIT 20;
+```
+
+```sql
+--4. Description: add a signed amount column (+ for deposit, – for withdrawal)
+SELECT 
+  "customer_id",
+  "txn_date",
+  CASE WHEN LOWER("txn_type") = 'deposit'
+       THEN  "txn_amount"
+       ELSE -1 * "txn_amount"
+  END AS "signed_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+```
+
+```sql
+--5. Description: running (cumulative) balance per customer by day
+SELECT
+  "customer_id",
+  "txn_date",
+  SUM( CASE WHEN LOWER("txn_type") = 'deposit'
+            THEN  "txn_amount"
+            ELSE -1 * "txn_amount"
+       END
+      ) 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_date"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)      AS "running_balance"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+ORDER BY "customer_id", "txn_date"
+LIMIT 20;
+```
+
+```sql
+--6. Description: min & max dates each customer will need for daily calendar expansion
+WITH cte AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT * FROM cte
+LIMIT 20;
+```
+
+```sql
+--7. Description: create a daily row for every customer using GENERATOR
+WITH bounds AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT
+  b."customer_id",
+  DATEADD('day', seq4(), b."min_dt") AS "calendar_date"
+FROM bounds b,
+     TABLE(GENERATOR(ROWCOUNT => 3650)) g      --enough days for ~10 yrs of history
+WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+ORDER BY b."customer_id", "calendar_date"
+LIMIT 20;
+```
+
+```sql
+--8. Description: daily balance per customer (carry-forward & negatives→0)
+WITH signed AS (
+  SELECT
+    "customer_id",
+    TO_DATE("txn_date") AS "txn_dt",
+    CASE WHEN LOWER("txn_type") = 'deposit' 
+         THEN  "txn_amount"
+         ELSE -1 * "txn_amount"
+    END AS "signed_amt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+running AS (
+  SELECT
+    "customer_id",
+    "txn_dt",
+    SUM("signed_amt") 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_dt"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+  FROM signed
+),
+calendar AS (
+  SELECT
+    b."customer_id",
+    DATEADD('day', seq4(), b."min_dt") AS "cal_dt"
+  FROM (
+    SELECT 
+      "customer_id",
+      MIN("txn_dt") AS "min_dt",
+      MAX("txn_dt") AS "max_dt"
+    FROM signed
+    GROUP BY "customer_id"
+  ) b,
+  TABLE(GENERATOR(ROWCOUNT => 3650)) g
+  WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+daily AS (
+  SELECT
+    c."customer_id",
+    c."cal_dt",
+    r."cum_bal"
+  FROM calendar c
+  LEFT JOIN running r
+    ON c."customer_id" = r."customer_id"
+   AND c."cal_dt"     = r."txn_dt"
+)
+SELECT
+  "customer_id",
+  "cal_dt"                                 AS "daily_date",
+  COALESCE(
+      LAST_VALUE("cum_bal") 
+        IGNORE NULLS
+        OVER (PARTITION BY "customer_id" 
+              ORDER BY "cal_dt"
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+      0
+  )                                         AS "daily_balance_capped"
+FROM daily
+ORDER BY "customer_id", "daily_date"
+LIMIT 20;
+```
+
+```sql
+--9. Description: highest (capped) daily balance per customer per month
+WITH daily_bal AS (  -- reuse query (8) up to final SELECT
+  /* … same CTEs from query 8 … */
+  SELECT
+    "customer_id",
+    "cal_dt" AS "daily_date",
+    COALESCE(
+        LAST_VALUE("cum_bal") 
+          IGNORE NULLS
+          OVER (PARTITION BY "customer_id" 
+                ORDER BY "cal_dt"
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        0
+    ) AS "daily_balance_capped"
+  FROM daily
+)
+SELECT
+  "customer_id",
+  TO_CHAR("daily_date", 'YYYY-MM') AS "month_id",
+  MAX("daily_balance_capped")      AS "max_daily_bal_in_month"
+FROM daily_bal
+GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+LIMIT 20;
+```
+
+```sql
+--10. Description: monthly total of customers’ maximum daily balances (final requirement)
+WITH daily_bal AS (  -- same logic as query 8
+  /* … CTE chain signed → running → calendar → daily … */
+  SELECT
+    "customer_id",
+    "cal_dt" AS "daily_date",
+    COALESCE(
+        LAST_VALUE("cum_bal") 
+          IGNORE NULLS
+          OVER (PARTITION BY "customer_id" 
+                ORDER BY "cal_dt"
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        0
+    ) AS "daily_balance_capped"
+  FROM daily
+),
+monthly_max AS (
+  SELECT
+    "customer_id",
+    TO_CHAR("daily_date", 'YYYY-MM') AS "month_id",
+    MAX("daily_balance_capped")      AS "max_daily_bal_in_month"
+  FROM daily_bal
+  GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+SELECT
+  "month_id",
+  SUM("max_daily_bal_in_month") AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id"
+LIMIT 20;
+```
+[Exploration]
+2025-05-07 07:05:10 - Thread-614 (execute) - INFO - [Try to execute]
+--1. Description: peek at individual customer transactions
+SELECT 
+  "customer_id",
+  "txn_date",
+  "txn_type",
+  "txn_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:11 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--1. Description: peek at individual customer transactions
+SELECT 
+  "customer_id",
+  "txn_date",
+  "txn_type",
+  "txn_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+Results:
+customer_id,txn_date,txn_type,txn_amount
+429,2020-01-21,deposit,82
+155,2020-01-10,deposit,712
+398,2020-01-01,deposit,196
+255,2020-01-14,deposit,563
+185,2020-01-29,deposit,626
+309,2020-01-13,deposit,995
+312,2020-01-20,deposit,485
+376,2020-01-03,deposit,706
+188,2020-01-13,deposit,601
+138,2020-01-11,deposit,520
+373,2020-01-18,deposit,596
+361,2020-01-12,deposit,797
+169,2020-01-10,deposit,628
+402,2020-01-05,deposit,435
+60,2020-01-19,deposit,495
+
+[Successfully executed]
+2025-05-07 07:05:11 - Thread-614 (execute) - INFO - [Try to execute]
+--2. Description: what distinct transaction types exist?
+SELECT DISTINCT 
+  "txn_type"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:12 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--2. Description: what distinct transaction types exist?
+SELECT DISTINCT 
+  "txn_type"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+Results:
+txn_type
+deposit
+withdrawal
+purchase
+
+[Successfully executed]
+2025-05-07 07:05:12 - Thread-614 (execute) - INFO - [Try to execute]
+--3. Description: earliest and latest transaction dates for a few customers
+SELECT 
+  "customer_id",
+  MIN("txn_date") AS "earliest_txn",
+  MAX("txn_date") AS "latest_txn"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+GROUP BY "customer_id"
+ORDER BY "customer_id"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:12 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--3. Description: earliest and latest transaction dates for a few customers
+SELECT 
+  "customer_id",
+  MIN("txn_date") AS "earliest_txn",
+  MAX("txn_date") AS "latest_txn"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+GROUP BY "customer_id"
+ORDER BY "customer_id"
+LIMIT 20;
+Results:
+customer_id,earliest_txn,latest_txn
+1,2020-01-02,2020-03-19
+2,2020-01-03,2020-03-24
+3,2020-01-27,2020-04-12
+4,2020-01-07,2020-03-25
+5,2020-01-15,2020-04-02
+6,2020-01-11,2020-03-31
+7,2020-01-20,2020-04-17
+8,2020-01-15,2020-04-13
+9,2020-01-21,2020-04-16
+10,2020-01-13,2020-04-10
+11,2020-01-19,2020-04-16
+12,2020-01-13,2020-03-23
+13,2020-01-02,2020-03-16
+14,2020-01-25,2020-04-05
+15,2020-01-25,2020-04-02
+16,2020-01-13,2020-04-11
+
+[Successfully executed]
+2025-05-07 07:05:12 - Thread-614 (execute) - INFO - [Try to execute]
+--4. Description: add a signed amount column (+ for deposit, – for withdrawal)
+SELECT 
+  "customer_id",
+  "txn_date",
+  CASE WHEN LOWER("txn_type") = 'deposit'
+       THEN  "txn_amount"
+       ELSE -1 * "txn_amount"
+  END AS "signed_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:12 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--4. Description: add a signed amount column (+ for deposit, – for withdrawal)
+SELECT 
+  "customer_id",
+  "txn_date",
+  CASE WHEN LOWER("txn_type") = 'deposit'
+       THEN  "txn_amount"
+       ELSE -1 * "txn_amount"
+  END AS "signed_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+Results:
+customer_id,txn_date,signed_amount
+429,2020-01-21,82
+155,2020-01-10,712
+398,2020-01-01,196
+255,2020-01-14,563
+185,2020-01-29,626
+309,2020-01-13,995
+312,2020-01-20,485
+376,2020-01-03,706
+188,2020-01-13,601
+138,2020-01-11,520
+373,2020-01-18,596
+361,2020-01-12,797
+169,2020-01-10,628
+402,2020-01-05,435
+60,2020-01-19,495
+378,2020-01-07,193
+383,2020-01-26,889
+292,2020-01-10,136
+63,2020-01-06,234
+499,2020-01-02,147
+
+[Successfully executed]
+2025-05-07 07:05:12 - Thread-614 (execute) - INFO - [Try to execute]
+--5. Description: running (cumulative) balance per customer by day
+SELECT
+  "customer_id",
+  "txn_date",
+  SUM( CASE WHEN LOWER("txn_type") = 'deposit'
+            THEN  "txn_amount"
+            ELSE -1 * "txn_amount"
+       END
+      ) 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_date"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)      AS "running_balance"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+ORDER BY "customer_id", "txn_date"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:13 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--5. Description: running (cumulative) balance per customer by day
+SELECT
+  "customer_id",
+  "txn_date",
+  SUM( CASE WHEN LOWER("txn_type") = 'deposit'
+            THEN  "txn_amount"
+            ELSE -1 * "txn_amount"
+       END
+      ) 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_date"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)      AS "running_balance"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+ORDER BY "customer_id", "txn_date"
+LIMIT 20;
+Results:
+customer_id,txn_date,running_balance
+1,2020-01-02,312
+1,2020-03-05,-300
+1,2020-03-17,24
+1,2020-03-19,-640
+2,2020-01-03,549
+2,2020-03-24,610
+3,2020-01-27,144
+3,2020-02-22,-821
+3,2020-03-05,-1034
+3,2020-03-19,-1222
+3,2020-04-12,-729
+4,2020-01-07,458
+4,2020-01-21,848
+4,2020-03-25,655
+5,2020-01-15,974
+5,2020-01-25,1780
+5,2020-01-31,954
+5,2020-03-02,68
+5,2020-03-19,786
+5,2020-03-26,0
+
+[Successfully executed]
+2025-05-07 07:05:13 - Thread-614 (execute) - INFO - [Try to execute]
+--6. Description: min & max dates each customer will need for daily calendar expansion
+WITH cte AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT * FROM cte
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:13 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--6. Description: min & max dates each customer will need for daily calendar expansion
+WITH cte AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT * FROM cte
+LIMIT 20;
+Results:
+customer_id,min_dt,max_dt
+429,2020-01-21,2020-04-04
+155,2020-01-10,2020-04-05
+398,2020-01-01,2020-03-24
+255,2020-01-14,2020-03-28
+185,2020-01-29,2020-04-24
+309,2020-01-13,2020-04-09
+312,2020-01-20,2020-04-15
+376,2020-01-03,2020-03-31
+188,2020-01-13,2020-04-07
+
+[Successfully executed]
+2025-05-07 07:05:13 - Thread-614 (execute) - INFO - [Try to execute]
+--7. Description: create a daily row for every customer using GENERATOR
+WITH bounds AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT
+  b."customer_id",
+  DATEADD('day', seq4(), b."min_dt") AS "calendar_date"
+FROM bounds b,
+     TABLE(GENERATOR(ROWCOUNT => 3650)) g      --enough days for ~10 yrs of history
+WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+ORDER BY b."customer_id", "calendar_date"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:13 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--7. Description: create a daily row for every customer using GENERATOR
+WITH bounds AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT
+  b."customer_id",
+  DATEADD('day', seq4(), b."min_dt") AS "calendar_date"
+FROM bounds b,
+     TABLE(GENERATOR(ROWCOUNT => 3650)) g      --enough days for ~10 yrs of history
+WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+ORDER BY b."customer_id", "calendar_date"
+LIMIT 20;
+Results:
+customer_id,calendar_date
+17,2020-02-08
+23,2020-03-20
+26,2020-02-16
+30,2020-03-29
+46,2020-03-09
+56,2020-03-24
+59,2020-03-09
+60,2020-03-20
+63,2020-02-17
+68,2020-03-12
+70,2020-02-13
+74,2020-03-03
+91,2020-03-02
+92,2020-03-14
+96,2020-02-19
+120,2020-02-26
+
+[Successfully executed]
+2025-05-07 07:05:13 - Thread-614 (execute) - INFO - [Try to execute]
+--8. Description: daily balance per customer (carry-forward & negatives→0)
+WITH signed AS (
+  SELECT
+    "customer_id",
+    TO_DATE("txn_date") AS "txn_dt",
+    CASE WHEN LOWER("txn_type") = 'deposit' 
+         THEN  "txn_amount"
+         ELSE -1 * "txn_amount"
+    END AS "signed_amt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+running AS (
+  SELECT
+    "customer_id",
+    "txn_dt",
+    SUM("signed_amt") 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_dt"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+  FROM signed
+),
+calendar AS (
+  SELECT
+    b."customer_id",
+    DATEADD('day', seq4(), b."min_dt") AS "cal_dt"
+  FROM (
+    SELECT 
+      "customer_id",
+      MIN("txn_dt") AS "min_dt",
+      MAX("txn_dt") AS "max_dt"
+    FROM signed
+    GROUP BY "customer_id"
+  ) b,
+  TABLE(GENERATOR(ROWCOUNT => 3650)) g
+  WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+daily AS (
+  SELECT
+    c."customer_id",
+    c."cal_dt",
+    r."cum_bal"
+  FROM calendar c
+  LEFT JOIN running r
+    ON c."customer_id" = r."customer_id"
+   AND c."cal_dt"     = r."txn_dt"
+)
+SELECT
+  "customer_id",
+  "cal_dt"                                 AS "daily_date",
+  COALESCE(
+      LAST_VALUE("cum_bal") 
+        IGNORE NULLS
+        OVER (PARTITION BY "customer_id" 
+              ORDER BY "cal_dt"
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+      0
+  )                                         AS "daily_balance_capped"
+FROM daily
+ORDER BY "customer_id", "daily_date"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:14 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--8. Description: daily balance per customer (carry-forward & negatives→0)
+WITH signed AS (
+  SELECT
+    "customer_id",
+    TO_DATE("txn_date") AS "txn_dt",
+    CASE WHEN LOWER("txn_type") = 'deposit' 
+         THEN  "txn_amount"
+         ELSE -1 * "txn_amount"
+    END AS "signed_amt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+running AS (
+  SELECT
+    "customer_id",
+    "txn_dt",
+    SUM("signed_amt") 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_dt"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+  FROM signed
+),
+calendar AS (
+  SELECT
+    b."customer_id",
+    DATEADD('day', seq4(), b."min_dt") AS "cal_dt"
+  FROM (
+    SELECT 
+      "customer_id",
+      MIN("txn_dt") AS "min_dt",
+      MAX("txn_dt") AS "max_dt"
+    FROM signed
+    GROUP BY "customer_id"
+  ) b,
+  TABLE(GENERATOR(ROWCOUNT => 3650)) g
+  WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+daily AS (
+  SELECT
+    c."customer_id",
+    c."cal_dt",
+    r."cum_bal"
+  FROM calendar c
+  LEFT JOIN running r
+    ON c."customer_id" = r."customer_id"
+   AND c."cal_dt"     = r."txn_dt"
+)
+SELECT
+  "customer_id",
+  "cal_dt"                                 AS "daily_date",
+  COALESCE(
+      LAST_VALUE("cum_bal") 
+        IGNORE NULLS
+        OVER (PARTITION BY "customer_id" 
+              ORDER BY "cal_dt"
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+      0
+  )                                         AS "daily_balance_capped"
+FROM daily
+ORDER BY "customer_id", "daily_date"
+LIMIT 20;
+Results:
+customer_id,daily_date,daily_balance_capped
+123,2020-04-05,-718
+123,2020-04-06,-1665
+123,2020-04-07,-2128
+378,2020-01-23,0
+378,2020-01-24,0
+378,2020-01-25,0
+378,2020-01-26,7
+378,2020-01-27,376
+378,2020-01-28,376
+378,2020-01-29,376
+378,2020-01-30,484
+378,2020-01-31,484
+378,2020-02-01,484
+378,2020-02-02,484
+
+[Successfully executed]
+2025-05-07 07:05:14 - Thread-614 (execute) - INFO - [Try to execute]
+--9. Description: highest (capped) daily balance per customer per month
+WITH daily_bal AS (  -- reuse query (8) up to final SELECT
+  /* … same CTEs from query 8 … */
+  SELECT
+    "customer_id",
+    "cal_dt" AS "daily_date",
+    COALESCE(
+        LAST_VALUE("cum_bal") 
+          IGNORE NULLS
+          OVER (PARTITION BY "customer_id" 
+                ORDER BY "cal_dt"
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+        0
+    ) AS "daily_balance_capped"
+  FROM daily
+)
+SELECT
+  "customer_id",
+  TO_CHAR("daily_date", 'YYYY-MM') AS "month_id",
+  MAX("daily_balance_capped")      AS "max_daily_bal_in_month"
+FROM daily_bal
+GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:05:14 - Thread-614 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': "##ERROR##002003 (42S02): SQL compilation error:\nObject 'DAILY' does not exist or not authorized."}
+[Error occurred]
+2025-05-07 07:07:52 - Thread-614 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: build daily balances per customer (carry-forward, negatives→0), grab each
+--             customer’s highest daily balance in every month, then sum those peaks to
+--             obtain the overall monthly total.  Comments outline each thinking step.
+WITH
+/* 1) Turn every transaction into a signed value (+deposit, −otherwise)           */
+signed AS (
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                                AS "txn_dt",
+        CASE WHEN LOWER("txn_type") = 'deposit'
+             THEN  "txn_amount"
+             ELSE -1 * "txn_amount"
+        END                                               AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+/* 2) Running (cumulative) balance but only on the actual transaction dates       */
+running AS (
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt")
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+    FROM signed
+),
+/* 3) Produce every calendar date between each customer’s min & max txn dates     */
+calendar AS (
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")                AS "cal_dt"
+    FROM (
+        SELECT
+            "customer_id",
+            MIN("txn_dt")  AS "min_dt",
+            MAX("txn_dt")  AS "max_dt"
+        FROM signed
+        GROUP BY "customer_id"
+    ) b,
+    TABLE(GENERATOR(ROWCOUNT => 3650)) g                  --enough for ~10 years
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+/* 4) Attach cumulative balance to each calendar day (NULL when no txn that day)  */
+daily_raw AS (
+    SELECT
+        c."customer_id",
+        c."cal_dt",
+        r."cum_bal"
+    FROM calendar c
+    LEFT JOIN running r
+           ON c."customer_id" = r."customer_id"
+          AND c."cal_dt"      = r."txn_dt"
+),
+/* 5) Carry-forward last known balance, replace NULL with previous, cap <0 at 0   */
+daily_bal AS (
+    SELECT
+        "customer_id",
+        "cal_dt"                                           AS "daily_date",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "cal_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                                 AS "daily_balance_capped"
+    FROM daily_raw
+),
+/* 6) For each customer & month, find the maximum daily balance                   */
+monthly_max AS (
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_date", 'YYYY-MM')                  AS "month_id",
+        MAX("daily_balance_capped")                       AS "max_daily_bal_in_month"
+    FROM daily_bal
+    GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+/* 7) Sum those customer peaks to get overall monthly totals                      */
+SELECT
+    "month_id",
+    SUM("max_daily_bal_in_month")                         AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id";
+```
+[Corrected SQL]
+2025-05-07 07:07:52 - Thread-614 (execute) - INFO - [Results for corrected sql]
+month_id,total_of_customer_max_balances
+2020-01,485
+2020-02,699
+2020-03,1649
+2020-04,318
+
+[Results for corrected sql]
+2025-05-07 07:08:39 - Thread-614 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: monthly total of customers’ maximum daily balances (re-built with the full
+--             CTE chain so every intermediate object exists and “daily” is defined)
+WITH
+/* 1) Convert each transaction into a signed amount (+deposit, −otherwise)         */
+signed AS (
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                                AS "txn_dt",
+        CASE WHEN LOWER("txn_type") = 'deposit'
+             THEN  "txn_amount"
+             ELSE -1 * "txn_amount"
+        END                                               AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+/* 2) Cumulative balance but only on transaction dates                             */
+running AS (
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt")
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+    FROM signed
+),
+/* 3) Generate every calendar day between each customer’s min & max txn date       */
+calendar AS (
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")                AS "cal_dt"
+    FROM (
+        SELECT
+            "customer_id",
+            MIN("txn_dt")  AS "min_dt",
+            MAX("txn_dt")  AS "max_dt"
+        FROM signed
+        GROUP BY "customer_id"
+    ) b,
+    TABLE(GENERATOR(ROWCOUNT => 3650)) g                  --ample range
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+/* 4) Attach cumulative balance to each calendar day                               */
+daily AS (
+    SELECT
+        c."customer_id",
+        c."cal_dt",
+        r."cum_bal"
+    FROM calendar c
+    LEFT JOIN running r
+           ON c."customer_id" = r."customer_id"
+          AND c."cal_dt"      = r."txn_dt"
+),
+/* 5) Carry-forward balance, replace NULL with previous, cap negatives at 0        */
+daily_bal AS (
+    SELECT
+        "customer_id",
+        "cal_dt"                                           AS "daily_date",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "cal_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                                 AS "daily_balance_capped"
+    FROM daily
+),
+/* 6) Maximum daily balance per customer per month                                  */
+monthly_max AS (
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_date", 'YYYY-MM')                  AS "month_id",
+        MAX("daily_balance_capped")                       AS "max_daily_bal_in_month"
+    FROM daily_bal
+    GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+/* 7) Sum customer peaks to reach the monthly total                                 */
+SELECT
+    "month_id",
+    SUM("max_daily_bal_in_month")                         AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id"
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-07 07:08:39 - Thread-614 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: build daily balances per customer (carry-forward, negatives→0), grab each
+--             customer’s highest daily balance in every month, then sum those peaks to
+--             obtain the overall monthly total.  Comments outline each thinking step.
+WITH
+/* 1) Turn every transaction into a signed value (+deposit, −otherwise)           */
+signed AS (
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                                AS "txn_dt",
+        CASE WHEN LOWER("txn_type") = 'deposit'
+             THEN  "txn_amount"
+             ELSE -1 * "txn_amount"
+        END                                               AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+/* 2) Running (cumulative) balance but only on the actual transaction dates       */
+running AS (
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt")
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+    FROM signed
+),
+/* 3) Produce every calendar date between each customer’s min & max txn dates     */
+calendar AS (
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")                AS "cal_dt"
+    FROM (
+        SELECT
+            "customer_id",
+            MIN("txn_dt")  AS "min_dt",
+            MAX("txn_dt")  AS "max_dt"
+        FROM signed
+        GROUP BY "customer_id"
+    ) b,
+    TABLE(GENERATOR(ROWCOUNT => 3650)) g                  --enough for ~10 years
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+/* 4) Attach cumulative balance to each calendar day (NULL when no txn that day)  */
+daily_raw AS (
+    SELECT
+        c."customer_id",
+        c."cal_dt",
+        r."cum_bal"
+    FROM calendar c
+    LEFT JOIN running r
+           ON c."customer_id" = r."customer_id"
+          AND c."cal_dt"      = r."txn_dt"
+),
+/* 5) Carry-forward last known balance, replace NULL with previous, cap <0 at 0   */
+daily_bal AS (
+    SELECT
+        "customer_id",
+        "cal_dt"                                           AS "daily_date",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "cal_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                                 AS "daily_balance_capped"
+    FROM daily_raw
+),
+/* 6) For each customer & month, find the maximum daily balance                   */
+monthly_max AS (
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_date", 'YYYY-MM')                  AS "month_id",
+        MAX("daily_balance_capped")                       AS "max_daily_bal_in_month"
+    FROM daily_bal
+    GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+/* 7) Sum those customer peaks to get overall monthly totals                      */
+SELECT
+    "month_id",
+    SUM("max_daily_bal_in_month")                         AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id";
+Results:
+month_id,total_of_customer_max_balances
+2020-01,485
+2020-02,699
+2020-03,1649
+2020-04,318
+
+[Successfully corrected]
+2025-05-07 07:08:39 - Thread-614 (execute) - INFO - [Try to execute]
+--Description: monthly total of customers’ maximum daily balances (re-built with the full
+--             CTE chain so every intermediate object exists and “daily” is defined)
+WITH
+/* 1) Convert each transaction into a signed amount (+deposit, −otherwise)         */
+signed AS (
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                                AS "txn_dt",
+        CASE WHEN LOWER("txn_type") = 'deposit'
+             THEN  "txn_amount"
+             ELSE -1 * "txn_amount"
+        END                                               AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+/* 2) Cumulative balance but only on transaction dates                             */
+running AS (
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt")
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+    FROM signed
+),
+/* 3) Generate every calendar day between each customer’s min & max txn date       */
+calendar AS (
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")                AS "cal_dt"
+    FROM (
+        SELECT
+            "customer_id",
+            MIN("txn_dt")  AS "min_dt",
+            MAX("txn_dt")  AS "max_dt"
+        FROM signed
+        GROUP BY "customer_id"
+    ) b,
+    TABLE(GENERATOR(ROWCOUNT => 3650)) g                  --ample range
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+/* 4) Attach cumulative balance to each calendar day                               */
+daily AS (
+    SELECT
+        c."customer_id",
+        c."cal_dt",
+        r."cum_bal"
+    FROM calendar c
+    LEFT JOIN running r
+           ON c."customer_id" = r."customer_id"
+          AND c."cal_dt"      = r."txn_dt"
+),
+/* 5) Carry-forward balance, replace NULL with previous, cap negatives at 0        */
+daily_bal AS (
+    SELECT
+        "customer_id",
+        "cal_dt"                                           AS "daily_date",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "cal_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                                 AS "daily_balance_capped"
+    FROM daily
+),
+/* 6) Maximum daily balance per customer per month                                  */
+monthly_max AS (
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_date", 'YYYY-MM')                  AS "month_id",
+        MAX("daily_balance_capped")                       AS "max_daily_bal_in_month"
+    FROM daily_bal
+    GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+/* 7) Sum customer peaks to reach the monthly total                                 */
+SELECT
+    "month_id",
+    SUM("max_daily_bal_in_month")                         AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id"
+LIMIT 20
+[Try to execute]
+2025-05-07 07:08:40 - Thread-614 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: monthly total of customers’ maximum daily balances (re-built with the full
+--             CTE chain so every intermediate object exists and “daily” is defined)
+WITH
+/* 1) Convert each transaction into a signed amount (+deposit, −otherwise)         */
+signed AS (
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                                AS "txn_dt",
+        CASE WHEN LOWER("txn_type") = 'deposit'
+             THEN  "txn_amount"
+             ELSE -1 * "txn_amount"
+        END                                               AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+/* 2) Cumulative balance but only on transaction dates                             */
+running AS (
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt")
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+    FROM signed
+),
+/* 3) Generate every calendar day between each customer’s min & max txn date       */
+calendar AS (
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")                AS "cal_dt"
+    FROM (
+        SELECT
+            "customer_id",
+            MIN("txn_dt")  AS "min_dt",
+            MAX("txn_dt")  AS "max_dt"
+        FROM signed
+        GROUP BY "customer_id"
+    ) b,
+    TABLE(GENERATOR(ROWCOUNT => 3650)) g                  --ample range
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+/* 4) Attach cumulative balance to each calendar day                               */
+daily AS (
+    SELECT
+        c."customer_id",
+        c."cal_dt",
+        r."cum_bal"
+    FROM calendar c
+    LEFT JOIN running r
+           ON c."customer_id" = r."customer_id"
+          AND c."cal_dt"      = r."txn_dt"
+),
+/* 5) Carry-forward balance, replace NULL with previous, cap negatives at 0        */
+daily_bal AS (
+    SELECT
+        "customer_id",
+        "cal_dt"                                           AS "daily_date",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "cal_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                                 AS "daily_balance_capped"
+    FROM daily
+),
+/* 6) Maximum daily balance per customer per month                                  */
+monthly_max AS (
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_date", 'YYYY-MM')                  AS "month_id",
+        MAX("daily_balance_capped")                       AS "max_daily_bal_in_month"
+    FROM daily_bal
+    GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+/* 7) Sum customer peaks to reach the monthly total                                 */
+SELECT
+    "month_id",
+    SUM("max_daily_bal_in_month")                         AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id"
+LIMIT 20
+Results:
+month_id,total_of_customer_max_balances
+2020-01,650
+2020-02,2491
+2020-03,0
+2020-04,1139
+
+[Successfully executed]
+2025-05-07 07:08:40 - Thread-614 (execute) - INFO - itercount: 0
+2025-05-07 07:08:40 - Thread-614 (execute) - INFO - [Self-refine]
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.INTEREST_MAP
+Column name: interest_summary Type: TEXT
+Column name: id Type: NUMBER
+Column name: interest_name Type: TEXT
+Column name: last_modified Type: TEXT
+Column name: created_at Type: TEXT
+Sample rows:
+[{'id': 4, 'interest_name': 'Luxury Retail Researchers', 'interest_summary': 'Consumers researching luxury product reviews and gift ideas.', 'created_at': '2016-05-26 14:57:59', 'last_modified': '2018-05-23 11:30:12'}, {'id': 6, 'interest_name': 'Vacation Planners', 'interest_summary': 'Consumers reading reviews of vacation destinations and accommodations.', 'created_at': '2016-05-26 14:57:59', 'last_modified': '2018-05-23 11:30:13'}, {'id': 7, 'interest_name': 'Motorcycle Enthusiasts', 'interest_summary': 'Readers of motorcycle news and reviews.', 'created_at': '2016-05-26 14:57:59', 'last_modified': '2018-05-23 11:30:13'}, {'id': 8, 'interest_name': 'Business News Readers', 'interest_summary': 'Readers of online business news content.', 'created_at': '2016-05-26 14:57:59', 'last_modified': '2018-05-23 11:30:12'}, {'id': 13, 'interest_name': 'Advertising Professionals', 'interest_summary': 'People who read advertising industry news.', 'created_at': '2016-05-26 14:57:59', 'last_modified': '2018-05-23 11:30:12'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.INTEREST_METRICS
+Column name: ranking Type: NUMBER
+Column name: percentile_ranking Type: FLOAT
+Column name: month_year Type: TEXT
+Column name: interest_id Type: FLOAT
+Column name: composition Type: FLOAT
+Column name: _month Type: FLOAT
+Column name: index_value Type: FLOAT
+Column name: _year Type: FLOAT
+Sample rows:
+[{'_month': 7.0, '_year': 2018.0, 'month_year': '07-2018', 'interest_id': 6106.0, 'composition': 9.93, 'index_value': 5.31, 'ranking': 2, 'percentile_ranking': 99.73}, {'_month': 7.0, '_year': 2018.0, 'month_year': '07-2018', 'interest_id': 18923.0, 'composition': 10.85, 'index_value': 5.29, 'ranking': 3, 'percentile_ranking': 99.59}, {'_month': 7.0, '_year': 2018.0, 'month_year': '07-2018', 'interest_id': 6344.0, 'composition': 10.32, 'index_value': 5.1, 'ranking': 4, 'percentile_ranking': 99.45}, {'_month': 7.0, '_year': 2018.0, 'month_year': '07-2018', 'interest_id': 100.0, 'composition': 10.77, 'index_value': 5.04, 'ranking': 5, 'percentile_ranking': 99.31}, {'_month': 7.0, '_year': 2018.0, 'month_year': '07-2018', 'interest_id': 79.0, 'composition': 11.21, 'index_value': 4.97, 'ranking': 7, 'percentile_ranking': 99.04}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.BITCOIN_PRICES
+Column name: low Type: FLOAT
+Column name: change Type: TEXT
+Column name: price Type: FLOAT
+Column name: open Type: FLOAT
+Column name: volume Type: TEXT
+Column name: high Type: FLOAT
+Column name: market_date Type: TEXT
+Column name: ticker Type: TEXT
+Sample rows:
+[{'ticker': 'ETH', 'market_date': '29-08-2021', 'price': 3177.84, 'open': 3243.96, 'high': 3282.21, 'low': 3162.79, 'volume': '582.04K', 'change': '-2.04%'}, {'ticker': 'ETH', 'market_date': '27-08-2021', 'price': 3273.58, 'open': 3093.78, 'high': 3279.93, 'low': 3063.37, 'volume': '839.54K', 'change': '5.82%'}, {'ticker': 'ETH', 'market_date': '26-08-2021', 'price': 3093.54, 'open': 3228.03, 'high': 3249.62, 'low': 3057.48, 'volume': '118.44K', 'change': '-4.17%'}, {'ticker': 'ETH', 'market_date': '24-08-2021', 'price': 3173.26, 'open': 3322.6, 'high': 3357.99, 'low': 3150.75, 'volume': '988.82K', 'change': '-4.41%'}, {'ticker': 'ETH', 'market_date': '23-08-2021', 'price': 3319.49, 'open': 3238.41, 'high': 3375.42, 'low': 3231.96, 'volume': '1.09M', 'change': '2.49%'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.SHOPPING_CART_CAMPAIGN_IDENTIFIER
+Column name: start_date Type: TEXT
+Column name: campaign_id Type: NUMBER
+Column name: campaign_name Type: TEXT
+Column name: end_date Type: TEXT
+Column name: products Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.SHOPPING_CART_EVENT_IDENTIFIER
+Column name: event_name Type: TEXT
+Column name: event_type Type: NUMBER
+Sample rows:
+[{'event_type': 2, 'event_name': 'Add to Cart'}, {'event_type': 3, 'event_name': 'Purchase'}, {'event_type': 4, 'event_name': 'Ad Impression'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.VEG_CAT
+Column name: category_code Type: NUMBER
+Column name: item_code Type: NUMBER
+Column name: category_name Type: TEXT
+Column name: item_name Type: TEXT
+Column name: index Type: NUMBER
+Sample rows:
+[{'index': 0, 'item_code': 102900005115168, 'item_name': 'Niushou Shengcai', 'category_code': 1011010101, 'category_name': 'Flower/Leaf\xa0Vegetables'}, {'index': 2, 'item_code': 102900005115625, 'item_name': 'Local Xiaomao Cabbage', 'category_code': 1011010101, 'category_name': 'Flower/Leaf\xa0Vegetables'}, {'index': 3, 'item_code': 102900005115748, 'item_name': 'White Caitai', 'category_code': 1011010101, 'category_name': 'Flower/Leaf\xa0Vegetables'}, {'index': 4, 'item_code': 102900005115762, 'item_name': 'Amaranth', 'category_code': 1011010101, 'category_name': 'Flower/Leaf\xa0Vegetables'}, {'index': 5, 'item_code': 102900005115779, 'item_name': 'Yunnan Shengcai', 'category_code': 1011010101, 'category_name': 'Flower/Leaf\xa0Vegetables'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.VEG_WHSLE_DF
+Column name: index Type: NUMBER
+Column name: whsle_px_rmb-kg Type: FLOAT
+Column name: whsle_date Type: TEXT
+Column name: item_code Type: NUMBER
+Sample rows:
+[{'index': 0, 'whsle_date': '2020-07-01 00:00:00', 'item_code': 102900005115762, 'whsle_px_rmb-kg': 3.88}, {'index': 5, 'whsle_date': '2020-07-01 00:00:00', 'item_code': 102900005115908, 'whsle_px_rmb-kg': 4.6}, {'index': 8, 'whsle_date': '2020-07-01 00:00:00', 'item_code': 102900005115984, 'whsle_px_rmb-kg': 3.44}, {'index': 9, 'whsle_date': '2020-07-01 00:00:00', 'item_code': 102900005116226, 'whsle_px_rmb-kg': 4.64}, {'index': 10, 'whsle_date': '2020-07-01 00:00:00', 'item_code': 102900005116233, 'whsle_px_rmb-kg': 5.76}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.BITCOIN_TRANSACTIONS
+Column name: quantity Type: FLOAT
+Column name: member_id Type: TEXT
+Column name: txn_id Type: NUMBER
+Column name: ticker Type: TEXT
+Column name: txn_type Type: TEXT
+Column name: percentage_fee Type: FLOAT
+Column name: txn_time Type: TEXT
+Column name: txn_date Type: TEXT
+Sample rows:
+[{'txn_id': 2, 'member_id': 'eccbc8', 'ticker': 'BTC', 'txn_date': '01-01-2017', 'txn_type': 'BUY', 'quantity': 50.0, 'percentage_fee': 0.3, 'txn_time': '2017-01-01T00:00:00.000Z'}, {'txn_id': 3, 'member_id': 'a87ff6', 'ticker': 'BTC', 'txn_date': '01-01-2017', 'txn_type': 'BUY', 'quantity': 50.0, 'percentage_fee': 0.0, 'txn_time': '2017-01-01T00:00:00.000Z'}, {'txn_id': 7, 'member_id': '8f14e4', 'ticker': 'BTC', 'txn_date': '01-01-2017', 'txn_type': 'BUY', 'quantity': 50.0, 'percentage_fee': 0.21, 'txn_time': '2017-01-01T00:00:00.000Z'}, {'txn_id': 8, 'member_id': 'c9f0f8', 'ticker': 'BTC', 'txn_date': '01-01-2017', 'txn_type': 'BUY', 'quantity': 50.0, 'percentage_fee': 0.3, 'txn_time': '2017-01-01T00:00:00.000Z'}, {'txn_id': 10, 'member_id': 'd3d944', 'ticker': 'BTC', 'txn_date': '01-01-2017', 'txn_type': 'BUY', 'quantity': 50.0, 'percentage_fee': 0.3, 'txn_time': '2017-01-01T00:00:00.000Z'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.SHOPPING_CART_EVENTS
+Column name: page_id Type: NUMBER
+Column name: event_type Type: NUMBER
+Column name: cookie_id Type: TEXT
+Column name: event_time Type: TEXT
+Column name: visit_id Type: TEXT
+Column name: sequence_number Type: NUMBER
+Sample rows:
+[{'visit_id': 'ccf365', 'cookie_id': 'c4ca42', 'page_id': 9, 'event_type': 1, 'sequence_number': 4, 'event_time': '2020-02-04 19:16:58.609142'}, {'visit_id': 'ccf365', 'cookie_id': 'c4ca42', 'page_id': 9, 'event_type': 2, 'sequence_number': 5, 'event_time': '2020-02-04 19:17:51.72942'}, {'visit_id': 'ccf365', 'cookie_id': 'c4ca42', 'page_id': 10, 'event_type': 2, 'sequence_number': 7, 'event_time': '2020-02-04 19:19:10.570786'}, {'visit_id': 'ccf365', 'cookie_id': 'c4ca42', 'page_id': 12, 'event_type': 1, 'sequence_number': 10, 'event_time': '2020-02-04 19:20:52.307244'}, {'visit_id': 'd58cbd', 'cookie_id': 'c81e72', 'page_id': 1, 'event_type': 1, 'sequence_number': 1, 'event_time': '2020-01-18 23:40:54.761906'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.VEG_LOSS_RATE_DF
+Column name: item_name Type: TEXT
+Column name: item_code Type: NUMBER
+Column name: index Type: NUMBER
+Column name: loss_rate_% Type: FLOAT
+Sample rows:
+[{'index': 0, 'item_code': 102900005115168, 'item_name': 'Niushou Shengcai', 'loss_rate_%': 4.39}, {'index': 1, 'item_code': 102900005115199, 'item_name': 'Sichuan Red Cedar', 'loss_rate_%': 10.46}, {'index': 7, 'item_code': 102900005115786, 'item_name': 'Zhuyecai', 'loss_rate_%': 13.62}, {'index': 8, 'item_code': 102900005115793, 'item_name': 'Chinese Cabbage', 'loss_rate_%': 7.59}, {'index': 10, 'item_code': 102900005115823, 'item_name': 'Shanghaiqing', 'loss_rate_%': 14.43}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_NODES
+Column name: region_id Type: NUMBER
+Column name: start_date Type: TEXT
+Column name: end_date Type: TEXT
+Column name: customer_id Type: NUMBER
+Column name: node_id Type: NUMBER
+Sample rows:
+[{'customer_id': 1, 'region_id': 3, 'node_id': 4, 'start_date': '2020-01-02', 'end_date': '2020-01-03'}, {'customer_id': 2, 'region_id': 3, 'node_id': 5, 'start_date': '2020-01-03', 'end_date': '2020-01-17'}, {'customer_id': 3, 'region_id': 5, 'node_id': 4, 'start_date': '2020-01-27', 'end_date': '2020-02-18'}, {'customer_id': 4, 'region_id': 5, 'node_id': 4, 'start_date': '2020-01-07', 'end_date': '2020-01-19'}, {'customer_id': 7, 'region_id': 2, 'node_id': 5, 'start_date': '2020-01-20', 'end_date': '2020-02-04'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.WEEKLY_SALES
+Column name: region Type: TEXT
+Column name: week_date Type: TEXT
+Column name: segment Type: TEXT
+Column name: customer_type Type: TEXT
+Column name: sales Type: NUMBER
+Column name: platform Type: TEXT
+Column name: transactions Type: NUMBER
+Sample rows:
+[{'week_date': '31/8/20', 'region': 'ASIA', 'platform': 'Retail', 'segment': 'F1', 'customer_type': 'New', 'transactions': 31574, 'sales': 996575}, {'week_date': '31/8/20', 'region': 'OCEANIA', 'platform': 'Shopify', 'segment': 'C2', 'customer_type': 'Existing', 'transactions': 4661, 'sales': 882690}, {'week_date': '31/8/20', 'region': 'AFRICA', 'platform': 'Retail', 'segment': 'F1', 'customer_type': 'Existing', 'transactions': 97604, 'sales': 5185233}, {'week_date': '31/8/20', 'region': 'OCEANIA', 'platform': 'Retail', 'segment': 'C2', 'customer_type': 'New', 'transactions': 111219, 'sales': 2980673}, {'week_date': '31/8/20', 'region': 'AFRICA', 'platform': 'Retail', 'segment': 'C3', 'customer_type': 'Existing', 'transactions': 284971, 'sales': 14430196}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.BITCOIN_MEMBERS
+Column name: first_name Type: TEXT
+Column name: member_id Type: TEXT
+Column name: region Type: TEXT
+Sample rows:
+[{'member_id': 'c4ca42', 'first_name': 'Danny', 'region': 'Australia'}, {'member_id': 'c81e72', 'first_name': 'Vipul', 'region': 'United States'}, {'member_id': 'a87ff6', 'first_name': 'Nandita', 'region': 'United States'}, {'member_id': 'e4da3b', 'first_name': 'Rowan', 'region': 'United States'}, {'member_id': '167909', 'first_name': 'Ayush', 'region': 'United States'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.CLEANED_WEEKLY_SALES
+Column name: platform Type: TEXT
+Column name: month_number Type: NUMBER
+Column name: age_band Type: TEXT
+Column name: calendar_year Type: NUMBER
+Column name: customer_type Type: TEXT
+Column name: region Type: TEXT
+Column name: demographic Type: TEXT
+Column name: week_number Type: NUMBER
+Column name: transactions Type: NUMBER
+Column name: avg_transaction Type: FLOAT
+Column name: segment Type: TEXT
+Column name: week_date Type: TEXT
+Column name: sales Type: NUMBER
+Column name: week_date_formatted Type: TEXT
+Sample rows:
+[{'week_date_formatted': '2020-8-31', 'week_date': '2020-08-31', 'region': 'USA', 'platform': 'Retail', 'segment': 'unknown', 'customer_type': 'Guest', 'transactions': 529151, 'sales': 16509610, 'week_number': 36, 'month_number': 8, 'calendar_year': 2020, 'age_band': 'unknown', 'demographic': 'unknown', 'avg_transaction': 31.2}, {'week_date_formatted': '2020-8-31', 'week_date': '2020-08-31', 'region': 'EUROPE', 'platform': 'Retail', 'segment': 'C1', 'customer_type': 'New', 'transactions': 4517, 'sales': 141942, 'week_number': 36, 'month_number': 8, 'calendar_year': 2020, 'age_band': 'Young Adults', 'demographic': 'Couples', 'avg_transaction': 31.42}, {'week_date_formatted': '2020-8-31', 'week_date': '2020-08-31', 'region': 'AFRICA', 'platform': 'Retail', 'segment': 'C2', 'customer_type': 'New', 'transactions': 58046, 'sales': 1758388, 'week_number': 36, 'month_number': 8, 'calendar_year': 2020, 'age_band': 'Middle Aged', 'demographic': 'Couples', 'avg_transaction': 30.29}, {'week_date_formatted': '2020-8-31', 'week_date': '2020-08-31', 'region': 'AFRICA', 'platform': 'Shopify', 'segment': 'F3', 'customer_type': 'Existing', 'transactions': 2514, 'sales': 519502, 'week_number': 36, 'month_number': 8, 'calendar_year': 2020, 'age_band': 'Retirees', 'demographic': 'Families', 'avg_transaction': 206.64}, {'week_date_formatted': '2020-8-31', 'week_date': '2020-08-31', 'region': 'ASIA', 'platform': 'Shopify', 'segment': 'F1', 'customer_type': 'Existing', 'transactions': 2158, 'sales': 371417, 'week_number': 36, 'month_number': 8, 'calendar_year': 2020, 'age_band': 'Young Adults', 'demographic': 'Families', 'avg_transaction': 172.11}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_REGIONS
+Column name: region_id Type: NUMBER
+Column name: region_name Type: TEXT
+Sample rows:
+[{'region_id': 3, 'region_name': 'Africa'}, {'region_id': 4, 'region_name': 'Asia'}, {'region_id': 5, 'region_name': 'Europe'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+Column name: customer_id Type: NUMBER
+Column name: txn_date Type: TEXT
+Column name: txn_amount Type: NUMBER
+Column name: txn_type Type: TEXT
+Sample rows:
+[{'customer_id': 429, 'txn_date': '2020-01-21', 'txn_type': 'deposit', 'txn_amount': 82}, {'customer_id': 155, 'txn_date': '2020-01-10', 'txn_type': 'deposit', 'txn_amount': 712}, {'customer_id': 398, 'txn_date': '2020-01-01', 'txn_type': 'deposit', 'txn_amount': 196}, {'customer_id': 255, 'txn_date': '2020-01-14', 'txn_type': 'deposit', 'txn_amount': 563}, {'customer_id': 373, 'txn_date': '2020-01-18', 'txn_type': 'deposit', 'txn_amount': 596}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.SHOPPING_CART_USERS
+Column name: user_id Type: NUMBER
+Column name: cookie_id Type: TEXT
+Column name: start_date Type: TEXT
+Sample rows:
+[{'user_id': 1, 'cookie_id': 'c4ca42', 'start_date': '2020-02-04'}, {'user_id': 2, 'cookie_id': 'c81e72', 'start_date': '2020-01-18'}, {'user_id': 4, 'cookie_id': 'a87ff6', 'start_date': '2020-02-22'}, {'user_id': 5, 'cookie_id': 'e4da3b', 'start_date': '2020-02-01'}, {'user_id': 7, 'cookie_id': '8f14e4', 'start_date': '2020-02-09'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.VEG_TXN_DF
+Column name: txn_date Type: TEXT
+Column name: qty_sold(kg) Type: FLOAT
+Column name: sale/return Type: TEXT
+Column name: txn_time Type: TEXT
+Column name: unit_selling_px_rmb/kg Type: FLOAT
+Column name: index Type: NUMBER
+Column name: discount(%) Type: NUMBER
+Column name: item_code Type: NUMBER
+Column name: day_of_week Type: TEXT
+Sample rows:
+[{'index': 1, 'txn_date': '2020-07-01 00:00:00', 'txn_time': '09:17:27', 'item_code': 102900005115960, 'qty_sold(kg)': 0.849, 'unit_selling_px_rmb/kg': 3.2, 'sale/return': 'sale', 'discount(%)': 1, 'day_of_week': 'Wednesday'}, {'index': 6, 'txn_date': '2020-07-01 00:00:00', 'txn_time': '09:21:56', 'item_code': 102900005115779, 'qty_sold(kg)': 0.338, 'unit_selling_px_rmb/kg': 8.0, 'sale/return': 'sale', 'discount(%)': 1, 'day_of_week': 'Wednesday'}, {'index': 7, 'txn_date': '2020-07-01 00:00:00', 'txn_time': '09:22:01', 'item_code': 102900005117056, 'qty_sold(kg)': 0.132, 'unit_selling_px_rmb/kg': 7.6, 'sale/return': 'sale', 'discount(%)': 1, 'day_of_week': 'Wednesday'}, {'index': 8, 'txn_date': '2020-07-01 00:00:00', 'txn_time': '09:22:01', 'item_code': 102900005115779, 'qty_sold(kg)': 0.213, 'unit_selling_px_rmb/kg': 8.0, 'sale/return': 'sale', 'discount(%)': 1, 'day_of_week': 'Wednesday'}, {'index': 9, 'txn_date': '2020-07-01 00:00:00', 'txn_time': '09:22:15', 'item_code': 102900011008522, 'qty_sold(kg)': 0.514, 'unit_selling_px_rmb/kg': 8.0, 'sale/return': 'sale', 'discount(%)': 1, 'day_of_week': 'Wednesday'}]
+
+--------------------------------------------------
+Table full name: BANK_SALES_TRADING.BANK_SALES_TRADING.SHOPPING_CART_PAGE_HIERARCHY
+Column name: page_id Type: NUMBER
+Column name: product_id Type: FLOAT
+Column name: page_name Type: TEXT
+Column name: product_category Type: TEXT
+Sample rows:
+[{'page_id': 2, 'page_name': 'All Products', 'product_category': '', 'product_id': nan}, {'page_id': 3, 'page_name': 'Salmon', 'product_category': 'Fish', 'product_id': 1.0}, {'page_id': 4, 'page_name': 'Kingfish', 'product_category': 'Fish', 'product_id': 2.0}, {'page_id': 6, 'page_name': 'Russian Caviar', 'product_category': 'Luxury', 'product_id': 4.0}, {'page_id': 7, 'page_name': 'Black Truffle', 'product_category': 'Luxury', 'product_id': 5.0}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'BANK_SALES_TRADING': {'BANK_SALES_TRADING': ['INTEREST_MAP', 'INTEREST_METRICS', 'BITCOIN_PRICES', 'SHOPPING_CART_CAMPAIGN_IDENTIFIER', 'SHOPPING_CART_EVENT_IDENTIFIER', 'VEG_CAT', 'VEG_WHSLE_DF', 'BITCOIN_TRANSACTIONS', 'SHOPPING_CART_EVENTS', 'VEG_LOSS_RATE_DF', 'CUSTOMER_NODES', 'WEEKLY_SALES', 'BITCOIN_MEMBERS', 'CLEANED_WEEKLY_SALES', 'CUSTOMER_REGIONS', 'CUSTOMER_TRANSACTIONS', 'SHOPPING_CART_USERS', 'VEG_TXN_DF', 'SHOPPING_CART_PAGE_HIERARCHY']}}
+
+Some few-shot examples after column exploration may be helpful:
+Query:
+--1. Description: peek at individual customer transactions
+SELECT 
+  "customer_id",
+  "txn_date",
+  "txn_type",
+  "txn_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+Answer:
+customer_id,txn_date,txn_type,txn_amount
+429,2020-01-21,deposit,82
+155,2020-01-10,deposit,712
+398,2020-01-01,deposit,196
+255,2020-01-14,deposit,563
+185,2020-01-29,deposit,626
+309,2020-01-13,deposit,995
+312,2020-01-20,deposit,485
+376,2020-01-03,deposit,706
+188,2020-01-13,deposit,601
+138,2020-01-11,deposit,520
+373,2020-01-18,deposit,596
+361,2020-01-12,deposit,797
+169,2020-01-10,deposit,628
+402,2020-01-05,deposit,435
+60,2020-01-19,deposit,495
+Query:
+--2. Description: what distinct transaction types exist?
+SELECT DISTINCT 
+  "txn_type"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+Answer:
+txn_type
+deposit
+withdrawal
+purchase
+Query:
+--3. Description: earliest and latest transaction dates for a few customers
+SELECT 
+  "customer_id",
+  MIN("txn_date") AS "earliest_txn",
+  MAX("txn_date") AS "latest_txn"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+GROUP BY "customer_id"
+ORDER BY "customer_id"
+LIMIT 20;
+Answer:
+customer_id,earliest_txn,latest_txn
+1,2020-01-02,2020-03-19
+2,2020-01-03,2020-03-24
+3,2020-01-27,2020-04-12
+4,2020-01-07,2020-03-25
+5,2020-01-15,2020-04-02
+6,2020-01-11,2020-03-31
+7,2020-01-20,2020-04-17
+8,2020-01-15,2020-04-13
+9,2020-01-21,2020-04-16
+10,2020-01-13,2020-04-10
+11,2020-01-19,2020-04-16
+12,2020-01-13,2020-03-23
+13,2020-01-02,2020-03-16
+14,2020-01-25,2020-04-05
+15,2020-01-25,2020-04-02
+16,2020-01-13,2020-04-11
+Query:
+--4. Description: add a signed amount column (+ for deposit, – for withdrawal)
+SELECT 
+  "customer_id",
+  "txn_date",
+  CASE WHEN LOWER("txn_type") = 'deposit'
+       THEN  "txn_amount"
+       ELSE -1 * "txn_amount"
+  END AS "signed_amount"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+LIMIT 20;
+Answer:
+customer_id,txn_date,signed_amount
+429,2020-01-21,82
+155,2020-01-10,712
+398,2020-01-01,196
+255,2020-01-14,563
+185,2020-01-29,626
+309,2020-01-13,995
+312,2020-01-20,485
+376,2020-01-03,706
+188,2020-01-13,601
+138,2020-01-11,520
+373,2020-01-18,596
+361,2020-01-12,797
+169,2020-01-10,628
+402,2020-01-05,435
+60,2020-01-19,495
+378,2020-01-07,193
+383,2020-01-26,889
+292,2020-01-10,136
+63,2020-01-06,234
+499,2020-01-02,147
+Query:
+--5. Description: running (cumulative) balance per customer by day
+SELECT
+  "customer_id",
+  "txn_date",
+  SUM( CASE WHEN LOWER("txn_type") = 'deposit'
+            THEN  "txn_amount"
+            ELSE -1 * "txn_amount"
+       END
+      ) 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_date"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)      AS "running_balance"
+FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+ORDER BY "customer_id", "txn_date"
+LIMIT 20;
+Answer:
+customer_id,txn_date,running_balance
+1,2020-01-02,312
+1,2020-03-05,-300
+1,2020-03-17,24
+1,2020-03-19,-640
+2,2020-01-03,549
+2,2020-03-24,610
+3,2020-01-27,144
+3,2020-02-22,-821
+3,2020-03-05,-1034
+3,2020-03-19,-1222
+3,2020-04-12,-729
+4,2020-01-07,458
+4,2020-01-21,848
+4,2020-03-25,655
+5,2020-01-15,974
+5,2020-01-25,1780
+5,2020-01-31,954
+5,2020-03-02,68
+5,2020-03-19,786
+5,2020-03-26,0
+Query:
+--6. Description: min & max dates each customer will need for daily calendar expansion
+WITH cte AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT * FROM cte
+LIMIT 20;
+Answer:
+customer_id,min_dt,max_dt
+429,2020-01-21,2020-04-04
+155,2020-01-10,2020-04-05
+398,2020-01-01,2020-03-24
+255,2020-01-14,2020-03-28
+185,2020-01-29,2020-04-24
+309,2020-01-13,2020-04-09
+312,2020-01-20,2020-04-15
+376,2020-01-03,2020-03-31
+188,2020-01-13,2020-04-07
+Query:
+--7. Description: create a daily row for every customer using GENERATOR
+WITH bounds AS (
+  SELECT 
+    "customer_id",
+    MIN(TO_DATE("txn_date")) AS "min_dt",
+    MAX(TO_DATE("txn_date")) AS "max_dt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+  GROUP BY "customer_id"
+)
+SELECT
+  b."customer_id",
+  DATEADD('day', seq4(), b."min_dt") AS "calendar_date"
+FROM bounds b,
+     TABLE(GENERATOR(ROWCOUNT => 3650)) g      --enough days for ~10 yrs of history
+WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+ORDER BY b."customer_id", "calendar_date"
+LIMIT 20;
+Answer:
+customer_id,calendar_date
+17,2020-02-08
+23,2020-03-20
+26,2020-02-16
+30,2020-03-29
+46,2020-03-09
+56,2020-03-24
+59,2020-03-09
+60,2020-03-20
+63,2020-02-17
+68,2020-03-12
+70,2020-02-13
+74,2020-03-03
+91,2020-03-02
+92,2020-03-14
+96,2020-02-19
+120,2020-02-26
+Query:
+--8. Description: daily balance per customer (carry-forward & negatives→0)
+WITH signed AS (
+  SELECT
+    "customer_id",
+    TO_DATE("txn_date") AS "txn_dt",
+    CASE WHEN LOWER("txn_type") = 'deposit' 
+         THEN  "txn_amount"
+         ELSE -1 * "txn_amount"
+    END AS "signed_amt"
+  FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+running AS (
+  SELECT
+    "customer_id",
+    "txn_dt",
+    SUM("signed_amt") 
+      OVER (PARTITION BY "customer_id"
+            ORDER BY "txn_dt"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+  FROM signed
+),
+calendar AS (
+  SELECT
+    b."customer_id",
+    DATEADD('day', seq4(), b."min_dt") AS "cal_dt"
+  FROM (
+    SELECT 
+      "customer_id",
+      MIN("txn_dt") AS "min_dt",
+      MAX("txn_dt") AS "max_dt"
+    FROM signed
+    GROUP BY "customer_id"
+  ) b,
+  TABLE(GENERATOR(ROWCOUNT => 3650)) g
+  WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+daily AS (
+  SELECT
+    c."customer_id",
+    c."cal_dt",
+    r."cum_bal"
+  FROM calendar c
+  LEFT JOIN running r
+    ON c."customer_id" = r."customer_id"
+   AND c."cal_dt"     = r."txn_dt"
+)
+SELECT
+  "customer_id",
+  "cal_dt"                                 AS "daily_date",
+  COALESCE(
+      LAST_VALUE("cum_bal") 
+        IGNORE NULLS
+        OVER (PARTITION BY "customer_id" 
+              ORDER BY "cal_dt"
+              ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+      0
+  )                                         AS "daily_balance_capped"
+FROM daily
+ORDER BY "customer_id", "daily_date"
+LIMIT 20;
+Answer:
+customer_id,daily_date,daily_balance_capped
+123,2020-04-05,-718
+123,2020-04-06,-1665
+123,2020-04-07,-2128
+378,2020-01-23,0
+378,2020-01-24,0
+378,2020-01-25,0
+378,2020-01-26,7
+378,2020-01-27,376
+378,2020-01-28,376
+378,2020-01-29,376
+378,2020-01-30,484
+378,2020-01-31,484
+378,2020-02-01,484
+378,2020-02-02,484
+Query:
+--Description: monthly total of customers’ maximum daily balances (re-built with the full
+--             CTE chain so every intermediate object exists and “daily” is defined)
+WITH
+/* 1) Convert each transaction into a signed amount (+deposit, −otherwise)         */
+signed AS (
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                                AS "txn_dt",
+        CASE WHEN LOWER("txn_type") = 'deposit'
+             THEN  "txn_amount"
+             ELSE -1 * "txn_amount"
+        END                                               AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+/* 2) Cumulative balance but only on transaction dates                             */
+running AS (
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt")
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cum_bal"
+    FROM signed
+),
+/* 3) Generate every calendar day between each customer’s min & max txn date       */
+calendar AS (
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")                AS "cal_dt"
+    FROM (
+        SELECT
+            "customer_id",
+            MIN("txn_dt")  AS "min_dt",
+            MAX("txn_dt")  AS "max_dt"
+        FROM signed
+        GROUP BY "customer_id"
+    ) b,
+    TABLE(GENERATOR(ROWCOUNT => 3650)) g                  --ample range
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+/* 4) Attach cumulative balance to each calendar day                               */
+daily AS (
+    SELECT
+        c."customer_id",
+        c."cal_dt",
+        r."cum_bal"
+    FROM calendar c
+    LEFT JOIN running r
+           ON c."customer_id" = r."customer_id"
+          AND c."cal_dt"      = r."txn_dt"
+),
+/* 5) Carry-forward balance, replace NULL with previous, cap negatives at 0        */
+daily_bal AS (
+    SELECT
+        "customer_id",
+        "cal_dt"                                           AS "daily_date",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "cal_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                                 AS "daily_balance_capped"
+    FROM daily
+),
+/* 6) Maximum daily balance per customer per month                                  */
+monthly_max AS (
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_date", 'YYYY-MM')                  AS "month_id",
+        MAX("daily_balance_capped")                       AS "max_daily_bal_in_month"
+    FROM daily_bal
+    GROUP BY "customer_id", TO_CHAR("daily_date", 'YYYY-MM')
+)
+/* 7) Sum customer peaks to reach the monthly total                                 */
+SELECT
+    "month_id",
+    SUM("max_daily_bal_in_month")                         AS "total_of_customer_max_balances"
+FROM monthly_max
+GROUP BY "month_id"
+ORDER BY "month_id"
+LIMIT 20
+Answer:
+month_id,total_of_customer_max_balances
+2020-01,650
+2020-02,2491
+2020-03,0
+2020-04,1139
+Task: For each customer, calculate their daily balances for every day between their earliest and latest transaction dates, including days without transactions by carrying forward the previous day's balance. Treat any negative daily balances as zero. Then, for each month, determine the highest daily balance each customer had during that month. Finally, for each month, sum these maximum daily balances across all customers to obtain a monthly total.
+
+Please think step by step and answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'BANK_SALES_TRADING': {'BANK_SALES_TRADING': ['INTEREST_MAP', 'INTEREST_METRICS', 'BITCOIN_PRICES', 'SHOPPING_CART_CAMPAIGN_IDENTIFIER', 'SHOPPING_CART_EVENT_IDENTIFIER', 'VEG_CAT', 'VEG_WHSLE_DF', 'BITCOIN_TRANSACTIONS', 'SHOPPING_CART_EVENTS', 'VEG_LOSS_RATE_DF', 'CUSTOMER_NODES', 'WEEKLY_SALES', 'BITCOIN_MEMBERS', 'CLEANED_WEEKLY_SALES', 'CUSTOMER_REGIONS', 'CUSTOMER_TRANSACTIONS', 'SHOPPING_CART_USERS', 'VEG_TXN_DF', 'SHOPPING_CART_PAGE_HIERARCHY']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-07 07:09:16 - Thread-614 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------
+   Daily balances ➜ customer-monthly peaks ➜ portfolio monthly sum
+   ---------------------------------------------------------------*/
+WITH signed_txns AS (   -- +deposit, −otherwise
+    SELECT
+        "customer_id",
+        TO_DATE("txn_date")                     AS "txn_dt",
+        CASE 
+            WHEN LOWER("txn_type") = 'deposit' 
+                 THEN  "txn_amount"
+            ELSE -1 * "txn_amount"
+        END                                     AS "signed_amt"
+    FROM BANK_SALES_TRADING.BANK_SALES_TRADING.CUSTOMER_TRANSACTIONS
+),
+
+running_bal AS (        -- cumulative balance on the actual txn days
+    SELECT
+        "customer_id",
+        "txn_dt",
+        SUM("signed_amt") 
+            OVER (PARTITION BY "customer_id"
+                  ORDER BY "txn_dt"
+                  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)      AS "cum_bal"
+    FROM signed_txns
+),
+
+date_bounds AS (        -- earliest & latest txn date per customer
+    SELECT
+        "customer_id",
+        MIN("txn_dt")    AS "min_dt",
+        MAX("txn_dt")    AS "max_dt"
+    FROM signed_txns
+    GROUP BY "customer_id"
+),
+
+calendar AS (           -- generate every calendar day per customer
+    SELECT
+        b."customer_id",
+        DATEADD('day', seq4(), b."min_dt")      AS "cal_dt"
+    FROM date_bounds b,
+         TABLE(GENERATOR(ROWCOUNT => 5000)) g   -- sufficiently large span
+    WHERE DATEADD('day', seq4(), b."min_dt") <= b."max_dt"
+),
+
+daily AS (              -- join txn-day balances to every calendar date
+    SELECT
+        c."customer_id",
+        c."cal_dt"                             AS "daily_dt",
+        r."cum_bal"
+    FROM calendar        c
+    LEFT JOIN running_bal r
+           ON  c."customer_id" = r."customer_id"
+           AND c."cal_dt"     = r."txn_dt"
+),
+
+daily_bal_capped AS (   -- carry-forward + cap negatives at 0
+    SELECT
+        "customer_id",
+        "daily_dt",
+        GREATEST(
+            0,
+            COALESCE(
+                LAST_VALUE("cum_bal") IGNORE NULLS
+                    OVER (PARTITION BY "customer_id"
+                          ORDER BY "daily_dt"
+                          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                0)
+        )                                   AS "daily_balance"
+    FROM daily
+),
+
+monthly_customer_peak AS (   -- highest daily balance each month per customer
+    SELECT
+        "customer_id",
+        TO_CHAR("daily_dt", 'YYYY-MM')      AS "month_id",
+        MAX("daily_balance")                AS "max_daily_balance"
+    FROM daily_bal_capped
+    GROUP BY "customer_id", TO_CHAR("daily_dt", 'YYYY-MM')
+)
+
+SELECT
+    "month_id",
+    SUM("max_daily_balance")                AS "monthly_total_max_balance"
+FROM monthly_customer_peak
+GROUP BY "month_id"
+ORDER BY "month_id";
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:09:17 - Thread-614 (execute) - INFO - Total iteration counts: 0

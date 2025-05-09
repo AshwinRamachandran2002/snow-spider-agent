@@ -1,0 +1,1721 @@
+2025-05-01 02:16:27 - Thread-768 (execute) - INFO - [Answer format]
+```csv
+condition,code
+```
+[Answer format]
+2025-05-01 02:18:10 - Thread-768 (execute) - INFO - [Exploration]
+Relevant columns and their potential usage  
+
+• `patient.id`: primary key for the patient record –‑ join field to the other two tables.  
+• `patient.name` (ARRAY<STRUCT>): contains `family`; filter last‑names that start with “A”.  
+• `patient.deceased.boolean` (and the whole `deceased` STRUCT): identify living patients (value is FALSE or NULL).  
+
+• `condition.subject.patientId`: links a condition to its patient.  
+• `condition.code.coding` (ARRAY<STRUCT>): fields `code` & `display` give the condition SNOMED code / wording – used to count a patient’s distinct conditions and to report the final answer.  
+
+• `medication_request.subject.patientId`: links a medication‑request to its patient.  
+• `medication_request.status`: filter only ‘active’ prescriptions.  
+• `medication_request.medication.codeableConcept.coding` (ARRAY<STRUCT>): each element’s `code` (and optionally `display`) is treated as one medication; used to count distinct active medications prescribed to a patient.  
+
+
+Ten exploratory → final BigQuery SQL queries
+(Every query is limited to 20 rows except the final answer; feel free to run them in sequence.)
+
+```sql
+-- 1. List some patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+LIMIT 20;
+```
+
+```sql
+-- 2. Living patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+```
+
+```sql
+-- 3. See one coding for each condition record
+SELECT c.id ,
+       c.subject.patientId AS patient_id ,
+       cc.code , cc.display
+FROM `bigquery-public-data.fhir_synthea.condition` AS c
+CROSS JOIN UNNEST(c.code.coding) AS cc
+LIMIT 20;
+```
+
+```sql
+-- 4. Patients that have exactly ONE distinct condition
+SELECT patient_id , COUNT(DISTINCT condition_code) AS cnt_conditions
+FROM (
+  SELECT c.subject.patientId         AS patient_id ,
+         cc.code                     AS condition_code
+  FROM   `bigquery-public-data.fhir_synthea.condition` c
+  CROSS  JOIN UNNEST(c.code.coding)  AS cc )
+GROUP BY patient_id
+HAVING cnt_conditions = 1
+LIMIT 20;
+```
+
+```sql
+-- 5. Living “A*” patients that also meet the “one‑condition” rule
+SELECT lp.patient_id , n.family
+FROM (
+  SELECT patient_id
+  FROM (
+    SELECT c.subject.patientId AS patient_id , cc.code AS cond_code
+    FROM   `bigquery-public-data.fhir_synthea.condition` c
+    CROSS  JOIN UNNEST(c.code.coding) AS cc )
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT cond_code) = 1 ) AS lp
+JOIN `bigquery-public-data.fhir_synthea.patient` AS p
+  ON p.id = lp.patient_id
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+```
+
+```sql
+-- 6. How many different *active* medications has each patient been prescribed?
+SELECT mr.subject.patientId              AS patient_id ,
+       COUNT(DISTINCT mc.code)           AS num_active_meds
+FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+WHERE mr.status = 'active'
+GROUP BY patient_id
+ORDER BY num_active_meds DESC
+LIMIT 20;
+```
+
+```sql
+-- 7. Combine selections: “A*” living, one‑condition, plus active‑med counts
+SELECT sel.patient_id ,
+       sel.family ,
+       med.num_active_meds
+FROM (
+  /* Re‑use previous filter for patients */
+  SELECT p.id AS patient_id , n.family
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+```
+
+```sql
+-- 8. Add each patient’s unique condition information
+SELECT sel.patient_id ,
+       cond.condition_code ,
+       cond.condition_display ,
+       med.num_active_meds
+FROM (
+  /* Same patient filter as above */
+  SELECT p.id AS patient_id
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+JOIN (
+  SELECT c.subject.patientId AS patient_id ,
+         cc.code   AS condition_code ,
+         cc.display AS condition_display
+  FROM `bigquery-public-data.fhir_synthea.condition` c
+  CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+  ON sel.patient_id = cond.patient_id
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+  ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. For every condition, take the *maximum* #active‑meds seen on any single patient
+SELECT condition_code ,
+       condition_display ,
+       MAX(num_active_meds) AS max_active_meds_for_single_patient
+FROM (
+  /* reuse query 8 but drop the LIMIT */
+  SELECT sel.patient_id ,
+         cond.condition_code ,
+         cond.condition_display ,
+         med.num_active_meds
+  FROM (
+    SELECT p.id AS patient_id
+    FROM `bigquery-public-data.fhir_synthea.patient` p
+    CROSS JOIN UNNEST(p.name) AS n
+    WHERE n.family LIKE 'A%'
+      AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+      AND p.id IN (
+        SELECT patient_id
+        FROM (
+          SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+          FROM   `bigquery-public-data.fhir_synthea.condition` c
+          CROSS  JOIN UNNEST(c.code.coding) AS cc )
+        GROUP BY patient_id
+        HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+  JOIN (
+    SELECT c.subject.patientId AS patient_id ,
+           cc.code AS condition_code ,
+           cc.display AS condition_display
+    FROM `bigquery-public-data.fhir_synthea.condition` c
+    CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+    ON sel.patient_id = cond.patient_id
+  LEFT JOIN (
+    SELECT mr.subject.patientId AS patient_id ,
+           COUNT(DISTINCT mc.code) AS num_active_meds
+    FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+    CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+    WHERE mr.status = 'active'
+    GROUP BY patient_id ) AS med
+    ON sel.patient_id = med.patient_id )
+GROUP BY condition_code , condition_display
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 20;
+```
+
+```sql
+-- 10. FINAL ANSWER: eight conditions with the highest
+--      “max #different active medications prescribed
+--      to any single living A* patient who has only one condition”
+SELECT condition_code ,
+       condition_display ,
+       max_active_meds_for_single_patient
+FROM (
+  SELECT condition_code ,
+         condition_display ,
+         MAX(num_active_meds) AS max_active_meds_for_single_patient
+  FROM (
+    /* identical inner logic as query 9 */
+    SELECT sel.patient_id ,
+           cond.condition_code ,
+           cond.condition_display ,
+           med.num_active_meds
+    FROM (
+      SELECT p.id AS patient_id
+      FROM `bigquery-public-data.fhir_synthea.patient` p
+      CROSS JOIN UNNEST(p.name) AS n
+      WHERE n.family LIKE 'A%'
+        AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+        AND p.id IN (
+          SELECT patient_id
+          FROM (
+            SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+            FROM   `bigquery-public-data.fhir_synthea.condition` c
+            CROSS  JOIN UNNEST(c.code.coding) AS cc )
+          GROUP BY patient_id
+          HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+    JOIN (
+      SELECT c.subject.patientId AS patient_id ,
+             cc.code AS condition_code ,
+             cc.display AS condition_display
+      FROM `bigquery-public-data.fhir_synthea.condition` c
+      CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+      ON sel.patient_id = cond.patient_id
+    LEFT JOIN (
+      SELECT mr.subject.patientId AS patient_id ,
+             COUNT(DISTINCT mc.code) AS num_active_meds
+      FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+      CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+      WHERE mr.status = 'active'
+      GROUP BY patient_id ) AS med
+      ON sel.patient_id = med.patient_id )
+  GROUP BY condition_code , condition_display )
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 8;
+```
+
+Run the last query to obtain the eight requested conditions (their SNOMED `condition_code`, readable `condition_display`, and the corresponding maximal number of active medications).
+[Exploration]
+2025-05-01 02:18:10 - Thread-768 (execute) - INFO - [Try to execute]
+-- 1. List some patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:12 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. List some patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+LIMIT 20;
+Results:
+id,family
+b54d72c2-12f4-43fb-bc0c-f417b761ea70,Alarcón922
+80b3de99-960e-4cfe-95d0-3db8ee20c706,Arias66
+f8e76665-3f36-4f62-8766-af0693f561c2,Ankunding277
+46ab2a0e-ff38-4278-8ab9-c07ae49c1133,Alvarez441
+a2f4f82b-d42f-4b39-9809-6cb8754f2bb3,Alvarado520
+53bbc5eb-ce03-4241-aae7-e249bba7f1db,Aparicio848
+2c9fa47a-eecb-4429-842c-942faf69d7dd,Araña824
+6e2abe8b-ecd1-4ea2-a1e6-717ae086cfb2,Avilés474
+
+[Successfully executed]
+2025-05-01 02:18:12 - Thread-768 (execute) - INFO - [Try to execute]
+-- 2. Living patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:13 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Living patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+Results:
+id,family
+c295157a-a84e-4bd8-8584-8296d149d978,Alonso270
+8319e658-4a44-4aa0-a2e8-f1a57abf2d88,Arreola736
+53d8c141-c64a-4bd0-8b5d-759afa527d1b,Aparicio848
+5b48d83a-74e0-4309-ba3a-86aeaafab091,Apodaca347
+8a1c8c05-dd80-486c-aa01-2dd0504f688f,Ayala238
+8a1c8c05-dd80-486c-aa01-2dd0504f688f,Alejandro916
+a805a39e-e7bd-4c10-a6fd-8144318ecf33,Atencio773
+e71f002c-e70f-4b16-a7b0-5a38a0fa0ff9,Adorno791
+
+[Successfully executed]
+2025-05-01 02:18:13 - Thread-768 (execute) - INFO - [Try to execute]
+-- 3. See one coding for each condition record
+SELECT c.id ,
+       c.subject.patientId AS patient_id ,
+       cc.code , cc.display
+FROM `bigquery-public-data.fhir_synthea.condition` AS c
+CROSS JOIN UNNEST(c.code.coding) AS cc
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:15 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. See one coding for each condition record
+SELECT c.id ,
+       c.subject.patientId AS patient_id ,
+       cc.code , cc.display
+FROM `bigquery-public-data.fhir_synthea.condition` AS c
+CROSS JOIN UNNEST(c.code.coding) AS cc
+LIMIT 20;
+Results:
+id,patient_id,code,display
+22d7addc-2168-433e-a904-5aaeecac682a,b6ac6938-ca96-4029-aa16-6dd4e4cc4fda,1734006,Fracture of the vertebral column with spinal cord injury
+8ce5be9e-56ab-47f7-8536-5e0456d8b5fe,8d2921b7-e9c2-4313-95df-463d569a05ca,1734006,Fracture of the vertebral column with spinal cord injury
+09d0d51d-8547-4df8-9915-acf2a496e9d8,19a818f9-b0f0-473e-bd36-e73ce39ac0c3,1734006,Fracture of the vertebral column with spinal cord injury
+
+[Successfully executed]
+2025-05-01 02:18:15 - Thread-768 (execute) - INFO - [Try to execute]
+-- 4. Patients that have exactly ONE distinct condition
+SELECT patient_id , COUNT(DISTINCT condition_code) AS cnt_conditions
+FROM (
+  SELECT c.subject.patientId         AS patient_id ,
+         cc.code                     AS condition_code
+  FROM   `bigquery-public-data.fhir_synthea.condition` c
+  CROSS  JOIN UNNEST(c.code.coding)  AS cc )
+GROUP BY patient_id
+HAVING cnt_conditions = 1
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:21 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4. Patients that have exactly ONE distinct condition
+SELECT patient_id , COUNT(DISTINCT condition_code) AS cnt_conditions
+FROM (
+  SELECT c.subject.patientId         AS patient_id ,
+         cc.code                     AS condition_code
+  FROM   `bigquery-public-data.fhir_synthea.condition` c
+  CROSS  JOIN UNNEST(c.code.coding)  AS cc )
+GROUP BY patient_id
+HAVING cnt_conditions = 1
+LIMIT 20;
+Results:
+patient_id,cnt_conditions
+19d8f4cd-304f-492f-ab68-177c04bb8586,1
+653b9269-f5c6-48d1-93d8-677f66c47962,1
+e0b59aac-8be9-4449-98da-bfdf6dd62f04,1
+9c933905-63b9-4704-8f17-3c861d3254b5,1
+1372df4e-e7e9-4612-bc49-d7daffb08db1,1
+80b517e7-a76d-4a88-8205-f7aebf07078b,1
+3f3b93e5-1ef7-4b8a-8437-794d04a60d87,1
+
+[Successfully executed]
+2025-05-01 02:18:21 - Thread-768 (execute) - INFO - [Try to execute]
+-- 5. Living “A*” patients that also meet the “one‑condition” rule
+SELECT lp.patient_id , n.family
+FROM (
+  SELECT patient_id
+  FROM (
+    SELECT c.subject.patientId AS patient_id , cc.code AS cond_code
+    FROM   `bigquery-public-data.fhir_synthea.condition` c
+    CROSS  JOIN UNNEST(c.code.coding) AS cc )
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT cond_code) = 1 ) AS lp
+JOIN `bigquery-public-data.fhir_synthea.patient` AS p
+  ON p.id = lp.patient_id
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:28 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5. Living “A*” patients that also meet the “one‑condition” rule
+SELECT lp.patient_id , n.family
+FROM (
+  SELECT patient_id
+  FROM (
+    SELECT c.subject.patientId AS patient_id , cc.code AS cond_code
+    FROM   `bigquery-public-data.fhir_synthea.condition` c
+    CROSS  JOIN UNNEST(c.code.coding) AS cc )
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT cond_code) = 1 ) AS lp
+JOIN `bigquery-public-data.fhir_synthea.patient` AS p
+  ON p.id = lp.patient_id
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+Results:
+patient_id,family
+4f10b9fa-d964-45da-8271-289515543394,Aranda843
+61ba9828-e293-4f01-897b-8a3be007c49c,Anderson154
+a97d6277-b67e-473e-8190-368f4000b125,Altenwerth646
+42e1d140-ba8b-432b-812e-fdd74585107a,Anderson154
+4b774178-0e60-4a9f-aa77-533bbdc2f322,Arriaga291
+60953bae-1ce9-413f-8a7b-f04f7b6d5430,Alemán808
+14c9f02d-7ef4-4413-a3c3-5a62e6fde28e,Agosto501
+
+[Successfully executed]
+2025-05-01 02:18:28 - Thread-768 (execute) - INFO - [Try to execute]
+-- 6. How many different *active* medications has each patient been prescribed?
+SELECT mr.subject.patientId              AS patient_id ,
+       COUNT(DISTINCT mc.code)           AS num_active_meds
+FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+WHERE mr.status = 'active'
+GROUP BY patient_id
+ORDER BY num_active_meds DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:32 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6. How many different *active* medications has each patient been prescribed?
+SELECT mr.subject.patientId              AS patient_id ,
+       COUNT(DISTINCT mc.code)           AS num_active_meds
+FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+WHERE mr.status = 'active'
+GROUP BY patient_id
+ORDER BY num_active_meds DESC
+LIMIT 20;
+Results:
+patient_id,num_active_meds
+dfbc5f1d-3b28-40c9-8e4e-5c7685163bcb,20
+dbe5e53a-058f-4add-b5f1-71f5772eb0b0,19
+07a730a0-c98f-4f80-8f65-3987b987ff58,19
+b327cc3b-08c2-4fe9-8416-cc83b5552e4f,18
+2b6e8585-da78-40f5-86ba-bbf410cff78a,18
+252ecc00-d878-4b84-a9f0-809209785093,18
+1ef90a6c-cfeb-42c1-828a-a027094e47a4,18
+
+[Successfully executed]
+2025-05-01 02:18:32 - Thread-768 (execute) - INFO - [Try to execute]
+-- 7. Combine selections: “A*” living, one‑condition, plus active‑med counts
+SELECT sel.patient_id ,
+       sel.family ,
+       med.num_active_meds
+FROM (
+  /* Re‑use previous filter for patients */
+  SELECT p.id AS patient_id , n.family
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:41 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7. Combine selections: “A*” living, one‑condition, plus active‑med counts
+SELECT sel.patient_id ,
+       sel.family ,
+       med.num_active_meds
+FROM (
+  /* Re‑use previous filter for patients */
+  SELECT p.id AS patient_id , n.family
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+Results:
+patient_id,family,num_active_meds
+10bdc7ba-bcb8-4d5f-88b4-f2e9a95c0e20,Abbott774,4
+822590f0-a068-40ae-a41a-59e2973a9a4c,Abshire638,4
+de111e10-4a7f-435c-8423-df365556ee59,Abernathy524,4
+9f9594d8-5b59-48e7-94d9-5436356b911f,Anderson154,3
+e30e036d-cb44-4666-8cd5-3b0a9b065b45,Abernathy524,3
+
+[Successfully executed]
+2025-05-01 02:18:41 - Thread-768 (execute) - INFO - [Try to execute]
+-- 8. Add each patient’s unique condition information
+SELECT sel.patient_id ,
+       cond.condition_code ,
+       cond.condition_display ,
+       med.num_active_meds
+FROM (
+  /* Same patient filter as above */
+  SELECT p.id AS patient_id
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+JOIN (
+  SELECT c.subject.patientId AS patient_id ,
+         cc.code   AS condition_code ,
+         cc.display AS condition_display
+  FROM `bigquery-public-data.fhir_synthea.condition` c
+  CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+  ON sel.patient_id = cond.patient_id
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+  ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:50 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8. Add each patient’s unique condition information
+SELECT sel.patient_id ,
+       cond.condition_code ,
+       cond.condition_display ,
+       med.num_active_meds
+FROM (
+  /* Same patient filter as above */
+  SELECT p.id AS patient_id
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+JOIN (
+  SELECT c.subject.patientId AS patient_id ,
+         cc.code   AS condition_code ,
+         cc.display AS condition_display
+  FROM `bigquery-public-data.fhir_synthea.condition` c
+  CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+  ON sel.patient_id = cond.patient_id
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+  ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+Results:
+patient_id,condition_code,condition_display,num_active_meds
+822590f0-a068-40ae-a41a-59e2973a9a4c,53741008,Coronary Heart Disease,4
+10bdc7ba-bcb8-4d5f-88b4-f2e9a95c0e20,53741008,Coronary Heart Disease,4
+de111e10-4a7f-435c-8423-df365556ee59,195662009,Acute viral pharyngitis (disorder),4
+50c33917-df6b-4777-a9ec-a9e64afb6256,40275004,Contact dermatitis,3
+
+[Successfully executed]
+2025-05-01 02:18:50 - Thread-768 (execute) - INFO - [Try to execute]
+-- 9. For every condition, take the *maximum* #active‑meds seen on any single patient
+SELECT condition_code ,
+       condition_display ,
+       MAX(num_active_meds) AS max_active_meds_for_single_patient
+FROM (
+  /* reuse query 8 but drop the LIMIT */
+  SELECT sel.patient_id ,
+         cond.condition_code ,
+         cond.condition_display ,
+         med.num_active_meds
+  FROM (
+    SELECT p.id AS patient_id
+    FROM `bigquery-public-data.fhir_synthea.patient` p
+    CROSS JOIN UNNEST(p.name) AS n
+    WHERE n.family LIKE 'A%'
+      AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+      AND p.id IN (
+        SELECT patient_id
+        FROM (
+          SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+          FROM   `bigquery-public-data.fhir_synthea.condition` c
+          CROSS  JOIN UNNEST(c.code.coding) AS cc )
+        GROUP BY patient_id
+        HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+  JOIN (
+    SELECT c.subject.patientId AS patient_id ,
+           cc.code AS condition_code ,
+           cc.display AS condition_display
+    FROM `bigquery-public-data.fhir_synthea.condition` c
+    CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+    ON sel.patient_id = cond.patient_id
+  LEFT JOIN (
+    SELECT mr.subject.patientId AS patient_id ,
+           COUNT(DISTINCT mc.code) AS num_active_meds
+    FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+    CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+    WHERE mr.status = 'active'
+    GROUP BY patient_id ) AS med
+    ON sel.patient_id = med.patient_id )
+GROUP BY condition_code , condition_display
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:18:57 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 9. For every condition, take the *maximum* #active‑meds seen on any single patient
+SELECT condition_code ,
+       condition_display ,
+       MAX(num_active_meds) AS max_active_meds_for_single_patient
+FROM (
+  /* reuse query 8 but drop the LIMIT */
+  SELECT sel.patient_id ,
+         cond.condition_code ,
+         cond.condition_display ,
+         med.num_active_meds
+  FROM (
+    SELECT p.id AS patient_id
+    FROM `bigquery-public-data.fhir_synthea.patient` p
+    CROSS JOIN UNNEST(p.name) AS n
+    WHERE n.family LIKE 'A%'
+      AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+      AND p.id IN (
+        SELECT patient_id
+        FROM (
+          SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+          FROM   `bigquery-public-data.fhir_synthea.condition` c
+          CROSS  JOIN UNNEST(c.code.coding) AS cc )
+        GROUP BY patient_id
+        HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+  JOIN (
+    SELECT c.subject.patientId AS patient_id ,
+           cc.code AS condition_code ,
+           cc.display AS condition_display
+    FROM `bigquery-public-data.fhir_synthea.condition` c
+    CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+    ON sel.patient_id = cond.patient_id
+  LEFT JOIN (
+    SELECT mr.subject.patientId AS patient_id ,
+           COUNT(DISTINCT mc.code) AS num_active_meds
+    FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+    CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+    WHERE mr.status = 'active'
+    GROUP BY patient_id ) AS med
+    ON sel.patient_id = med.patient_id )
+GROUP BY condition_code , condition_display
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 20;
+Results:
+condition_code,condition_display,max_active_meds_for_single_patient
+195662009,Acute viral pharyngitis (disorder),4
+53741008,Coronary Heart Disease,4
+49436004,Atrial Fibrillation,3
+40275004,Contact dermatitis,3
+444814009,Viral sinusitis (disorder),3
+
+[Successfully executed]
+2025-05-01 02:18:57 - Thread-768 (execute) - INFO - [Try to execute]
+-- 10. FINAL ANSWER: eight conditions with the highest
+--      “max #different active medications prescribed
+--      to any single living A* patient who has only one condition”
+SELECT condition_code ,
+       condition_display ,
+       max_active_meds_for_single_patient
+FROM (
+  SELECT condition_code ,
+         condition_display ,
+         MAX(num_active_meds) AS max_active_meds_for_single_patient
+  FROM (
+    /* identical inner logic as query 9 */
+    SELECT sel.patient_id ,
+           cond.condition_code ,
+           cond.condition_display ,
+           med.num_active_meds
+    FROM (
+      SELECT p.id AS patient_id
+      FROM `bigquery-public-data.fhir_synthea.patient` p
+      CROSS JOIN UNNEST(p.name) AS n
+      WHERE n.family LIKE 'A%'
+        AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+        AND p.id IN (
+          SELECT patient_id
+          FROM (
+            SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+            FROM   `bigquery-public-data.fhir_synthea.condition` c
+            CROSS  JOIN UNNEST(c.code.coding) AS cc )
+          GROUP BY patient_id
+          HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+    JOIN (
+      SELECT c.subject.patientId AS patient_id ,
+             cc.code AS condition_code ,
+             cc.display AS condition_display
+      FROM `bigquery-public-data.fhir_synthea.condition` c
+      CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+      ON sel.patient_id = cond.patient_id
+    LEFT JOIN (
+      SELECT mr.subject.patientId AS patient_id ,
+             COUNT(DISTINCT mc.code) AS num_active_meds
+      FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+      CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+      WHERE mr.status = 'active'
+      GROUP BY patient_id ) AS med
+      ON sel.patient_id = med.patient_id )
+  GROUP BY condition_code , condition_display )
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 8;
+[Try to execute]
+2025-05-01 02:19:06 - Thread-768 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 10. FINAL ANSWER: eight conditions with the highest
+--      “max #different active medications prescribed
+--      to any single living A* patient who has only one condition”
+SELECT condition_code ,
+       condition_display ,
+       max_active_meds_for_single_patient
+FROM (
+  SELECT condition_code ,
+         condition_display ,
+         MAX(num_active_meds) AS max_active_meds_for_single_patient
+  FROM (
+    /* identical inner logic as query 9 */
+    SELECT sel.patient_id ,
+           cond.condition_code ,
+           cond.condition_display ,
+           med.num_active_meds
+    FROM (
+      SELECT p.id AS patient_id
+      FROM `bigquery-public-data.fhir_synthea.patient` p
+      CROSS JOIN UNNEST(p.name) AS n
+      WHERE n.family LIKE 'A%'
+        AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+        AND p.id IN (
+          SELECT patient_id
+          FROM (
+            SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+            FROM   `bigquery-public-data.fhir_synthea.condition` c
+            CROSS  JOIN UNNEST(c.code.coding) AS cc )
+          GROUP BY patient_id
+          HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+    JOIN (
+      SELECT c.subject.patientId AS patient_id ,
+             cc.code AS condition_code ,
+             cc.display AS condition_display
+      FROM `bigquery-public-data.fhir_synthea.condition` c
+      CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+      ON sel.patient_id = cond.patient_id
+    LEFT JOIN (
+      SELECT mr.subject.patientId AS patient_id ,
+             COUNT(DISTINCT mc.code) AS num_active_meds
+      FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+      CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+      WHERE mr.status = 'active'
+      GROUP BY patient_id ) AS med
+      ON sel.patient_id = med.patient_id )
+  GROUP BY condition_code , condition_display )
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 8;
+Results:
+condition_code,condition_display,max_active_meds_for_single_patient
+195662009,Acute viral pharyngitis (disorder),4
+53741008,Coronary Heart Disease,4
+444814009,Viral sinusitis (disorder),3
+40275004,Contact dermatitis,3
+38341003,Hypertension,3
+
+[Successfully executed]
+2025-05-01 02:19:06 - Thread-768 (execute) - INFO - itercount: 0
+2025-05-01 02:19:06 - Thread-768 (execute) - INFO - [Self-refine]
+Table full name: bigquery-public-data.fhir_synthea.patient
+Column name: active Type: BOOL Description: None
+Column name: animal Type: STRUCT<species STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, breed STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, genderStatus STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>> Description: None
+Column name: contact Type: ARRAY<STRUCT<relationship ARRAY<STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>>, name STRUCT<use STRING, text STRING, family STRING, given ARRAY<STRING>, prefix ARRAY<STRING>, suffix ARRAY<STRING>, period STRUCT<start STRING, `end` STRING>>, telecom ARRAY<STRUCT<system STRING, value STRING, use STRING, rank INT64, period STRUCT<start STRING, `end` STRING>>>, address STRUCT<use STRING, type STRING, text STRING, line ARRAY<STRING>, city STRING, district STRING, state STRING, postalCode STRING, country STRING, period STRUCT<start STRING, `end` STRING>>, gender STRING, organization STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>, period STRUCT<start STRING, `end` STRING>>> Description: None
+Column name: generalPractitioner Type: ARRAY<STRUCT<organizationId STRING, practitionerId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: implicitRules Type: STRING Description: None
+Column name: language Type: STRING Description: None
+Column name: link Type: ARRAY<STRUCT<other STRUCT<patientId STRING, relatedPersonId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>, type STRING>> Description: None
+Column name: managingOrganization Type: STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING> Description: None
+Column name: photo Type: ARRAY<STRUCT<contentType STRING, language STRING, data STRING, url STRING, size INT64, `hash` STRING, title STRING, creation STRING>> Description: None
+Column name: birthPlace Type: STRUCT<value STRUCT<address STRUCT<city STRING, country STRING, state STRING>>> Description: None
+Column name: disability_adjusted_life_years Type: STRUCT<value STRUCT<decimal FLOAT64>> Description: None
+Column name: patient_mothersMaidenName Type: STRUCT<value STRUCT<string STRING>> Description: None
+Column name: quality_adjusted_life_years Type: STRUCT<value STRUCT<decimal FLOAT64>> Description: None
+Column name: shr_actor_FictionalPerson_extension Type: STRUCT<value STRUCT<boolean BOOL>> Description: None
+Column name: shr_demographics_SocialSecurityNumber_extension Type: STRUCT<value STRUCT<string STRING>> Description: None
+Column name: shr_entity_FathersName_extension Type: STRUCT<value STRUCT<humanName STRUCT<text STRING>>> Description: None
+Column name: shr_entity_Person_extension Type: STRUCT<value STRUCT<reference STRUCT<basicId STRING>>> Description: None
+Column name: us_core_birthsex Type: STRUCT<value STRUCT<code STRING>> Description: None
+Column name: us_core_ethnicity Type: STRUCT<ombCategory STRUCT<value STRUCT<coding STRUCT<code STRING, display STRING, system STRING>>>, text STRUCT<value STRUCT<string STRING>>> Description: None
+Column name: us_core_race Type: STRUCT<ombCategory STRUCT<value STRUCT<coding STRUCT<code STRING, display STRING, system STRING>>>, text STRUCT<value STRUCT<string STRING>>> Description: None
+Column name: address Type: ARRAY<STRUCT<district STRING, period STRUCT<start STRING, `end` STRING>, text STRING, type STRING, use STRING, geolocation STRUCT<latitude STRUCT<value STRUCT<decimal FLOAT64>>, longitude STRUCT<value STRUCT<decimal FLOAT64>>>, city STRING, country STRING, line ARRAY<STRING>, postalCode STRING, state STRING>> Description: None
+Column name: birthDate Type: STRING Description: None
+Column name: communication Type: ARRAY<STRUCT<preferred BOOL, language STRUCT<coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>, text STRING>>> Description: None
+Column name: deceased Type: STRUCT<boolean BOOL, dateTime STRING> Description: None
+Column name: gender Type: STRING Description: None
+Column name: id Type: STRING Description: None
+Column name: identifier Type: ARRAY<STRUCT<assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>, period STRUCT<start STRING, `end` STRING>, use STRING, system STRING, type STRUCT<coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>, text STRING>, value STRING>> Description: None
+Column name: maritalStatus Type: STRUCT<coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>, text STRING> Description: None
+Column name: meta Type: STRUCT<lastUpdated TIMESTAMP, security ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, tag ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, versionId STRING, profile ARRAY<STRING>> Description: None
+Column name: multipleBirth Type: STRUCT<boolean BOOL, integer INT64> Description: None
+Column name: name Type: ARRAY<STRUCT<period STRUCT<start STRING, `end` STRING>, text STRING, family STRING, given ARRAY<STRING>, prefix ARRAY<STRING>, suffix ARRAY<STRING>, use STRING>> Description: None
+Column name: telecom Type: ARRAY<STRUCT<period STRUCT<start STRING, `end` STRING>, rank INT64, system STRING, use STRING, value STRING>> Description: None
+Column name: text Type: STRUCT<div STRING, status STRING> Description: None
+Sample rows:
+[{'active': None, 'animal': None, 'contact': '[]', 'generalPractitioner': '[]', 'implicitRules': None, 'language': None, 'link': '[]', 'managingOrganization': None, 'photo': '[]', 'birthPlace': {'value': {'address': {'city': 'Salvador', 'country': 'BR', 'state': 'Bahia'}}}, 'disability_adjusted_life_years': {'value': {'decimal': 0.07162991009081023}}, 'patient_mothersMaidenName': {'value': {'string': 'Vikki110 Dooley940'}}, 'quality_adjusted_life_years': {'value': {'decimal': 8.92837008990919}}, 'shr_actor_FictionalPerson_extension': {'value': {'boolean': True}}, 'shr_demographics_SocialSecurityNumber_extension': {'value': {'string': '999-99-6784'}}, 'shr_entity_FathersName_extension': {'value': {'humanName': {'text': 'Willis868 Hane680'}}}, 'shr_entity_Person_extension': {'value': {'reference': {'basicId': 'de73637e-4e27-4943-b9fa-1287662cb110'}}}, 'us_core_birthsex': {'value': {'code': 'F'}}, 'us_core_ethnicity': {'ombCategory': {'value': {'coding': {'code': '2186-5', 'display': 'Not
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.fhir_synthea.condition
+Column name: asserter Type: STRUCT<practitionerId STRING, patientId STRING, relatedPersonId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING> Description: None
+Column name: bodySite Type: ARRAY<STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>> Description: None
+Column name: evidence Type: ARRAY<STRUCT<code ARRAY<STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>>, detail ARRAY<STRUCT<resourceId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>>>> Description: None
+Column name: identifier Type: ARRAY<STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>> Description: None
+Column name: implicitRules Type: STRING Description: None
+Column name: language Type: STRING Description: None
+Column name: note Type: ARRAY<STRUCT<author STRUCT<reference STRUCT<practitionerId STRING, patientId STRING, relatedPersonId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>, string STRING>, time STRING, text STRING>> Description: None
+Column name: severity Type: STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING> Description: None
+Column name: stage Type: STRUCT<summary STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, assessment ARRAY<STRUCT<clinicalImpressionId STRING, diagnosticReportId STRING, observationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>>> Description: None
+Column name: text Type: STRUCT<status STRING, div STRING> Description: None
+Column name: abatement Type: STRUCT<age STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>, boolean BOOL, period STRUCT<start STRING, `end` STRING>, `range` STRUCT<low STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, high STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>>, string STRING, dateTime STRING> Description: None
+Column name: assertedDate Type: STRING Description: None
+Column name: category Type: ARRAY<STRUCT<text STRING, coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>>> Description: None
+Column name: clinicalStatus Type: STRING Description: None
+Column name: code Type: STRUCT<coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>, text STRING> Description: None
+Column name: context Type: STRUCT<display STRING, episodeOfCareId STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, reference STRING, encounterId STRING> Description: None
+Column name: id Type: STRING Description: None
+Column name: meta Type: STRUCT<lastUpdated TIMESTAMP, security ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, tag ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, versionId STRING, profile ARRAY<STRING>> Description: None
+Column name: onset Type: STRUCT<age STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>, period STRUCT<start STRING, `end` STRING>, `range` STRUCT<low STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, high STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>>, string STRING, dateTime STRING> Description: None
+Column name: subject Type: STRUCT<display STRING, groupId STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, reference STRING, patientId STRING> Description: None
+Column name: verificationStatus Type: STRING Description: None
+Sample rows:
+[{'asserter': None, 'bodySite': '[]', 'evidence': '[]', 'identifier': '[]', 'implicitRules': None, 'language': None, 'note': '[]', 'severity': None, 'stage': None, 'text': None, 'abatement': None, 'assertedDate': '1964-03-06T18:57:59+00:00', 'category': "[{'text': None, 'coding': array([{'userSelected': None, 'version': None, 'code': 'disease', 'display': 'Disease', 'system': 'http://standardhealthrecord.org/shr/condition/vs/ConditionCategoryVS'}],\n       dtype=object)}                                                                                                                                                                                ]", 'clinicalStatus': 'active', 'code': {'coding': "[{'userSelected': None, 'version': None, 'code': '1734006', 'display': 'Fracture of the vertebral column with spinal cord injury', 'system': 'http://snomed.info/sct'}]", 'text': 'Fracture of the vertebral column with spinal cord injury'}, 'context': {'display': None, 'episodeOfCareId': None, 'ide
+
+
+--------------------------------------------------
+Table full name: bigquery-public-data.fhir_synthea.medication_request
+Column name: basedOn Type: ARRAY<STRUCT<carePlanId STRING, medicationRequestId STRING, procedureRequestId STRING, referralRequestId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: category Type: STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING> Description: None
+Column name: definition Type: ARRAY<STRUCT<activityDefinitionId STRING, planDefinitionId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: detectedIssue Type: ARRAY<STRUCT<detectedIssueId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: dispenseRequest Type: STRUCT<validityPeriod STRUCT<start STRING, `end` STRING>, numberOfRepeatsAllowed INT64, quantity STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, expectedSupplyDuration STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>, performer STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: eventHistory Type: ARRAY<STRUCT<provenanceId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: groupIdentifier Type: STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>>, display STRING>>, display STRING>> Description: None
+Column name: identifier Type: ARRAY<STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>> Description: None
+Column name: implicitRules Type: STRING Description: None
+Column name: language Type: STRING Description: None
+Column name: note Type: ARRAY<STRUCT<author STRUCT<reference STRUCT<practitionerId STRING, patientId STRING, relatedPersonId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>, string STRING>, time STRING, text STRING>> Description: None
+Column name: priorPrescription Type: STRUCT<medicationRequestId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING> Description: None
+Column name: priority Type: STRING Description: None
+Column name: reasonCode Type: ARRAY<STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>> Description: None
+Column name: recorder Type: STRUCT<practitionerId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING> Description: None
+Column name: substitution Type: STRUCT<allowed BOOL, reason STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>> Description: None
+Column name: supportingInformation Type: ARRAY<STRUCT<resourceId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>> Description: None
+Column name: text Type: STRUCT<status STRING, div STRING> Description: None
+Column name: shr_action_RequestedContext_extension Type: STRUCT<shr_action_RequestIntent_extension STRUCT<value STRUCT<code STRING>>, shr_action_Status_extension STRUCT<value STRUCT<code STRING>>> Description: None
+Column name: shr_base_ActionCode_extension Type: STRUCT<value STRUCT<codeableConcept STRUCT<coding ARRAY<STRUCT<code STRING, display STRING, system STRING>>, text STRING>>> Description: None
+Column name: authoredOn Type: STRING Description: None
+Column name: context Type: STRUCT<display STRING, episodeOfCareId STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, reference STRING, encounterId STRING> Description: None
+Column name: dosageInstruction Type: ARRAY<STRUCT<maxDosePerAdministration STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, maxDosePerLifetime STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, maxDosePerPeriod STRUCT<numerator STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>, denominator STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>>, method STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, patientInstruction STRING, rate STRUCT<ratio STRUCT<numerator STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>, denominator STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>>, `range` STRUCT<low STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, high STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>>, quantity STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>>, route STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, site STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, text STRING, additionalInstruction ARRAY<STRUCT<coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>, text STRING>>, asNeeded STRUCT<codeableConcept STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, boolean BOOL>, dose STRUCT<`range` STRUCT<low STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, high STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>>, quantity STRUCT<code STRING, system STRING, unit STRING, value FLOAT64>>, sequence INT64, timing STRUCT<code STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, event ARRAY<STRING>, repeat STRUCT<bounds STRUCT<duration STRUCT<value FLOAT64, comparator STRING, unit STRING, system STRING, code STRING>, `range` STRUCT<low STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>, high STRUCT<value FLOAT64, unit STRING, system STRING, code STRING>>, period STRUCT<start STRING, `end` STRING>>, count INT64, countMax INT64, dayOfWeek ARRAY<STRING>, duration FLOAT64, durationMax FLOAT64, durationUnit STRING, frequencyMax INT64, offset INT64, periodMax FLOAT64, timeOfDay ARRAY<STRING>, `when` ARRAY<STRING>, frequency INT64, period FLOAT64, periodUnit STRING>>>> Description: None
+Column name: id Type: STRING Description: None
+Column name: intent Type: STRING Description: None
+Column name: medication Type: STRUCT<reference STRUCT<medicationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, display STRING>, codeableConcept STRUCT<coding ARRAY<STRUCT<userSelected BOOL, version STRING, code STRING, display STRING, system STRING>>, text STRING>> Description: None
+Column name: meta Type: STRUCT<lastUpdated TIMESTAMP, security ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, tag ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, versionId STRING, profile ARRAY<STRING>> Description: None
+Column name: reasonReference Type: ARRAY<STRUCT<display STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, observationId STRING, reference STRING, conditionId STRING>> Description: None
+Column name: requester Type: STRUCT<agent STRUCT<deviceId STRING, display STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, organizationId STRING, patientId STRING, reference STRING, relatedPersonId STRING, practitionerId STRING>, onBehalfOf STRUCT<display STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, reference STRING, organizationId STRING>> Description: None
+Column name: status Type: STRING Description: None
+Column name: subject Type: STRUCT<display STRING, groupId STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, identifier STRUCT<use STRING, type STRUCT<coding ARRAY<STRUCT<system STRING, version STRING, code STRING, display STRING, userSelected BOOL>>, text STRING>, system STRING, value STRING, period STRUCT<start STRING, `end` STRING>, assigner STRUCT<organizationId STRING, reference STRING, display STRING>>, display STRING>>, reference STRING, patientId STRING> Description: None
+Sample rows:
+[{'basedOn': '[]', 'category': None, 'definition': '[]', 'detectedIssue': '[]', 'dispenseRequest': None, 'eventHistory': '[]', 'groupIdentifier': None, 'identifier': '[]', 'implicitRules': None, 'language': None, 'note': '[]', 'priorPrescription': None, 'priority': None, 'reasonCode': '[]', 'recorder': None, 'substitution': None, 'supportingInformation': '[]', 'text': None, 'shr_action_RequestedContext_extension': {'shr_action_RequestIntent_extension': {'value': {'code': 'original-order'}}, 'shr_action_Status_extension': {'value': {'code': 'completed'}}}, 'shr_base_ActionCode_extension': {'value': {'codeableConcept': {'coding': "[{'code': '33633005', 'display': 'Prescription of drug (procedure)', 'system': 'http://snomed.info/sct'}]", 'text': 'Prescription of drug (procedure)'}}}, 'authoredOn': '1975-06-17T05:54:38+00:00', 'context': {'display': None, 'episodeOfCareId': None, 'identifier': None, 'reference': None, 'encounterId': 'c642ee8e-e49f-4e93-b28b-61a6ede4becc'}, 'dosageInstructi
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'bigquery-public-data': {'fhir_synthea': ['patient', 'condition', 'medication_request']}}
+Begin Exploring Related Columns
+Relevant columns and their potential usage  
+
+• `patient.id`: primary key for the patient record –‑ join field to the other two tables.  
+• `patient.name` (ARRAY<STRUCT>): contains `family`; filter last‑names that start with “A”.  
+• `patient.deceased.boolean` (and the whole `deceased` STRUCT): identify living patients (value is FALSE or NULL).  
+
+• `condition.subject.patientId`: links a condition to its patient.  
+• `condition.code.coding` (ARRAY<STRUCT>): fields `code` & `display` give the condition SNOMED code / wording – used to count a patient’s distinct conditions and to report the final answer.  
+
+• `medication_request.subject.patientId`: links a medication‑request to its patient.  
+• `medication_request.status`: filter only ‘active’ prescriptions.  
+• `medication_request.medication.codeableConcept.coding` (ARRAY<STRUCT>): each element’s `code` (and optionally `display`) is treated as one medication; used to count distinct active medications prescribed to a patient.  
+
+
+Ten exploratory → final BigQuery SQL queries
+(Every query is limited to 20 rows except the final answer; feel free to run them in sequence.)
+
+```sql
+-- 1. List some patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+LIMIT 20;
+```
+
+```sql
+-- 2. Living patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+```
+
+```sql
+-- 3. See one coding for each condition record
+SELECT c.id ,
+       c.subject.patientId AS patient_id ,
+       cc.code , cc.display
+FROM `bigquery-public-data.fhir_synthea.condition` AS c
+CROSS JOIN UNNEST(c.code.coding) AS cc
+LIMIT 20;
+```
+
+```sql
+-- 4. Patients that have exactly ONE distinct condition
+SELECT patient_id , COUNT(DISTINCT condition_code) AS cnt_conditions
+FROM (
+  SELECT c.subject.patientId         AS patient_id ,
+         cc.code                     AS condition_code
+  FROM   `bigquery-public-data.fhir_synthea.condition` c
+  CROSS  JOIN UNNEST(c.code.coding)  AS cc )
+GROUP BY patient_id
+HAVING cnt_conditions = 1
+LIMIT 20;
+```
+
+```sql
+-- 5. Living “A*” patients that also meet the “one‑condition” rule
+SELECT lp.patient_id , n.family
+FROM (
+  SELECT patient_id
+  FROM (
+    SELECT c.subject.patientId AS patient_id , cc.code AS cond_code
+    FROM   `bigquery-public-data.fhir_synthea.condition` c
+    CROSS  JOIN UNNEST(c.code.coding) AS cc )
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT cond_code) = 1 ) AS lp
+JOIN `bigquery-public-data.fhir_synthea.patient` AS p
+  ON p.id = lp.patient_id
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+```
+
+```sql
+-- 6. How many different *active* medications has each patient been prescribed?
+SELECT mr.subject.patientId              AS patient_id ,
+       COUNT(DISTINCT mc.code)           AS num_active_meds
+FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+WHERE mr.status = 'active'
+GROUP BY patient_id
+ORDER BY num_active_meds DESC
+LIMIT 20;
+```
+
+```sql
+-- 7. Combine selections: “A*” living, one‑condition, plus active‑med counts
+SELECT sel.patient_id ,
+       sel.family ,
+       med.num_active_meds
+FROM (
+  /* Re‑use previous filter for patients */
+  SELECT p.id AS patient_id , n.family
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+```
+
+```sql
+-- 8. Add each patient’s unique condition information
+SELECT sel.patient_id ,
+       cond.condition_code ,
+       cond.condition_display ,
+       med.num_active_meds
+FROM (
+  /* Same patient filter as above */
+  SELECT p.id AS patient_id
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+JOIN (
+  SELECT c.subject.patientId AS patient_id ,
+         cc.code   AS condition_code ,
+         cc.display AS condition_display
+  FROM `bigquery-public-data.fhir_synthea.condition` c
+  CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+  ON sel.patient_id = cond.patient_id
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+  ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. For every condition, take the *maximum* #active‑meds seen on any single patient
+SELECT condition_code ,
+       condition_display ,
+       MAX(num_active_meds) AS max_active_meds_for_single_patient
+FROM (
+  /* reuse query 8 but drop the LIMIT */
+  SELECT sel.patient_id ,
+         cond.condition_code ,
+         cond.condition_display ,
+         med.num_active_meds
+  FROM (
+    SELECT p.id AS patient_id
+    FROM `bigquery-public-data.fhir_synthea.patient` p
+    CROSS JOIN UNNEST(p.name) AS n
+    WHERE n.family LIKE 'A%'
+      AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+      AND p.id IN (
+        SELECT patient_id
+        FROM (
+          SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+          FROM   `bigquery-public-data.fhir_synthea.condition` c
+          CROSS  JOIN UNNEST(c.code.coding) AS cc )
+        GROUP BY patient_id
+        HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+  JOIN (
+    SELECT c.subject.patientId AS patient_id ,
+           cc.code AS condition_code ,
+           cc.display AS condition_display
+    FROM `bigquery-public-data.fhir_synthea.condition` c
+    CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+    ON sel.patient_id = cond.patient_id
+  LEFT JOIN (
+    SELECT mr.subject.patientId AS patient_id ,
+           COUNT(DISTINCT mc.code) AS num_active_meds
+    FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+    CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+    WHERE mr.status = 'active'
+    GROUP BY patient_id ) AS med
+    ON sel.patient_id = med.patient_id )
+GROUP BY condition_code , condition_display
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 20;
+```
+
+```sql
+-- 10. FINAL ANSWER: eight conditions with the highest
+--      “max #different active medications prescribed
+--      to any single living A* patient who has only one condition”
+SELECT condition_code ,
+       condition_display ,
+       max_active_meds_for_single_patient
+FROM (
+  SELECT condition_code ,
+         condition_display ,
+         MAX(num_active_meds) AS max_active_meds_for_single_patient
+  FROM (
+    /* identical inner logic as query 9 */
+    SELECT sel.patient_id ,
+           cond.condition_code ,
+           cond.condition_display ,
+           med.num_active_meds
+    FROM (
+      SELECT p.id AS patient_id
+      FROM `bigquery-public-data.fhir_synthea.patient` p
+      CROSS JOIN UNNEST(p.name) AS n
+      WHERE n.family LIKE 'A%'
+        AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+        AND p.id IN (
+          SELECT patient_id
+          FROM (
+            SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+            FROM   `bigquery-public-data.fhir_synthea.condition` c
+            CROSS  JOIN UNNEST(c.code.coding) AS cc )
+          GROUP BY patient_id
+          HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+    JOIN (
+      SELECT c.subject.patientId AS patient_id ,
+             cc.code AS condition_code ,
+             cc.display AS condition_display
+      FROM `bigquery-public-data.fhir_synthea.condition` c
+      CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+      ON sel.patient_id = cond.patient_id
+    LEFT JOIN (
+      SELECT mr.subject.patientId AS patient_id ,
+             COUNT(DISTINCT mc.code) AS num_active_meds
+      FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+      CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+      WHERE mr.status = 'active'
+      GROUP BY patient_id ) AS med
+      ON sel.patient_id = med.patient_id )
+  GROUP BY condition_code , condition_display )
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 8;
+```
+
+Run the last query to obtain the eight requested conditions (their SNOMED `condition_code`, readable `condition_display`, and the corresponding maximal number of active medications).
+Refined SQLs and results:
+Query:
+-- 1. List some patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+LIMIT 20;
+Answer:
+id,family
+b54d72c2-12f4-43fb-bc0c-f417b761ea70,Alarcón922
+80b3de99-960e-4cfe-95d0-3db8ee20c706,Arias66
+f8e76665-3f36-4f62-8766-af0693f561c2,Ankunding277
+46ab2a0e-ff38-4278-8ab9-c07ae49c1133,Alvarez441
+a2f4f82b-d42f-4b39-9809-6cb8754f2bb3,Alvarado520
+53bbc5eb-ce03-4241-aae7-e249bba7f1db,Aparicio848
+2c9fa47a-eecb-4429-842c-942faf69d7dd,Araña824
+6e2abe8b-ecd1-4ea2-a1e6-717ae086cfb2,Avilés474
+Query:
+-- 2. Living patients whose last name starts with “A”
+SELECT p.id , n.family
+FROM `bigquery-public-data.fhir_synthea.patient` AS p
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+Answer:
+id,family
+c295157a-a84e-4bd8-8584-8296d149d978,Alonso270
+8319e658-4a44-4aa0-a2e8-f1a57abf2d88,Arreola736
+53d8c141-c64a-4bd0-8b5d-759afa527d1b,Aparicio848
+5b48d83a-74e0-4309-ba3a-86aeaafab091,Apodaca347
+8a1c8c05-dd80-486c-aa01-2dd0504f688f,Ayala238
+8a1c8c05-dd80-486c-aa01-2dd0504f688f,Alejandro916
+a805a39e-e7bd-4c10-a6fd-8144318ecf33,Atencio773
+e71f002c-e70f-4b16-a7b0-5a38a0fa0ff9,Adorno791
+Query:
+-- 3. See one coding for each condition record
+SELECT c.id ,
+       c.subject.patientId AS patient_id ,
+       cc.code , cc.display
+FROM `bigquery-public-data.fhir_synthea.condition` AS c
+CROSS JOIN UNNEST(c.code.coding) AS cc
+LIMIT 20;
+Answer:
+id,patient_id,code,display
+22d7addc-2168-433e-a904-5aaeecac682a,b6ac6938-ca96-4029-aa16-6dd4e4cc4fda,1734006,Fracture of the vertebral column with spinal cord injury
+8ce5be9e-56ab-47f7-8536-5e0456d8b5fe,8d2921b7-e9c2-4313-95df-463d569a05ca,1734006,Fracture of the vertebral column with spinal cord injury
+09d0d51d-8547-4df8-9915-acf2a496e9d8,19a818f9-b0f0-473e-bd36-e73ce39ac0c3,1734006,Fracture of the vertebral column with spinal cord injury
+Query:
+-- 4. Patients that have exactly ONE distinct condition
+SELECT patient_id , COUNT(DISTINCT condition_code) AS cnt_conditions
+FROM (
+  SELECT c.subject.patientId         AS patient_id ,
+         cc.code                     AS condition_code
+  FROM   `bigquery-public-data.fhir_synthea.condition` c
+  CROSS  JOIN UNNEST(c.code.coding)  AS cc )
+GROUP BY patient_id
+HAVING cnt_conditions = 1
+LIMIT 20;
+Answer:
+patient_id,cnt_conditions
+19d8f4cd-304f-492f-ab68-177c04bb8586,1
+653b9269-f5c6-48d1-93d8-677f66c47962,1
+e0b59aac-8be9-4449-98da-bfdf6dd62f04,1
+9c933905-63b9-4704-8f17-3c861d3254b5,1
+1372df4e-e7e9-4612-bc49-d7daffb08db1,1
+80b517e7-a76d-4a88-8205-f7aebf07078b,1
+3f3b93e5-1ef7-4b8a-8437-794d04a60d87,1
+Query:
+-- 5. Living “A*” patients that also meet the “one‑condition” rule
+SELECT lp.patient_id , n.family
+FROM (
+  SELECT patient_id
+  FROM (
+    SELECT c.subject.patientId AS patient_id , cc.code AS cond_code
+    FROM   `bigquery-public-data.fhir_synthea.condition` c
+    CROSS  JOIN UNNEST(c.code.coding) AS cc )
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT cond_code) = 1 ) AS lp
+JOIN `bigquery-public-data.fhir_synthea.patient` AS p
+  ON p.id = lp.patient_id
+CROSS JOIN UNNEST(p.name) AS n
+WHERE n.family LIKE 'A%'
+  AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+LIMIT 20;
+Answer:
+patient_id,family
+4f10b9fa-d964-45da-8271-289515543394,Aranda843
+61ba9828-e293-4f01-897b-8a3be007c49c,Anderson154
+a97d6277-b67e-473e-8190-368f4000b125,Altenwerth646
+42e1d140-ba8b-432b-812e-fdd74585107a,Anderson154
+4b774178-0e60-4a9f-aa77-533bbdc2f322,Arriaga291
+60953bae-1ce9-413f-8a7b-f04f7b6d5430,Alemán808
+14c9f02d-7ef4-4413-a3c3-5a62e6fde28e,Agosto501
+Query:
+-- 6. How many different *active* medications has each patient been prescribed?
+SELECT mr.subject.patientId              AS patient_id ,
+       COUNT(DISTINCT mc.code)           AS num_active_meds
+FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+WHERE mr.status = 'active'
+GROUP BY patient_id
+ORDER BY num_active_meds DESC
+LIMIT 20;
+Answer:
+patient_id,num_active_meds
+dfbc5f1d-3b28-40c9-8e4e-5c7685163bcb,20
+dbe5e53a-058f-4add-b5f1-71f5772eb0b0,19
+07a730a0-c98f-4f80-8f65-3987b987ff58,19
+b327cc3b-08c2-4fe9-8416-cc83b5552e4f,18
+2b6e8585-da78-40f5-86ba-bbf410cff78a,18
+252ecc00-d878-4b84-a9f0-809209785093,18
+1ef90a6c-cfeb-42c1-828a-a027094e47a4,18
+Query:
+-- 7. Combine selections: “A*” living, one‑condition, plus active‑med counts
+SELECT sel.patient_id ,
+       sel.family ,
+       med.num_active_meds
+FROM (
+  /* Re‑use previous filter for patients */
+  SELECT p.id AS patient_id , n.family
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+Answer:
+patient_id,family,num_active_meds
+10bdc7ba-bcb8-4d5f-88b4-f2e9a95c0e20,Abbott774,4
+822590f0-a068-40ae-a41a-59e2973a9a4c,Abshire638,4
+de111e10-4a7f-435c-8423-df365556ee59,Abernathy524,4
+9f9594d8-5b59-48e7-94d9-5436356b911f,Anderson154,3
+e30e036d-cb44-4666-8cd5-3b0a9b065b45,Abernathy524,3
+Query:
+-- 8. Add each patient’s unique condition information
+SELECT sel.patient_id ,
+       cond.condition_code ,
+       cond.condition_display ,
+       med.num_active_meds
+FROM (
+  /* Same patient filter as above */
+  SELECT p.id AS patient_id
+  FROM `bigquery-public-data.fhir_synthea.patient` p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+    AND p.id IN (
+      SELECT patient_id
+      FROM (
+        SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+        FROM   `bigquery-public-data.fhir_synthea.condition` c
+        CROSS  JOIN UNNEST(c.code.coding) AS cc )
+      GROUP BY patient_id
+      HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+JOIN (
+  SELECT c.subject.patientId AS patient_id ,
+         cc.code   AS condition_code ,
+         cc.display AS condition_display
+  FROM `bigquery-public-data.fhir_synthea.condition` c
+  CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+  ON sel.patient_id = cond.patient_id
+LEFT JOIN (
+  SELECT mr.subject.patientId AS patient_id ,
+         COUNT(DISTINCT mc.code) AS num_active_meds
+  FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+  GROUP BY patient_id ) AS med
+  ON sel.patient_id = med.patient_id
+ORDER BY med.num_active_meds DESC
+LIMIT 20;
+Answer:
+patient_id,condition_code,condition_display,num_active_meds
+822590f0-a068-40ae-a41a-59e2973a9a4c,53741008,Coronary Heart Disease,4
+10bdc7ba-bcb8-4d5f-88b4-f2e9a95c0e20,53741008,Coronary Heart Disease,4
+de111e10-4a7f-435c-8423-df365556ee59,195662009,Acute viral pharyngitis (disorder),4
+50c33917-df6b-4777-a9ec-a9e64afb6256,40275004,Contact dermatitis,3
+Query:
+-- 9. For every condition, take the *maximum* #active‑meds seen on any single patient
+SELECT condition_code ,
+       condition_display ,
+       MAX(num_active_meds) AS max_active_meds_for_single_patient
+FROM (
+  /* reuse query 8 but drop the LIMIT */
+  SELECT sel.patient_id ,
+         cond.condition_code ,
+         cond.condition_display ,
+         med.num_active_meds
+  FROM (
+    SELECT p.id AS patient_id
+    FROM `bigquery-public-data.fhir_synthea.patient` p
+    CROSS JOIN UNNEST(p.name) AS n
+    WHERE n.family LIKE 'A%'
+      AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+      AND p.id IN (
+        SELECT patient_id
+        FROM (
+          SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+          FROM   `bigquery-public-data.fhir_synthea.condition` c
+          CROSS  JOIN UNNEST(c.code.coding) AS cc )
+        GROUP BY patient_id
+        HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+  JOIN (
+    SELECT c.subject.patientId AS patient_id ,
+           cc.code AS condition_code ,
+           cc.display AS condition_display
+    FROM `bigquery-public-data.fhir_synthea.condition` c
+    CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+    ON sel.patient_id = cond.patient_id
+  LEFT JOIN (
+    SELECT mr.subject.patientId AS patient_id ,
+           COUNT(DISTINCT mc.code) AS num_active_meds
+    FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+    CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+    WHERE mr.status = 'active'
+    GROUP BY patient_id ) AS med
+    ON sel.patient_id = med.patient_id )
+GROUP BY condition_code , condition_display
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 20;
+Answer:
+condition_code,condition_display,max_active_meds_for_single_patient
+195662009,Acute viral pharyngitis (disorder),4
+53741008,Coronary Heart Disease,4
+49436004,Atrial Fibrillation,3
+40275004,Contact dermatitis,3
+444814009,Viral sinusitis (disorder),3
+Query:
+-- 10. FINAL ANSWER: eight conditions with the highest
+--      “max #different active medications prescribed
+--      to any single living A* patient who has only one condition”
+SELECT condition_code ,
+       condition_display ,
+       max_active_meds_for_single_patient
+FROM (
+  SELECT condition_code ,
+         condition_display ,
+         MAX(num_active_meds) AS max_active_meds_for_single_patient
+  FROM (
+    /* identical inner logic as query 9 */
+    SELECT sel.patient_id ,
+           cond.condition_code ,
+           cond.condition_display ,
+           med.num_active_meds
+    FROM (
+      SELECT p.id AS patient_id
+      FROM `bigquery-public-data.fhir_synthea.patient` p
+      CROSS JOIN UNNEST(p.name) AS n
+      WHERE n.family LIKE 'A%'
+        AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+        AND p.id IN (
+          SELECT patient_id
+          FROM (
+            SELECT c.subject.patientId AS patient_id , cc.code AS c_code
+            FROM   `bigquery-public-data.fhir_synthea.condition` c
+            CROSS  JOIN UNNEST(c.code.coding) AS cc )
+          GROUP BY patient_id
+          HAVING COUNT(DISTINCT c_code) = 1) ) AS sel
+    JOIN (
+      SELECT c.subject.patientId AS patient_id ,
+             cc.code AS condition_code ,
+             cc.display AS condition_display
+      FROM `bigquery-public-data.fhir_synthea.condition` c
+      CROSS JOIN UNNEST(c.code.coding) AS cc ) AS cond
+      ON sel.patient_id = cond.patient_id
+    LEFT JOIN (
+      SELECT mr.subject.patientId AS patient_id ,
+             COUNT(DISTINCT mc.code) AS num_active_meds
+      FROM `bigquery-public-data.fhir_synthea.medication_request` mr
+      CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+      WHERE mr.status = 'active'
+      GROUP BY patient_id ) AS med
+      ON sel.patient_id = med.patient_id )
+  GROUP BY condition_code , condition_display )
+ORDER BY max_active_meds_for_single_patient DESC
+LIMIT 8;
+Answer:
+condition_code,condition_display,max_active_meds_for_single_patient
+195662009,Acute viral pharyngitis (disorder),4
+53741008,Coronary Heart Disease,4
+444814009,Viral sinusitis (disorder),3
+40275004,Contact dermatitis,3
+38341003,Hypertension,3
+End Exploring Related Columns
+Task: Among living patients whose last names begin with "A" and who each have exactly one distinct condition, which eight conditions have the highest number of different active medications prescribed to any single patient, and what are their corresponding codes?
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+Usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Follow the answer format like: ```csv
+condition,code
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'bigquery-public-data': {'fhir_synthea': ['patient', 'condition', 'medication_request']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 02:19:36 - Thread-768 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH living_a_patients AS (
+  SELECT DISTINCT p.id
+  FROM `bigquery-public-data.fhir_synthea.patient` AS p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+),
+patient_condition_codes AS (
+  SELECT c.subject.patientId AS patient_id,
+         cc.code,
+         cc.display
+  FROM `bigquery-public-data.fhir_synthea.condition` AS c
+  CROSS JOIN UNNEST(c.code.coding) AS cc
+  WHERE c.subject.patientId IN (SELECT id FROM living_a_patients)
+),
+single_condition_patients AS (
+  SELECT patient_id
+  FROM patient_condition_codes
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT code) = 1
+),
+patient_active_meds AS (
+  SELECT mr.subject.patientId AS patient_id,
+         COUNT(DISTINCT mc.code) AS med_cnt
+  FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+    AND mr.subject.patientId IN (SELECT patient_id FROM single_condition_patients)
+    AND mc.code IS NOT NULL
+  GROUP BY patient_id
+),
+condition_max_meds AS (
+  SELECT pc.code,
+         pc.display AS condition,
+         MAX(COALESCE(pm.med_cnt,0)) AS max_meds
+  FROM patient_condition_codes AS pc
+  JOIN single_condition_patients AS sp
+    ON pc.patient_id = sp.patient_id
+  LEFT JOIN patient_active_meds AS pm
+    ON pc.patient_id = pm.patient_id
+  GROUP BY pc.code, pc.display
+)
+SELECT condition,
+       code
+FROM condition_max_meds
+ORDER BY max_meds DESC, code
+LIMIT 8;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:19:39 - Thread-768 (execute) - INFO - [Executed results in self-refine]
+condition,code
+Acute viral pharyngitis (disorder),195662009
+Coronary Heart Disease,53741008
+Body mass index 30+ - obesity (finding),162864005
+Hypertension,38341003
+Contact dermatitis,40275004
+Viral sinusitis (disorder),444814009
+Perennial allergic rhinitis,446096008
+Atrial Fibrillation,49436004
+
+[Executed results in self-refine]
+2025-05-01 02:19:39 - Thread-768 (execute) - INFO - itercount: 1
+2025-05-01 02:19:39 - Thread-768 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Among living patients whose last names begin with "A" and who each have exactly one distinct condition, which eight conditions have the highest number of different active medications prescribed to any single patient, and what are their corresponding codes?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+condition,code
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+condition,code
+Acute viral pharyngitis (disorder),195662009
+Coronary Heart Disease,53741008
+Body mass index 30+ - obesity (finding),162864005
+Hypertension,38341003
+Contact dermatitis,40275004
+Viral sinusitis (disorder),444814009
+Perennial allergic rhinitis,446096008
+Atrial Fibrillation,49436004
+Current sql:
+WITH living_a_patients AS (
+  SELECT DISTINCT p.id
+  FROM `bigquery-public-data.fhir_synthea.patient` AS p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+),
+patient_condition_codes AS (
+  SELECT c.subject.patientId AS patient_id,
+         cc.code,
+         cc.display
+  FROM `bigquery-public-data.fhir_synthea.condition` AS c
+  CROSS JOIN UNNEST(c.code.coding) AS cc
+  WHERE c.subject.patientId IN (SELECT id FROM living_a_patients)
+),
+single_condition_patients AS (
+  SELECT patient_id
+  FROM patient_condition_codes
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT code) = 1
+),
+patient_active_meds AS (
+  SELECT mr.subject.patientId AS patient_id,
+         COUNT(DISTINCT mc.code) AS med_cnt
+  FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+    AND mr.subject.patientId IN (SELECT patient_id FROM single_condition_patients)
+    AND mc.code IS NOT NULL
+  GROUP BY patient_id
+),
+condition_max_meds AS (
+  SELECT pc.code,
+         pc.display AS condition,
+         MAX(COALESCE(pm.med_cnt,0)) AS max_meds
+  FROM patient_condition_codes AS pc
+  JOIN single_condition_patients AS sp
+    ON pc.patient_id = sp.patient_id
+  LEFT JOIN patient_active_meds AS pm
+    ON pc.patient_id = pm.patient_id
+  GROUP BY pc.code, pc.display
+)
+SELECT condition,
+       code
+FROM condition_max_meds
+ORDER BY max_meds DESC, code
+LIMIT 8;
+[Self-refine]
+2025-05-01 02:20:00 - Thread-768 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH living_a_patients AS (
+  SELECT DISTINCT p.id
+  FROM `bigquery-public-data.fhir_synthea.patient` AS p
+  CROSS JOIN UNNEST(p.name) AS n
+  WHERE n.family LIKE 'A%'
+    AND (p.deceased.boolean IS FALSE OR p.deceased.boolean IS NULL)
+),
+patient_condition_codes AS (
+  SELECT c.subject.patientId AS patient_id,
+         cc.code,
+         cc.display
+  FROM `bigquery-public-data.fhir_synthea.condition` AS c
+  CROSS JOIN UNNEST(c.code.coding) AS cc
+  WHERE c.subject.patientId IN (SELECT id FROM living_a_patients)
+),
+single_condition_patients AS (
+  SELECT patient_id
+  FROM patient_condition_codes
+  GROUP BY patient_id
+  HAVING COUNT(DISTINCT code) = 1
+),
+patient_active_meds AS (
+  SELECT mr.subject.patientId AS patient_id,
+         COUNT(DISTINCT mc.code) AS med_cnt
+  FROM `bigquery-public-data.fhir_synthea.medication_request` AS mr
+  CROSS JOIN UNNEST(mr.medication.codeableConcept.coding) AS mc
+  WHERE mr.status = 'active'
+    AND mr.subject.patientId IN (SELECT patient_id FROM single_condition_patients)
+    AND mc.code IS NOT NULL
+  GROUP BY patient_id
+),
+condition_max_meds AS (
+  SELECT pc.code,
+         pc.display AS condition,
+         MAX(COALESCE(pm.med_cnt, 0)) AS max_meds
+  FROM patient_condition_codes AS pc
+  JOIN single_condition_patients AS sp
+    ON pc.patient_id = sp.patient_id
+  LEFT JOIN patient_active_meds AS pm
+    ON pc.patient_id = pm.patient_id
+  GROUP BY pc.code, pc.display
+)
+SELECT condition,
+       code
+FROM condition_max_meds
+ORDER BY max_meds DESC, code
+LIMIT 8;
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:20:04 - Thread-768 (execute) - INFO - [Executed results in self-refine]
+condition,code
+Acute viral pharyngitis (disorder),195662009
+Coronary Heart Disease,53741008
+Body mass index 30+ - obesity (finding),162864005
+Hypertension,38341003
+Contact dermatitis,40275004
+Viral sinusitis (disorder),444814009
+Perennial allergic rhinitis,446096008
+Atrial Fibrillation,49436004
+
+[Executed results in self-refine]
+2025-05-01 02:20:04 - Thread-768 (execute) - INFO - [Consistent results]
+condition,code
+Acute viral pharyngitis (disorder),195662009
+Coronary Heart Disease,53741008
+Body mass index 30+ - obesity (finding),162864005
+Hypertension,38341003
+Contact dermatitis,40275004
+Viral sinusitis (disorder),444814009
+Perennial allergic rhinitis,446096008
+Atrial Fibrillation,49436004
+
+[Consistent results]
+2025-05-01 02:20:04 - Thread-768 (execute) - INFO - Total iteration counts: 1

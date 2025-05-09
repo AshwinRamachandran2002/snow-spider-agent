@@ -1,0 +1,1377 @@
+2025-05-01 03:44:57 - Thread-1632 (execute) - INFO - [Answer format]
+```csv
+travel_coordinates,cumulative_travel_distance
+```
+[Answer format]
+2025-05-01 03:46:40 - Thread-1632 (execute) - INFO - [Exploration]
+Relevant tables / columns and why they matter  
+
+US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES  
+• "STATE": restrict rows to Florida (‘FL’)  
+• "ZIP": link every address to a 5‑digit ZIP Code  
+• "LATITUDE": rank addresses from north→south (higher latitude = farther north)  
+• "NUMBER": first part of the street address we must return  
+• "STREET": street name we must return  
+• "STREET_TYPE": street type we must return  
+
+US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX  
+• "GEO_ID", "GEO_NAME", "LEVEL": identify Florida’s state‑level GEO_ID (needed for joins)  
+
+US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS  
+• "GEO_ID": ZIP‑code (e.g., zip/32615) we want to analyse  
+• "RELATED_GEO_ID": links that ZIP to the Florida state GEO_ID (geoId/12)  
+• "LEVEL": makes sure the record we pull is a ZIP (usually “CensusZipCodeTabulationArea”)  
+
+US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS  
+• "GEO_ID": same ZIP‑code string as above  
+• "RELATIONSHIP_TYPE": want ‘coordinates_wkt’ so we can turn each ZIP polygon into a GEOGRAPHY object  
+• "VALUE": polygon WKT used to calculate surface area → find “largest ZIP area”  
+
+Typical conditions we will apply  
+• "STATE" = 'FL'                                  -- for Florida addresses  
+• "RELATIONSHIP_TYPE" = 'coordinates_wkt'         -- to obtain polygon WKT  
+• "RELATED_GEO_ID" = 'geoId/12'                   -- Florida’s state GEO_ID (verified in query #1)  
+• "GEO_ID" LIKE 'zip/%'                           -- keep only ZIP‑level polygons  
+• ORDER BY ST_AREA(...) DESC                      -- rank ZIPs by area  
+• ORDER BY "LATITUDE" DESC                        -- rank addresses north→south  
+
+
+
+10 exploratory → final Snowflake SQL queries  
+(Each returns ≤ 20 rows; all column names in double quotes.)
+
+```sql
+-- 1. Description: Confirm Florida’s state-level GEO_ID in the index table.
+SELECT 
+    "GEO_ID", 
+    "GEO_NAME", 
+    "LEVEL"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX
+WHERE "GEO_NAME" ILIKE '%Florida%' 
+  AND "LEVEL" = 'State'
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: Show a few ZIP GEO_IDs that are explicitly related to Florida.
+SELECT DISTINCT 
+    "GEO_ID",
+    "LEVEL",
+    "RELATED_GEO_ID",
+    "RELATED_GEO_NAME"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS
+WHERE "RELATED_GEO_ID" = 'geoId/12'        -- Florida
+  AND "GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: Peek at ZIP polygons (WKT) that belong to Florida to ensure they exist.
+SELECT 
+    c."GEO_ID",
+    LEFT(c."VALUE", 120) AS "WKT_SAMPLE"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: Compute area (m²) of every Florida ZIP polygon and show 20 largest.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: Isolate the single largest‑area Florida ZIP (top 1) for later use.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 1;
+```
+
+```sql
+-- 6. Description: Count how many Florida addresses fall inside each of the 20 largest ZIP areas.
+WITH big_zips AS (
+    SELECT 
+        c."GEO_ID"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID" = 'geoId/12'
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'
+    ORDER BY ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) DESC
+    LIMIT 20
+)
+SELECT 
+    SUBSTR(b."GEO_ID", 5) AS "ZIP",
+    COUNT(*)               AS "ADDRESS_CNT"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a
+JOIN big_zips b
+  ON a."ZIP" = SUBSTR(b."GEO_ID", 5)
+WHERE a."STATE" = 'FL'
+GROUP BY SUBSTR(b."GEO_ID", 5)
+ORDER BY "ADDRESS_CNT" DESC
+LIMIT 20;
+```
+
+```sql
+-- 7. Description: Display a sample of addresses inside the single largest‑area ZIP.
+--    Replace '32615' with the ZIP code found in query #5 if different.
+SELECT 
+    "ADDRESS_ID",
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "CITY",
+    "LATITUDE",
+    "LONGITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'          -- placeholder: use actual ZIP from query #5
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: Rank Florida addresses in that ZIP north → south (highest latitude first).
+--    Again, substitute correct ZIP code obtained earlier.
+SELECT 
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'
+ORDER BY "LATITUDE" DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. Description: Retrieve the 10 northernmost addresses (final answer set).
+--    Ensure ordering strictly by latitude, returning only requested columns.
+SELECT 
+    "NUMBER"       AS "ADDRESS_NUMBER",
+    "STREET"       AS "STREET_NAME",
+    "STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'           -- use largest-area ZIP found in query #5
+ORDER BY "LATITUDE" DESC
+LIMIT 10;
+```
+
+```sql
+-- 10. Description: Quick sanity‑check — confirm all 10 rows really lie inside the
+--     geometry polygon for that ZIP (geospatial containment test).
+WITH zip_poly AS (
+    SELECT 
+        ST_GEOGFROMTEXT(c."VALUE") AS "GEOG"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    WHERE c."GEO_ID" = 'zip/32615'               -- adjust to real GEO_ID
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+)
+SELECT 
+    a."NUMBER",
+    a."STREET",
+    a."STREET_TYPE",
+    a."LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a,
+     zip_poly z
+WHERE a."STATE" = 'FL'
+  AND a."ZIP" = '32615'
+  AND ST_CONTAINS(z."GEOG", ST_POINT(a."LONGITUDE", a."LATITUDE"))
+ORDER BY a."LATITUDE" DESC
+LIMIT 20;
+```
+
+Use the ZIP code surfaced in query #5 in place of the placeholder ‘32615’.  
+Query #9 returns the final list of the ten northernmost addresses (number, street name, type) inside Florida’s largest ZIP‑code area.
+[Exploration]
+2025-05-01 03:46:40 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 1. Description: Confirm Florida’s state-level GEO_ID in the index table.
+SELECT 
+    "GEO_ID", 
+    "GEO_NAME", 
+    "LEVEL"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX
+WHERE "GEO_NAME" ILIKE '%Florida%' 
+  AND "LEVEL" = 'State'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:41 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Description: Confirm Florida’s state-level GEO_ID in the index table.
+SELECT 
+    "GEO_ID", 
+    "GEO_NAME", 
+    "LEVEL"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX
+WHERE "GEO_NAME" ILIKE '%Florida%' 
+  AND "LEVEL" = 'State'
+LIMIT 20;
+Results:
+GEO_ID,GEO_NAME,LEVEL
+geoId/12,Florida,State
+
+[Successfully executed]
+2025-05-01 03:46:41 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 2. Description: Show a few ZIP GEO_IDs that are explicitly related to Florida.
+SELECT DISTINCT 
+    "GEO_ID",
+    "LEVEL",
+    "RELATED_GEO_ID",
+    "RELATED_GEO_NAME"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS
+WHERE "RELATED_GEO_ID" = 'geoId/12'        -- Florida
+  AND "GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:42 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Description: Show a few ZIP GEO_IDs that are explicitly related to Florida.
+SELECT DISTINCT 
+    "GEO_ID",
+    "LEVEL",
+    "RELATED_GEO_ID",
+    "RELATED_GEO_NAME"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS
+WHERE "RELATED_GEO_ID" = 'geoId/12'        -- Florida
+  AND "GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+Results:
+GEO_ID,LEVEL,RELATED_GEO_ID,RELATED_GEO_NAME
+zip/34952,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/32444,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/32934,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/33009,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/32307,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/34234,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/34951,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/34290,CensusZipCodeTabulationArea,geoId/12,Florida
+
+[Successfully executed]
+2025-05-01 03:46:42 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 3. Description: Peek at ZIP polygons (WKT) that belong to Florida to ensure they exist.
+SELECT 
+    c."GEO_ID",
+    LEFT(c."VALUE", 120) AS "WKT_SAMPLE"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:43 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. Description: Peek at ZIP polygons (WKT) that belong to Florida to ensure they exist.
+SELECT 
+    c."GEO_ID",
+    LEFT(c."VALUE", 120) AS "WKT_SAMPLE"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+Results:
+GEO_ID,WKT_SAMPLE
+zip/32955,"POLYGON((-80.862815 28.347221,-80.86246 28.347186,-80.862104 28.34715,-80.85973 28.346914,-80.855429 28.346488,-80.85047"
+zip/32195,"POLYGON((-81.963422 28.989663,-81.963194 28.989673,-81.962731 28.989602,-81.962436 28.989587,-81.962374 28.990325,-81.96"
+zip/34222,"POLYGON((-82.552149 27.511654,-82.552125 27.511631,-82.552069 27.511629,-82.552034 27.511639,-82.551954 27.511674,-82.55"
+zip/32622,"POLYGON((-82.418617 29.923184,-82.418521 29.923435,-82.418379 29.923
+
+[Successfully executed]
+2025-05-01 03:46:43 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 4. Description: Compute area (m²) of every Florida ZIP polygon and show 20 largest.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:44 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4. Description: Compute area (m²) of every Florida ZIP polygon and show 20 largest.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 20;
+Results:
+GEO_ID,ZIP_AREA_M2
+zip/33034,3255045485.783802
+zip/34141,2576326082.2004128
+zip/34972,2245592864.2414064
+zip/33440,1900026199.6729956
+zip/34142,1652651613.538897
+zip/34266,1502915005.3350286
+zip/34739,1238625304.4574008
+zip/32344,1183627915.0865655
+zip/33982,1079388183.8556955
+zip/34974,1027365283.7272027
+zip/32060,1027162324.6894567
+zip/32321,986256792.9821653
+zip/33935,947705458.2233229
+zip/32680,924197593.9383329
+zip/32331,911404856.9332409
+zip/33898,890132423.0507332
+
+[Successfully executed]
+2025-05-01 03:46:44 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 5. Description: Isolate the single largest‑area Florida ZIP (top 1) for later use.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 1;
+[Try to execute]
+2025-05-01 03:46:45 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5. Description: Isolate the single largest‑area Florida ZIP (top 1) for later use.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 1;
+Results:
+GEO_ID,ZIP_AREA_M2
+zip/33034,3255045485.783802
+
+[Successfully executed]
+2025-05-01 03:46:45 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 6. Description: Count how many Florida addresses fall inside each of the 20 largest ZIP areas.
+WITH big_zips AS (
+    SELECT 
+        c."GEO_ID"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID" = 'geoId/12'
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'
+    ORDER BY ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) DESC
+    LIMIT 20
+)
+SELECT 
+    SUBSTR(b."GEO_ID", 5) AS "ZIP",
+    COUNT(*)               AS "ADDRESS_CNT"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a
+JOIN big_zips b
+  ON a."ZIP" = SUBSTR(b."GEO_ID", 5)
+WHERE a."STATE" = 'FL'
+GROUP BY SUBSTR(b."GEO_ID", 5)
+ORDER BY "ADDRESS_CNT" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:46 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6. Description: Count how many Florida addresses fall inside each of the 20 largest ZIP areas.
+WITH big_zips AS (
+    SELECT 
+        c."GEO_ID"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID" = 'geoId/12'
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'
+    ORDER BY ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) DESC
+    LIMIT 20
+)
+SELECT 
+    SUBSTR(b."GEO_ID", 5) AS "ZIP",
+    COUNT(*)               AS "ADDRESS_CNT"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a
+JOIN big_zips b
+  ON a."ZIP" = SUBSTR(b."GEO_ID", 5)
+WHERE a."STATE" = 'FL'
+GROUP BY SUBSTR(b."GEO_ID", 5)
+ORDER BY "ADDRESS_CNT" DESC
+LIMIT 20;
+Results:
+ZIP,ADDRESS_CNT
+33852,94906
+34266,44186
+33982,38576
+33935,35242
+34972,30736
+33440,29495
+33898,28126
+34142,20250
+34974,19612
+32680,18559
+33034,14165
+32060,10741
+33471,9518
+32344,8512
+32465,7455
+32348,6490
+32321,6341
+32331,4236
+34739,1482
+34141,340
+
+[Successfully executed]
+2025-05-01 03:46:46 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 7. Description: Display a sample of addresses inside the single largest‑area ZIP.
+--    Replace '32615' with the ZIP code found in query #5 if different.
+SELECT 
+    "ADDRESS_ID",
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "CITY",
+    "LATITUDE",
+    "LONGITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'          -- placeholder: use actual ZIP from query #5
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:47 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7. Description: Display a sample of addresses inside the single largest‑area ZIP.
+--    Replace '32615' with the ZIP code found in query #5 if different.
+SELECT 
+    "ADDRESS_ID",
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "CITY",
+    "LATITUDE",
+    "LONGITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'          -- placeholder: use actual ZIP from query #5
+LIMIT 20;
+Results:
+ADDRESS_ID,NUMBER,STREET,STREET_TYPE,CITY,LATITUDE,LONGITUDE
+addressId/fc1cd9bd2f1ddf1e8d9eda9c548ba8e6,11117,County Rd 236,,Highspringsalachua,29.8779839,-82.4665471
+addressId/ecf66b49462e18186af41ce32cbac62a,11958,State Rd 235,,Highspringsalachua,29.8053531,-82.4749077
+addressId/bbd7ad4332b9024916df028497473559,16304,Us-441,,Alachua,29.802992,-82.5280912
+addressId/27114d850214eb467dbfeda1f9ad8f07,14923,125th,Street,Alachua,29.7919,-82.479322
+addressId/2237c6bd8295f8b49549d267a33563d1,1631
+
+[Successfully executed]
+2025-05-01 03:46:47 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 8. Description: Rank Florida addresses in that ZIP north → south (highest latitude first).
+--    Again, substitute correct ZIP code obtained earlier.
+SELECT 
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'
+ORDER BY "LATITUDE" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:47 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8. Description: Rank Florida addresses in that ZIP north → south (highest latitude first).
+--    Again, substitute correct ZIP code obtained earlier.
+SELECT 
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'
+ORDER BY "LATITUDE" DESC
+LIMIT 20;
+Results:
+NUMBER,STREET,STREET_TYPE,LATITUDE
+16091,Martin Luther King,Boulevard,29.99976
+15210,Us Highway 441,,29.94833
+,Cr 241,,29.9434798
+16644,County Rd 1491,,29.9429973
+16478,County Rd 1491,,29.942991
+16120,County Rd 1491,,29.9419181
+17306,County Rd 1491,,29.9388066
+15816,County Rd 1491,,29.9369614
+16644,County Rd 1491,,29.9368751
+15816,Cr-1491,,29.9367128
+16108,County Rd 1491,,29.936398
+16628,County Rd 1491,,29.9349135
+
+[Successfully executed]
+2025-05-01 03:46:47 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 9. Description: Retrieve the 10 northernmost addresses (final answer set).
+--    Ensure ordering strictly by latitude, returning only requested columns.
+SELECT 
+    "NUMBER"       AS "ADDRESS_NUMBER",
+    "STREET"       AS "STREET_NAME",
+    "STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'           -- use largest-area ZIP found in query #5
+ORDER BY "LATITUDE" DESC
+LIMIT 10;
+[Try to execute]
+2025-05-01 03:46:48 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 9. Description: Retrieve the 10 northernmost addresses (final answer set).
+--    Ensure ordering strictly by latitude, returning only requested columns.
+SELECT 
+    "NUMBER"       AS "ADDRESS_NUMBER",
+    "STREET"       AS "STREET_NAME",
+    "STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'           -- use largest-area ZIP found in query #5
+ORDER BY "LATITUDE" DESC
+LIMIT 10;
+Results:
+ADDRESS_NUMBER,STREET_NAME,STREET_TYPE
+16091,Martin Luther King,Boulevard
+15210,Us Highway 441,
+,Cr 241,
+16644,County Rd 1491,
+16478,County Rd 1491,
+16120,County Rd 1491,
+17306,County Rd 1491,
+15816,County Rd 1491,
+16644,County Rd 1491,
+15816,Cr-1491,
+
+[Successfully executed]
+2025-05-01 03:46:48 - Thread-1632 (execute) - INFO - [Try to execute]
+-- 10. Description: Quick sanity‑check — confirm all 10 rows really lie inside the
+--     geometry polygon for that ZIP (geospatial containment test).
+WITH zip_poly AS (
+    SELECT 
+        ST_GEOGFROMTEXT(c."VALUE") AS "GEOG"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    WHERE c."GEO_ID" = 'zip/32615'               -- adjust to real GEO_ID
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+)
+SELECT 
+    a."NUMBER",
+    a."STREET",
+    a."STREET_TYPE",
+    a."LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a,
+     zip_poly z
+WHERE a."STATE" = 'FL'
+  AND a."ZIP" = '32615'
+  AND ST_CONTAINS(z."GEOG", ST_POINT(a."LONGITUDE", a."LATITUDE"))
+ORDER BY a."LATITUDE" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:46:49 - Thread-1632 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 10. Description: Quick sanity‑check — confirm all 10 rows really lie inside the
+--     geometry polygon for that ZIP (geospatial containment test).
+WITH zip_poly AS (
+    SELECT 
+        ST_GEOGFROMTEXT(c."VALUE") AS "GEOG"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    WHERE c."GEO_ID" = 'zip/32615'               -- adjust to real GEO_ID
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+)
+SELECT 
+    a."NUMBER",
+    a."STREET",
+    a."STREET_TYPE",
+    a."LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a,
+     zip_poly z
+WHERE a."STATE" = 'FL'
+  AND a."ZIP" = '32615'
+  AND ST_CONTAINS(z."GEOG", ST_POINT(a."LONGITUDE", a."LATITUDE"))
+ORDER BY a."LATITUDE" DESC
+LIMIT 20;
+Results:
+NUMBER,STREET,STREET_TYPE,LATITUDE
+,Cr 241,,29.9434798
+16644,County Rd 1491,,29.9429973
+16478,County Rd 1491,,29.942991
+16120,County Rd 1491,,29.9419181
+17306,County Rd 1491,,29.9388066
+15816,County Rd 1491,,29.9369614
+16644,County Rd 1491,,29.9368751
+15816,Cr-1491,,29.9367128
+16108,County Rd 1491,,29.936398
+16628,County Rd 1491,,29.9349135
+16628,County Rd 1491,,29.9348067
+15704,County Rd 1491,,29.9338355
+
+[Successfully executed]
+2025-05-01 03:46:49 - Thread-1632 (execute) - INFO - itercount: 0
+2025-05-01 03:46:49 - Thread-1632 (execute) - INFO - [Self-refine]
+Table full name: US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS
+Column name: RELATED_GEO_NAME Type: TEXT Description: Name of the place related to GEO_NAME. This is a place that overlaps or is contained within the primary geo (e.g., city within a state)
+Column name: RELATED_GEO_ID Type: TEXT Description: A unique identifier for the related place joinable to the GEOGRAPHY_INDEX table
+Column name: RELATED_LEVEL Type: TEXT Description: Geographic level or hierarchy of the related place (e.g., Country, State, County, City, Continent, CountrySubRegion, etc.)
+Column name: RELATIONSHIP_TYPE Type: TEXT Description: Relationship between the two places. Contains means the RELATED_GEO_ID is fully contained within the GEO_ID (e.g., relationship of state to a city) while Overlaps indicates the GEO_ID is a subpart of the RELATED_GEO_ID (e.g., relationship of city to a state)
+Column name: GEO_ID Type: TEXT Description: A unique identifier for a place joinable to the GEOGRAPHY_INDEX table
+Column name: GEO_NAME Type: TEXT Description: Full name of the place
+Column name: LEVEL Type: TEXT Description: Geographic level or hierarchy (e.g., Country, State, County, City, Continent, CountrySubRegion, etc.)
+Sample rows:
+[{'GEO_NAME': '35300541', 'GEO_ID': 'statcanId/S051235300541', 'LEVEL': 'DisseminationArea', 'RELATED_GEO_NAME': 'Northern America', 'RELATED_GEO_ID': 'countrySubRegion/021', 'RELATED_LEVEL': 'CountrySubRegion', 'RELATIONSHIP_TYPE': 'Overlaps'}, {'GEO_NAME': '47878', 'GEO_ID': 'zip/47878', 'LEVEL': 'CensusZipCodeTabulationArea', 'RELATED_GEO_NAME': 'Northern America', 'RELATED_GEO_ID': 'countrySubRegion/021', 'RELATED_LEVEL': 'CountrySubRegion', 'RELATIONSHIP_TYPE': 'Overlaps'}, {'GEO_NAME': '48139', 'GEO_ID': 'zip/48139', 'LEVEL': 'CensusZipCodeTabulationArea', 'RELATED_GEO_NAME': 'United States', 'RELATED_GEO_ID': 'country/USA', 'RELATED_LEVEL': 'Country', 'RELATIONSHIP_TYPE': 'Overlaps'}, {'GEO_NAME': 'Massachusetts', 'GEO_ID': 'geoId/25', 'LEVEL': 'State', 'RELATED_GEO_NAME': 'Block Group 5, Census Tract 3703, Middlesex County, Massachusetts', 'RELATED_GEO_ID': 'censusBlockGroup/250173703005', 'RELATED_LEVEL': 'CensusBlockGroup', 'RELATIONSHIP_TYPE': 'Contains'}, {'GEO_NAME': 'West
+
+
+--------------------------------------------------
+Table full name: US_ADDRESSES__POI.CYBERSYN.POINT_OF_INTEREST_ADDRESSES_RELATIONSHIPS
+Column name: POI_ID Type: TEXT Description: A unique identifier for a point of interest (such as a park, a branch of a fast food chain, a hotel, etc.) based on its description and location. It is joinable to the point_of_interest_index table.
+Column name: RELATIONSHIP_TYPE Type: TEXT Description: Relationship between the two places. We use 'Overlaps' to indicate that the POI_ID is a subpart of the ADDRESS_ID (e.g., relationship of an apartment to an apartment building, as there could be several points of interest at the same address, especially if the data is lacking accurate unit information).
+Column name: RELATIONSHIP_START_DATE Type: DATE Description: The date from which a given relationship is valid. For example, if the NAME of a place at a given POI_ID changed on 2023-04-01, then  relationship_start_date of 2023-04-01 is assigned. However, currently, all the values in this column are NULL since it only contains most recent characteristics with no historical changes.
+Column name: RELATIONSHIP_END_DATE Type: DATE Description: The date from which a given relationship is valid. For example, if the NAME of a place at a given POI_ID changed on 2023-04-01, then relationship_end_date of 2023-03-31 is assigned to the NAME for that POI_ID. However, currently, all the values in this column are NULL since it only contains most recent characteristics with no historical changes.
+Column name: ADDRESS_ID Type: TEXT Description: A unique identifier for an address based on street address that is joinable to the us_addresses table.
+Sample rows:
+[{'POI_ID': '08f269606d84474b0383b1e7e8c016f0', 'ADDRESS_ID': 'addressId/98b58eaa8ec6d4166d2e181b221bdc78', 'RELATIONSHIP_TYPE': 'Overlaps', 'RELATIONSHIP_START_DATE': None, 'RELATIONSHIP_END_DATE': None}, {'POI_ID': '08f268cda876e7840399de7cbe47424a', 'ADDRESS_ID': 'addressId/b68bf965318c97738ef54e952fdb7d3e', 'RELATIONSHIP_TYPE': 'Overlaps', 'RELATIONSHIP_START_DATE': None, 'RELATIONSHIP_END_DATE': None}, {'POI_ID': '08f283409da358d9038afebdd8a48370', 'ADDRESS_ID': 'addressId/cfe743ff143eb73171361acd2c67b640', 'RELATIONSHIP_TYPE': 'Overlaps', 'RELATIONSHIP_START_DATE': None, 'RELATIONSHIP_END_DATE': None}, {'POI_ID': '08f44ac08654024c03d93bb8f3f122fd', 'ADDRESS_ID': 'addressId/f7b067ec19a8c4e0d252a3534be6c2cd', 'RELATIONSHIP_TYPE': 'Overlaps', 'RELATIONSHIP_START_DATE': None, 'RELATIONSHIP_END_DATE': None}, {'POI_ID': '08f4413390635c1903c4104e6338a78f', 'ADDRESS_ID': 'addressId/24274acb391d5356cf97a99ee9da08bb', 'RELATIONSHIP_TYPE': 'Overlaps', 'RELATIONSHIP_START_DATE': None, 'RELAT
+
+
+--------------------------------------------------
+Table full name: US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+Column name: STREET_DIRECTIONAL_SUFFIX Type: TEXT Description: a directional modifier following the street name, such as S or NE
+Column name: STREET_DIRECTIONAL_PREFIX Type: TEXT Description: a directional modifier preceding the street name, such as N or SW
+Column name: ID_ZIP Type: TEXT Description: A unique identifier for a zip code joinable to the geography_index/relationships tables
+Column name: ID_COUNTRY Type: TEXT Description: A unique identifier for a country joinable to the geography_index/relationships tables
+Column name: LONGITUDE Type: FLOAT Description: longitude coordinate in degrees
+Column name: ADDRESS_ID Type: TEXT Description: A unique identifier of an address based on street address that is joinable to the point_of_interest_addresses_relationships table.
+Column name: ZIP Type: TEXT Description: 5-digit code identifying the location of an address
+Column name: ID_STATE Type: TEXT Description: A unique identifier for a state, Washington, D.C. or Puerto Rico joinable to the geography_index/relationships tables
+Column name: UNIT Type: TEXT Description: number or label for a unit used to distinguish multiple tenants at a single address
+Column name: STREET_TYPE Type: TEXT Description: string type of the street, such as ROAD
+Column name: LATITUDE Type: FLOAT Description: latitude coordinate in degrees
+Column name: NUMBER Type: TEXT Description: number of the address identifying location on a street
+Column name: STREET Type: TEXT Description: name of the street
+Column name: CITY Type: TEXT Description: name of the city
+Column name: ID_CITY Type: TEXT Description: A unique identifier for a city joinable to the geography_index/relationships tables
+Column name: STATE Type: TEXT Description: name of the state
+Sample rows:
+[{'ADDRESS_ID': 'addressId/dc300a05308812315403177f94140723', 'ID_ZIP': 'zip/76435', 'ID_CITY': 'geoId/4812736', 'ID_STATE': 'geoId/48', 'ID_COUNTRY': 'country/USA', 'LONGITUDE': -98.8322983, 'LATITUDE': 32.2707423, 'NUMBER': '307', 'STREET_DIRECTIONAL_PREFIX': 'W', 'STREET': 'Anthracite', 'STREET_TYPE': 'Street', 'STREET_DIRECTIONAL_SUFFIX': None, 'UNIT': None, 'CITY': 'Carbon', 'STATE': 'TX', 'ZIP': '76435'}, {'ADDRESS_ID': 'addressId/ae15ac2c134974f5599c7f16d391e061', 'ID_ZIP': 'zip/37042', 'ID_CITY': 'geoId/4715160', 'ID_STATE': 'geoId/47', 'ID_COUNTRY': 'country/USA', 'LONGITUDE': -87.4201814, 'LATITUDE': 36.5539342, 'NUMBER': '580', 'STREET_DIRECTIONAL_PREFIX': None, 'STREET': 'Cabot', 'STREET_TYPE': 'Cove', 'STREET_DIRECTIONAL_SUFFIX': None, 'UNIT': None, 'CITY': 'Clarksville', 'STATE': 'TN', 'ZIP': '37042'}, {'ADDRESS_ID': 'addressId/a190cfd4c9532b7c48dbbff6b1b37cbb', 'ID_ZIP': 'zip/46360', 'ID_CITY': 'geoId/1848798', 'ID_STATE': 'geoId/18', 'ID_COUNTRY': 'country/USA', 'LONGIT
+
+
+--------------------------------------------------
+Table full name: US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX
+Column name: LEVEL Type: TEXT Description: Geographic level or hierarchy (e.g., Country, State, County, City, Continent, CountrySubRegion, etc.)
+Column name: ISO_ALPHA2 Type: TEXT Description: 2 letter country code from International Organization for Standardization
+Column name: GEO_ID Type: TEXT Description: A unique identifier for a place (a nation, state, zip-code, etc.)
+Column name: ISO_3166_2_CODE Type: TEXT Description: Full ISO-3166 code
+Column name: ISO_NUMERIC_CODE Type: TEXT Description: Numeric code from International Organization for Standardization
+Column name: GEO_NAME Type: TEXT Description: Full name of the place
+Column name: ISO_NAME Type: TEXT Description: Country name from International Organization for Standardization
+Column name: ISO_ALPHA3 Type: TEXT Description: 3 letter country code from International Organization for Standardization
+Sample rows:
+[{'GEO_ID': 'censusBlockGroup/470190716001', 'GEO_NAME': 'Block Group 1; Census Tract 716; Carter County; Tennessee', 'LEVEL': 'CensusBlockGroup', 'ISO_NAME': None, 'ISO_ALPHA2': None, 'ISO_ALPHA3': None, 'ISO_NUMERIC_CODE': None, 'ISO_3166_2_CODE': None}, {'GEO_ID': 'geoId/04019004080', 'GEO_NAME': 'Census Tract 40.80, Pima County, Arizona', 'LEVEL': 'CensusTract', 'ISO_NAME': None, 'ISO_ALPHA2': None, 'ISO_ALPHA3': None, 'ISO_NUMERIC_CODE': None, 'ISO_3166_2_CODE': None}, {'GEO_ID': 'geoId/48397040507', 'GEO_NAME': 'Census Tract 405.07, Rockwall County, Texas', 'LEVEL': 'CensusTract', 'ISO_NAME': None, 'ISO_ALPHA2': None, 'ISO_ALPHA3': None, 'ISO_NUMERIC_CODE': None, 'ISO_3166_2_CODE': None}, {'GEO_ID': 'censusBlockGroup/060590017063', 'GEO_NAME': 'Block Group 3; Census Tract 17.06; Orange County; California', 'LEVEL': 'CensusBlockGroup', 'ISO_NAME': None, 'ISO_ALPHA2': None, 'ISO_ALPHA3': None, 'ISO_NUMERIC_CODE': None, 'ISO_3166_2_CODE': None}, {'GEO_ID': 'geoId/36089991900', 'GEO_
+
+
+--------------------------------------------------
+Table full name: US_ADDRESSES__POI.CYBERSYN.CYBERSYN_DATA_CATALOG
+Column name: DATA_SOURCE Type: ARRAY Description: Source of the data.
+Column name: LICENSE_URL Type: ARRAY Description: Array of URLs that provide the licensing for the data sources in this table.
+Column name: CREATED_DATE Type: DATE Description: Date for the table's addition to the Snowflake Marketplace.
+Column name: LISTING_NAME Type: ARRAY Description: Human-readable name of listing(s) associated with table.
+Column name: TABLE_NAME_PROPER Type: TEXT Description: Human-readable table name.
+Column name: LAST_UPDATED_TIMESTAMP Type: TIMESTAMP_TZ Description: Timestamp for the table's last update or modification.
+Column name: DESCRIPTION Type: TEXT Description: Details on the source of the data, the table, and what is included in the table.
+Column name: TABLE_TYPE Type: TEXT Description: Cybersyn table type as part of the unified schema.
+Column name: SELECT_RELATED_TABLES Type: ARRAY Description: Array of tables that you can join based on the entity and variable relationships; not an exhaustive list.
+Column name: DOCUMENTATION_URL Type: TEXT Description: URL of the documentation associated with the table.
+Column name: SHORT_DESCRIPTION Type: TEXT Description: Summarized details on the source of the data, the table, and what is included in the table.
+Column name: DATA_SOURCE_URL Type: ARRAY Description: Array of URLs that provide the overview of each of the data sources in this table.
+Column name: ENTITIES Type: ARRAY Description: Array of entities that are included in the table.
+Column name: LISTING_URL Type: ARRAY Description: URLs of listing(s) associated with table.
+Column name: TABLE_NAME Type: TEXT Description: Machine-readable table name.
+Sample rows:
+[{'TABLE_NAME': 'aircraft_carrier_index', 'TABLE_NAME_PROPER': 'Aircraft Carrier Index', 'TABLE_TYPE': 'index', 'LISTING_URL': '[\n  "https://app.snowflake.com/marketplace/listing/GZTSZAS2KGK",\n  "https://app.snowflake.com/marketplace/listing/GZTSZ290BUX66"\n]', 'LISTING_NAME': '[\n  "Global Government",\n  "Financials & Economics: Enterprise "\n]', 'DATA_SOURCE': '[\n  "US Department of Transportation (DOT)"\n]', 'DESCRIPTION': 'The Aircraft Carrier Index table provides a list of airline carriers, including their unique identification codes, names, and key operational details.', 'ENTITIES': None, 'SELECT_RELATED_TABLES': '[\n  "us_department_of_transportation_timeseries"\n]', 'DATA_SOURCE_URL': '[\n  "https://www.bts.gov/browse-statistical-products-and-data/bts-publications/data-bank-28ds-t-100-domestic-segment-data"\n]', 'LICENSE_URL': '[\n  "https://www.transportation.gov/data"\n]', 'CREATED_DATE': '2024-07-29', 'LAST_UPDATED_TIMESTAMP': '2024-08-19 22:26:27.018000+00:00', 'DOCUMEN
+
+
+--------------------------------------------------
+Table full name: US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS
+Column name: GEO_NAME Type: TEXT Description: Full name of the place
+Column name: RELATIONSHIP_END_DATE Type: DATE Description: The date through which a given characteristic is valid. For example, if the coordinates for ZIP code 12345 changed on 2023-04-01 (i.e., on 2023-04-01 the Census Bureau released shapefiles with updated coordinates for ZIP code 12345), then relationship_end_date of 2023-03-31 is assigned to the previous coordinates for ZIP code 12345. However, currently, all the values in this column are NULL since it only contains most recent characteristics with no historical changes.
+Column name: RELATIONSHIP_START_DATE Type: DATE Description: The date from which a given characteristic is valid. For example, if the coordinates for ZIP code 12345 changed on 2023-04-01 (i.e., on 2023-04-01 the Census Bureau released shapefiles with updated coordinates for ZIP code 12345), then relationship_start_date of 2023-04-01 is assigned. However, currently, all the values in this column are NULL since it only contains most recent characteristics with no historical changes.
+Column name: GEO_ID Type: TEXT Description: A unique identifier for a place (a nation, state, zip-code, etc.) joinable to the geography index table for adding geospatial information.
+Column name: RELATIONSHIP_TYPE Type: TEXT Description: Description of the provided characteristic. For example, 'coordinates_wkt' means that VALUE contains the GEO_ID's coordinates in WKT format, while 'coordinates_geojson' means that VALUE contains the GEO_ID's coordinates in GeoJSON format.
+Column name: VALUE Type: TEXT Description: Value of the characteristic specified in RELATIONSHIP_TYPE.
+Sample rows:
+[{'GEO_ID': 'geoId/05143010510', 'GEO_NAME': 'Census Tract 105.10, Washington County, Arkansas', 'RELATIONSHIP_TYPE': 'coordinates_wkt', 'VALUE': 'POLYGON((-94.17461 36.176666,-94.1746 36.177048,-94.174579 36.177905,-94.174559 36.178831,-94.174543 36.179592,-94.174539 36.179759,-94.174533 36.179953,-94.174514 36.180624,-94.174496 36.181341,-94.174473 36.182259,-94.174448 36.183353,-94.174406 36.185023,-94.174402 36.185074,-94.174397 36.185358,-94.174385 36.185899,-94.174384 36.185951,-94.174372 36.18646,-94.174361 36.187005,-94.174345 36.187781,-94.17434 36.18803,-94.174334 36.188354,-94.174322 36.188782,-94.174304 36.189467,-94.174282 36.190322,-94.174271 36.190958,-94.174266 36.191282,-94.17424 36.192229,-94.174208 36.193162,-94.174178 36.19447,-94.174157 36.195402,-94.174136 36.196276,-94.174128 36.196596,-94.174115 36.197218,-94.174071 36.199032,-94.174057 36.199615,-94.174034 36.200423,-94.173989 36.202147,-94.173975 36.202708,-94.173957 36.203507,-94.173946 36.204002,-94.17394 36
+
+
+--------------------------------------------------
+Table full name: US_ADDRESSES__POI.CYBERSYN.POINT_OF_INTEREST_INDEX
+Column name: CATEGORY_MAIN Type: TEXT Description: Primary category or class of place for the POI.
+Column name: POI_NAME Type: TEXT Description: Name of the place, merchant, or landmark for the particular the POI.
+Column name: CATEGORY_ALTERNATE Type: ARRAY Description: Alternate categories of the POI. A POI could fit multiple categories (e.g., Restaurant, Burger Restaurant, Fast Food Restaurant), in which case one category would be recorded as CATEGORY_MAIN and the remaining categories would be recorded in a list under CATEGORY_ALTERNATE.
+Column name: POI_ID Type: TEXT Description: A unique identifier for a point of interest (such as a park, fast food chain, hotel, etc.) based on its description and location. This is joinable to the POINT_OF_INTEREST_ADDRESSES_RELATIONSHIPS table which can be used to link POIs to addresses.
+Sample rows:
+[{'POI_ID': '08f2aad4446520ec03e1f001780831d4', 'POI_NAME': 'Bk Rentals', 'CATEGORY_MAIN': 'Party Equipment Rental', 'CATEGORY_ALTERNATE': '[\n  "Party Supply",\n  "Retail"\n]'}, {'POI_ID': '08f44a112860108a03b33ba25948478f', 'POI_NAME': 'Amethyst Law Group', 'CATEGORY_MAIN': 'Lawyer', 'CATEGORY_ALTERNATE': None}, {'POI_ID': '08f2986ab4d3447503b83560c1fe48ad', 'POI_NAME': 'Iglesia Cristiana Mi Refugio', 'CATEGORY_MAIN': 'Church Cathedral', 'CATEGORY_ALTERNATE': '[\n  "Religious Organization"\n]'}, {'POI_ID': '08f2832b99aed21203072dc6cbb35c3b', 'POI_NAME': 'Jass Gardening', 'CATEGORY_MAIN': None, 'CATEGORY_ALTERNATE': None}, {'POI_ID': '08f2a33cd328310e0331f178e0caa82b', 'POI_NAME': 'Pampered By G', 'CATEGORY_MAIN': None, 'CATEGORY_ALTERNATE': None}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'US_ADDRESSES__POI': {'CYBERSYN': ['GEOGRAPHY_RELATIONSHIPS', 'POINT_OF_INTEREST_ADDRESSES_RELATIONSHIPS', 'US_ADDRESSES', 'GEOGRAPHY_INDEX', 'CYBERSYN_DATA_CATALOG', 'GEOGRAPHY_CHARACTERISTICS', 'POINT_OF_INTEREST_INDEX']}}
+Begin Exploring Related Columns
+Relevant tables / columns and why they matter  
+
+US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES  
+• "STATE": restrict rows to Florida (‘FL’)  
+• "ZIP": link every address to a 5‑digit ZIP Code  
+• "LATITUDE": rank addresses from north→south (higher latitude = farther north)  
+• "NUMBER": first part of the street address we must return  
+• "STREET": street name we must return  
+• "STREET_TYPE": street type we must return  
+
+US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX  
+• "GEO_ID", "GEO_NAME", "LEVEL": identify Florida’s state‑level GEO_ID (needed for joins)  
+
+US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS  
+• "GEO_ID": ZIP‑code (e.g., zip/32615) we want to analyse  
+• "RELATED_GEO_ID": links that ZIP to the Florida state GEO_ID (geoId/12)  
+• "LEVEL": makes sure the record we pull is a ZIP (usually “CensusZipCodeTabulationArea”)  
+
+US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS  
+• "GEO_ID": same ZIP‑code string as above  
+• "RELATIONSHIP_TYPE": want ‘coordinates_wkt’ so we can turn each ZIP polygon into a GEOGRAPHY object  
+• "VALUE": polygon WKT used to calculate surface area → find “largest ZIP area”  
+
+Typical conditions we will apply  
+• "STATE" = 'FL'                                  -- for Florida addresses  
+• "RELATIONSHIP_TYPE" = 'coordinates_wkt'         -- to obtain polygon WKT  
+• "RELATED_GEO_ID" = 'geoId/12'                   -- Florida’s state GEO_ID (verified in query #1)  
+• "GEO_ID" LIKE 'zip/%'                           -- keep only ZIP‑level polygons  
+• ORDER BY ST_AREA(...) DESC                      -- rank ZIPs by area  
+• ORDER BY "LATITUDE" DESC                        -- rank addresses north→south  
+
+
+
+10 exploratory → final Snowflake SQL queries  
+(Each returns ≤ 20 rows; all column names in double quotes.)
+
+```sql
+-- 1. Description: Confirm Florida’s state-level GEO_ID in the index table.
+SELECT 
+    "GEO_ID", 
+    "GEO_NAME", 
+    "LEVEL"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX
+WHERE "GEO_NAME" ILIKE '%Florida%' 
+  AND "LEVEL" = 'State'
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: Show a few ZIP GEO_IDs that are explicitly related to Florida.
+SELECT DISTINCT 
+    "GEO_ID",
+    "LEVEL",
+    "RELATED_GEO_ID",
+    "RELATED_GEO_NAME"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS
+WHERE "RELATED_GEO_ID" = 'geoId/12'        -- Florida
+  AND "GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: Peek at ZIP polygons (WKT) that belong to Florida to ensure they exist.
+SELECT 
+    c."GEO_ID",
+    LEFT(c."VALUE", 120) AS "WKT_SAMPLE"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: Compute area (m²) of every Florida ZIP polygon and show 20 largest.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: Isolate the single largest‑area Florida ZIP (top 1) for later use.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 1;
+```
+
+```sql
+-- 6. Description: Count how many Florida addresses fall inside each of the 20 largest ZIP areas.
+WITH big_zips AS (
+    SELECT 
+        c."GEO_ID"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID" = 'geoId/12'
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'
+    ORDER BY ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) DESC
+    LIMIT 20
+)
+SELECT 
+    SUBSTR(b."GEO_ID", 5) AS "ZIP",
+    COUNT(*)               AS "ADDRESS_CNT"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a
+JOIN big_zips b
+  ON a."ZIP" = SUBSTR(b."GEO_ID", 5)
+WHERE a."STATE" = 'FL'
+GROUP BY SUBSTR(b."GEO_ID", 5)
+ORDER BY "ADDRESS_CNT" DESC
+LIMIT 20;
+```
+
+```sql
+-- 7. Description: Display a sample of addresses inside the single largest‑area ZIP.
+--    Replace '32615' with the ZIP code found in query #5 if different.
+SELECT 
+    "ADDRESS_ID",
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "CITY",
+    "LATITUDE",
+    "LONGITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'          -- placeholder: use actual ZIP from query #5
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: Rank Florida addresses in that ZIP north → south (highest latitude first).
+--    Again, substitute correct ZIP code obtained earlier.
+SELECT 
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'
+ORDER BY "LATITUDE" DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. Description: Retrieve the 10 northernmost addresses (final answer set).
+--    Ensure ordering strictly by latitude, returning only requested columns.
+SELECT 
+    "NUMBER"       AS "ADDRESS_NUMBER",
+    "STREET"       AS "STREET_NAME",
+    "STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'           -- use largest-area ZIP found in query #5
+ORDER BY "LATITUDE" DESC
+LIMIT 10;
+```
+
+```sql
+-- 10. Description: Quick sanity‑check — confirm all 10 rows really lie inside the
+--     geometry polygon for that ZIP (geospatial containment test).
+WITH zip_poly AS (
+    SELECT 
+        ST_GEOGFROMTEXT(c."VALUE") AS "GEOG"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    WHERE c."GEO_ID" = 'zip/32615'               -- adjust to real GEO_ID
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+)
+SELECT 
+    a."NUMBER",
+    a."STREET",
+    a."STREET_TYPE",
+    a."LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a,
+     zip_poly z
+WHERE a."STATE" = 'FL'
+  AND a."ZIP" = '32615'
+  AND ST_CONTAINS(z."GEOG", ST_POINT(a."LONGITUDE", a."LATITUDE"))
+ORDER BY a."LATITUDE" DESC
+LIMIT 20;
+```
+
+Use the ZIP code surfaced in query #5 in place of the placeholder ‘32615’.  
+Query #9 returns the final list of the ten northernmost addresses (number, street name, type) inside Florida’s largest ZIP‑code area.
+Refined SQLs and results:
+Query:
+-- 1. Description: Confirm Florida’s state-level GEO_ID in the index table.
+SELECT 
+    "GEO_ID", 
+    "GEO_NAME", 
+    "LEVEL"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_INDEX
+WHERE "GEO_NAME" ILIKE '%Florida%' 
+  AND "LEVEL" = 'State'
+LIMIT 20;
+Answer:
+GEO_ID,GEO_NAME,LEVEL
+geoId/12,Florida,State
+Query:
+-- 2. Description: Show a few ZIP GEO_IDs that are explicitly related to Florida.
+SELECT DISTINCT 
+    "GEO_ID",
+    "LEVEL",
+    "RELATED_GEO_ID",
+    "RELATED_GEO_NAME"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS
+WHERE "RELATED_GEO_ID" = 'geoId/12'        -- Florida
+  AND "GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+Answer:
+GEO_ID,LEVEL,RELATED_GEO_ID,RELATED_GEO_NAME
+zip/34952,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/32444,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/32934,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/33009,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/32307,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/34234,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/34951,CensusZipCodeTabulationArea,geoId/12,Florida
+zip/34290,CensusZipCodeTabulationArea,geoId/12,Florida
+Query:
+-- 3. Description: Peek at ZIP polygons (WKT) that belong to Florida to ensure they exist.
+SELECT 
+    c."GEO_ID",
+    LEFT(c."VALUE", 120) AS "WKT_SAMPLE"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+LIMIT 20;
+Answer:
+GEO_ID,WKT_SAMPLE
+zip/32955,"POLYGON((-80.862815 28.347221,-80.86246 28.347186,-80.862104 28.34715,-80.85973 28.346914,-80.855429 28.346488,-80.85047"
+zip/32195,"POLYGON((-81.963422 28.989663,-81.963194 28.989673,-81.962731 28.989602,-81.962436 28.989587,-81.962374 28.990325,-81.96"
+zip/34222,"POLYGON((-82.552149 27.511654,-82.552125 27.511631,-82.552069 27.511629,-82.552034 27.511639,-82.551954 27.511674,-82.55"
+zip/32622,"POLYGON((-82.418617 29.923184,-82.418521 29.923435,-82.418379 29.923
+Query:
+-- 4. Description: Compute area (m²) of every Florida ZIP polygon and show 20 largest.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 20;
+Answer:
+GEO_ID,ZIP_AREA_M2
+zip/33034,3255045485.783802
+zip/34141,2576326082.2004128
+zip/34972,2245592864.2414064
+zip/33440,1900026199.6729956
+zip/34142,1652651613.538897
+zip/34266,1502915005.3350286
+zip/34739,1238625304.4574008
+zip/32344,1183627915.0865655
+zip/33982,1079388183.8556955
+zip/34974,1027365283.7272027
+zip/32060,1027162324.6894567
+zip/32321,986256792.9821653
+zip/33935,947705458.2233229
+zip/32680,924197593.9383329
+zip/32331,911404856.9332409
+zip/33898,890132423.0507332
+Query:
+-- 5. Description: Isolate the single largest‑area Florida ZIP (top 1) for later use.
+SELECT 
+    c."GEO_ID",
+    ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) AS "ZIP_AREA_M2"
+FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+  ON c."GEO_ID" = r."GEO_ID"
+WHERE r."RELATED_GEO_ID" = 'geoId/12'
+  AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+  AND c."GEO_ID" LIKE 'zip/%'
+ORDER BY "ZIP_AREA_M2" DESC
+LIMIT 1;
+Answer:
+GEO_ID,ZIP_AREA_M2
+zip/33034,3255045485.783802
+Query:
+-- 6. Description: Count how many Florida addresses fall inside each of the 20 largest ZIP areas.
+WITH big_zips AS (
+    SELECT 
+        c."GEO_ID"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID" = 'geoId/12'
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'
+    ORDER BY ST_AREA( ST_GEOGFROMTEXT(c."VALUE") ) DESC
+    LIMIT 20
+)
+SELECT 
+    SUBSTR(b."GEO_ID", 5) AS "ZIP",
+    COUNT(*)               AS "ADDRESS_CNT"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a
+JOIN big_zips b
+  ON a."ZIP" = SUBSTR(b."GEO_ID", 5)
+WHERE a."STATE" = 'FL'
+GROUP BY SUBSTR(b."GEO_ID", 5)
+ORDER BY "ADDRESS_CNT" DESC
+LIMIT 20;
+Answer:
+ZIP,ADDRESS_CNT
+33852,94906
+34266,44186
+33982,38576
+33935,35242
+34972,30736
+33440,29495
+33898,28126
+34142,20250
+34974,19612
+32680,18559
+33034,14165
+32060,10741
+33471,9518
+32344,8512
+32465,7455
+32348,6490
+32321,6341
+32331,4236
+34739,1482
+34141,340
+Query:
+-- 7. Description: Display a sample of addresses inside the single largest‑area ZIP.
+--    Replace '32615' with the ZIP code found in query #5 if different.
+SELECT 
+    "ADDRESS_ID",
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "CITY",
+    "LATITUDE",
+    "LONGITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'          -- placeholder: use actual ZIP from query #5
+LIMIT 20;
+Answer:
+ADDRESS_ID,NUMBER,STREET,STREET_TYPE,CITY,LATITUDE,LONGITUDE
+addressId/fc1cd9bd2f1ddf1e8d9eda9c548ba8e6,11117,County Rd 236,,Highspringsalachua,29.8779839,-82.4665471
+addressId/ecf66b49462e18186af41ce32cbac62a,11958,State Rd 235,,Highspringsalachua,29.8053531,-82.4749077
+addressId/bbd7ad4332b9024916df028497473559,16304,Us-441,,Alachua,29.802992,-82.5280912
+addressId/27114d850214eb467dbfeda1f9ad8f07,14923,125th,Street,Alachua,29.7919,-82.479322
+addressId/2237c6bd8295f8b49549d267a33563d1,1631
+Query:
+-- 8. Description: Rank Florida addresses in that ZIP north → south (highest latitude first).
+--    Again, substitute correct ZIP code obtained earlier.
+SELECT 
+    "NUMBER",
+    "STREET",
+    "STREET_TYPE",
+    "LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'
+ORDER BY "LATITUDE" DESC
+LIMIT 20;
+Answer:
+NUMBER,STREET,STREET_TYPE,LATITUDE
+16091,Martin Luther King,Boulevard,29.99976
+15210,Us Highway 441,,29.94833
+,Cr 241,,29.9434798
+16644,County Rd 1491,,29.9429973
+16478,County Rd 1491,,29.942991
+16120,County Rd 1491,,29.9419181
+17306,County Rd 1491,,29.9388066
+15816,County Rd 1491,,29.9369614
+16644,County Rd 1491,,29.9368751
+15816,Cr-1491,,29.9367128
+16108,County Rd 1491,,29.936398
+16628,County Rd 1491,,29.9349135
+Query:
+-- 9. Description: Retrieve the 10 northernmost addresses (final answer set).
+--    Ensure ordering strictly by latitude, returning only requested columns.
+SELECT 
+    "NUMBER"       AS "ADDRESS_NUMBER",
+    "STREET"       AS "STREET_NAME",
+    "STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES
+WHERE "STATE" = 'FL'
+  AND "ZIP" = '32615'           -- use largest-area ZIP found in query #5
+ORDER BY "LATITUDE" DESC
+LIMIT 10;
+Answer:
+ADDRESS_NUMBER,STREET_NAME,STREET_TYPE
+16091,Martin Luther King,Boulevard
+15210,Us Highway 441,
+,Cr 241,
+16644,County Rd 1491,
+16478,County Rd 1491,
+16120,County Rd 1491,
+17306,County Rd 1491,
+15816,County Rd 1491,
+16644,County Rd 1491,
+15816,Cr-1491,
+Query:
+-- 10. Description: Quick sanity‑check — confirm all 10 rows really lie inside the
+--     geometry polygon for that ZIP (geospatial containment test).
+WITH zip_poly AS (
+    SELECT 
+        ST_GEOGFROMTEXT(c."VALUE") AS "GEOG"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    WHERE c."GEO_ID" = 'zip/32615'               -- adjust to real GEO_ID
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+)
+SELECT 
+    a."NUMBER",
+    a."STREET",
+    a."STREET_TYPE",
+    a."LATITUDE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a,
+     zip_poly z
+WHERE a."STATE" = 'FL'
+  AND a."ZIP" = '32615'
+  AND ST_CONTAINS(z."GEOG", ST_POINT(a."LONGITUDE", a."LATITUDE"))
+ORDER BY a."LATITUDE" DESC
+LIMIT 20;
+Answer:
+NUMBER,STREET,STREET_TYPE,LATITUDE
+,Cr 241,,29.9434798
+16644,County Rd 1491,,29.9429973
+16478,County Rd 1491,,29.942991
+16120,County Rd 1491,,29.9419181
+17306,County Rd 1491,,29.9388066
+15816,County Rd 1491,,29.9369614
+16644,County Rd 1491,,29.9368751
+15816,Cr-1491,,29.9367128
+16108,County Rd 1491,,29.936398
+16628,County Rd 1491,,29.9349135
+16628,County Rd 1491,,29.9348067
+15704,County Rd 1491,,29.9338355
+End Exploring Related Columns
+Task: Find the top 10 northernmost addresses in Florida's largest zip code area. What are their address numbers, street names, and types?
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+travel_coordinates,cumulative_travel_distance
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'US_ADDRESSES__POI': {'CYBERSYN': ['GEOGRAPHY_RELATIONSHIPS', 'POINT_OF_INTEREST_ADDRESSES_RELATIONSHIPS', 'US_ADDRESSES', 'GEOGRAPHY_INDEX', 'CYBERSYN_DATA_CATALOG', 'GEOGRAPHY_CHARACTERISTICS', 'POINT_OF_INTEREST_INDEX']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 03:47:36 - Thread-1632 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH fl_largest_zip AS (
+    SELECT
+        SUBSTR(c."GEO_ID", 5) AS "ZIP_CODE"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS AS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS  AS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID"      = 'geoId/12'                    -- Florida
+      AND c."RELATIONSHIP_TYPE"   = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'                                 -- ZIP‑code polygons
+    ORDER BY ST_AREA(ST_GEOGFROMTEXT(c."VALUE")) DESC
+    LIMIT 1
+)
+
+SELECT
+    a."NUMBER"       AS "ADDRESS_NUMBER",
+    a."STREET"       AS "STREET_NAME",
+    a."STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES AS a
+JOIN fl_largest_zip                     AS z
+  ON a."ZIP" = z."ZIP_CODE"
+WHERE a."STATE" = 'FL'
+ORDER BY a."LATITUDE" DESC NULLS LAST, a."ADDRESS_ID"
+LIMIT 10;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:47:38 - Thread-1632 (execute) - INFO - [Executed results in self-refine]
+ADDRESS_NUMBER,STREET_NAME,STREET_TYPE
+206,3rd,Avenue
+2508,Broward,Boulevard
+1671,8th,Avenue
+,336th St & Mcminn,Road
+690,12th,Street
+,Vacant,Land
+41020,170,Street
+201,2nd,Avenue
+1328,Krome,Avenue
+601,Palm,Drive
+
+[Executed results in self-refine]
+2025-05-01 03:47:38 - Thread-1632 (execute) - INFO - itercount: 1
+2025-05-01 03:47:38 - Thread-1632 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Find the top 10 northernmost addresses in Florida's largest zip code area. What are their address numbers, street names, and types?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+travel_coordinates,cumulative_travel_distance
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+ADDRESS_NUMBER,STREET_NAME,STREET_TYPE
+206,3rd,Avenue
+2508,Broward,Boulevard
+1671,8th,Avenue
+,336th St & Mcminn,Road
+690,12th,Street
+,Vacant,Land
+41020,170,Street
+201,2nd,Avenue
+1328,Krome,Avenue
+601,Palm,Drive
+Current sql:
+WITH fl_largest_zip AS (
+    SELECT
+        SUBSTR(c."GEO_ID", 5) AS "ZIP_CODE"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS AS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS  AS r
+      ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID"      = 'geoId/12'                    -- Florida
+      AND c."RELATIONSHIP_TYPE"   = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'                                 -- ZIP‑code polygons
+    ORDER BY ST_AREA(ST_GEOGFROMTEXT(c."VALUE")) DESC
+    LIMIT 1
+)
+
+SELECT
+    a."NUMBER"       AS "ADDRESS_NUMBER",
+    a."STREET"       AS "STREET_NAME",
+    a."STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES AS a
+JOIN fl_largest_zip                     AS z
+  ON a."ZIP" = z."ZIP_CODE"
+WHERE a."STATE" = 'FL'
+ORDER BY a."LATITUDE" DESC NULLS LAST, a."ADDRESS_ID"
+LIMIT 10;
+[Self-refine]
+2025-05-01 03:48:16 - Thread-1632 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH fl_largest_zip AS (
+    SELECT
+        SUBSTR(c."GEO_ID", 5) AS "ZIP_CODE"
+    FROM US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_CHARACTERISTICS c
+    JOIN US_ADDRESSES__POI.CYBERSYN.GEOGRAPHY_RELATIONSHIPS  r
+          ON c."GEO_ID" = r."GEO_ID"
+    WHERE r."RELATED_GEO_ID"    = 'geoId/12'            -- Florida
+      AND c."RELATIONSHIP_TYPE" = 'coordinates_wkt'
+      AND c."GEO_ID" LIKE 'zip/%'
+    ORDER BY ST_AREA(ST_GEOGFROMTEXT(c."VALUE")) DESC
+    LIMIT 1
+)
+
+SELECT
+    a."NUMBER"       AS "ADDRESS_NUMBER",
+    a."STREET"       AS "STREET_NAME",
+    a."STREET_TYPE"  AS "STREET_TYPE"
+FROM US_ADDRESSES__POI.CYBERSYN.US_ADDRESSES a
+JOIN fl_largest_zip z
+  ON a."ZIP" = z."ZIP_CODE"
+WHERE a."STATE" = 'FL'
+ORDER BY a."LATITUDE" DESC NULLS LAST, a."ADDRESS_ID"
+LIMIT 10;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:48:18 - Thread-1632 (execute) - INFO - [Executed results in self-refine]
+ADDRESS_NUMBER,STREET_NAME,STREET_TYPE
+206,3rd,Avenue
+2508,Broward,Boulevard
+1671,8th,Avenue
+,336th St & Mcminn,Road
+690,12th,Street
+,Vacant,Land
+41020,170,Street
+201,2nd,Avenue
+1328,Krome,Avenue
+601,Palm,Drive
+
+[Executed results in self-refine]
+2025-05-01 03:48:18 - Thread-1632 (execute) - INFO - [Consistent results]
+ADDRESS_NUMBER,STREET_NAME,STREET_TYPE
+206,3rd,Avenue
+2508,Broward,Boulevard
+1671,8th,Avenue
+,336th St & Mcminn,Road
+690,12th,Street
+,Vacant,Land
+41020,170,Street
+201,2nd,Avenue
+1328,Krome,Avenue
+601,Palm,Drive
+
+[Consistent results]
+2025-05-01 03:48:18 - Thread-1632 (execute) - INFO - Total iteration counts: 1

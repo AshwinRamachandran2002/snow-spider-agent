@@ -1,0 +1,91 @@
+SELECT
+    channel AS "Channel",
+    "Number_of_Sessions"
+FROM (
+    SELECT
+        channel,
+        COUNT(*) AS "Number_of_Sessions"
+    FROM (
+        SELECT DISTINCT
+            t."USER_PSEUDO_ID",
+            t."EVENT_TIMESTAMP",
+            CASE
+                WHEN t."TRAFFIC_SOURCE":"medium"::STRING IS NULL OR t."TRAFFIC_SOURCE":"source"::STRING IS NULL THEN 'Unassigned'
+                WHEN LOWER(t."TRAFFIC_SOURCE":"medium"::STRING) = 'organic' 
+                     AND LOWER(t."TRAFFIC_SOURCE":"source"::STRING) IN ('google', 'bing', 'duckduckgo', 'ecosia', 'yahoo', 'baidu', 'yandex') THEN 'Organic Search'
+                WHEN LOWER(t."TRAFFIC_SOURCE":"medium"::STRING) IN ('cpc', 'ppc', 'paidsearch') 
+                     AND LOWER(t."TRAFFIC_SOURCE":"source"::STRING) IN ('google', 'bing', 'duckduckgo', 'ecosia', 'yahoo', 'baidu', 'yandex') THEN 'Paid Search'
+                WHEN LOWER(t."TRAFFIC_SOURCE":"medium"::STRING) = 'referral' THEN 'Referral'
+                WHEN LOWER(t."TRAFFIC_SOURCE":"medium"::STRING) IN ('(none)', '(not set)') 
+                     AND LOWER(t."TRAFFIC_SOURCE":"source"::STRING) = '(direct)' THEN 'Direct'
+                ELSE 'Unassigned'
+            END AS channel
+        FROM (
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201201"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201202"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201203"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201204"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201205"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201206"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201207"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201208"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201209"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201210"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201211"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201212"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201213"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201214"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201215"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201216"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201217"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201218"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201219"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201220"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201221"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201222"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201223"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201224"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201225"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201226"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201227"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201228"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201229"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201230"
+            UNION ALL
+            SELECT * FROM "GA4"."GA4_OBFUSCATED_SAMPLE_ECOMMERCE"."EVENTS_20201231"
+        ) t
+        WHERE t."EVENT_NAME" = 'session_start'
+    ) 
+    GROUP BY channel
+    ORDER BY "Number_of_Sessions" DESC NULLS LAST, channel ASC
+) 
+LIMIT 1 OFFSET 3;

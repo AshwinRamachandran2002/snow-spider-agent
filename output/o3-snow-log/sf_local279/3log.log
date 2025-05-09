@@ -1,0 +1,2381 @@
+2025-05-07 07:18:23 - Thread-740 (execute) - INFO - [Exploration]
+```sql
+--Description: 1) Look up the safety stock rules for each product
+SELECT 
+    "product_id",
+    "qty_minimum",
+    "qty_purchase"
+FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+LIMIT 20;
+```
+
+```sql
+--Description: 2) See which products actually have 2019 sales activity
+SELECT DISTINCT 
+    "product_id"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+LIMIT 20;
+```
+
+```sql
+--Description: 3) Inspect monthly sales quantities per product for 2019
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 4) Check each 2019-month’s planned replenishment (budget) lines
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 5) See December-2018 purchases (to approximate starting on-hand)
+SELECT 
+    "id"          AS "purchase_id",
+    "product_id",
+    "qty",
+    "purchased"
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES
+WHERE "purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+ORDER BY "product_id"
+LIMIT 20;
+```
+
+```sql
+--Description: 6) Aggregate on-hand quantity per product for all purchases up to 2018-12-31
+SELECT 
+    p."product_id",
+    SUM(p."qty")       AS "purchased_qty_upto_20181231"
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES        p
+WHERE p."purchased" <= '2018-12-31'
+GROUP BY p."product_id"
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Aggregate 2019 sales per product and month (negative movement)
+SELECT 
+    "product_id",
+    "mth",
+    SUM("qty")    AS "sales_qty_2019"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+GROUP BY "product_id", "mth"
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Aggregate 2019 planned purchases per product and month (positive movement)
+SELECT 
+    "product_id",
+    "mth",
+    SUM("qty") AS "budget_qty_2019"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+GROUP BY "product_id", "mth"
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 9) Generate the 12 calendar months of 2019 (helper set for a recursive model)
+SELECT 
+    DATEADD(month, SEQ4(), '2019-01-01') AS "mth"
+FROM TABLE(GENERATOR(ROWCOUNT => 12))
+LIMIT 20;
+```
+
+```sql
+--Description: 10) (One-shot) Calculate, per product, the 2019 month whose ending stock is closest to the minimum.
+--This query illustrates the complete recursive logic tying together starting inventory, sales, restocks and minimums.
+WITH
+    start_inv AS (                              -- inventory as of 2018-12-31
+        SELECT 
+            p."product_id",
+            COALESCE(SUM(p."qty"),0) AS "opening_qty"
+        FROM ORACLE_SQL.ORACLE_SQL.PURCHASES p
+        WHERE p."purchased" <= '2018-12-31'
+        GROUP BY p."product_id"
+    ),
+    cal AS (                                    -- the 12 months in order
+        SELECT 
+            DATEADD(month, SEQ4(), '2019-01-01')::DATE AS "mth"
+        FROM TABLE(GENERATOR(ROWCOUNT => 12))
+    ),
+    sales AS (                                  -- 2019 sales per product & month
+        SELECT 
+            "product_id",
+            "mth"::DATE   AS "mth",
+            SUM("qty")    AS "sales_qty"
+        FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+        WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+        GROUP BY "product_id", "mth"
+    ),
+    budgets AS (                                -- 2019 planned purchases
+        SELECT 
+            "product_id",
+            "mth"::DATE  AS "mth",
+            SUM("qty")   AS "buy_qty"
+        FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+        WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+        GROUP BY "product_id", "mth"
+    ),
+    min_rules AS (                              -- minimum / restock rules
+        SELECT 
+            "product_id",
+            "qty_minimum",
+            "qty_purchase"
+        FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+    ),
+    all_products AS (                           -- make sure every product appears in every month row
+        SELECT DISTINCT s."product_id" FROM sales s
+        UNION
+        SELECT DISTINCT b."product_id" FROM budgets b
+        UNION
+        SELECT DISTINCT m."product_id" FROM min_rules m
+    ),
+/* -------------  recursive inventory walk ------------- */
+    inv_by_month AS (
+        SELECT      -- anchor for January 2019
+            p."product_id",
+            c."mth",
+            si."opening_qty"                             AS "opening_qty",
+            COALESCE(b."buy_qty",0)                      AS "planned_buy",
+            0                                            AS "restock_qty",          -- evaluated later
+            COALESCE(s."sales_qty",0)                    AS "sales_qty",
+            NULL::FLOAT                                  AS "closing_qty"           -- evaluated later
+        FROM all_products     p
+        CROSS JOIN (SELECT * FROM cal WHERE "mth" = '2019-01-01') c
+        LEFT  JOIN start_inv  si ON si."product_id" = p."product_id"
+        LEFT  JOIN sales      s  ON s."product_id"      = p."product_id" AND s."mth" = c."mth"
+        LEFT  JOIN budgets    b  ON b."product_id"      = p."product_id" AND b."mth" = c."mth"
+
+        UNION ALL
+
+        SELECT      -- subsequent months pick prior closing balance
+            curr."product_id",
+            c."mth",
+            prev."closing_qty"                          AS "opening_qty",
+            COALESCE(b."buy_qty",0)                     AS "planned_buy",
+            0                                           AS "restock_qty",
+            COALESCE(s."sales_qty",0)                   AS "sales_qty",
+            NULL::FLOAT                                 AS "closing_qty"
+        FROM inv_by_month         prev
+        JOIN all_products         curr  ON curr."product_id" = prev."product_id"
+        JOIN cal                  c     ON c."mth"           = DATEADD(month,1,prev."mth")
+        LEFT JOIN sales           s     ON s."product_id"    = curr."product_id" AND s."mth" = c."mth"
+        LEFT JOIN budgets         b     ON b."product_id"    = curr."product_id" AND b."mth" = c."mth"
+        WHERE c."mth" <= '2019-12-01'
+    ),
+    calc AS (               -- work out closing stock + triggered restocks
+        SELECT 
+            m.*,
+            r."qty_minimum",
+            r."qty_purchase",
+            CASE 
+                WHEN (m."opening_qty" + m."planned_buy" - m."sales_qty") < r."qty_minimum"
+                     THEN r."qty_purchase"
+                     ELSE 0
+            END                                       AS "restock_qty_final",
+            (m."opening_qty" + m."planned_buy" - m."sales_qty" + 
+                 CASE WHEN (m."opening_qty" + m."planned_buy" - m."sales_qty") < r."qty_minimum"
+                          THEN r."qty_purchase" ELSE 0 END)              AS "closing_qty_final"
+        FROM inv_by_month m
+        JOIN min_rules   r ON r."product_id" = m."product_id"
+    ),
+    want AS (            -- distance to minimum each month
+        SELECT
+            "product_id",
+            "mth",
+            ABS("closing_qty_final" - "qty_minimum") AS "abs_diff"
+        FROM calc
+    ),
+    ranked AS (          -- take the month with the smallest absolute difference
+        SELECT 
+            w.*,
+            ROW_NUMBER() OVER (PARTITION BY "product_id" ORDER BY "abs_diff", "mth") AS rn
+        FROM want w
+    )
+SELECT 
+    "product_id",
+    "mth"     AS "closest_month",
+    "abs_diff"::NUMBER(10,2)  AS "smallest_gap_to_min"
+FROM ranked
+WHERE rn = 1
+ORDER BY "product_id"
+LIMIT 20;
+```
+[Exploration]
+2025-05-07 07:18:23 - Thread-740 (execute) - INFO - [Try to execute]
+--Description: 1) Look up the safety stock rules for each product
+SELECT 
+    "product_id",
+    "qty_minimum",
+    "qty_purchase"
+FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:18:24 - Thread-740 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1) Look up the safety stock rules for each product
+SELECT 
+    "product_id",
+    "qty_minimum",
+    "qty_purchase"
+FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+LIMIT 20;
+Results:
+product_id,qty_minimum,qty_purchase
+6520,100.0,400.0
+6600,30.0,100.0
+
+[Successfully executed]
+2025-05-07 07:18:24 - Thread-740 (execute) - INFO - [Try to execute]
+--Description: 2) See which products actually have 2019 sales activity
+SELECT DISTINCT 
+    "product_id"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:18:24 - Thread-740 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-07 07:19:31 - Thread-740 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Our 2019-filtered query returned nothing, so first confirm which calendar years actually exist in the 
+--"MONTHLY_SALES" table.  By extracting the first four characters of each "mth" value we can list the distinct years 
+--present and their row counts; this will tell us whether 2019 data is missing altogether or if a date-format mismatch 
+--is the culprit.
+SELECT 
+    SUBSTR("mth",1,4) AS "year",
+    COUNT(*)          AS "row_count"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+GROUP BY SUBSTR("mth",1,4)
+ORDER BY "year";
+```
+[Corrected SQL]
+2025-05-07 07:19:31 - Thread-740 (execute) - INFO - [Results for corrected sql]
+year,row_count
+2016,120
+2017,120
+2018,120
+
+[Results for corrected sql]
+2025-05-07 07:22:26 - Thread-740 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 3) Inspect monthly sales quantities per product for ALL years (date filter removed so rows are guaranteed)
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 4) Check planned replenishment (budget) lines – use 2018, the year present in sample data
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2018-01-01' AND '2018-12-31'
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 5) See purchases for December 2016 (sample data year) instead of 2018
+SELECT 
+    "id"          AS "purchase_id",
+    "product_id",
+    "qty",
+    "purchased"
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES
+WHERE "purchased" BETWEEN '2016-12-01' AND '2016-12-31'
+ORDER BY "product_id"
+LIMIT 20;
+```
+
+```sql
+--Description: 6) Aggregate on-hand quantity per product for all purchases up to 2016-12-31
+SELECT 
+    p."product_id",
+    SUM(p."qty") AS "purchased_qty_upto_20161231"
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES p
+WHERE p."purchased" <= '2016-12-31'
+GROUP BY p."product_id"
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Aggregate 2016 sales per product and month (the only sales year in sample rows)
+SELECT 
+    "product_id",
+    "mth",
+    SUM("qty") AS "sales_qty_2016"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+WHERE "mth" BETWEEN '2016-01-01' AND '2016-12-31'
+GROUP BY "product_id", "mth"
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Aggregate 2018 planned purchases per product and month (matches MONTHLY_BUDGET sample)
+SELECT 
+    "product_id",
+    "mth",
+    SUM("qty") AS "budget_qty_2018"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2018-01-01' AND '2018-12-31'
+GROUP BY "product_id", "mth"
+ORDER BY "product_id", "mth"
+LIMIT 20;
+```
+
+```sql
+--Description: 9) Generate the 12 calendar months of 2016 (helper set for a recursive model built on actual sales year)
+SELECT 
+    DATEADD(month, SEQ4(), '2016-01-01') AS "mth"
+FROM TABLE(GENERATOR(ROWCOUNT => 12))
+LIMIT 20;
+```
+
+```sql
+--Description: 10) One-shot inventory walk now anchored to 2016 (year with sales).  
+--Rest of logic unchanged, but dates adjusted to 2016 to ensure data presence.
+WITH
+    start_inv AS (
+        SELECT 
+            p."product_id",
+            COALESCE(SUM(p."qty"),0) AS "opening_qty"
+        FROM ORACLE_SQL.ORACLE_SQL.PURCHASES p
+        WHERE p."purchased" <= '2015-12-31'
+        GROUP BY p."product_id"
+    ),
+    cal AS (
+        SELECT DATEADD(month, SEQ4(), '2016-01-01')::DATE AS "mth"
+        FROM TABLE(GENERATOR(ROWCOUNT => 12))
+    ),
+    sales AS (
+        SELECT 
+            "product_id",
+            "mth"::DATE AS "mth",
+            SUM("qty")  AS "sales_qty"
+        FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+        WHERE "mth" BETWEEN '2016-01-01' AND '2016-12-31'
+        GROUP BY "product_id", "mth"
+    ),
+    budgets AS (           -- keep 2016 even if mostly zero
+        SELECT 
+            "product_id",
+            "mth"::DATE AS "mth",
+            SUM("qty")  AS "buy_qty"
+        FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+        WHERE "mth" BETWEEN '2016-01-01' AND '2016-12-31'
+        GROUP BY "product_id", "mth"
+    ),
+    min_rules AS (
+        SELECT 
+            "product_id",
+            "qty_minimum",
+            "qty_purchase"
+        FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+    ),
+    all_products AS (
+        SELECT DISTINCT s."product_id" FROM sales s
+        UNION
+        SELECT DISTINCT b."product_id" FROM budgets b
+        UNION
+        SELECT DISTINCT m."product_id" FROM min_rules m
+    ),
+    inv_by_month AS (
+        SELECT
+            p."product_id",
+            c."mth",
+            si."opening_qty",
+            COALESCE(b."buy_qty",0) AS "planned_buy",
+            COALESCE(s."sales_qty",0) AS "sales_qty"
+        FROM all_products p
+        CROSS JOIN (SELECT * FROM cal WHERE "mth" = '2016-01-01') c
+        LEFT JOIN start_inv si ON si."product_id" = p."product_id"
+        LEFT JOIN sales     s  ON s."product_id" = p."product_id" AND s."mth" = c."mth"
+        LEFT JOIN budgets   b  ON b."product_id" = p."product_id" AND b."mth" = c."mth"
+        UNION ALL
+        SELECT
+            prev."product_id",
+            c."mth",
+            prev_closing."closing_qty_final" AS "opening_qty",
+            COALESCE(b."buy_qty",0),
+            COALESCE(s."sales_qty",0)
+        FROM inv_by_month prev
+        JOIN all_products ap          ON ap."product_id" = prev."product_id"
+        JOIN cal         c            ON c."mth" = DATEADD(month,1,prev."mth")
+        LEFT JOIN sales  s            ON s."product_id" = ap."product_id" AND s."mth" = c."mth"
+        LEFT JOIN budgets b           ON b."product_id" = ap."product_id" AND b."mth" = c."mth"
+        JOIN LATERAL (                -- compute closing of prior month to feed forward
+            SELECT
+                CASE 
+                    WHEN (prev."opening_qty" + prev."planned_buy" - prev."sales_qty") 
+                         < mr."qty_minimum" THEN 
+                         (prev."opening_qty" + prev."planned_buy" - prev."sales_qty") 
+                         + mr."qty_purchase"
+                    ELSE
+                         (prev."opening_qty" + prev."planned_buy" - prev."sales_qty")
+                END AS "closing_qty_final"
+            FROM min_rules mr
+            WHERE mr."product_id" = prev."product_id"
+        ) prev_closing
+        WHERE c."mth" <= '2016-12-01'
+    ),
+    calc AS (
+        SELECT
+            ibm.*,
+            mr."qty_minimum",
+            mr."qty_purchase",
+            CASE
+                WHEN (ibm."opening_qty" + ibm."planned_buy" - ibm."sales_qty") < mr."qty_minimum"
+                     THEN mr."qty_purchase"
+                     ELSE 0
+            END AS "restock_qty",
+            (ibm."opening_qty" + ibm."planned_buy" - ibm."sales_qty"
+             + CASE
+                   WHEN (ibm."opening_qty" + ibm."planned_buy" - ibm."sales_qty") < mr."qty_minimum"
+                   THEN mr."qty_purchase" ELSE 0 END) AS "closing_qty_final"
+        FROM inv_by_month ibm
+        JOIN min_rules  mr ON mr."product_id" = ibm."product_id"
+    ),
+    ranked AS (
+        SELECT
+            "product_id",
+            "mth",
+            ABS("closing_qty_final" - "qty_minimum") AS "abs_diff",
+            ROW_NUMBER() OVER (PARTITION BY "product_id" 
+                               ORDER BY ABS("closing_qty_final" - "qty_minimum"), "mth") AS rn
+        FROM calc
+    )
+SELECT
+    "product_id",
+    "mth"       AS "closest_month",
+    "abs_diff"  AS "smallest_gap_to_min"
+FROM ranked
+WHERE rn = 1
+ORDER BY "product_id"
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-07 07:22:26 - Thread-740 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Our 2019-filtered query returned nothing, so first confirm which calendar years actually exist in the 
+--"MONTHLY_SALES" table.  By extracting the first four characters of each "mth" value we can list the distinct years 
+--present and their row counts; this will tell us whether 2019 data is missing altogether or if a date-format mismatch 
+--is the culprit.
+SELECT 
+    SUBSTR("mth",1,4) AS "year",
+    COUNT(*)          AS "row_count"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+GROUP BY SUBSTR("mth",1,4)
+ORDER BY "year";
+Results:
+year,row_count
+2016,120
+2017,120
+2018,120
+
+[Successfully corrected]
+2025-05-07 07:22:26 - Thread-740 (execute) - INFO - [Try to execute]
+--Description: 3) Inspect monthly sales quantities per product for ALL years (date filter removed so rows are guaranteed)
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+ORDER BY "product_id", "mth"
+LIMIT 20
+[Try to execute]
+2025-05-07 07:22:27 - Thread-740 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3) Inspect monthly sales quantities per product for ALL years (date filter removed so rows are guaranteed)
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+ORDER BY "product_id", "mth"
+LIMIT 20
+Results:
+product_id,mth,qty
+4040,2016-01-01,42
+4040,2016-02-01,37
+4040,2016-03-01,39
+4040,2016-04-01,22
+4040,2016-05-01,11
+4040,2016-06-01,6
+4040,2016-07-01,7
+4040,2016-08-01,14
+4040,2016-09-01,25
+4040,2016-10-01,12
+4040,2016-11-01,27
+4040,2016-12-01,44
+4040,2017-01-01,33
+4040,2017-02-01,34
+4040,2017-03-01,18
+4040,2017-04-01,19
+4040,2017-05-01,2
+4040,2017-06-01,12
+4040,2017-07-01,21
+4040,2017-08-01,8
+
+[Successfully executed]
+2025-05-07 07:22:27 - Thread-740 (execute) - INFO - [Try to execute]
+--Description: 4) Check planned replenishment (budget) lines – use 2018, the year present in sample data
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2018-01-01' AND '2018-12-31'
+ORDER BY "product_id", "mth"
+LIMIT 20
+[Try to execute]
+2025-05-07 07:22:28 - Thread-740 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4) Check planned replenishment (budget) lines – use 2018, the year present in sample data
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2018-01-01' AND '2018-12-31'
+ORDER BY "product_id", "mth"
+LIMIT 20
+Results:
+product_id,mth,qty
+6520,2018-01-01,30.0
+6520,2018-02-01,30.0
+6520,2018-03-01,30.0
+6520,2018-04-01,30.0
+6520,2018-05-01,40.0
+6520,2018-06-01,50.0
+6520,2018-07-01,50.0
+6520,2018-08-01,40.0
+6520,2018-09-01,30.0
+6520,2018-10-01,30.0
+6520,2018-11-01,30.0
+6520,2018-12-01,30.0
+6600,2018-01-01,6.0
+6600,2018-02-01,6.0
+6600,2018-03-01,6.0
+6600,2018-04-01,6.0
+6600,2018-05-01,6.0
+6600,2018-06-01,6.0
+6600,2018-07-01,6.0
+6600,2018-08-01,6.0
+
+[Successfully executed]
+2025-05-07 07:22:28 - Thread-740 (execute) - INFO - [Try to execute]
+--Description: 5) See purchases for December 2016 (sample data year) instead of 2018
+SELECT 
+    "id"          AS "purchase_id",
+    "product_id",
+    "qty",
+    "purchased"
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES
+WHERE "purchased" BETWEEN '2016-12-01' AND '2016-12-31'
+ORDER BY "product_id"
+LIMIT 20
+[Try to execute]
+2025-05-07 07:22:28 - Thread-740 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 2 at position 4\ninvalid identifier \'"id"\''}
+[Error occurred]
+2025-05-07 07:24:28 - Thread-740 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: The last query failed because "id" (lower-case) is not a case-sensitive column name in Snowflake; the actual 
+--identifier is stored in uppercase.  Re-quote each column in uppercase so the engine finds them, and pull December-2016
+--purchase activity.
+SELECT
+    "ID"          AS "purchase_id",
+    "PRODUCT_ID",
+    "QTY",
+    "PURCHASED"
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES
+WHERE "PURCHASED" BETWEEN '2016-12-01' AND '2016-12-31'
+ORDER BY "PRODUCT_ID"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:24:28 - Thread-740 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 2 at position 4\ninvalid identifier 'ID'"}
+[Results for corrected sql]
+2025-05-07 07:27:12 - Thread-740 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Quoted identifiers are case-sensitive; using "id" or "ID" failed because the column was defined
+--without quotes and therefore stored in uppercase (case-insensitive).  By omitting the quotes Snowflake resolves
+--the column automatically.  This query lists every purchase made between 1-Dec-2016 and 31-Dec-2016 so we can
+--confirm on-hand stock for that period.
+SELECT
+    id           AS purchase_id,
+    product_id,
+    qty,
+    purchased
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES
+WHERE purchased BETWEEN '2016-12-01' AND '2016-12-31'
+ORDER BY product_id
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:27:12 - Thread-740 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 2 at position 4\ninvalid identifier 'ID'"}
+[Results for corrected sql]
+2025-05-07 07:29:57 - Thread-740 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Remove double-quotes so Snowflake resolves the ordinary (case-insensitive) column names and return
+--December-2016 purchases; ordering by product_id lets us quickly review which items were bought in that period.
+SELECT
+    id            AS purchase_id,
+    product_id,
+    qty,
+    purchased
+FROM ORACLE_SQL.ORACLE_SQL.PURCHASES
+WHERE purchased BETWEEN '2016-12-01' AND '2016-12-31'
+ORDER BY product_id
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:29:58 - Thread-740 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 2 at position 4\ninvalid identifier 'ID'"}
+[Results for corrected sql]
+2025-05-07 07:29:58 - Thread-740 (execute) - INFO - itercount: 0
+2025-05-07 07:29:58 - Thread-740 (execute) - INFO - [Self-refine]
+Table full name: ORACLE_SQL.ORACLE_SQL.BREWERIES
+Column name: id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[{'id': 523, 'name': 'Happy Hoppy Hippo'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CONWAY_GEN_ZERO
+Column name: x Type: TEXT
+Column name: alive Type: TEXT
+Column name: y Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CUSTOMER_REVIEWS
+Column name: customer_id Type: NUMBER
+Column name: review_list Type: TEXT
+Sample rows:
+[{'customer_id': 50042, 'review_list': '4040:A,6600:C,7950:B'}, {'customer_id': 50741, 'review_list': '4160:A'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.EMPLOYEES
+Column name: id Type: NUMBER
+Column name: title Type: TEXT
+Column name: name Type: TEXT
+Column name: supervisor_id Type: FLOAT
+Sample rows:
+[{'id': 142, 'name': 'Harold King', 'title': 'Managing Director', 'supervisor_id': nan}, {'id': 143, 'name': 'Mogens Juel', 'title': 'IT Manager', 'supervisor_id': 147.0}, {'id': 147, 'name': 'Ursula Mwbesi', 'title': 'Operations Chief', 'supervisor_id': 142.0}, {'id': 148, 'name': 'Maria Juarez', 'title': 'Purchaser', 'supervisor_id': 144.0}, {'id': 151, 'name': 'Jim Kronzki', 'title': 'Sales Manager', 'supervisor_id': 144.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ID_NAME_COLL_TYPE
+Column name: collection_id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+Column name: mth Type: TEXT
+Column name: product_id Type: NUMBER
+Column name: qty Type: FLOAT
+Sample rows:
+[{'product_id': 6520, 'mth': '2018-02-01', 'qty': 30.0}, {'product_id': 6520, 'mth': '2018-04-01', 'qty': 30.0}, {'product_id': 6520, 'mth': '2018-05-01', 'qty': 40.0}, {'product_id': 6520, 'mth': '2018-06-01', 'qty': 50.0}, {'product_id': 6520, 'mth': '2018-07-01', 'qty': 50.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+Column name: mth Type: TEXT
+Column name: product_id Type: NUMBER
+Column name: qty Type: NUMBER
+Sample rows:
+[{'product_id': 4040, 'mth': '2016-01-01', 'qty': 42}, {'product_id': 4040, 'mth': '2016-03-01', 'qty': 39}, {'product_id': 4040, 'mth': '2016-04-01', 'qty': 22}, {'product_id': 4040, 'mth': '2016-06-01', 'qty': 6}, {'product_id': 4040, 'mth': '2016-07-01', 'qty': 7}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ORDERLINES
+Column name: order_id Type: NUMBER
+Column name: qty Type: FLOAT
+Column name: product_id Type: NUMBER
+Column name: amount Type: FLOAT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 9233, 'order_id': 422, 'product_id': 4280, 'qty': 80.0, 'amount': 1750.0}, {'id': 9234, 'order_id': 422, 'product_id': 6520, 'qty': 80.0, 'amount': 1275.0}, {'id': 9279, 'order_id': 425, 'product_id': 5310, 'qty': 40.0, 'amount': 750.0}, {'id': 9280, 'order_id': 425, 'product_id': 5430, 'qty': 60.0, 'amount': 1150.0}, {'id': 9282, 'order_id': 425, 'product_id': 6600, 'qty': 24.0, 'amount': 480.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCTS
+Column name: id Type: NUMBER
+Column name: group_id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[{'id': 4040, 'name': 'Coalminers Sweat', 'group_id': 142}, {'id': 4160, 'name': 'Reindeer Fuel', 'group_id': 142}, {'id': 4280, 'name': 'Hoppy Crude Oil', 'group_id': 142}, {'id': 5310, 'name': 'Monks and Nuns', 'group_id': 152}, {'id': 5430, 'name': 'Hercule Trippel', 'group_id': 152}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCT_GROUPS
+Column name: id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PURCHASES
+Column name: product_id Type: NUMBER
+Column name: purchased Type: TEXT
+Column name: cost Type: FLOAT
+Column name: id Type: NUMBER
+Column name: qty Type: NUMBER
+Column name: brewery_id Type: NUMBER
+Sample rows:
+[{'id': 602, 'purchased': '2016-01-03', 'brewery_id': 536, 'product_id': 4280, 'qty': 17, 'cost': 122.0}, {'id': 605, 'purchased': '2016-01-09', 'brewery_id': 523, 'product_id': 7870, 'qty': 105, 'cost': 770.0}, {'id': 607, 'purchased': '2016-02-04', 'brewery_id': 518, 'product_id': 5310, 'qty': 87, 'cost': 654.0}, {'id': 608, 'purchased': '2016-02-05', 'brewery_id': 518, 'product_id': 5430, 'qty': 52, 'cost': 360.0}, {'id': 609, 'purchased': '2016-02-06', 'brewery_id': 518, 'product_id': 6520, 'qty': 87, 'cost': 570.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.LOCATIONS
+Column name: position Type: NUMBER
+Column name: warehouse Type: NUMBER
+Column name: aisle Type: TEXT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 1, 'warehouse': 1, 'aisle': 'A', 'position': 1}, {'id': 3, 'warehouse': 1, 'aisle': 'A', 'position': 3}, {'id': 4, 'warehouse': 1, 'aisle': 'A', 'position': 4}, {'id': 6, 'warehouse': 1, 'aisle': 'A', 'position': 6}, {'id': 7, 'warehouse': 1, 'aisle': 'A', 'position': 7}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PACKAGING_RELATIONS
+Column name: qty Type: NUMBER
+Column name: packaging_id Type: NUMBER
+Column name: contains_id Type: NUMBER
+Sample rows:
+[{'packaging_id': 521, 'contains_id': 502, 'qty': 72}, {'packaging_id': 522, 'contains_id': 501, 'qty': 36}, {'packaging_id': 533, 'contains_id': 522, 'qty': 10}, {'packaging_id': 534, 'contains_id': 523, 'qty': 20}, {'packaging_id': 534, 'contains_id': 524, 'qty': 16}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_APPS
+Column name: id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[{'id': 542, 'name': 'Webshop'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_PAGES
+Column name: app_id Type: NUMBER
+Column name: page_no Type: NUMBER
+Column name: friendly_url Type: TEXT
+Sample rows:
+[{'app_id': 542, 'page_no': 1, 'friendly_url': '/Shop'}, {'app_id': 542, 'page_no': 3, 'friendly_url': '/Breweries'}, {'app_id': 542, 'page_no': 4, 'friendly_url': '/About'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CUSTOMERS
+Column name: name Type: TEXT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 51007, 'name': 'Boom Beer Bar'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CUSTOMER_FAVORITES
+Column name: customer_id Type: NUMBER
+Column name: favorite_list Type: TEXT
+Sample rows:
+[{'customer_id': 50741, 'favorite_list': '5430,7790,7870'}, {'customer_id': 51069, 'favorite_list': '6520'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ID_NAME_TYPE
+Column name: name Type: TEXT
+Column name: id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ORDERS
+Column name: delivery Type: TEXT
+Column name: id Type: NUMBER
+Column name: ordered Type: TEXT
+Column name: customer_id Type: NUMBER
+Sample rows:
+[{'id': 421, 'customer_id': 50042, 'ordered': '2019-01-15', 'delivery': ''}, {'id': 425, 'customer_id': 51069, 'ordered': '2019-02-17', 'delivery': ''}, {'id': 426, 'customer_id': 50741, 'ordered': '2019-02-26', 'delivery': ''}, {'id': 427, 'customer_id': 50042, 'ordered': '2019-03-02', 'delivery': ''}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PICKING_LOG
+Column name: log_time Type: TEXT
+Column name: pickline_no Type: FLOAT
+Column name: picklist_id Type: NUMBER
+Column name: activity Type: TEXT
+Column name: location_id Type: FLOAT
+Sample rows:
+[{'picklist_id': 841, 'log_time': '2019-01-16 14:05:44', 'activity': 'A', 'location_id': 16.0, 'pickline_no': nan}, {'picklist_id': 841, 'log_time': '2019-01-16 14:06:01', 'activity': 'D', 'location_id': 16.0, 'pickline_no': nan}, {'picklist_id': 841, 'log_time': '2019-01-16 14:06:20', 'activity': 'A', 'location_id': 29.0, 'pickline_no': nan}, {'picklist_id': 841, 'log_time': '2019-01-16 14:06:27', 'activity': 'P', 'location_id': 29.0, 'pickline_no': 2.0}, {'picklist_id': 841, 'log_time': '2019-01-16 14:07:20', 'activity': 'P', 'location_id': 77.0, 'pickline_no': 3.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+Column name: qty_purchase Type: FLOAT
+Column name: qty_minimum Type: FLOAT
+Column name: product_id Type: NUMBER
+Sample rows:
+[{'product_id': 6520, 'qty_minimum': 100.0, 'qty_purchase': 400.0}, {'product_id': 6600, 'qty_minimum': 30.0, 'qty_purchase': 100.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.STOCK
+Column name: company Type: TEXT
+Column name: symbol Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.TICKER
+Column name: price Type: FLOAT
+Column name: symbol Type: TEXT
+Column name: day Type: TEXT
+Sample rows:
+[{'symbol': 'BEER', 'day': '2019-04-02', 'price': 14.2}, {'symbol': 'BEER', 'day': '2019-04-03', 'price': 14.2}, {'symbol': 'BEER', 'day': '2019-04-04', 'price': 15.7}, {'symbol': 'BEER', 'day': '2019-04-05', 'price': 15.6}, {'symbol': 'BEER', 'day': '2019-04-08', 'price': 14.8}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PICKING_LINE
+Column name: picklist_id Type: NUMBER
+Column name: qty Type: FLOAT
+Column name: product_id Type: NUMBER
+Column name: line_no Type: NUMBER
+Column name: order_id Type: NUMBER
+Column name: location_id Type: NUMBER
+Sample rows:
+[{'picklist_id': 841, 'line_no': 1, 'location_id': 16, 'order_id': 421, 'product_id': 6520, 'qty': 42.0}, {'picklist_id': 841, 'line_no': 2, 'location_id': 29, 'order_id': 421, 'product_id': 6520, 'qty': 14.0}, {'picklist_id': 841, 'line_no': 5, 'location_id': 114, 'order_id': 421, 'product_id': 4280, 'qty': 39.0}, {'picklist_id': 841, 'line_no': 6, 'location_id': 186, 'order_id': 421, 'product_id': 6520, 'qty': 24.0}, {'picklist_id': 841, 'line_no': 7, 'location_id': 165, 'order_id': 421, 'product_id': 6520, 'qty': 14.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_COUNTER_HIST
+Column name: day Type: TEXT
+Column name: app_id Type: NUMBER
+Column name: page_no Type: NUMBER
+Column name: counter Type: NUMBER
+Sample rows:
+[{'app_id': 542, 'page_no': 1, 'day': '2019-04-05', 'counter': 5311}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-07', 'counter': 5458}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-08', 'counter': 5517}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-09', 'counter': 5580}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-10', 'counter': 5659}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CHANNELS_DIM
+Column name: name Type: TEXT
+Column name: id Type: NUMBER
+Column name: shortcut Type: TEXT
+Sample rows:
+[{'id': 42, 'name': 'Twitter', 'shortcut': 'tw'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.EMP_HIRE_PERIODS
+Column name: end_ Type: TEXT
+Column name: start_ Type: TEXT
+Column name: title Type: TEXT
+Column name: emp_id Type: NUMBER
+Sample rows:
+[{'emp_id': 142, 'start_': '2010-07-01', 'end_': '2012-04-01', 'title': 'Product Director'}, {'emp_id': 144, 'start_': '2010-07-01', 'end_': '2013-07-01', 'title': 'Sales Manager'}, {'emp_id': 144, 'start_': '2012-04-01', 'end_': '', 'title': 'Product Director'}, {'emp_id': 145, 'start_': '2014-02-01', 'end_': '', 'title': 'IT Developer'}, {'emp_id': 145, 'start_': '2019-02-01', 'end_': '', 'title': 'Scrum Master'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_DEVICES
+Column name: phone Type: NUMBER
+Column name: day Type: TEXT
+Column name: tablet Type: NUMBER
+Column name: pc Type: NUMBER
+Sample rows:
+[{'day': '2019-05-01', 'pc': 1042, 'tablet': 812, 'phone': 1610}, {'day': '2019-05-02', 'pc': 967, 'tablet': 1102, 'phone': 2159}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_DEMOGRAPHICS
+Column name: f_tw_qty Type: NUMBER
+Column name: f_fb_qty Type: NUMBER
+Column name: m_tw_cnt Type: NUMBER
+Column name: m_tw_qty Type: NUMBER
+Column name: f_fb_cnt Type: NUMBER
+Column name: f_tw_cnt Type: NUMBER
+Column name: m_fb_qty Type: NUMBER
+Column name: day Type: TEXT
+Column name: m_fb_cnt Type: NUMBER
+Sample rows:
+[{'day': '2019-05-01', 'm_tw_cnt': 1232, 'm_tw_qty': 86, 'm_fb_cnt': 1017, 'm_fb_qty': 64, 'f_tw_cnt': 651, 'f_tw_qty': 76, 'f_fb_cnt': 564, 'f_fb_qty': 68}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.FAVORITE_COLL_TYPE
+Column name: id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.GENDER_DIM
+Column name: name Type: TEXT
+Column name: letter Type: TEXT
+Sample rows:
+[{'letter': 'F', 'name': 'Female'}, {'letter': 'M', 'name': 'Male'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ID_NAME_COLL_ENTRIES
+Column name: collection_id Type: TEXT
+Column name: name Type: TEXT
+Column name: id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.INVENTORY
+Column name: location_id Type: NUMBER
+Column name: product_id Type: NUMBER
+Column name: purchase_id Type: NUMBER
+Column name: id Type: NUMBER
+Column name: qty Type: FLOAT
+Sample rows:
+[{'id': 1148, 'location_id': 244, 'product_id': 7870, 'purchase_id': 719, 'qty': 11.0}, {'id': 1151, 'location_id': 23, 'product_id': 7870, 'purchase_id': 719, 'qty': 48.0}, {'id': 1154, 'location_id': 179, 'product_id': 7950, 'purchase_id': 720, 'qty': 36.0}, {'id': 1175, 'location_id': 170, 'product_id': 7790, 'purchase_id': 724, 'qty': 48.0}, {'id': 1181, 'location_id': 185, 'product_id': 7950, 'purchase_id': 725, 'qty': 48.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PACKAGING
+Column name: name Type: TEXT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 501, 'name': 'Bottle 330cl'}, {'id': 531, 'name': 'Pallet of L'}, {'id': 532, 'name': 'Pallet of M'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PICKING_LIST
+Column name: created Type: TEXT
+Column name: id Type: NUMBER
+Column name: picker_emp_id Type: NUMBER
+Sample rows:
+[{'id': 842, 'created': '2019-01-19 15:57:42', 'picker_emp_id': 152}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_PAGE_VISITS
+Column name: client_ip Type: TEXT
+Column name: page_no Type: NUMBER
+Column name: app_id Type: NUMBER
+Column name: visit_time Type: TEXT
+Sample rows:
+[{'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:16:31', 'app_id': 542, 'page_no': 3}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:41:12', 'app_id': 542, 'page_no': 3}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:42:37', 'app_id': 542, 'page_no': 2}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:55:02', 'app_id': 542, 'page_no': 4}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 09:17:50', 'app_id': 542, 'page_no': 2}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCT_ALCOHOL
+Column name: abv Type: FLOAT
+Column name: product_id Type: NUMBER
+Column name: sales_volume Type: FLOAT
+Sample rows:
+[{'product_id': 4040, 'sales_volume': 330.0, 'abv': 8.5}, {'product_id': 4280, 'sales_volume': 330.0, 'abv': 7.0}, {'product_id': 5310, 'sales_volume': 330.0, 'abv': 5.0}, {'product_id': 5430, 'sales_volume': 330.0, 'abv': 6.5}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.SERVER_HEARTBEAT
+Column name: beat_time Type: TEXT
+Column name: server Type: TEXT
+Sample rows:
+[{'server': '10.0.0.100', 'beat_time': '2019-04-10 13:45'}, {'server': '10.0.0.100', 'beat_time': '2019-04-10 13:55'}, {'server': '10.0.0.142', 'beat_time': '2019-04-10 13:00'}, {'server': '10.0.0.142', 'beat_time': '2019-04-10 13:25'}, {'server': '10.0.0.142', 'beat_time': '2019-04-10 13:55'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'ORACLE_SQL': {'ORACLE_SQL': ['BREWERIES', 'CONWAY_GEN_ZERO', 'CUSTOMER_REVIEWS', 'EMPLOYEES', 'ID_NAME_COLL_TYPE', 'MONTHLY_BUDGET', 'MONTHLY_SALES', 'ORDERLINES', 'PRODUCTS', 'PRODUCT_GROUPS', 'PURCHASES', 'LOCATIONS', 'PACKAGING_RELATIONS', 'WEB_APPS', 'WEB_PAGES', 'CUSTOMERS', 'CUSTOMER_FAVORITES', 'ID_NAME_TYPE', 'ORDERS', 'PICKING_LOG', 'PRODUCT_MINIMUMS', 'STOCK', 'TICKER', 'PICKING_LINE', 'WEB_COUNTER_HIST', 'CHANNELS_DIM', 'EMP_HIRE_PERIODS', 'WEB_DEVICES', 'WEB_DEMOGRAPHICS', 'FAVORITE_COLL_TYPE', 'GENDER_DIM', 'ID_NAME_COLL_ENTRIES', 'INVENTORY', 'PACKAGING', 'PICKING_LIST', 'WEB_PAGE_VISITS', 'PRODUCT_ALCOHOL', 'SERVER_HEARTBEAT']}}
+
+Some few-shot examples after column exploration may be helpful:
+Query:
+--Description: 1) Look up the safety stock rules for each product
+SELECT 
+    "product_id",
+    "qty_minimum",
+    "qty_purchase"
+FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+LIMIT 20;
+Answer:
+product_id,qty_minimum,qty_purchase
+6520,100.0,400.0
+6600,30.0,100.0
+Query:
+--Description: 3) Inspect monthly sales quantities per product for ALL years (date filter removed so rows are guaranteed)
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+ORDER BY "product_id", "mth"
+LIMIT 20
+Answer:
+product_id,mth,qty
+4040,2016-01-01,42
+4040,2016-02-01,37
+4040,2016-03-01,39
+4040,2016-04-01,22
+4040,2016-05-01,11
+4040,2016-06-01,6
+4040,2016-07-01,7
+4040,2016-08-01,14
+4040,2016-09-01,25
+4040,2016-10-01,12
+4040,2016-11-01,27
+4040,2016-12-01,44
+4040,2017-01-01,33
+4040,2017-02-01,34
+4040,2017-03-01,18
+4040,2017-04-01,19
+4040,2017-05-01,2
+4040,2017-06-01,12
+4040,2017-07-01,21
+4040,2017-08-01,8
+Query:
+--Description: 4) Check planned replenishment (budget) lines – use 2018, the year present in sample data
+SELECT 
+    "product_id",
+    "mth",
+    "qty"
+FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+WHERE "mth" BETWEEN '2018-01-01' AND '2018-12-31'
+ORDER BY "product_id", "mth"
+LIMIT 20
+Answer:
+product_id,mth,qty
+6520,2018-01-01,30.0
+6520,2018-02-01,30.0
+6520,2018-03-01,30.0
+6520,2018-04-01,30.0
+6520,2018-05-01,40.0
+6520,2018-06-01,50.0
+6520,2018-07-01,50.0
+6520,2018-08-01,40.0
+6520,2018-09-01,30.0
+6520,2018-10-01,30.0
+6520,2018-11-01,30.0
+6520,2018-12-01,30.0
+6600,2018-01-01,6.0
+6600,2018-02-01,6.0
+6600,2018-03-01,6.0
+6600,2018-04-01,6.0
+6600,2018-05-01,6.0
+6600,2018-06-01,6.0
+6600,2018-07-01,6.0
+6600,2018-08-01,6.0
+Task: Using a recursive monthly inventory adjustment model starting from December 2018 inventory levels, where we restock a product if its ending inventory drops below the minimum required level, determine for each product the month in 2019 where the absolute difference between its ending inventory and the minimum required level is the smallest, and return the product_id, that month, and the absolute difference.
+
+Please think step by step and answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'ORACLE_SQL': {'ORACLE_SQL': ['BREWERIES', 'CONWAY_GEN_ZERO', 'CUSTOMER_REVIEWS', 'EMPLOYEES', 'ID_NAME_COLL_TYPE', 'MONTHLY_BUDGET', 'MONTHLY_SALES', 'ORDERLINES', 'PRODUCTS', 'PRODUCT_GROUPS', 'PURCHASES', 'LOCATIONS', 'PACKAGING_RELATIONS', 'WEB_APPS', 'WEB_PAGES', 'CUSTOMERS', 'CUSTOMER_FAVORITES', 'ID_NAME_TYPE', 'ORDERS', 'PICKING_LOG', 'PRODUCT_MINIMUMS', 'STOCK', 'TICKER', 'PICKING_LINE', 'WEB_COUNTER_HIST', 'CHANNELS_DIM', 'EMP_HIRE_PERIODS', 'WEB_DEVICES', 'WEB_DEMOGRAPHICS', 'FAVORITE_COLL_TYPE', 'GENDER_DIM', 'ID_NAME_COLL_ENTRIES', 'INVENTORY', 'PACKAGING', 'PICKING_LIST', 'WEB_PAGE_VISITS', 'PRODUCT_ALCOHOL', 'SERVER_HEARTBEAT']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-07 07:34:41 - Thread-740 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*-----------------------------------------------------------
+  Recursive monthly inventory forecast for 2019
+  – start with physical stock assumed to be the 31-Dec-2018
+    quantity found in ORACLE_SQL.ORACLE_SQL.INVENTORY
+  – for every month:   end = start – sales
+                       if end < minimum  ⇒  end := end + qty_purchase
+  – capture absolute difference to minimum and, per product,
+    keep the month where that difference is smallest
+-----------------------------------------------------------*/
+WITH
+/* 1. safety-stock rules */
+min_rules AS (
+    SELECT
+        "product_id",
+        "qty_minimum",
+        "qty_purchase"
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+
+/* 2. starting inventory (used as 31-Dec-2018 closing balance) */
+start_inv AS (
+    SELECT
+        "product_id",
+        COALESCE(SUM("qty"),0)           AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY "product_id"
+),
+
+/* 3. sales registered for 2019 (one row per product & month) */
+sales_2019 AS (
+    SELECT
+        "product_id",
+        TO_DATE("mth")                   AS mth,
+        SUM("qty")                       AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY "product_id", TO_DATE("mth")
+),
+
+/* 4. month series for the twelve months of 2019 */
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+
+/* 5. Cartesian list of every product (with min rule) and every month */
+prod_months AS (
+    SELECT
+        mr."product_id",
+        m.mth,
+        mr."qty_minimum",
+        mr."qty_purchase"
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+
+/* 6. initial (January-2019) state to seed the recursion */
+initial_state AS (
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        COALESCE(si.qty_end_2018,0)      AS start_inventory,
+        COALESCE(s19.sales_qty,0)        AS sales_qty
+    FROM prod_months          pm
+    LEFT JOIN start_inv       si  ON si."product_id" = pm."product_id"
+    LEFT JOIN sales_2019      s19 ON s19."product_id" = pm."product_id"
+                                 AND s19.mth          = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+
+/*-----------------------------------------------------------
+  7. recursive month-by-month inventory calculation
+-----------------------------------------------------------*/
+inventory_recursive AS (
+
+    /* anchor : January 2019 */
+    SELECT
+        ist."product_id",
+        ist.mth,
+        ist."qty_minimum",
+        ist."qty_purchase",
+        ist.start_inventory                  AS inventory_start,
+        ist.sales_qty,
+        CASE
+             WHEN ist.start_inventory - ist.sales_qty < ist."qty_minimum"
+             THEN ist.start_inventory - ist.sales_qty + ist."qty_purchase"
+             ELSE ist.start_inventory - ist.sales_qty
+        END                                   AS inventory_end
+    FROM initial_state ist
+
+    UNION ALL
+
+    /* recursive part : February-2019 … December-2019 */
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        ir.inventory_end                     AS inventory_start,
+        COALESCE(s19.sales_qty,0)            AS sales_qty,
+        CASE
+             WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm."qty_minimum"
+             THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm."qty_purchase"
+             ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END                                   AS inventory_end
+    FROM inventory_recursive ir
+    JOIN prod_months       pm  ON pm."product_id" = ir."product_id"
+                              AND pm.mth          = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019   s19 ON s19."product_id" = pm."product_id"
+                              AND s19.mth          = pm.mth
+),
+
+/* 8. absolute difference between ending stock and minimum */
+differences AS (
+    SELECT
+        "product_id",
+        mth,
+        ABS(inventory_end - "qty_minimum")   AS abs_diff
+    FROM inventory_recursive
+)
+
+/* 9. pick, per product, the month with the smallest deviation */
+SELECT
+    "product_id",
+    TO_CHAR(mth, 'YYYY-MM-01')               AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY "product_id"
+                           ORDER BY abs_diff ASC, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY "product_id";
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:34:42 - Thread-740 (execute) - INFO - itercount: 1
+2025-05-07 07:34:42 - Thread-740 (execute) - INFO - [Self-refine]
+Input sql:
+/*-----------------------------------------------------------
+  Recursive monthly inventory forecast for 2019
+  – start with physical stock assumed to be the 31-Dec-2018
+    quantity found in ORACLE_SQL.ORACLE_SQL.INVENTORY
+  – for every month:   end = start – sales
+                       if end < minimum  ⇒  end := end + qty_purchase
+  – capture absolute difference to minimum and, per product,
+    keep the month where that difference is smallest
+-----------------------------------------------------------*/
+WITH
+/* 1. safety-stock rules */
+min_rules AS (
+    SELECT
+        "product_id",
+        "qty_minimum",
+        "qty_purchase"
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+
+/* 2. starting inventory (used as 31-Dec-2018 closing balance) */
+start_inv AS (
+    SELECT
+        "product_id",
+        COALESCE(SUM("qty"),0)           AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY "product_id"
+),
+
+/* 3. sales registered for 2019 (one row per product & month) */
+sales_2019 AS (
+    SELECT
+        "product_id",
+        TO_DATE("mth")                   AS mth,
+        SUM("qty")                       AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY "product_id", TO_DATE("mth")
+),
+
+/* 4. month series for the twelve months of 2019 */
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+
+/* 5. Cartesian list of every product (with min rule) and every month */
+prod_months AS (
+    SELECT
+        mr."product_id",
+        m.mth,
+        mr."qty_minimum",
+        mr."qty_purchase"
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+
+/* 6. initial (January-2019) state to seed the recursion */
+initial_state AS (
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        COALESCE(si.qty_end_2018,0)      AS start_inventory,
+        COALESCE(s19.sales_qty,0)        AS sales_qty
+    FROM prod_months          pm
+    LEFT JOIN start_inv       si  ON si."product_id" = pm."product_id"
+    LEFT JOIN sales_2019      s19 ON s19."product_id" = pm."product_id"
+                                 AND s19.mth          = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+
+/*-----------------------------------------------------------
+  7. recursive month-by-month inventory calculation
+-----------------------------------------------------------*/
+inventory_recursive AS (
+
+    /* anchor : January 2019 */
+    SELECT
+        ist."product_id",
+        ist.mth,
+        ist."qty_minimum",
+        ist."qty_purchase",
+        ist.start_inventory                  AS inventory_start,
+        ist.sales_qty,
+        CASE
+             WHEN ist.start_inventory - ist.sales_qty < ist."qty_minimum"
+             THEN ist.start_inventory - ist.sales_qty + ist."qty_purchase"
+             ELSE ist.start_inventory - ist.sales_qty
+        END                                   AS inventory_end
+    FROM initial_state ist
+
+    UNION ALL
+
+    /* recursive part : February-2019 … December-2019 */
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        ir.inventory_end                     AS inventory_start,
+        COALESCE(s19.sales_qty,0)            AS sales_qty,
+        CASE
+             WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm."qty_minimum"
+             THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm."qty_purchase"
+             ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END                                   AS inventory_end
+    FROM inventory_recursive ir
+    JOIN prod_months       pm  ON pm."product_id" = ir."product_id"
+                              AND pm.mth          = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019   s19 ON s19."product_id" = pm."product_id"
+                              AND s19.mth          = pm.mth
+),
+
+/* 8. absolute difference between ending stock and minimum */
+differences AS (
+    SELECT
+        "product_id",
+        mth,
+        ABS(inventory_end - "qty_minimum")   AS abs_diff
+    FROM inventory_recursive
+)
+
+/* 9. pick, per product, the month with the smallest deviation */
+SELECT
+    "product_id",
+    TO_CHAR(mth, 'YYYY-MM-01')               AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY "product_id"
+                           ORDER BY abs_diff ASC, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY "product_id";
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 14 at position 8\ninvalid identifier \'"product_id"\''}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:36:40 - Thread-740 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH RECURSIVE
+/*-----------------------------------------------------------------
+  1. safety-stock rules
+-----------------------------------------------------------------*/
+min_rules AS (
+    SELECT
+        product_id,
+        qty_minimum,
+        qty_purchase
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+/*-----------------------------------------------------------------
+  2. physical stock on 31-Dec-2018
+-----------------------------------------------------------------*/
+start_inv AS (
+    SELECT
+        product_id,
+        COALESCE(SUM(qty),0) AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY product_id
+),
+/*-----------------------------------------------------------------
+  3. sales per product & month for the year 2019
+-----------------------------------------------------------------*/
+sales_2019 AS (
+    SELECT
+        product_id,
+        TO_DATE(mth)               AS mth,
+        SUM(qty)                   AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE mth BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY product_id, TO_DATE(mth)
+),
+/*-----------------------------------------------------------------
+  4. list of the twelve months in 2019
+-----------------------------------------------------------------*/
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+/*-----------------------------------------------------------------
+  5. cross-join every product with every month
+-----------------------------------------------------------------*/
+prod_months AS (
+    SELECT
+        mr.product_id,
+        m.mth,
+        mr.qty_minimum,
+        mr.qty_purchase
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+/*-----------------------------------------------------------------
+  6. initial state (January-2019) to seed the recursion
+-----------------------------------------------------------------*/
+initial_state AS (
+    SELECT
+        pm.product_id,
+        pm.mth,
+        pm.qty_minimum,
+        pm.qty_purchase,
+        COALESCE(si.qty_end_2018,0) AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM prod_months pm
+    LEFT JOIN start_inv  si  ON si.product_id = pm.product_id
+    LEFT JOIN sales_2019 s19 ON s19.product_id = pm.product_id
+                            AND s19.mth        = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+/*-----------------------------------------------------------------
+  7. recursive month-by-month inventory forecast
+-----------------------------------------------------------------*/
+inventory_recursive AS (
+    /* anchor : January-2019 */
+    SELECT
+        product_id,
+        mth,
+        qty_minimum,
+        qty_purchase,
+        inventory_start,
+        sales_qty,
+        CASE
+            WHEN inventory_start - sales_qty < qty_minimum
+                 THEN inventory_start - sales_qty + qty_purchase
+            ELSE inventory_start - sales_qty
+        END AS inventory_end
+    FROM initial_state
+
+    UNION ALL
+
+    /* recursion : February-2019 … December-2019 */
+    SELECT
+        pm.product_id,
+        pm.mth,
+        pm.qty_minimum,
+        pm.qty_purchase,
+        ir.inventory_end            AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty,
+        CASE
+            WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm.qty_minimum
+                 THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm.qty_purchase
+            ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END AS inventory_end
+    FROM inventory_recursive ir
+    JOIN prod_months pm
+      ON pm.product_id = ir.product_id
+     AND pm.mth        = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019 s19
+      ON s19.product_id = pm.product_id
+     AND s19.mth        = pm.mth
+),
+/*-----------------------------------------------------------------
+  8. absolute difference between ending stock and minimum
+-----------------------------------------------------------------*/
+differences AS (
+    SELECT
+        product_id,
+        mth,
+        ABS(inventory_end - qty_minimum) AS abs_diff
+    FROM inventory_recursive
+)
+/*-----------------------------------------------------------------
+  9. per product, keep the 2019 month whose ending stock
+     is closest to the safety minimum
+-----------------------------------------------------------------*/
+SELECT
+    product_id,
+    TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY product_id
+                           ORDER BY abs_diff, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY product_id;
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:36:40 - Thread-740 (execute) - INFO - itercount: 2
+2025-05-07 07:36:40 - Thread-740 (execute) - INFO - [Self-refine]
+Input sql:
+WITH RECURSIVE
+/*-----------------------------------------------------------------
+  1. safety-stock rules
+-----------------------------------------------------------------*/
+min_rules AS (
+    SELECT
+        product_id,
+        qty_minimum,
+        qty_purchase
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+/*-----------------------------------------------------------------
+  2. physical stock on 31-Dec-2018
+-----------------------------------------------------------------*/
+start_inv AS (
+    SELECT
+        product_id,
+        COALESCE(SUM(qty),0) AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY product_id
+),
+/*-----------------------------------------------------------------
+  3. sales per product & month for the year 2019
+-----------------------------------------------------------------*/
+sales_2019 AS (
+    SELECT
+        product_id,
+        TO_DATE(mth)               AS mth,
+        SUM(qty)                   AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE mth BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY product_id, TO_DATE(mth)
+),
+/*-----------------------------------------------------------------
+  4. list of the twelve months in 2019
+-----------------------------------------------------------------*/
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+/*-----------------------------------------------------------------
+  5. cross-join every product with every month
+-----------------------------------------------------------------*/
+prod_months AS (
+    SELECT
+        mr.product_id,
+        m.mth,
+        mr.qty_minimum,
+        mr.qty_purchase
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+/*-----------------------------------------------------------------
+  6. initial state (January-2019) to seed the recursion
+-----------------------------------------------------------------*/
+initial_state AS (
+    SELECT
+        pm.product_id,
+        pm.mth,
+        pm.qty_minimum,
+        pm.qty_purchase,
+        COALESCE(si.qty_end_2018,0) AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM prod_months pm
+    LEFT JOIN start_inv  si  ON si.product_id = pm.product_id
+    LEFT JOIN sales_2019 s19 ON s19.product_id = pm.product_id
+                            AND s19.mth        = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+/*-----------------------------------------------------------------
+  7. recursive month-by-month inventory forecast
+-----------------------------------------------------------------*/
+inventory_recursive AS (
+    /* anchor : January-2019 */
+    SELECT
+        product_id,
+        mth,
+        qty_minimum,
+        qty_purchase,
+        inventory_start,
+        sales_qty,
+        CASE
+            WHEN inventory_start - sales_qty < qty_minimum
+                 THEN inventory_start - sales_qty + qty_purchase
+            ELSE inventory_start - sales_qty
+        END AS inventory_end
+    FROM initial_state
+
+    UNION ALL
+
+    /* recursion : February-2019 … December-2019 */
+    SELECT
+        pm.product_id,
+        pm.mth,
+        pm.qty_minimum,
+        pm.qty_purchase,
+        ir.inventory_end            AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty,
+        CASE
+            WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm.qty_minimum
+                 THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm.qty_purchase
+            ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END AS inventory_end
+    FROM inventory_recursive ir
+    JOIN prod_months pm
+      ON pm.product_id = ir.product_id
+     AND pm.mth        = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019 s19
+      ON s19.product_id = pm.product_id
+     AND s19.mth        = pm.mth
+),
+/*-----------------------------------------------------------------
+  8. absolute difference between ending stock and minimum
+-----------------------------------------------------------------*/
+differences AS (
+    SELECT
+        product_id,
+        mth,
+        ABS(inventory_end - qty_minimum) AS abs_diff
+    FROM inventory_recursive
+)
+/*-----------------------------------------------------------------
+  9. per product, keep the 2019 month whose ending stock
+     is closest to the safety minimum
+-----------------------------------------------------------------*/
+SELECT
+    product_id,
+    TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY product_id
+                           ORDER BY abs_diff, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY product_id;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 7 at position 8\ninvalid identifier 'PRODUCT_ID'"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:39:12 - Thread-740 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*---------------------------------------------------------------
+   Recursive monthly inventory model for 2019
+----------------------------------------------------------------*/
+WITH
+/*---------------------------------------------------------------
+  1. Safety-stock rules per product
+----------------------------------------------------------------*/
+min_rules AS (
+    SELECT
+        "product_id",
+        "qty_minimum",
+        "qty_purchase"
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+/*---------------------------------------------------------------
+  2. Physical stock on 31-Dec-2018
+----------------------------------------------------------------*/
+start_inv AS (
+    SELECT
+        "product_id",
+        COALESCE(SUM("qty"),0) AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY "product_id"
+),
+/*---------------------------------------------------------------
+  3. Sales per product & month in 2019
+----------------------------------------------------------------*/
+sales_2019 AS (
+    SELECT
+        "product_id",
+        TO_DATE("mth")          AS mth,
+        SUM("qty")              AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY "product_id", TO_DATE("mth")
+),
+/*---------------------------------------------------------------
+  4. Twelve months of 2019
+----------------------------------------------------------------*/
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+/*---------------------------------------------------------------
+  5. Cartesian product (every product × every month)
+----------------------------------------------------------------*/
+prod_months AS (
+    SELECT
+        mr."product_id",
+        m.mth,
+        mr."qty_minimum",
+        mr."qty_purchase"
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+/*---------------------------------------------------------------
+  6. Initial state (Jan-2019) to seed recursion
+----------------------------------------------------------------*/
+initial_state AS (
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        COALESCE(si.qty_end_2018,0) AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM prod_months pm
+    LEFT JOIN start_inv  si  ON si."product_id" = pm."product_id"
+    LEFT JOIN sales_2019 s19 ON s19."product_id" = pm."product_id"
+                            AND s19.mth          = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+/*---------------------------------------------------------------
+  7. Recursive month-by-month inventory forecast
+----------------------------------------------------------------*/
+inventory_recursive
+(   "product_id",
+    mth,
+    "qty_minimum",
+    "qty_purchase",
+    inventory_start,
+    sales_qty,
+    inventory_end
+) AS (
+    /* Anchor – January 2019 */
+    SELECT
+        "product_id",
+        mth,
+        "qty_minimum",
+        "qty_purchase",
+        inventory_start,
+        sales_qty,
+        CASE
+            WHEN inventory_start - sales_qty < "qty_minimum"
+                 THEN inventory_start - sales_qty + "qty_purchase"
+            ELSE inventory_start - sales_qty
+        END
+    FROM initial_state
+
+    UNION ALL
+
+    /* Recursive steps – Feb-2019 … Dec-2019 */
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        ir.inventory_end               AS inventory_start,
+        COALESCE(s19.sales_qty,0)      AS sales_qty,
+        CASE
+            WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm."qty_minimum"
+                 THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm."qty_purchase"
+            ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END
+    FROM inventory_recursive ir
+    JOIN prod_months pm
+      ON pm."product_id" = ir."product_id"
+     AND pm.mth          = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019 s19
+      ON s19."product_id" = pm."product_id"
+     AND s19.mth          = pm.mth
+),
+/*---------------------------------------------------------------
+  8. Absolute difference between ending stock and minimum
+----------------------------------------------------------------*/
+differences AS (
+    SELECT
+        "product_id",
+        mth,
+        ABS(inventory_end - "qty_minimum") AS abs_diff
+    FROM inventory_recursive
+)
+/*---------------------------------------------------------------
+  9. Month in 2019 where deviation is smallest (per product)
+----------------------------------------------------------------*/
+SELECT
+    "product_id",
+    TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY "product_id"
+                           ORDER BY abs_diff, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY "product_id";
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:39:13 - Thread-740 (execute) - INFO - itercount: 3
+2025-05-07 07:39:13 - Thread-740 (execute) - INFO - [Self-refine]
+Input sql:
+/*---------------------------------------------------------------
+   Recursive monthly inventory model for 2019
+----------------------------------------------------------------*/
+WITH
+/*---------------------------------------------------------------
+  1. Safety-stock rules per product
+----------------------------------------------------------------*/
+min_rules AS (
+    SELECT
+        "product_id",
+        "qty_minimum",
+        "qty_purchase"
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+/*---------------------------------------------------------------
+  2. Physical stock on 31-Dec-2018
+----------------------------------------------------------------*/
+start_inv AS (
+    SELECT
+        "product_id",
+        COALESCE(SUM("qty"),0) AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY "product_id"
+),
+/*---------------------------------------------------------------
+  3. Sales per product & month in 2019
+----------------------------------------------------------------*/
+sales_2019 AS (
+    SELECT
+        "product_id",
+        TO_DATE("mth")          AS mth,
+        SUM("qty")              AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY "product_id", TO_DATE("mth")
+),
+/*---------------------------------------------------------------
+  4. Twelve months of 2019
+----------------------------------------------------------------*/
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+/*---------------------------------------------------------------
+  5. Cartesian product (every product × every month)
+----------------------------------------------------------------*/
+prod_months AS (
+    SELECT
+        mr."product_id",
+        m.mth,
+        mr."qty_minimum",
+        mr."qty_purchase"
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+/*---------------------------------------------------------------
+  6. Initial state (Jan-2019) to seed recursion
+----------------------------------------------------------------*/
+initial_state AS (
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        COALESCE(si.qty_end_2018,0) AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM prod_months pm
+    LEFT JOIN start_inv  si  ON si."product_id" = pm."product_id"
+    LEFT JOIN sales_2019 s19 ON s19."product_id" = pm."product_id"
+                            AND s19.mth          = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+/*---------------------------------------------------------------
+  7. Recursive month-by-month inventory forecast
+----------------------------------------------------------------*/
+inventory_recursive
+(   "product_id",
+    mth,
+    "qty_minimum",
+    "qty_purchase",
+    inventory_start,
+    sales_qty,
+    inventory_end
+) AS (
+    /* Anchor – January 2019 */
+    SELECT
+        "product_id",
+        mth,
+        "qty_minimum",
+        "qty_purchase",
+        inventory_start,
+        sales_qty,
+        CASE
+            WHEN inventory_start - sales_qty < "qty_minimum"
+                 THEN inventory_start - sales_qty + "qty_purchase"
+            ELSE inventory_start - sales_qty
+        END
+    FROM initial_state
+
+    UNION ALL
+
+    /* Recursive steps – Feb-2019 … Dec-2019 */
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        ir.inventory_end               AS inventory_start,
+        COALESCE(s19.sales_qty,0)      AS sales_qty,
+        CASE
+            WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm."qty_minimum"
+                 THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm."qty_purchase"
+            ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END
+    FROM inventory_recursive ir
+    JOIN prod_months pm
+      ON pm."product_id" = ir."product_id"
+     AND pm.mth          = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019 s19
+      ON s19."product_id" = pm."product_id"
+     AND s19.mth          = pm.mth
+),
+/*---------------------------------------------------------------
+  8. Absolute difference between ending stock and minimum
+----------------------------------------------------------------*/
+differences AS (
+    SELECT
+        "product_id",
+        mth,
+        ABS(inventory_end - "qty_minimum") AS abs_diff
+    FROM inventory_recursive
+)
+/*---------------------------------------------------------------
+  9. Month in 2019 where deviation is smallest (per product)
+----------------------------------------------------------------*/
+SELECT
+    "product_id",
+    TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY "product_id"
+                           ORDER BY abs_diff, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY "product_id";
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 17 at position 8\ninvalid identifier \'"product_id"\''}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:39:59 - Thread-740 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*------------------------------------------------------------------
+   Recursive monthly inventory model – find, for each product,
+   the 2019 month where ending stock is closest to the minimum.
+------------------------------------------------------------------*/
+WITH
+/* 1) Safety-stock rules */
+min_rules          AS (
+    SELECT product_id,
+           qty_minimum,
+           qty_purchase
+    FROM   ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+
+/* 2) Physical stock counted 31-Dec-2018 */
+start_inv          AS (
+    SELECT product_id,
+           COALESCE(SUM(qty),0)  AS qty_end_2018
+    FROM   ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP  BY product_id
+),
+
+/* 3) Sales registered during 2019 (aggregated per month) */
+sales_2019         AS (
+    SELECT product_id,
+           TO_DATE(mth)          AS mth,
+           SUM(qty)              AS sales_qty
+    FROM   ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE  mth BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP  BY product_id, TO_DATE(mth)
+),
+
+/* 4) The twelve months of 2019 */
+months_2019        AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM   TABLE(GENERATOR(ROWCOUNT => 12))
+),
+
+/* 5) Cartesian list: every (product × month) pair */
+prod_months        AS (
+    SELECT mr.product_id,
+           m.mth,
+           mr.qty_minimum,
+           mr.qty_purchase
+    FROM   min_rules mr
+           CROSS JOIN months_2019 m
+),
+
+/* 6) Initial state for recursion (January-2019) */
+initial_state      AS (
+    SELECT pm.product_id,
+           pm.mth,
+           pm.qty_minimum,
+           pm.qty_purchase,
+           COALESCE(si.qty_end_2018,0) AS inventory_start,
+           COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM   prod_months pm
+           LEFT JOIN start_inv  si  ON si.product_id = pm.product_id
+           LEFT JOIN sales_2019 s19 ON s19.product_id = pm.product_id
+                                   AND s19.mth       = pm.mth
+    WHERE  pm.mth = '2019-01-01'
+),
+
+/*--------------------------------------------------------------
+  7) Recursive month-by-month inventory projection
+--------------------------------------------------------------*/
+RECURSIVE inventory_recursive
+          (product_id, mth, qty_minimum, qty_purchase,
+           inventory_start, sales_qty, inventory_end) AS (
+
+    /* --- anchor : January-2019 --- */
+    SELECT  product_id,
+            mth,
+            qty_minimum,
+            qty_purchase,
+            inventory_start,
+            sales_qty,
+            CASE
+               WHEN inventory_start - sales_qty < qty_minimum
+               THEN inventory_start - sales_qty + qty_purchase   -- restock
+               ELSE inventory_start - sales_qty
+            END
+    FROM    initial_state
+
+    UNION ALL
+
+    /* --- recursion : February-…-December-2019 --- */
+    SELECT  pm.product_id,
+            pm.mth,
+            pm.qty_minimum,
+            pm.qty_purchase,
+            ir.inventory_end                       AS inventory_start,
+            COALESCE(s19.sales_qty,0)              AS sales_qty,
+            CASE
+               WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm.qty_minimum
+               THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm.qty_purchase
+               ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+            END
+    FROM    inventory_recursive ir
+            JOIN prod_months pm
+              ON pm.product_id = ir.product_id
+             AND pm.mth        = DATEADD(month, 1, ir.mth)
+            LEFT JOIN sales_2019 s19
+              ON s19.product_id = pm.product_id
+             AND s19.mth        = pm.mth
+),
+
+/* 8) Absolute deviation from minimum */
+differences        AS (
+    SELECT product_id,
+           mth,
+           ABS(inventory_end - qty_minimum) AS abs_diff
+    FROM   inventory_recursive
+)
+
+/* 9) Month where deviation is smallest */
+SELECT  product_id,
+        TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+        abs_diff
+FROM   (
+        SELECT d.*,
+               ROW_NUMBER() OVER (PARTITION BY product_id
+                                  ORDER BY abs_diff, mth) AS rn
+        FROM   differences d
+       )
+WHERE  rn = 1
+ORDER BY product_id;
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:40:00 - Thread-740 (execute) - INFO - itercount: 4
+2025-05-07 07:40:00 - Thread-740 (execute) - INFO - [Self-refine]
+Input sql:
+/*------------------------------------------------------------------
+   Recursive monthly inventory model – find, for each product,
+   the 2019 month where ending stock is closest to the minimum.
+------------------------------------------------------------------*/
+WITH
+/* 1) Safety-stock rules */
+min_rules          AS (
+    SELECT product_id,
+           qty_minimum,
+           qty_purchase
+    FROM   ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+
+/* 2) Physical stock counted 31-Dec-2018 */
+start_inv          AS (
+    SELECT product_id,
+           COALESCE(SUM(qty),0)  AS qty_end_2018
+    FROM   ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP  BY product_id
+),
+
+/* 3) Sales registered during 2019 (aggregated per month) */
+sales_2019         AS (
+    SELECT product_id,
+           TO_DATE(mth)          AS mth,
+           SUM(qty)              AS sales_qty
+    FROM   ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE  mth BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP  BY product_id, TO_DATE(mth)
+),
+
+/* 4) The twelve months of 2019 */
+months_2019        AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM   TABLE(GENERATOR(ROWCOUNT => 12))
+),
+
+/* 5) Cartesian list: every (product × month) pair */
+prod_months        AS (
+    SELECT mr.product_id,
+           m.mth,
+           mr.qty_minimum,
+           mr.qty_purchase
+    FROM   min_rules mr
+           CROSS JOIN months_2019 m
+),
+
+/* 6) Initial state for recursion (January-2019) */
+initial_state      AS (
+    SELECT pm.product_id,
+           pm.mth,
+           pm.qty_minimum,
+           pm.qty_purchase,
+           COALESCE(si.qty_end_2018,0) AS inventory_start,
+           COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM   prod_months pm
+           LEFT JOIN start_inv  si  ON si.product_id = pm.product_id
+           LEFT JOIN sales_2019 s19 ON s19.product_id = pm.product_id
+                                   AND s19.mth       = pm.mth
+    WHERE  pm.mth = '2019-01-01'
+),
+
+/*--------------------------------------------------------------
+  7) Recursive month-by-month inventory projection
+--------------------------------------------------------------*/
+RECURSIVE inventory_recursive
+          (product_id, mth, qty_minimum, qty_purchase,
+           inventory_start, sales_qty, inventory_end) AS (
+
+    /* --- anchor : January-2019 --- */
+    SELECT  product_id,
+            mth,
+            qty_minimum,
+            qty_purchase,
+            inventory_start,
+            sales_qty,
+            CASE
+               WHEN inventory_start - sales_qty < qty_minimum
+               THEN inventory_start - sales_qty + qty_purchase   -- restock
+               ELSE inventory_start - sales_qty
+            END
+    FROM    initial_state
+
+    UNION ALL
+
+    /* --- recursion : February-…-December-2019 --- */
+    SELECT  pm.product_id,
+            pm.mth,
+            pm.qty_minimum,
+            pm.qty_purchase,
+            ir.inventory_end                       AS inventory_start,
+            COALESCE(s19.sales_qty,0)              AS sales_qty,
+            CASE
+               WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm.qty_minimum
+               THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm.qty_purchase
+               ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+            END
+    FROM    inventory_recursive ir
+            JOIN prod_months pm
+              ON pm.product_id = ir.product_id
+             AND pm.mth        = DATEADD(month, 1, ir.mth)
+            LEFT JOIN sales_2019 s19
+              ON s19.product_id = pm.product_id
+             AND s19.mth        = pm.mth
+),
+
+/* 8) Absolute deviation from minimum */
+differences        AS (
+    SELECT product_id,
+           mth,
+           ABS(inventory_end - qty_minimum) AS abs_diff
+    FROM   inventory_recursive
+)
+
+/* 9) Month where deviation is smallest */
+SELECT  product_id,
+        TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+        abs_diff
+FROM   (
+        SELECT d.*,
+               ROW_NUMBER() OVER (PARTITION BY product_id
+                                  ORDER BY abs_diff, mth) AS rn
+        FROM   differences d
+       )
+WHERE  rn = 1
+ORDER BY product_id;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##001003 (42000): SQL compilation error:\nsyntax error line 62 at position 10 unexpected 'inventory_recursive'.\nsyntax error line 63 at position 11 unexpected 'product_id'.\nsyntax error line 64 at position 54 unexpected 'AS'."}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:41:38 - Thread-740 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*------------------------------------------------------------------
+  Recursive monthly inventory model – for each product, return the
+  2019 month whose ending stock is closest to the minimum level.
+------------------------------------------------------------------*/
+WITH RECURSIVE
+/*------------------------------------------------------------------
+  1) Safety-stock rules per product
+------------------------------------------------------------------*/
+min_rules AS (
+    SELECT
+        "product_id",
+        "qty_minimum",
+        "qty_purchase"
+    FROM ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+),
+
+/*------------------------------------------------------------------
+  2) Physical stock counted on 31-Dec-2018
+------------------------------------------------------------------*/
+start_inv AS (
+    SELECT
+        "product_id",
+        COALESCE(SUM("qty"),0) AS qty_end_2018
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY
+    GROUP BY "product_id"
+),
+
+/*------------------------------------------------------------------
+  3) Sales per product & month in 2019
+------------------------------------------------------------------*/
+sales_2019 AS (
+    SELECT
+        "product_id",
+        TO_DATE("mth")          AS mth,
+        SUM("qty")              AS sales_qty
+    FROM ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+    WHERE "mth" BETWEEN '2019-01-01' AND '2019-12-31'
+    GROUP BY "product_id", TO_DATE("mth")
+),
+
+/*------------------------------------------------------------------
+  4) All twelve months of 2019
+------------------------------------------------------------------*/
+months_2019 AS (
+    SELECT DATEADD(month, seq4(), TO_DATE('2019-01-01')) AS mth
+    FROM TABLE(GENERATOR(ROWCOUNT => 12))
+),
+
+/*------------------------------------------------------------------
+  5) Cartesian list: every (product × month) pair
+------------------------------------------------------------------*/
+prod_months AS (
+    SELECT
+        mr."product_id",
+        m.mth,
+        mr."qty_minimum",
+        mr."qty_purchase"
+    FROM min_rules mr
+    CROSS JOIN months_2019 m
+),
+
+/*------------------------------------------------------------------
+  6) Initial state for recursion (January-2019)
+------------------------------------------------------------------*/
+initial_state AS (
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        COALESCE(si.qty_end_2018,0) AS inventory_start,
+        COALESCE(s19.sales_qty,0)   AS sales_qty
+    FROM prod_months pm
+    LEFT JOIN start_inv  si  ON si."product_id" = pm."product_id"
+    LEFT JOIN sales_2019 s19 ON s19."product_id" = pm."product_id"
+                            AND s19.mth          = pm.mth
+    WHERE pm.mth = '2019-01-01'
+),
+
+/*------------------------------------------------------------------
+  7) Recursive month-by-month inventory projection
+------------------------------------------------------------------*/
+inventory_recursive (
+    product_id,
+    mth,
+    qty_minimum,
+    qty_purchase,
+    inventory_start,
+    sales_qty,
+    inventory_end
+) AS (
+    /* Anchor row – January-2019 */
+    SELECT
+        product_id,
+        mth,
+        qty_minimum,
+        qty_purchase,
+        inventory_start,
+        sales_qty,
+        CASE
+            WHEN inventory_start - sales_qty < qty_minimum
+            THEN inventory_start - sales_qty + qty_purchase   -- restock
+            ELSE inventory_start - sales_qty
+        END
+    FROM initial_state
+
+    UNION ALL
+
+    /* Recursive part – February-…-December-2019 */
+    SELECT
+        pm."product_id",
+        pm.mth,
+        pm."qty_minimum",
+        pm."qty_purchase",
+        ir.inventory_end                     AS inventory_start,
+        COALESCE(s19.sales_qty,0)            AS sales_qty,
+        CASE
+            WHEN ir.inventory_end - COALESCE(s19.sales_qty,0) < pm."qty_minimum"
+            THEN ir.inventory_end - COALESCE(s19.sales_qty,0) + pm."qty_purchase"
+            ELSE ir.inventory_end - COALESCE(s19.sales_qty,0)
+        END
+    FROM inventory_recursive ir
+    JOIN prod_months pm
+      ON pm."product_id" = ir.product_id
+     AND pm.mth          = DATEADD(month, 1, ir.mth)
+    LEFT JOIN sales_2019 s19
+      ON s19."product_id" = pm."product_id"
+     AND s19.mth          = pm.mth
+),
+
+/*------------------------------------------------------------------
+  8) Absolute deviation from minimum
+------------------------------------------------------------------*/
+differences AS (
+    SELECT
+        product_id,
+        mth,
+        ABS(inventory_end - qty_minimum) AS abs_diff
+    FROM inventory_recursive
+)
+
+/*------------------------------------------------------------------
+  9) Select, per product, the month with smallest deviation
+------------------------------------------------------------------*/
+SELECT
+    product_id,
+    TO_CHAR(mth, 'YYYY-MM-01') AS month_2019,
+    abs_diff
+FROM (
+    SELECT
+        d.*,
+        ROW_NUMBER() OVER (PARTITION BY product_id
+                           ORDER BY abs_diff, mth) AS rn
+    FROM differences d
+)
+WHERE rn = 1
+ORDER BY product_id;
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:41:38 - Thread-740 (execute) - INFO - Total iteration counts: 5
+2025-05-07 07:41:38 - Thread-740 (execute) - INFO - Max Iter, remove file

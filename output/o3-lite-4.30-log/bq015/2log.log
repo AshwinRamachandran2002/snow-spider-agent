@@ -1,0 +1,521 @@
+2025-05-01 04:11:01 - Thread-15 (execute) - INFO - [Answer format]
+```csv
+tag,mention_count
+```
+[Answer format]
+2025-05-01 04:12:48 - Thread-15 (execute) - INFO - [Exploration]
+Relevant columns / how they might help  
+
+• `comments.text` or `commentsV2.text` : free‑form comment body – a Stack Overflow question URL will appear here.  
+• `comments.time_ts` or `commentsV2.timestamp` : filter to comments “on or after 2014‑01‑01”.  
+• `comments.id` / `commentsV2.id` : comment id – used only for inspection.  
+• `full_partition_extra.url` : the canonical URL stored with a Hacker News item. Some of those items are Stack Overflow questions that were submitted to HN as stories; these rows also contain…  
+• `full_partition_extra.tags` : ARRAY<STRING> containing the Stack Overflow tag string (pipe‑delimited).  
+• `full_partition_extra.type` : identify rows that are stories ( `type = 'story'` ).  
+• `full_partition_extra.timestamp` : used to restrict the window to ≥ 2014 as well.  
+
+Typical conditions we will need  
+
+•  Only comments from 2014‑01‑01 onward    
+   `WHERE time_ts >= '2014-01-01'`  
+
+•  Only comments that reference a Stack Overflow question    
+   `AND LOWER(text) LIKE '%stackoverflow.com/questions/%'`  
+
+•  Only HN stories that point to Stack Overflow questions and therefore include the tag string  
+   `WHERE LOWER(url) LIKE '%stackoverflow.com/questions/%'`  
+
+Below are ten exploratory / progressive SQL snippets (LIMIT 20 each) that one could run in BigQuery to understand the data and arrive at the final result. Replace or remove the final LIMIT in real production queries.
+
+```sql
+-- 1. Peek at 20 post‑2013 comments that mention a Stack Overflow question
+SELECT id, time_ts, by, text
+FROM   `fh-bigquery.hackernews.comments`
+WHERE  time_ts >= '2014-01-01'
+  AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT  20;
+```
+
+```sql
+-- 2. Same inspection but using the newer commentsV2 table
+SELECT id, timestamp, by, text
+FROM   `fh-bigquery.hackernews.commentsV2`
+WHERE  timestamp >= '2014-01-01'
+  AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT  20;
+```
+
+```sql
+-- 3. Extract Stack Overflow question id from comment text
+--    (looks for ".../questions/<digits>/")
+SELECT
+  REGEXP_EXTRACT(LOWER(text),
+                 r'/questions/([0-9]+)') AS so_qid,
+  COUNT(*) AS times_mentioned
+FROM   `fh-bigquery.hackernews.comments`
+WHERE  time_ts >= '2014-01-01'
+  AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+GROUP BY so_qid
+ORDER BY times_mentioned DESC
+LIMIT 20;
+```
+
+```sql
+-- 4. Same extraction using commentsV2
+SELECT
+  REGEXP_EXTRACT(LOWER(text),
+                 r'/questions/([0-9]+)') AS so_qid,
+  COUNT(*) AS times_mentioned
+FROM   `fh-bigquery.hackernews.commentsV2`
+WHERE  timestamp >= '2014-01-01'
+  AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+GROUP BY so_qid
+ORDER BY times_mentioned DESC
+LIMIT 20;
+```
+
+```sql
+-- 5. Combine both comment tables, deduplicate, count mentions
+WITH mentions AS (
+  SELECT REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM   `fh-bigquery.hackernews.comments`
+  WHERE  time_ts >= '2014-01-01'
+    AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+  UNION ALL
+  SELECT REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM   `fh-bigquery.hackernews.commentsV2`
+  WHERE  timestamp >= '2014-01-01'
+    AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+)
+SELECT so_qid, COUNT(*) AS times_mentioned
+FROM   mentions
+GROUP  BY so_qid
+ORDER  BY times_mentioned DESC
+LIMIT 20;
+```
+
+```sql
+-- 6. Preview HN stories that are actually Stack Overflow questions
+SELECT id, url, tags
+FROM   `fh-bigquery.hackernews.full_partition_extra`
+WHERE  type = 'story'
+  AND  LOWER(url) LIKE '%stackoverflow.com/questions/%'
+  AND  timestamp >= '2014-01-01'
+LIMIT 20;
+```
+
+```sql
+-- 7. Extract Stack Overflow question id and the raw tag string
+SELECT
+  REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+  ARRAY_TO_STRING(tags, '|')                AS tag_str
+FROM   `fh-bigquery.hackernews.full_partition_extra`
+WHERE  type = 'story'
+  AND  LOWER(url) LIKE '%stackoverflow.com/questions/%'
+  AND  timestamp >= '2014-01-01'
+LIMIT 20;
+```
+
+```sql
+-- 8. Join comment mentions with story rows so we can attach tag_str
+WITH mentions AS (
+  SELECT REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid,
+         COUNT(*) AS times_mentioned
+  FROM   `fh-bigquery.hackernews.comments`
+  WHERE  time_ts >= '2014-01-01'
+    AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+  GROUP  BY so_qid
+)
+SELECT m.so_qid, m.times_mentioned, s.tag_str
+FROM   mentions AS m
+JOIN (
+  SELECT REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+         ARRAY_TO_STRING(tags, '|') AS tag_str
+  FROM   `fh-bigquery.hackernews.full_partition_extra`
+  WHERE  type = 'story'
+    AND  LOWER(url) LIKE '%stackoverflow.com/questions/%'
+) AS s
+USING (so_qid)
+LIMIT 20;
+```
+
+```sql
+-- 9. Split tag_str, explode into individual tags, weight by times_mentioned
+WITH mentions AS (
+  SELECT REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid,
+         COUNT(*) AS times_mentioned
+  FROM   `fh-bigquery.hackernews.comments`
+  WHERE  time_ts >= '2014-01-01'
+    AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+  GROUP  BY so_qid
+),
+so_tags AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+    ARRAY_TO_STRING(tags, '|') AS tag_str
+  FROM   `fh-bigquery.hackernews.full_partition_extra`
+  WHERE  type = 'story'
+    AND  LOWER(url) LIKE '%stackoverflow.com/questions/%'
+)
+SELECT
+  tag,
+  SUM(times_mentioned) AS total_mentions
+FROM   (
+  SELECT
+    m.times_mentioned,
+    SPLIT(t.tag_str, '|') AS tag_arr
+  FROM   mentions AS m
+  JOIN   so_tags  AS t USING (so_qid)
+), UNNEST(tag_arr) AS tag
+GROUP BY tag
+ORDER BY total_mentions DESC
+LIMIT 20;
+```
+
+```sql
+-- 10. Final query: top‑10 Stack Overflow tags mentioned in HN comments (≥2014)
+WITH comments_unified AS (
+  SELECT REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM   `fh-bigquery.hackernews.comments`
+  WHERE  time_ts >= '2014-01-01'
+    AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+  UNION ALL
+  SELECT REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM   `fh-bigquery.hackernews.commentsV2`
+  WHERE  timestamp >= '2014-01-01'
+    AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+),
+mention_counts AS (
+  SELECT so_qid, COUNT(*) AS times_mentioned
+  FROM   comments_unified
+  GROUP  BY so_qid
+),
+question_tags AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+    ARRAY_TO_STRING(tags, '|') AS tag_str
+  FROM   `fh-bigquery.hackernews.full_partition_extra`
+  WHERE  type = 'story'
+    AND  LOWER(url) LIKE '%stackoverflow.com/questions/%'
+)
+SELECT
+  tag,
+  SUM(times_mentioned) AS total_mentions
+FROM  (
+  SELECT
+    mc.times_mentioned,
+    SPLIT(qt.tag_str, '|') AS tag_arr
+  FROM   mention_counts AS mc
+  JOIN   question_tags  AS qt USING (so_qid)
+), UNNEST(tag_arr) AS tag
+GROUP BY tag
+ORDER BY total_mentions DESC
+LIMIT 10;
+```
+
+These 10 queries incrementally explore the needed data, culminating in a query that delivers the requested “top 10 Stack Overflow tags most often referenced in Hacker News comments since 2014”.
+[Exploration]
+2025-05-01 04:12:48 - Thread-15 (execute) - INFO - [Try to execute]
+-- 1. Peek at 20 post‑2013 comments that mention a Stack Overflow question
+SELECT id, time_ts, by, text
+FROM   `fh-bigquery.hackernews.comments`
+WHERE  time_ts >= '2014-01-01'
+  AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT  20;
+[Try to execute]
+2025-05-01 04:12:49 - Thread-15 (execute) - INFO - [Error occurred]
+400 Syntax error: Expected end of input but got keyword BY at [2:21]; reason: invalidQuery, location: query, message: Syntax error: Expected end of input but got keyword BY at [2:21]
+
+Location: US
+Job ID: 05af90b4-56e5-4d30-8c97-54cd9b037719
+
+[Error occurred]
+2025-05-01 04:13:52 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: We want to preview 20 Hacker News comments that reference Stack Overflow questions, 
+-- restricted to comments posted on or after 2014‑01‑01.  
+-- 1) Use `fh-bigquery.hackernews.comments` (original comments table).  
+-- 2) Filter by date with `time_ts >= '2014-01-01'`.  
+-- 3) Detect SO links by searching the comment text for the substring 
+--    "stackoverflow.com/questions/"; apply LOWER() to make the match case‑insensitive.  
+-- 4) The column name `by` is a reserved keyword, so wrap it in back‑ticks to avoid a syntax error.  
+-- 5) LIMIT 20 for a quick look.
+
+SELECT
+  id,
+  time_ts,
+  `by`,
+  text
+FROM `fh-bigquery.hackernews.comments`
+WHERE time_ts >= '2014-01-01'
+  AND LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 04:13:54 - Thread-15 (execute) - INFO - [Results for corrected sql]
+403 Access Denied: Table fh-bigquery:hackernews.comments: User does not have permission to query table fh-bigquery:hackernews.comments, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table fh-bigquery:hackernews.comments: User does not have permission to query table fh-bigquery:hackernews.comments, or perhaps it does not exist.
+
+Location: US
+Job ID: 5d9e2cc5-ef82-4908-b377-ebb7f21c1de0
+
+[Results for corrected sql]
+2025-05-01 04:15:29 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- We need one final query that answers: “Which ten Stack Overflow tags are associated with
+-- the questions most frequently mentioned in Hacker News comments since 2014‑01‑01?”
+--
+-- Steps explained inline:
+-- 1.  Pull all rows from `commentsV2` whose text contains a Stack Overflow question URL.
+--     Extract the numeric question id (so_qid) with REGEXP_EXTRACT and keep only rows
+--     from 2014‑01‑01 onward.  This is CTE mention_raw.
+-- 2.  Aggregate mention_raw to count how many times each question id was referenced
+--     (mention_counts).
+-- 3.  From `full_partition_extra`, collect every HN story whose URL points to a
+--     Stack Overflow question; each such story row already includes `tags`
+--     (an ARRAY<STRING> that stores a single pipe‑delimited tag string).  We convert the
+--     array to a single string so we can split it later (question_tags).
+-- 4.  Join mention_counts with question_tags on the common question id, then split the
+--     tag string, UNNEST into individual tag values, and sum the mention counts per tag.
+-- 5.  Order the tags by total mentions and return the top 10.
+
+WITH mention_raw AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM `fh-bigquery.hackernews.commentsV2`
+  WHERE timestamp >= '2014-01-01'
+    AND LOWER(text) LIKE '%stackoverflow.com/questions/%'
+),
+mention_counts AS (
+  SELECT
+    so_qid,
+    COUNT(*) AS mentions
+  FROM mention_raw
+  WHERE so_qid IS NOT NULL
+  GROUP BY so_qid
+),
+question_tags AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+    ARRAY_TO_STRING(tags, '|')                         AS tag_str
+  FROM `fh-bigquery.hackernews.full_partition_extra`
+  WHERE type = 'story'
+    AND LOWER(url) LIKE '%stackoverflow.com/questions/%'
+)
+SELECT
+  tag,
+  SUM(mc.mentions) AS total_mentions
+FROM mention_counts AS mc
+JOIN question_tags  AS qt USING (so_qid)
+JOIN UNNEST(SPLIT(qt.tag_str, '|')) AS tag
+GROUP BY tag
+ORDER BY total_mentions DESC
+LIMIT 10;
+```
+[Corrected SQL]
+2025-05-01 04:15:30 - Thread-15 (execute) - INFO - [Results for corrected sql]
+403 Access Denied: Table fh-bigquery:hackernews.commentsV2: User does not have permission to query table fh-bigquery:hackernews.commentsV2, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table fh-bigquery:hackernews.commentsV2: User does not have permission to query table fh-bigquery:hackernews.commentsV2, or perhaps it does not exist.
+
+Location: US
+Job ID: 52669f2c-df49-42aa-9937-70e8260b7d44
+
+[Results for corrected sql]
+2025-05-01 04:17:26 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Objective: return the ten Stack Overflow tags whose questions are most often cited
+--            inside Hacker News comments posted on or after 2014‑01‑01.
+--
+-- Accessible data:
+--   1. fh-bigquery.hackernews.full_partitioned
+--        • holds every HN item; restrict to rows where type='comment'.
+--        • contains the comment body in `text` and a TIMESTAMP column `timestamp`.
+--
+--   2. fh-bigquery.hackernews.full_partition_extra
+--        • holds HN “story” rows; when the URL points to a Stack Overflow question the
+--          ARRAY<STRING> field `tags` stores its tag list.
+--
+-- Steps:
+--   a. Extract each Stack Overflow question id (so_qid) that appears in comments since 2014.
+--   b. Count how many times every so_qid is mentioned.
+--   c. From story rows, map each so_qid to its tag list.
+--   d. Join counts to tag lists, explode tags, aggregate by tag, sort, and limit to 10.
+
+WITH mention_raw AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM `fh-bigquery.hackernews.full_partitioned`
+  WHERE type = 'comment'
+    AND timestamp >= '2014-01-01'
+    AND LOWER(text) LIKE '%stackoverflow.com/questions/%'
+),
+mention_counts AS (
+  SELECT
+    so_qid,
+    COUNT(*) AS mentions
+  FROM mention_raw
+  WHERE so_qid IS NOT NULL
+  GROUP BY so_qid
+),
+question_tags AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+    tags                                                AS tag_array
+  FROM `fh-bigquery.hackernews.full_partition_extra`
+  WHERE type = 'story'
+    AND LOWER(url) LIKE '%stackoverflow.com/questions/%'
+)
+SELECT
+  tag,
+  SUM(mc.mentions) AS total_mentions
+FROM mention_counts AS mc
+JOIN question_tags  AS qt USING (so_qid)
+JOIN UNNEST(qt.tag_array) AS tag
+GROUP BY tag
+ORDER BY total_mentions DESC
+LIMIT 10;
+```
+[Corrected SQL]
+2025-05-01 04:17:27 - Thread-15 (execute) - INFO - [Results for corrected sql]
+403 Access Denied: Table fh-bigquery:hackernews.full_partition_extra: User does not have permission to query table fh-bigquery:hackernews.full_partition_extra, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table fh-bigquery:hackernews.full_partition_extra: User does not have permission to query table fh-bigquery:hackernews.full_partition_extra, or perhaps it does not exist.
+
+Location: US
+Job ID: c817756a-73d5-4e3f-84a7-3dfb4cbc2b96
+
+[Results for corrected sql]
+2025-05-01 04:17:27 - Thread-15 (execute) - INFO - [Try to execute]
+-- 2. Same inspection but using the newer commentsV2 table
+SELECT id, timestamp, by, text
+FROM   `fh-bigquery.hackernews.commentsV2`
+WHERE  timestamp >= '2014-01-01'
+  AND  LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT  20;
+[Try to execute]
+2025-05-01 04:17:28 - Thread-15 (execute) - INFO - [Error occurred]
+400 Syntax error: Expected end of input but got keyword BY at [2:23]; reason: invalidQuery, location: query, message: Syntax error: Expected end of input but got keyword BY at [2:23]
+
+Location: US
+Job ID: 27b8c963-9c52-4b6c-af7c-70f86210ca24
+
+[Error occurred]
+2025-05-01 04:18:54 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: We cannot access the `comments` / `commentsV2` tables, so we use the
+-- publicly readable `full_partitioned` table for comments and `full_partition_extra`
+-- for stories (which already store Stack Overflow tag lists). Steps:
+--   1. Scan `full_partitioned` for rows where type='comment', date ≥ 2014‑01‑01,
+--      and the comment text contains “stackoverflow.com/questions/”.
+--      Extract the numeric Stack Overflow question id (so_qid) with REGEXP_EXTRACT.
+--   2. Count how many times every so_qid appears (mentions per question).
+--   3. From `full_partition_extra` pick story rows whose URL is a Stack Overflow
+--      question, extract the same so_qid and keep their tags array.
+--   4. Join the mention counts to the tag lists on so_qid, UNNEST the tag array so
+--      each tag inherits the question’s mention count, aggregate by tag, and return
+--      the ten tags with the highest summed mention counts.
+
+WITH mention_raw AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(text), r'/questions/([0-9]+)') AS so_qid
+  FROM `fh-bigquery.hackernews.full_partitioned`
+  WHERE type = 'comment'
+    AND timestamp >= '2014-01-01'
+    AND LOWER(text) LIKE '%stackoverflow.com/questions/%'
+),
+mention_counts AS (
+  SELECT
+    so_qid,
+    COUNT(*) AS mentions
+  FROM mention_raw
+  WHERE so_qid IS NOT NULL
+  GROUP BY so_qid
+),
+question_tags AS (
+  SELECT
+    REGEXP_EXTRACT(LOWER(url), r'/questions/([0-9]+)') AS so_qid,
+    tags                                                AS tag_array
+  FROM `fh-bigquery.hackernews.full_partition_extra`
+  WHERE type = 'story'
+    AND LOWER(url) LIKE '%stackoverflow.com/questions/%'
+)
+SELECT
+  tag,
+  SUM(mc.mentions) AS total_mentions
+FROM mention_counts AS mc
+JOIN question_tags  AS qt USING (so_qid)
+JOIN UNNEST(qt.tag_array) AS tag
+GROUP BY tag
+ORDER BY total_mentions DESC
+LIMIT 10;
+```
+[Corrected SQL]
+2025-05-01 04:18:55 - Thread-15 (execute) - INFO - [Results for corrected sql]
+403 Access Denied: Table fh-bigquery:hackernews.full_partition_extra: User does not have permission to query table fh-bigquery:hackernews.full_partition_extra, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table fh-bigquery:hackernews.full_partition_extra: User does not have permission to query table fh-bigquery:hackernews.full_partition_extra, or perhaps it does not exist.
+
+Location: US
+Job ID: acdf09d7-6fbf-4c78-b5dc-940bf225d1f1
+
+[Results for corrected sql]
+2025-05-01 04:20:52 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Since access to `comments`, `commentsV2`, and `full_partition_extra` tables is restricted,
+-- we rely on the public table `fh-bigquery.hackernews.full_partitioned`.  
+-- Objective: inspect 20 Hacker News comments that reference Stack Overflow questions,
+-- posted on or after 2014‑01‑01, to verify our extraction logic.
+-- Steps embodied in the query:
+--   1. Work only with rows whose `type` is 'comment'.  
+--   2. Keep comments with `timestamp` ≥ '2014‑01‑01'.  
+--   3. Use a case‑insensitive LIKE to find “stackoverflow.com/questions/” in the `text`.  
+--   4. Escape the column `by` (reserved keyword) with back‑ticks.  
+--   5. Limit output to 20 rows for a quick sample.
+
+SELECT
+  id,
+  timestamp,
+  `by`,
+  text
+FROM `fh-bigquery.hackernews.full_partitioned`
+WHERE type = 'comment'
+  AND timestamp >= '2014-01-01'
+  AND LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 04:20:53 - Thread-15 (execute) - INFO - [Results for corrected sql]
+403 Access Denied: Table fh-bigquery:hackernews.full_partitioned: User does not have permission to query table fh-bigquery:hackernews.full_partitioned, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table fh-bigquery:hackernews.full_partitioned: User does not have permission to query table fh-bigquery:hackernews.full_partitioned, or perhaps it does not exist.
+
+Location: US
+Job ID: f41cb95c-509d-4c2f-a2a0-d4c6e3ca77ee
+
+[Results for corrected sql]
+2025-05-01 04:23:07 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Because access to the main comment tables is denied, we fall back to the public monthly
+-- snapshot `fh-bigquery.hackernews.full_201510`.  To confirm that Stack Overflow question
+-- links exist in these data, we pull a small sample of comments that contain such links:
+--   • keep only rows where `type = 'comment'`;
+--   • require the Unix‑epoch `time` to be on or after 2014‑01‑01 (1388534400);
+--   • search `text` (case‑insensitive) for “stackoverflow.com/questions/”;
+--   • escape the reserved keyword column `by` with back‑ticks;
+--   • return 20 rows for inspection.
+
+SELECT
+  id,
+  time,
+  `by`,
+  text
+FROM `fh-bigquery.hackernews.full_201510`
+WHERE type = 'comment'
+  AND time >= 1388534400              -- 2014‑01‑01 UTC
+  AND LOWER(text) LIKE '%stackoverflow.com/questions/%'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 04:23:08 - Thread-15 (execute) - INFO - [Results for corrected sql]
+403 Access Denied: Table fh-bigquery:hackernews.full_201510: User does not have permission to query table fh-bigquery:hackernews.full_201510, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table fh-bigquery:hackernews.full_201510: User does not have permission to query table fh-bigquery:hackernews.full_201510, or perhaps it does not exist.
+
+Location: US
+Job ID: fbc65a21-0f72-42c4-8516-1eefc6061f44
+
+[Results for corrected sql]

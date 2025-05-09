@@ -1,0 +1,2061 @@
+2025-05-07 06:31:09 - Thread-416 (execute) - INFO - [Exploration]
+```sql
+--Description: 1) Quick look at the distribution of heavy–atom counts that are already
+--normalised in the partitioned compound-properties table we will join later.
+SELECT 
+  cp."heavy_atoms"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+LIMIT 20;
+```
+
+```sql
+--Description: 2) Inspect activities whose pChEMBL values are reported (non-null) and
+--that look large (>10).  This tells us which assays / standard_types might qualify.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_relation",
+  a."standard_value",
+  a."pchembl_value",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."pchembl_value" IS NOT NULL
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+LIMIT 20;
+```
+
+```sql
+--Description: 3) Join the same activity rows to compound-properties to pick up heavy
+--atom counts, so we can later filter to the 10–15 atom window.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_value",
+  cp."heavy_atoms",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  cp."heavy_atoms" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+--Description: 4) Bring in canonical SMILES so we can later build the MD5-based UUIDs
+--required by the task specification.
+SELECT 
+  a."activity_id",
+  cs."canonical_smiles"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"      a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+    ON a."molregno" = cs."molregno"
+LIMIT 20;
+```
+
+```sql
+--Description: 5) Count how many qualifying activity rows exist per assay & standard
+--type after restricting to 10–15 heavy atoms and non-null standard values.
+SELECT 
+  a."assay_id",
+  a."standard_type",
+  COUNT(*) AS "n_activities"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND a."standard_value" IS NOT NULL
+GROUP BY 
+  a."assay_id", a."standard_type"
+HAVING 
+  COUNT(*) < 5
+LIMIT 20;
+```
+
+```sql
+--Description: 6) Check for duplicate-flagged rows inside the same assay so that we can
+--later keep only assays with <2 duplicate activities.
+SELECT 
+  a."assay_id",
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) AS "dup_cnt"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+GROUP BY 
+  a."assay_id"
+HAVING 
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) < 2
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Produce all pairs of *different* molecules tested in exactly the same
+--assay & standard_type that satisfy the heavy-atom and pChEMBL filters.  No change
+--classification yet – this is to verify that such pairs actually exist.
+SELECT DISTINCT
+  a1."activity_id"        AS "activity_id_1",
+  a2."activity_id"        AS "activity_id_2",
+  a1."assay_id",
+  a1."standard_type",
+  a1."standard_value"     AS "std_val_1",
+  a2."standard_value"     AS "std_val_2"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a1
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a2
+    ON a1."assay_id"      = a2."assay_id"
+   AND a1."standard_type" = a2."standard_type"
+   AND a1."molregno"     <> a2."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp1
+    ON a1."molregno" = cp1."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp2
+    ON a2."molregno" = cp2."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp1."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(cp2."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a1."pchembl_value") > 10
+  AND TRY_TO_NUMBER(a2."pchembl_value") > 10
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Grab the highest (latest) document ID per assay among rows that pass
+--all basic filters; this will later let us take “latest publication” for each pair.
+SELECT 
+  a."assay_id",
+  MAX(TRY_TO_NUMBER(a."doc_id")) AS "max_doc_id"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+GROUP BY 
+  a."assay_id"
+LIMIT 20;
+```
+
+```sql
+--Description: 9) Explore the text relations (‘=’, ‘<’, ‘>’, etc.) so we can reliably
+--classify increases vs decreases in the final step.
+SELECT DISTINCT 
+  a."standard_relation"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."standard_relation" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+--Description: 10) Prototype the MD5-based UUID creation exactly as the task demands
+--using two *literal* activity IDs; we’ll later plug in real IDs & SMILES in place.
+SELECT 
+  TO_HEX(
+    MD5(
+      TO_JSON_STRING(
+        OBJECT_CONSTRUCT('A', '12345678', 'B', '87654321')
+      )
+    )
+  ) AS "mmp_delta_uuid_example";
+```
+
+[Exploration]
+2025-05-07 06:31:09 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 1) Quick look at the distribution of heavy–atom counts that are already
+--normalised in the partitioned compound-properties table we will join later.
+SELECT 
+  cp."heavy_atoms"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:11 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1) Quick look at the distribution of heavy–atom counts that are already
+--normalised in the partitioned compound-properties table we will join later.
+SELECT 
+  cp."heavy_atoms"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+LIMIT 20;
+Results:
+heavy_atoms
+50
+64
+54
+54
+51
+70
+61
+64
+53
+48
+47
+55
+51
+70
+56
+57
+62
+63
+61
+47
+
+[Successfully executed]
+2025-05-07 06:31:11 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 2) Inspect activities whose pChEMBL values are reported (non-null) and
+--that look large (>10).  This tells us which assays / standard_types might qualify.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_relation",
+  a."standard_value",
+  a."pchembl_value",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."pchembl_value" IS NOT NULL
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:12 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2) Inspect activities whose pChEMBL values are reported (non-null) and
+--that look large (>10).  This tells us which assays / standard_types might qualify.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_relation",
+  a."standard_value",
+  a."pchembl_value",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."pchembl_value" IS NOT NULL
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+LIMIT 20;
+Results:
+activity_id,assay_id,standard_type,standard_relation,standard_value,pchembl_value,molregno
+1421981,305651,IC50,=,0.017,10.77,300648
+2638095,501124,IC50,=,0.0278,10.56,480314
+183792,201108,IC50,=,0.03,10.52,212535
+1058641,122682,IC50,=,0.015,10.82,609762
+2703153,582918,IC50,=,0.02,10.7,125241
+6386716,770739,IC50,=,0.0271,10.57,1180612
+100469,68568,IC50,=,0.016,10.8,184149
+176547,39626,IC50,=,0.01,11,127106
+2015550,453484,IC50,=,0.022,10.66,408978
+
+[Successfully executed]
+2025-05-07 06:31:12 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 3) Join the same activity rows to compound-properties to pick up heavy
+--atom counts, so we can later filter to the 10–15 atom window.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_value",
+  cp."heavy_atoms",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  cp."heavy_atoms" IS NOT NULL
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:13 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3) Join the same activity rows to compound-properties to pick up heavy
+--atom counts, so we can later filter to the 10–15 atom window.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_value",
+  cp."heavy_atoms",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  cp."heavy_atoms" IS NOT NULL
+LIMIT 20;
+Results:
+activity_id,assay_id,standard_type,standard_value,heavy_atoms,molregno
+3021495,598450,IC50,340,20,576644
+3023171,599107,IC50,9430,25,578545
+3056026,603366,IC50,6350,24,594554
+3058834,603828,IC50,60000000,12,1037865
+3059523,602335,IC50,1200,23,5295
+3061847,603228,IC50,695,48,592218
+3066591,606155,IC50,400000,19,593335
+3072768,605389,IC50,3000,41,591762
+3076644,606335,IC50,210,36,593051
+3078372,604005,IC50,19700,23,469153
+
+[Successfully executed]
+2025-05-07 06:31:13 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 4) Bring in canonical SMILES so we can later build the MD5-based UUIDs
+--required by the task specification.
+SELECT 
+  a."activity_id",
+  cs."canonical_smiles"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"      a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+    ON a."molregno" = cs."molregno"
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:15 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4) Bring in canonical SMILES so we can later build the MD5-based UUIDs
+--required by the task specification.
+SELECT 
+  a."activity_id",
+  cs."canonical_smiles"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"      a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+    ON a."molregno" = cs."molregno"
+LIMIT 20;
+Results:
+activity_id,canonical_smiles
+44742,CCc1c(CC)c2cc3nc(cc4[nH]c(c(C)c4CC)c4[nH]c(cc5nc(cc1[nH]2)C(CCC(=O)N(CCO)CCO)=C5C)c(CC)c4C)C(C)=C3CCC(=O)N(CCO)CCO
+93575,C[C@]12CCC(=O)C=C1CC[C@@H]1[C@@H]2[C@@H](O)C[C@@]2(C)[C@H]1CC[C@]2(O)C(=O)CO
+101076,CC(C)c1cc(Cc2cnc(N)nc2N)cc(C(C)C)c1O
+177883,CC(C)[C@@H]1C(=O)N(S(C)(=O)=O)[C@@H]2CN(C(=O)/C=C/CN3CCCCC3)C[C@H]21.Cl
+180499,CN1CCN(c2c(F)cc3c(=O)c(C(=O)O)cn4c3c2SCC4)CC1
+190278,O=c1cc(-c2ccccc2)oc2ccc3ccccc3c12
+215101,CN1[C@@H]2CC[C@H]1C[C@@H](OC(=O)C(CO
+
+[Successfully executed]
+2025-05-07 06:31:15 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 5) Count how many qualifying activity rows exist per assay & standard
+--type after restricting to 10–15 heavy atoms and non-null standard values.
+SELECT 
+  a."assay_id",
+  a."standard_type",
+  COUNT(*) AS "n_activities"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND a."standard_value" IS NOT NULL
+GROUP BY 
+  a."assay_id", a."standard_type"
+HAVING 
+  COUNT(*) < 5
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:17 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 5) Count how many qualifying activity rows exist per assay & standard
+--type after restricting to 10–15 heavy atoms and non-null standard values.
+SELECT 
+  a."assay_id",
+  a."standard_type",
+  COUNT(*) AS "n_activities"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND a."standard_value" IS NOT NULL
+GROUP BY 
+  a."assay_id", a."standard_type"
+HAVING 
+  COUNT(*) < 5
+LIMIT 20;
+Results:
+assay_id,standard_type,n_activities
+1359256,TIME,1
+679194,Km,2
+1873065,CC50,1
+1989625,Km,4
+838308,Km,1
+430868,Kd,2
+1566690,Kd,4
+1520489,Activity,2
+1437733,Kd,1
+1557018,CC50,2
+1452075,CC50,3
+1299116,CC50,1
+32989,Kd,3
+609049,MIC80,3
+1436493,Kd,2
+1301698,Potency,4
+338917,EC50,3
+172935,EC50,1
+163023,EC50,2
+216983,EC50,4
+
+[Successfully executed]
+2025-05-07 06:31:17 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 6) Check for duplicate-flagged rows inside the same assay so that we can
+--later keep only assays with <2 duplicate activities.
+SELECT 
+  a."assay_id",
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) AS "dup_cnt"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+GROUP BY 
+  a."assay_id"
+HAVING 
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) < 2
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:21 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 6) Check for duplicate-flagged rows inside the same assay so that we can
+--later keep only assays with <2 duplicate activities.
+SELECT 
+  a."assay_id",
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) AS "dup_cnt"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+GROUP BY 
+  a."assay_id"
+HAVING 
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) < 2
+LIMIT 20;
+Results:
+assay_id,dup_cnt
+1663373,0
+829301,0
+1670511,0
+1769518,0
+880523,0
+933982,0
+984871,0
+1896840,0
+1466367,0
+1697571,0
+1699718,0
+1295651,0
+1474946,0
+1625611,0
+1895058,0
+1623239,0
+1911881,0
+922402,0
+1339624,0
+1616805,0
+
+[Successfully executed]
+2025-05-07 06:31:21 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 7) Produce all pairs of *different* molecules tested in exactly the same
+--assay & standard_type that satisfy the heavy-atom and pChEMBL filters.  No change
+--classification yet – this is to verify that such pairs actually exist.
+SELECT DISTINCT
+  a1."activity_id"        AS "activity_id_1",
+  a2."activity_id"        AS "activity_id_2",
+  a1."assay_id",
+  a1."standard_type",
+  a1."standard_value"     AS "std_val_1",
+  a2."standard_value"     AS "std_val_2"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a1
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a2
+    ON a1."assay_id"      = a2."assay_id"
+   AND a1."standard_type" = a2."standard_type"
+   AND a1."molregno"     <> a2."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp1
+    ON a1."molregno" = cp1."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp2
+    ON a2."molregno" = cp2."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp1."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(cp2."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a1."pchembl_value") > 10
+  AND TRY_TO_NUMBER(a2."pchembl_value") > 10
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:25 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 7) Produce all pairs of *different* molecules tested in exactly the same
+--assay & standard_type that satisfy the heavy-atom and pChEMBL filters.  No change
+--classification yet – this is to verify that such pairs actually exist.
+SELECT DISTINCT
+  a1."activity_id"        AS "activity_id_1",
+  a2."activity_id"        AS "activity_id_2",
+  a1."assay_id",
+  a1."standard_type",
+  a1."standard_value"     AS "std_val_1",
+  a2."standard_value"     AS "std_val_2"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a1
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a2
+    ON a1."assay_id"      = a2."assay_id"
+   AND a1."standard_type" = a2."standard_type"
+   AND a1."molregno"     <> a2."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp1
+    ON a1."molregno" = cp1."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp2
+    ON a2."molregno" = cp2."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp1."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(cp2."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a1."pchembl_value") > 10
+  AND TRY_TO_NUMBER(a2."pchembl_value") > 10
+LIMIT 20;
+Results:
+activity_id_1,activity_id_2,assay_id,standard_type,std_val_1,std_val_2
+1081396,1074398,143097,Ki,0.027,0.015
+1909028,1909011,439959,Ki,0.027,0.01349
+1086886,1082696,143097,Ki,0.025,0.026
+1210176,1198202,143855,Ki,0.023,0.025
+1195606,1198202,143855,Ki,0.021,0.025
+1136349,1107495,157,Ki,0.02239,0.01698
+549563,516979,142899,Kd,0.028,0.027
+1909040,1908977,439959,Ki,0.028,0.0182
+1909012,1909007,439959,Ki,0.014,0.0182
+
+[Successfully executed]
+2025-05-07 06:31:25 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 8) Grab the highest (latest) document ID per assay among rows that pass
+--all basic filters; this will later let us take “latest publication” for each pair.
+SELECT 
+  a."assay_id",
+  MAX(TRY_TO_NUMBER(a."doc_id")) AS "max_doc_id"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+GROUP BY 
+  a."assay_id"
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:26 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 8) Grab the highest (latest) document ID per assay among rows that pass
+--all basic filters; this will later let us take “latest publication” for each pair.
+SELECT 
+  a."assay_id",
+  MAX(TRY_TO_NUMBER(a."doc_id")) AS "max_doc_id"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+GROUP BY 
+  a."assay_id"
+LIMIT 20;
+Results:
+assay_id,max_doc_id
+303546,21501
+143871,6774
+142930,2344
+435003,35664
+143854,6774
+1454459,90223
+33684,15882
+143415,16491
+615093,50377
+1454461,90223
+714883,55203
+143393,16851
+578992,47891
+452154,37247
+501117,47212
+157,16992
+302242,21562
+143227,6768
+320936,30035
+833017,62804
+
+[Successfully executed]
+2025-05-07 06:31:26 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 9) Explore the text relations (‘=’, ‘<’, ‘>’, etc.) so we can reliably
+--classify increases vs decreases in the final step.
+SELECT DISTINCT 
+  a."standard_relation"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."standard_relation" IS NOT NULL
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:31:27 - Thread-416 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 9) Explore the text relations (‘=’, ‘<’, ‘>’, etc.) so we can reliably
+--classify increases vs decreases in the final step.
+SELECT DISTINCT 
+  a."standard_relation"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."standard_relation" IS NOT NULL
+LIMIT 20;
+Results:
+standard_relation
+>
+<
+=
+>>
+~
+<=
+>=
+<<
+
+[Successfully executed]
+2025-05-07 06:31:27 - Thread-416 (execute) - INFO - [Try to execute]
+--Description: 10) Prototype the MD5-based UUID creation exactly as the task demands
+--using two *literal* activity IDs; we’ll later plug in real IDs & SMILES in place.
+SELECT 
+  TO_HEX(
+    MD5(
+      TO_JSON_STRING(
+        OBJECT_CONSTRUCT('A', '12345678', 'B', '87654321')
+      )
+    )
+  ) AS "mmp_delta_uuid_example";
+[Try to execute]
+2025-05-07 06:31:27 - Thread-416 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##002140 (42601): SQL compilation error:\nUnknown functions TO_JSON_STRING, TO_HEX'}
+[Error occurred]
+2025-05-07 06:33:31 - Thread-416 (execute) - INFO - [Corrected SQL]
+```sql
+--Description (thinking process):
+--1. OBJECT_CONSTRUCT('A',id1,'B',id2) builds the JSON object {"A":id1,"B":id2}.
+--2. TO_VARCHAR converts that JSON object to a string identical to what TO_JSON_STRING
+--   would have produced, keeping only Snowflake-native functions.
+--3. MD5 hashes the resulting string and returns the digest in HEX by default.
+--4. Casting the digest to VARCHAR lets us see the hexadecimal text.
+--5. Hard-coded IDs below (“12345678”, “87654321”) are placeholders; in the real
+--   workflow they will be replaced by columns containing activity IDs or SMILES.
+SELECT
+  MD5(
+    TO_VARCHAR(
+      OBJECT_CONSTRUCT('A','12345678','B','87654321')
+    )
+  )::VARCHAR AS "mmp_delta_uuid_example";
+```
+[Corrected SQL]
+2025-05-07 06:33:32 - Thread-416 (execute) - INFO - [Results for corrected sql]
+mmp_delta_uuid_example
+1b399881672def6f8bff12a38cea8715
+
+[Results for corrected sql]
+2025-05-07 06:33:32 - Thread-416 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description (thinking process):
+--1. OBJECT_CONSTRUCT('A',id1,'B',id2) builds the JSON object {"A":id1,"B":id2}.
+--2. TO_VARCHAR converts that JSON object to a string identical to what TO_JSON_STRING
+--   would have produced, keeping only Snowflake-native functions.
+--3. MD5 hashes the resulting string and returns the digest in HEX by default.
+--4. Casting the digest to VARCHAR lets us see the hexadecimal text.
+--5. Hard-coded IDs below (“12345678”, “87654321”) are placeholders; in the real
+--   workflow they will be replaced by columns containing activity IDs or SMILES.
+SELECT
+  MD5(
+    TO_VARCHAR(
+      OBJECT_CONSTRUCT('A','12345678','B','87654321')
+    )
+  )::VARCHAR AS "mmp_delta_uuid_example";
+Results:
+mmp_delta_uuid_example
+1b399881672def6f8bff12a38cea8715
+
+[Successfully corrected]
+2025-05-07 06:33:32 - Thread-416 (execute) - INFO - itercount: 0
+2025-05-07 06:33:32 - Thread-416 (execute) - INFO - [Self-refine]
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_PROPERTIES
+Column name: activity_id Type: TEXT
+Column name: value Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: type Type: TEXT
+Column name: relation Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: standard_type Type: TEXT
+Sample rows:
+[{'activity_id': '21166957', 'type': 'CONCENTRATION', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21166392', 'type': 'CONCENTRATION', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21166307', 'type': 'CONCENTRATION', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21164971', 'type': 'CONCENTRATION', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21164507', 'type': 'CONCENTRATION', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_PROPERTIES_29
+Column name: relation Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: value Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: result_flag Type: TEXT
+Column name: type Type: TEXT
+Sample rows:
+[{'activity_id': '20987147', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '0.01', 'result_flag': '0'}, {'activity_id': '20987146', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '0.01', 'result_flag': '0'}, {'activity_id': '20987145', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '0.01', 'result_flag': '0'}, {'activity_id': '20987143', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '0.01', 'result_flag': '0'}, {'activity_id': '20987141', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '0.01', 'result_flag': '0'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_PROPERTIES_30
+Column name: standard_value Type: FLOAT Description: Standardised form of the VALUE
+Column name: relation Type: TEXT Description: Symbol constraining the value (e.g. >, <, =)
+Column name: activity_id Type: NUMBER Description: FK to ACTIVITY_ID in ACTIVITIES table.
+Column name: value Type: FLOAT Description: Numberical value for the parameter or property
+Column name: standard_relation Type: TEXT Description: Standardised form of the RELATION
+Column name: standard_type Type: TEXT Description:  Standardised form of the TYPE
+Column name: type Type: TEXT Description: The parameter or property type
+Sample rows:
+[{'activity_id': 17806322, 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': 65.0}, {'activity_id': 17806380, 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': 8.0}, {'activity_id': 17876611, 'standard_type': 'HILLSLOPE', 'standard_relation': '=', 'standard_value': 1.187}, {'activity_id': 17876618, 'standard_type': 'MAX_EFFECT', 'standard_relation': '=', 'standard_value': 65.35}, {'activity_id': 17876866, 'standard_type': 'HILLSLOPE', 'standard_relation': '=', 'standard_value': 1.019}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.COMPOUND_STRUCTURES_30
+Column name: canonical_smiles Type: TEXT Description: Canonical smiles, generated using RDKit
+Column name: standard_inchi_key Type: TEXT Description: IUPAC standard InChI key for the compound
+Column name: standard_inchi Type: TEXT Description: IUPAC standard InChI for the compound
+Column name: molregno Type: NUMBER Description: Internal Primary Key for the compound structure and foreign key to molecule_dictionary table
+Sample rows:
+[{'molregno': 1009028, 'standard_inchi_key': 'RKCVJJTUFYQVCN-UHFFFAOYSA-N', 'canonical_smiles': 'CCOc1ccc(CCNC(=O)C2CCN(C(=O)N(C)C)CC2)cc1OCC'}, {'molregno': 1010022, 'standard_inchi_key': 'QOJGYVPCYWYDGQ-UYRXBGFRSA-N', 'canonical_smiles': 'O=C(NCC1CCCO1)/C(=C/c1ccc(Cl)cc1)NC(=O)c1ccccc1'}, {'molregno': 1010206, 'standard_inchi_key': 'DIQSIOBGMYDDKC-UHFFFAOYSA-N', 'canonical_smiles': 'COc1cc(CCC(=O)OCn2nnc3ccccc3c2=O)cc(OC)c1OC'}, {'molregno': 1013439, 'standard_inchi_key': 'MOMFXATYAINJML-UHFFFAOYSA-N', 'canonical_smiles': 'CC(=O)c1nccs1'}, {'molregno': 1013996, 'standard_inchi_key': 'XNHVDRYUSNMAET-UHFFFAOYSA-N', 'canonical_smiles': 'COc1ccc(CC(=O)OCC(=O)NCc2ccco2)cc1'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.COMPOUND_STRUCTURES
+Column name: molregno Type: TEXT
+Column name: canonical_smiles Type: TEXT
+Column name: standard_inchi_key Type: TEXT
+Column name: standard_inchi Type: TEXT
+Sample rows:
+[{'molregno': '2014864', 'standard_inchi': 'InChI=1S/C23H18F3NO4/c24-23(25,26)22(30)18-7-2-1-6-16(18)21-17(14-5-3-9-27-13-14)11-15(12-19(21)22)31-10-4-8-20(28)29/h1-3,5-7,9,11-13,30H,4,8,10H2,(H,28,29)', 'standard_inchi_key': 'XTOQQNFUWVNSHE-UHFFFAOYSA-N', 'canonical_smiles': 'O=C(O)CCCOc1cc(-c2cccnc2)c2c(c1)C(O)(C(F)(F)F)c1ccccc1-2'}, {'molregno': '179168', 'standard_inchi': 'InChI=1S/C21H19F3N2O4S/c1-29-19-6-2-3-7-20(19)30-18-10-8-17(9-11-18)26(14-16-5-4-12-25-13-16)31(27,28)15-21(22,23)24/h2-13H,14-15H2,1H3', 'standard_inchi_key': 'ALMACYDZFBMGOR-UHFFFAOYSA-N', 'canonical_smiles': 'COc1ccccc1Oc1ccc(N(Cc2cccnc2)S(=O)(=O)CC(F)(F)F)cc1'}, {'molregno': '2023617', 'standard_inchi': 'InChI=1S/C21H17F3N6O2/c1-32-19-6-5-16(28-29-19)13-7-8-30-17(11-25-18(30)10-13)14-3-2-4-15(9-14)27-20(31)26-12-21(22,23)24/h2-11H,12H2,1H3,(H2,26,27,31)', 'standard_inchi_key': 'KDGIYEHYWASRCT-UHFFFAOYSA-N', 'canonical_smiles': 'COc1ccc(-c2ccn3c(-c4cccc(NC(=O)NCC(F)(F)F)c4)cnc3c2)nn1'}, {'molregno': '2029073', 'standard_inchi': 'InChI=1S/C33H28N2O5/c1-20-21(2)35(18-22-7-10-24(11-8-22)26-5-3-4-6-27(26)33(37)38)29-13-12-25(16-28(20)29)32(36)34-17-23-9-14-30-31(15-23)40-19-39-30/h3-16H,17-19H2,1-2H3,(H,34,36)(H,37,38)', 'standard_inchi_key': 'XCYTZHNEBZAPSP-UHFFFAOYSA-N', 'canonical_smiles': 'Cc1c(C)n(Cc2ccc(-c3ccccc3C(=O)O)cc2)c2ccc(C(=O)NCc3ccc4c(c3)OCO4)cc12'}, {'molregno': '2031478', 'standard_inchi': 'InChI=1S/C18H21NO3/c20-14-7-9-18(10-8-14)11-12-19(17(21)22-18)16-6-5-13-3-1-2-4-15(13)16/h1-4,16H,5-12H2/t16-/m0/s1', 'standard_inchi_key': 'HYPVTHRCKBWHFU-INIZCTEOSA-N', 'canonical_smiles': 'O=C1CCC2(CC1)CCN([C@H]1CCc3ccccc31)C(=O)O2'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_27
+Column name: units Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: relation Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: molregno Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: value Type: TEXT
+Column name: type Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: standard_units Type: TEXT
+Column name: standard_relation Type: TEXT
+Sample rows:
+[{'activity_id': '10927303', 'assay_id': '826080', 'molregno': '1348835', 'standard_relation': '=', 'standard_value': '3.631', 'standard_units': 'nM', 'standard_type': 'Ki', 'potential_duplicate': '0', 'pchembl_value': '8.44'}, {'activity_id': '10927916', 'assay_id': '824658', 'molregno': '51524', 'standard_relation': '=', 'standard_value': '2450', 'standard_units': 'nM', 'standard_type': 'Ki', 'potential_duplicate': '0', 'pchembl_value': '5.61'}, {'activity_id': '10947337', 'assay_id': '826836', 'molregno': '1076074', 'standard_relation': '=', 'standard_value': '27', 'standard_units': 'nM', 'standard_type': 'Ki', 'potential_duplicate': '0', 'pchembl_value': '7.57'}, {'activity_id': '10952211', 'assay_id': '829296', 'molregno': '1355355', 'standard_relation': '=', 'standard_value': '0.7943', 'standard_units': 'nM', 'standard_type': 'Ki', 'potential_duplicate': '0', 'pchembl_value': '9.1'}, {'activity_id': '10953429', 'assay_id': '830731', 'molregno': '1354452', 'standard_relation': '=', 'standard_value': '1.3', 'standard_units': 'nM', 'standard_type': 'Ki', 'potential_duplicate': '1', 'pchembl_value': '8.89'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_SUPP_28
+Column name: relation Type: TEXT
+Column name: value Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: as_id Type: TEXT
+Column name: smid Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: comments Type: TEXT
+Column name: type Type: TEXT
+Sample rows:
+[{'as_id': '1130569', 'smid': '1443844', 'relation': None, 'standard_type': 'THIGH MUSCLE_RIGHT SOLEUS, MYOCYTE, INFLAMMATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: R070710-059; HEART_Affymetrix: 102644.CEL'}, {'as_id': '1130570', 'smid': '1443845', 'relation': None, 'standard_type': 'THIGH MUSCLE_RIGHT SOLEUS, MYOCYTE, REGENERATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: R070710-059; HEART_Affymetrix: 102644.CEL'}, {'as_id': '1130572', 'smid': '1443847', 'relation': None, 'standard_type': 'THIGH MUSCLE_RIGHT GASTROCNEMIUS, MYOCYTE, INFLAMMATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: R070710-059; HEART_Affymetrix: 102644.CEL'}, {'as_id': '1130574', 'smid': '1443849', 'relation': None, 'standard_type': 'HEART_RIGHT VENTRICLE, MINERALIZATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: R070710-059; HEART_Affymetrix: 102644.CEL'}, {'as_id': '1130576', 'smid': '1443851', 'relation': None, 'standard_type': 'HEART_RIGHT ATRIUM, MYOCYTE, DEGENERATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: R070710-059; HEART_Affymetrix: 102644.CEL'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_28
+Column name: molregno Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: relation Type: TEXT
+Column name: value Type: TEXT
+Column name: type Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: pchembl_value Type: TEXT
+Sample rows:
+[{'activity_id': '15606900', 'assay_id': '1496534', 'molregno': '1945883', 'standard_relation': '=', 'standard_value': '4', 'standard_type': 'MIC', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '15607368', 'assay_id': '1496706', 'molregno': '1945884', 'standard_relation': '=', 'standard_value': '0.5', 'standard_type': 'MIC', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '15614092', 'assay_id': '1499949', 'molregno': '1947430', 'standard_relation': '=', 'standard_value': '4', 'standard_type': 'MIC', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '15619949', 'assay_id': '1499729', 'molregno': '1947037', 'standard_relation': '>', 'standard_value': '100', 'standard_type': 'MIC', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '15653762', 'assay_id': '1506536', 'molregno': '1953528', 'standard_relation': '=', 'standard_value': '256', 'standard_type': 'MIC', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_SUPP_27
+Column name: smid Type: TEXT
+Column name: relation Type: TEXT
+Column name: type Type: TEXT
+Column name: as_id Type: TEXT
+Column name: value Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: comments Type: TEXT
+Sample rows:
+[{'as_id': '1176704', 'smid': '1464805', 'type': 'LIVER_SUBCAPSULAR, FIBROSIS', 'relation': None, 'standard_type': 'LIVER_SUBCAPSULAR, FIBROSIS', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-124; LIVER_Codelink: T00116576; LIVER_Affymetrix: 97695.CEL; KIDNEY_Codelink: T00130763; KIDNEY_Affymetrix: 92040.CEL; BONE MARROW_Codelink: T00137712; SPLEEN_Codelink: T00131906'}, {'as_id': '1176705', 'smid': '1464806', 'type': 'LIVER_NUCLEAR CYTOPLASMIC CONDENSATION', 'relation': None, 'standard_type': 'LIVER_NUCLEAR CYTOPLASMIC CONDENSATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176709', 'smid': '1464810', 'type': 'LIVER_BILE DUCT HYPERPLASIA', 'relation': None, 'standard_type': 'LIVER_BILE DUCT HYPERPLASIA', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176710', 'smid': '1464811', 'type': 'LIVER_BILE DUCT, NECROSIS, ONCOCYTIC', 'relation': None, 'standard_type': 'LIVER_BILE DUCT, NECROSIS, ONCOCYTIC', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176712', 'smid': '1464813', 'type': 'LIVER_CAPSULE, MESOTHELIAL CELL, HYPERPLASIA', 'relation': None, 'standard_type': 'LIVER_CAPSULE, MESOTHELIAL CELL, HYPERPLASIA', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_29
+Column name: value Type: TEXT
+Column name: type Type: TEXT
+Column name: relation Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: doc_id Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: molregno Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: standard_type Type: TEXT
+Sample rows:
+[{'activity_id': '2309381', 'assay_id': '509144', 'doc_id': '41296', 'molregno': '417226', 'standard_relation': '=', 'standard_value': '10.48', 'standard_type': 'IC50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '2316988', 'assay_id': '502607', 'doc_id': '39823', 'molregno': '504348', 'standard_relation': '=', 'standard_value': '5', 'standard_type': 'IC50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '2380778', 'assay_id': '493176', 'doc_id': '45874', 'molregno': '575680', 'standard_relation': '=', 'standard_value': '3.3', 'standard_type': 'IC50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '2395564', 'assay_id': '519150', 'doc_id': '45465', 'molregno': '455815', 'standard_relation': '=', 'standard_value': '2.73', 'standard_type': 'IC50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '2461609', 'assay_id': '553804', 'doc_id': '44370', 'molregno': '507747', 'standard_relation': '=', 'standard_value': '9', 'standard_type': 'IC50', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_26
+Column name: value Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: doc_id Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: molregno Type: TEXT
+Column name: relation Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: type Type: TEXT
+Column name: activity_id Type: TEXT
+Sample rows:
+[{'activity_id': '6808138', 'assay_id': '752411', 'doc_id': '51887', 'molregno': '747570', 'standard_value': '100000', 'standard_type': 'Potency', 'potential_duplicate': '0', 'pchembl_value': None, 'relation': None}, {'activity_id': '6812272', 'assay_id': '752434', 'doc_id': '51887', 'molregno': '839879', 'standard_value': '100000', 'standard_type': 'Potency', 'potential_duplicate': '0', 'pchembl_value': None, 'relation': None}, {'activity_id': '6821650', 'assay_id': '752411', 'doc_id': '51887', 'molregno': '1092504', 'standard_value': '100000', 'standard_type': 'Potency', 'potential_duplicate': '0', 'pchembl_value': None, 'relation': None}, {'activity_id': '6822225', 'assay_id': '752411', 'doc_id': '51887', 'molregno': '1114107', 'standard_value': '100000', 'standard_type': 'Potency', 'potential_duplicate': '0', 'pchembl_value': None, 'relation': None}, {'activity_id': '6835000', 'assay_id': '752434', 'doc_id': '51887', 'molregno': '929107', 'standard_value': '100000', 'standard_type': 'Potency', 'potential_duplicate': '0', 'pchembl_value': None, 'relation': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ASSAY_PARAMETERS_30
+Column name: value Type: FLOAT Description: The value of the parameter being described, according to the original data source. Used for numeric data
+Column name: assay_id Type: NUMBER Description: Foreign key to assays table. The assay to which this parameter belongs
+Column name: standard_relation Type: TEXT Description: Standardized form of the RELATION
+Column name: relation Type: TEXT Description: The relation symbol for the parameter being described, according to the original data source
+Column name: standard_type Type: TEXT Description:  Standardized form of the TYPE
+Column name: type Type: TEXT Description: The type of parameter being described, according to the original data source
+Column name: standard_value Type: FLOAT Description: Standardized form of the VALUE
+Sample rows:
+[{'assay_id': 100201, 'standard_type': 'DOSE', 'standard_relation': None, 'standard_value': None}, {'assay_id': 132722, 'standard_type': 'DOSE', 'standard_relation': None, 'standard_value': None}, {'assay_id': 1960587, 'standard_type': 'Reference ligand pKi  Â± SEM', 'standard_relation': None, 'standard_value': None}, {'assay_id': 1960588, 'standard_type': 'Radioligand pKd Â± SEM', 'standard_relation': None, 'standard_value': None}, {'assay_id': 1960588, 'standard_type': 'Reference ligand pKi  Â± SEM', 'standard_relation': None, 'standard_value': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.COMPOUND_PROPERTIES
+Column name: heavy_atoms Type: TEXT
+Column name: molregno Type: TEXT
+Sample rows:
+[{'molregno': '16583', 'heavy_atoms': None}, {'molregno': '20382', 'heavy_atoms': None}, {'molregno': '113570', 'heavy_atoms': None}, {'molregno': '172486', 'heavy_atoms': None}, {'molregno': '179726', 'heavy_atoms': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES
+Column name: standard_type Type: TEXT
+Column name: value Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: doc_id Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: molregno Type: TEXT
+Column name: type Type: TEXT
+Column name: relation Type: TEXT
+Sample rows:
+[{'activity_id': '18404618', 'assay_id': '1735198', 'doc_id': '107245', 'molregno': '2268393', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '8008536', 'assay_id': '799568', 'doc_id': '60777', 'molregno': '1273345', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '16452956', 'assay_id': '1552692', 'doc_id': '97933', 'molregno': '2062412', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '220622', 'assay_id': '184096', 'doc_id': '15414', 'molregno': '60719', 'standard_relation': '=', 'standard_value': '47', 'standard_type': 'K', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '1264161', 'assay_id': '18151', 'doc_id': '12842', 'molregno': '604970', 'standard_relation': '=', 'standard_value': '0.202', 'standard_type': 'P', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_23
+Column name: standard_type Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: molregno Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: activity_comment Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Sample rows:
+[{'activity_id': '12752070', 'assay_id': '954272', 'molregno': '1233529', 'standard_relation': None, 'standard_value': '22387.2', 'standard_type': 'Potency', 'activity_comment': 'inconclusive', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '13086776', 'assay_id': '954338', 'molregno': '1223324', 'standard_relation': None, 'standard_value': '22387.2', 'standard_type': 'Potency', 'activity_comment': 'active', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '14009269', 'assay_id': '1301428', 'molregno': '902942', 'standard_relation': None, 'standard_value': '22387.2', 'standard_type': 'Potency', 'activity_comment': 'inconclusive', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '14029028', 'assay_id': '1301460', 'molregno': '738322', 'standard_relation': None, 'standard_value': '22387.2', 'standard_type': 'Potency', 'activity_comment': 'inconclusive', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '14087894', 'assay_id': '1301428', 'molregno': '728863', 'standard_relation': None, 'standard_value': '22387.2', 'standard_type': 'Potency', 'activity_comment': 'active', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_25
+Column name: type Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: standard_relation Type: TEXT
+Column name: activity_comment Type: TEXT
+Column name: molregno Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: relation Type: TEXT
+Column name: value Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: standard_value Type: TEXT
+Sample rows:
+[{'activity_id': '4120539', 'assay_id': '688238', 'molregno': '843965', 'standard_relation': '=', 'standard_value': '28183.8', 'standard_type': 'Potency', 'activity_comment': 'Inconclusive', 'potential_duplicate': '0', 'pchembl_value': '4.55'}, {'activity_id': '4129246', 'assay_id': '688238', 'molregno': '803404', 'standard_relation': '=', 'standard_value': '28183.8', 'standard_type': 'Potency', 'activity_comment': 'Inconclusive', 'potential_duplicate': '0', 'pchembl_value': '4.55'}, {'activity_id': '4131965', 'assay_id': '688238', 'molregno': '1700284', 'standard_relation': '=', 'standard_value': '28183.8', 'standard_type': 'Potency', 'activity_comment': 'Active', 'potential_duplicate': '0', 'pchembl_value': '4.55'}, {'activity_id': '4140281', 'assay_id': '688238', 'molregno': '825876', 'standard_relation': '=', 'standard_value': '28183.8', 'standard_type': 'Potency', 'activity_comment': 'Inconclusive', 'potential_duplicate': '0', 'pchembl_value': '4.55'}, {'activity_id': '4144979', 'assay_id': '688238', 'molregno': '903365', 'standard_relation': '=', 'standard_value': '28183.8', 'standard_type': 'Potency', 'activity_comment': 'Inconclusive', 'potential_duplicate': '0', 'pchembl_value': '4.55'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_30
+Column name: potential_duplicate Type: NUMBER Description: When set to 1, indicates that the value is likely to be a repeat citation of a value reported in a previous ChEMBL paper, rather than a new, independent measurement. Note: value of zero does not guarantee that the measurement is novel/independent though
+Column name: type Type: TEXT Description: Type of end-point measurement: e.g. IC50, LD50, %inhibition etc, as it appears in the original dataset
+Column name: value Type: FLOAT Description: Datapoint value as it appears in the original dataset.
+Column name: doc_id Type: NUMBER Description: Foreign key to documents table (for quick lookup of publication details - can also link to documents through compound_records or assays table)
+Column name: standard_value Type: FLOAT Description: Same as PUBLISHED_VALUE but transformed to common units: e.g. mM concentrations converted to nM.
+Column name: molregno Type: NUMBER Description: Foreign key to compounds table (for quick lookup of compound structure - can also link to compounds through compound_records table)
+Column name: pchembl_value Type: FLOAT Description: Negative log of selected concentration-response activity values (IC50/EC50/XC50/AC50/Ki/Kd/Potency)
+Column name: activity_id Type: NUMBER Description: Unique ID for the activity row
+Column name: assay_id Type: NUMBER Description: Foreign key to the assays table (containing the assay description)
+Column name: standard_type Type: TEXT Description:  Standardised version of the published_activity_type (e.g. IC50 rather than Ic-50/Ic50/ic50/ic-50)
+Sample rows:
+[{'activity_id': 11986917, 'assay_id': 845240, 'doc_id': 51887, 'molregno': 832066, 'standard_value': 17782.8, 'standard_type': 'Potency', 'potential_duplicate': 0, 'pchembl_value': None}, {'activity_id': 11986994, 'assay_id': 845245, 'doc_id': 51887, 'molregno': 806591, 'standard_value': 3162.3, 'standard_type': 'Potency', 'potential_duplicate': 0, 'pchembl_value': None}, {'activity_id': 11987046, 'assay_id': 845245, 'doc_id': 51887, 'molregno': 998762, 'standard_value': 11220.2, 'standard_type': 'Potency', 'potential_duplicate': 0, 'pchembl_value': None}, {'activity_id': 11989643, 'assay_id': 845225, 'doc_id': 51887, 'molregno': 985779, 'standard_value': 63095.7, 'standard_type': 'Potency', 'potential_duplicate': 0, 'pchembl_value': None}, {'activity_id': 12007512, 'assay_id': 845248, 'doc_id': 51887, 'molregno': 789614, 'standard_value': 35481.3, 'standard_type': 'Potency', 'potential_duplicate': 0, 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_33
+Column name: molregno Type: TEXT
+Column name: bao_endpoint Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: pchembl_value Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: relation Type: TEXT
+Column name: value Type: TEXT
+Column name: doc_id Type: TEXT
+Column name: type Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Sample rows:
+[{'activity_id': '411349', 'assay_id': '115373', 'doc_id': '7417', 'molregno': '282599', 'standard_value': '43.5', 'standard_type': '%', 'potential_duplicate': '0', 'pchembl_value': None, 'bao_endpoint': 'BAO_0000179', 'relation': '='}, {'activity_id': '2237898', 'assay_id': '511059', 'doc_id': '44259', 'molregno': '111580', 'standard_value': '1.79', 'standard_type': 'D', 'potential_duplicate': '0', 'pchembl_value': None, 'bao_endpoint': 'BAO_0000179', 'relation': '='}, {'activity_id': '2195537', 'assay_id': '530354', 'doc_id': '42643', 'molregno': '507188', 'standard_value': '0.2', 'standard_type': 'D', 'potential_duplicate': '0', 'pchembl_value': None, 'bao_endpoint': 'BAO_0000179', 'relation': '='}, {'activity_id': '2918924', 'assay_id': '587816', 'doc_id': '48409', 'molregno': '569069', 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None, 'bao_endpoint': 'BAO_0003042', 'relation': None}, {'activity_id': '20664599', 'assay_id': '1985658', 'doc_id': '116309', 'molregno': '2377869', 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None, 'bao_endpoint': 'BAO_0003042', 'relation': None}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_PROPERTIES_33
+Column name: standard_relation Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: type Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: value Type: TEXT
+Column name: relation Type: TEXT
+Column name: activity_id Type: TEXT
+Sample rows:
+[{'activity_id': '21474161', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21471685', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21362076', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21331260', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}, {'activity_id': '21329866', 'relation': '=', 'value': '1.0e-05', 'standard_type': 'CONCENTRATION', 'standard_relation': '=', 'standard_value': '1.0e-05'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_24
+Column name: relation Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: value Type: TEXT
+Column name: doc_id Type: TEXT
+Column name: type Type: TEXT
+Column name: assay_id Type: TEXT
+Column name: activity_id Type: TEXT
+Column name: potential_duplicate Type: TEXT
+Column name: molregno Type: TEXT
+Column name: standard_type Type: TEXT
+Sample rows:
+[{'activity_id': '6208858', 'assay_id': '748129', 'doc_id': '57656', 'molregno': '1146844', 'standard_value': '4', 'standard_type': 'MIC', 'potential_duplicate': '0', 'relation': '='}, {'activity_id': '6209709', 'assay_id': '747748', 'doc_id': '57660', 'molregno': '1704427', 'standard_value': '16', 'standard_type': 'MIC', 'potential_duplicate': '0', 'relation': '='}, {'activity_id': '6219271', 'assay_id': '751141', 'doc_id': '57931', 'molregno': '1056382', 'standard_value': '3.1', 'standard_type': 'MIC', 'potential_duplicate': '0', 'relation': '='}, {'activity_id': '6256417', 'assay_id': '753375', 'doc_id': '58041', 'molregno': '1160100', 'standard_value': '4', 'standard_type': 'MIC', 'potential_duplicate': '0', 'relation': '='}, {'activity_id': '6294357', 'assay_id': '759315', 'doc_id': '58441', 'molregno': '1166796', 'standard_value': '0.125', 'standard_type': 'MIC', 'potential_duplicate': '0', 'relation': '='}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_SUPP_24
+Column name: value Type: TEXT
+Column name: as_id Type: TEXT
+Column name: standard_value Type: TEXT
+Column name: type Type: TEXT
+Column name: relation Type: TEXT
+Column name: standard_type Type: TEXT
+Column name: comments Type: TEXT
+Sample rows:
+[{'as_id': '1176707', 'relation': None, 'standard_type': 'LIVER_AUTOLYSIS', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176708', 'relation': None, 'standard_type': 'LIVER_BILE DUCT DILATATION', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176709', 'relation': None, 'standard_type': 'LIVER_BILE DUCT HYPERPLASIA', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176710', 'relation': None, 'standard_type': 'LIVER_BILE DUCT, NECROSIS, ONCOCYTIC', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}, {'as_id': '1176711', 'relation': None, 'standard_type': 'LIVER_CAPSULE, INFLAMMATORY CELL INFILTRATE, MIXED CELL', 'standard_value': '0', 'comments': 'SAMPLE_ID: S011009-125; LIVER_Codelink: T00127213; LIVER_Affymetrix: 97581.CEL; KIDNEY_Codelink: T00131259; KIDNEY_Affymetrix: 92102.CEL; BONE MARROW_Codelink: T00137713; SPLEEN_Codelink: T00131907'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.ACTIVITY_SUPP_29
+Column name: standard_value Type: TEXT
+Column name: as_id Type: TEXT
+Column name: value Type: TEXT
+Column name: type Type: TEXT
+Column name: standard_type Type: TEXT
+Sample rows:
+[{'as_id': '1130568', 'standard_type': 'THIGH MUSCLE_RIGHT SOLEUS, MYOCYTE, DEGENERATION', 'standard_value': '0'}, {'as_id': '1130570', 'standard_type': 'THIGH MUSCLE_RIGHT SOLEUS, MYOCYTE, REGENERATION', 'standard_value': '0'}, {'as_id': '1130577', 'standard_type': 'HEART_EPICARDIUM, CELLULAR INFILTRATE, MIXED CELL', 'standard_value': '0'}, {'as_id': '1130578', 'standard_type': 'HEART_INTRAMYOCARDIAL ARTERIES, CELLULAR INFILTRATE, MIXED CELL', 'standard_value': '0'}, {'as_id': '1130580', 'standard_type': 'HEART_INTRAMYOCARDIAL ARTERIES, NECROSIS, FIBRINOID', 'standard_value': '0'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.COMPOUND_STRUCTURES_26
+Column name: canonical_smiles Type: TEXT
+Column name: molregno Type: TEXT
+Column name: standard_inchi_key Type: TEXT
+Column name: standard_inchi Type: TEXT
+Sample rows:
+[{'molregno': '1611937', 'standard_inchi': 'InChI=1S/C21H23N7O/c22-15-4-2-10-28(13-15)19-7-9-25-12-18(19)27-21(29)20-16(23)5-6-17(26-20)14-3-1-8-24-11-14/h1,3,5-9,11-12,15H,2,4,10,13,22-23H2,(H,27,29)/t15-/m0/s1', 'standard_inchi_key': 'VNHNIGCSETXKQL-HNNXBMFYSA-N', 'canonical_smiles': 'Nc1ccc(-c2cccnc2)nc1C(=O)Nc1cnccc1N1CCC[C@H](N)C1'}, {'molregno': '1613204', 'standard_inchi': 'InChI=1S/C32H25FN2O8S2/c1-21-27(18-22-10-13-24(14-11-22)44(2)38)26-15-12-23(33)19-29(26)28(21)20-30(36)41-16-6-7-17-42-31-32(35(37)43-34-31)45(39,40)25-8-4-3-5-9-25/h3-5,8-15,18-19H,16-17,20H2,1-2H3/b27-18-', 'standard_inchi_key': 'NFBLPHPVEXWZJZ-IMRQLAEWSA-N', 'canonical_smiles': 'CC1=C(CC(=O)OCC#CCOc2no[n+]([O-])c2S(=O)(=O)c2ccccc2)c2cc(F)ccc2/C1=C\\c1ccc([S+](C)[O-])cc1'}, {'molregno': '1613563', 'standard_inchi': 'InChI=1S/C80H127N23O22/c1-16-41(10)64(79(124)101-56(26-40(8)9)78(123)103-65(46(15)104)80(125)96-53(66(83)111)23-37(2)3)102-62(108)34-87-68(113)43(12)91-70(115)45(14)93-74(119)58(29-49-32-85-36-89-49)100-77(122)59(30-60(82)106)94-61(107)33-86-67(112)42(11)90-69(114)44(13)92-73(118)57(28-48-31-84-35-88-48)99-76(121)55(25-39(6)7)98-75(120)54(24-38(4)5)97-72(117)52(21-22-63(109)110)95-71(116)51(81)27-47-17-19-50(105)20-18-47/h17-20,31-32,35-46,51-59,64-65,104-105H,16,21-30,33-34,81H2,1-15H3,(H2,82,106)(H2,83,111)(H,84,88)(H,85,89)(H,86,112)(H,87,113)(H,90,114)(H,91,115)(H,92,118)(H,93,119)(H,94,107)(H,95,116)(H,96,125)(H,97,117)(H,98,120)(H,99,121)(H,100,122)(H,101,124)(H,102,108)(H,103,123)(H,109,110)/t41-,42-,43-,44-,45-,46+,51-,52-,53-,54-,55-,56-,57-,58-,59-,64-,65-/m0/s1', 'standard_inchi_key': 'BKBOHGWOOAWOGT-OWWRUJIXSA-N', 'canonical_smiles': 'CC[C@H](C)[C@H](NC(=O)CNC(=O)[C@H](C)NC(=O)[C@H](C)NC(=O)[C@H](Cc1cnc[nH]1)NC(=O)[C@H](CC(N)=O)NC(=O)CNC(=O)[C@H](C)NC(=O)[C@H](C)NC(=O)[C@H](Cc1cnc[nH]1)NC(=O)[C@H](CC(C)C)NC(=O)[C@H](CC(C)C)NC(=O)[C@H](CCC(=O)O)NC(=O)[C@@H](N)Cc1ccc(O)cc1)C(=O)N[C@@H](CC(C)C)C(=O)N[C@H](C(=O)N[C@@H](CC(C)C)C(N)=O)[C@@H](C)O'}, {'molregno': '1616556', 'standard_inchi': 'InChI=1S/C28H33FN4O3/c1-35-26-8-3-2-7-25(26)23-5-4-6-24(19-23)33-14-12-32(13-15-33)16-18-36-17-11-28(34)31-21-22-9-10-27(29)30-20-22/h2-10,19-20H,11-18,21H2,1H3,(H,31,34)', 'standard_inchi_key': 'BJVXUJCYUYVLDD-UHFFFAOYSA-N', 'canonical_smiles': 'COc1ccccc1-c1cccc(N2CCN(CCOCCC(=O)NCc3ccc(F)nc3)CC2)c1'}, {'molregno': '1619406', 'standard_inchi': 'InChI=1S/C19H14ClN3O2/c20-15-7-3-13(4-8-15)18(24)22-16-9-5-14(6-10-16)19(25)23-17-2-1-11-21-12-17/h1-12H,(H,22,24)(H,23,25)', 'standard_inchi_key': 'YWYWIFFWCVCCKH-UHFFFAOYSA-N', 'canonical_smiles': 'O=C(Nc1ccc(C(=O)Nc2cccnc2)cc1)c1ccc(Cl)cc1'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.COMPOUND_STRUCTURES_33
+Column name: standard_inchi_key Type: TEXT
+Column name: canonical_smiles Type: TEXT
+Column name: standard_inchi Type: TEXT
+Column name: molregno Type: TEXT
+Sample rows:
+[{'molregno': '2277861', 'standard_inchi': 'InChI=1S/C32H32F3N5O4/c1-21-3-10-27(43-18-15-40-13-16-42-17-14-40)19-28(21)38-30(41)24-4-8-25(9-5-24)37-31-36-20-22(2)29(39-31)23-6-11-26(12-7-23)44-32(33,34)35/h3-12,19-20H,13-18H2,1-2H3,(H,38,41)(H,36,37,39)', 'standard_inchi_key': 'QIOBIFGGAWJNHY-UHFFFAOYSA-N', 'canonical_smiles': 'Cc1ccc(OCCN2CCOCC2)cc1NC(=O)c1ccc(Nc2ncc(C)c(-c3ccc(OC(F)(F)F)cc3)n2)cc1'}, {'molregno': '480624', 'standard_inchi': 'InChI=1S/C17H15N3O2/c1-11(12-5-3-2-4-6-12)19-14-15(17(22)16(14)21)20-13-7-9-18-10-8-13/h2-11,19H,1H3,(H,18,20)/t11-/m0/s1', 'standard_inchi_key': 'MCBPNFWHHNJTGN-NSHDSACASA-N', 'canonical_smiles': 'C[C@H](Nc1c(Nc2ccncc2)c(=O)c1=O)c1ccccc1'}, {'molregno': '2298583', 'standard_inchi': 'InChI=1S/C26H27IN8O2/c1-4-24(36)30-19-13-20(23(37-3)14-22(19)34-11-9-33(2)10-12-34)31-26-28-15-21-25(32-26)35(16-29-21)18-7-5-17(27)6-8-18/h4-8,13-16H,1,9-12H2,2-3H3,(H,30,36)(H,28,31,32)', 'standard_inchi_key': 'LRTSXZGIBMYYHO-UHFFFAOYSA-N', 'canonical_smiles': 'C=CC(=O)Nc1cc(Nc2ncc3ncn(-c4ccc(I)cc4)c3n2)c(OC)cc1N1CCN(C)CC1'}, {'molregno': '509616', 'standard_inchi': 'InChI=1S/C31H42F2N4O4/c1-5-9-36(10-6-2)30(40)23-14-20(4)13-22(18-23)29(39)35-26(17-21-15-24(32)19-25(33)16-21)28(38)27-31(41)37(11-7-3)12-8-34-27/h13-16,18-19,26-28,34,38H,5-12,17H2,1-4H3,(H,35,39)/t26-,27-,28-/m0/s1', 'standard_inchi_key': 'GKMLMHBHJMGYTA-KCHLEUMXSA-N', 'canonical_smiles': 'CCCN(CCC)C(=O)c1cc(C)cc(C(=O)N[C@@H](Cc2cc(F)cc(F)c2)[C@H](O)[C@@H]2NCCN(CCC)C2=O)c1'}, {'molregno': '515729', 'standard_inchi': 'InChI=1S/C14H12ClN3/c15-11-7-5-10(6-8-11)9-16-14-17-12-3-1-2-4-13(12)18-14/h1-8H,9H2,(H2,16,17,18)', 'standard_inchi_key': 'GNCUDHLBPMQNEJ-UHFFFAOYSA-N', 'canonical_smiles': 'Clc1ccc(CNc2nc3ccccc3[nH]2)cc1'}]
+
+--------------------------------------------------
+Table full name: EBI_CHEMBL.EBI_CHEMBL.COMPOUND_PROPERTIES_29
+Column name: heavy_atoms Type: TEXT
+Sample rows:
+[{'heavy_atoms': '39'}, {'heavy_atoms': '39'}, {'heavy_atoms': '39'}, {'heavy_atoms': '39'}, {'heavy_atoms': '39'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+### Data Sources:
+Part tables of ChEMBL database:
+- activity data: patents-public-data.ebi_chembl.activities_29
+- compound structures: patents-public-data.ebi_chembl.compound_structures_29 
+- compound properties: patents-public-data.ebi_chembl.compound_properties_29 
+- publication documents: patents-public-data.ebi_chembl.docs_29 
+
+### UUID Generation:
+Activity Pair UUID (mmp_delta_uuid):
+Generated using the MD5 hash of the JSON string of the pair's activity IDs:
+to_hex(md5(to_json_string(struct(A, B))))
+Both A and B can be activity id or canonical_smiles
+
+### Standard Change Classification:
+Determines whether the standard value between two molecules has increased, decreased, or stayed the same:
+'decrease': If standard_value_1 >(>>) standard_value_2 and measurement relations do not conflict.
+'increase': If standard_value_1 <(<<) standard_value_2 and measurement relations do not conflict.
+'no-change': If standard_value_1 =(~) standard_value_2 and both standard relations indicate equality.
+
+### How to Got the publication Date
+To compute a publication date for each document, we use the following method, which assigns a date based on the document's relative position within its journal and year, ordered by its first page number.
+
+#### 1. Year Calculation
+
+- **Year**: Use the document's publication year as the year in the date.
+  - If the document's year is known, use that year.
+  - If the year is missing or unavailable, default to **1970**.
+
+#### 2. Month Calculation
+
+- **Grouping**: For all documents within the same **journal** and **year**, group them together.
+- **Ordering**: Within each group, order the documents by their `first_page` number (converted to an integer).
+- **Percent Rank Computation**:
+  - Calculate the **percent rank** of each document in the ordered list.
+  - **Percent Rank Formula**:
+
+    $$\text{Percent Rank} = \frac{\text{Rank of Document} - 1}{\text{Total Documents in Group} - 1}$$
+
+    - The rank starts at 1 for the first document.
+    - The percent rank ranges from 0 to 1.
+- **Month Assignment**:
+  - Scale the percent rank to months by multiplying it by 11:
+
+    $$\text{Scaled Value} = \text{Percent Rank} \times 11$$
+
+  - Take the integer part of the scaled value (floor it):
+
+    $$\text{Floor Value} = \left\lfloor \text{Scaled Value} \right\rfloor$$
+
+  - Add 1 to get the month number (since months are from 1 to 12):
+
+    $$\text{Month} = \text{Floor Value} + 1$$
+
+  - **Note**: If the computed month is not available (e.g., due to missing data), default the month to **1**.
+
+#### 3. Day Calculation
+
+- **Using the Same Percent Rank**: Use the percent rank computed in the month calculation.
+- **Day Assignment**:
+  - Scale the percent rank to days by multiplying it by **308**:
+
+    $$\text{Scaled Value} = \text{Percent Rank} \times 308$$
+
+    - The number 308 is chosen because it is the product of 11 months and 28 days (11 × 28), representing the total number of days in an 11-month period with 28 days per month.
+  - Take the integer part of the scaled value (floor it):
+
+    $$\text{Floor Value} = \left\lfloor \text{Scaled Value} \right\rfloor$$
+
+  - Compute the modulus of the floor value with 28:
+
+    $$\text{Modulo Value} = \text{Floor Value} \bmod 28$$
+
+  - Add 1 to get the day number (since days are from 1 to 28):
+
+    $$\text{Day} = \text{Modulo Value} + 1$$
+
+  - **Note**: If the computed day is not available, default the day to **1**.
+
+### 4. Constructing the publication Date
+
+- Combine the computed **Year**, **Month**, and **Day** to form the publication date.
+
+  $$\text{publication Date} : \text{Year}-\text{Month}-\text{Day}$$
+
+  For example, 2002-06-15.
+
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'EBI_CHEMBL': {'EBI_CHEMBL': ['ACTIVITY_PROPERTIES', 'ACTIVITY_PROPERTIES_29', 'ACTIVITY_PROPERTIES_30', 'COMPOUND_STRUCTURES_30', 'COMPOUND_STRUCTURES', 'ACTIVITIES_27', 'ACTIVITY_SUPP_28', 'ACTIVITIES_28', 'ACTIVITY_SUPP_27', 'ACTIVITIES_29', 'ACTIVITIES_26', 'ASSAY_PARAMETERS_30', 'COMPOUND_PROPERTIES', 'ACTIVITIES', 'ACTIVITIES_23', 'ACTIVITIES_25', 'ACTIVITIES_30', 'ACTIVITIES_33', 'ACTIVITY_PROPERTIES_33', 'ACTIVITIES_24', 'ACTIVITY_SUPP_24', 'ACTIVITY_SUPP_29', 'COMPOUND_STRUCTURES_26', 'COMPOUND_STRUCTURES_33', 'COMPOUND_PROPERTIES_29']}}
+
+Some few-shot examples after column exploration may be helpful:
+Query:
+--Description: 1) Quick look at the distribution of heavy–atom counts that are already
+--normalised in the partitioned compound-properties table we will join later.
+SELECT 
+  cp."heavy_atoms"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+LIMIT 20;
+Answer:
+heavy_atoms
+50
+64
+54
+54
+51
+70
+61
+64
+53
+48
+47
+55
+51
+70
+56
+57
+62
+63
+61
+47
+Query:
+--Description: 2) Inspect activities whose pChEMBL values are reported (non-null) and
+--that look large (>10).  This tells us which assays / standard_types might qualify.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_relation",
+  a."standard_value",
+  a."pchembl_value",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."pchembl_value" IS NOT NULL
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+LIMIT 20;
+Answer:
+activity_id,assay_id,standard_type,standard_relation,standard_value,pchembl_value,molregno
+1421981,305651,IC50,=,0.017,10.77,300648
+2638095,501124,IC50,=,0.0278,10.56,480314
+183792,201108,IC50,=,0.03,10.52,212535
+1058641,122682,IC50,=,0.015,10.82,609762
+2703153,582918,IC50,=,0.02,10.7,125241
+6386716,770739,IC50,=,0.0271,10.57,1180612
+100469,68568,IC50,=,0.016,10.8,184149
+176547,39626,IC50,=,0.01,11,127106
+2015550,453484,IC50,=,0.022,10.66,408978
+Query:
+--Description: 3) Join the same activity rows to compound-properties to pick up heavy
+--atom counts, so we can later filter to the 10–15 atom window.
+SELECT 
+  a."activity_id",
+  a."assay_id",
+  a."standard_type",
+  a."standard_value",
+  cp."heavy_atoms",
+  a."molregno"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  cp."heavy_atoms" IS NOT NULL
+LIMIT 20;
+Answer:
+activity_id,assay_id,standard_type,standard_value,heavy_atoms,molregno
+3021495,598450,IC50,340,20,576644
+3023171,599107,IC50,9430,25,578545
+3056026,603366,IC50,6350,24,594554
+3058834,603828,IC50,60000000,12,1037865
+3059523,602335,IC50,1200,23,5295
+3061847,603228,IC50,695,48,592218
+3066591,606155,IC50,400000,19,593335
+3072768,605389,IC50,3000,41,591762
+3076644,606335,IC50,210,36,593051
+3078372,604005,IC50,19700,23,469153
+Query:
+--Description: 4) Bring in canonical SMILES so we can later build the MD5-based UUIDs
+--required by the task specification.
+SELECT 
+  a."activity_id",
+  cs."canonical_smiles"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"      a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+    ON a."molregno" = cs."molregno"
+LIMIT 20;
+Answer:
+activity_id,canonical_smiles
+44742,CCc1c(CC)c2cc3nc(cc4[nH]c(c(C)c4CC)c4[nH]c(cc5nc(cc1[nH]2)C(CCC(=O)N(CCO)CCO)=C5C)c(CC)c4C)C(C)=C3CCC(=O)N(CCO)CCO
+93575,C[C@]12CCC(=O)C=C1CC[C@@H]1[C@@H]2[C@@H](O)C[C@@]2(C)[C@H]1CC[C@]2(O)C(=O)CO
+101076,CC(C)c1cc(Cc2cnc(N)nc2N)cc(C(C)C)c1O
+177883,CC(C)[C@@H]1C(=O)N(S(C)(=O)=O)[C@@H]2CN(C(=O)/C=C/CN3CCCCC3)C[C@H]21.Cl
+180499,CN1CCN(c2c(F)cc3c(=O)c(C(=O)O)cn4c3c2SCC4)CC1
+190278,O=c1cc(-c2ccccc2)oc2ccc3ccccc3c12
+215101,CN1[C@@H]2CC[C@H]1C[C@@H](OC(=O)C(CO
+Query:
+--Description: 5) Count how many qualifying activity rows exist per assay & standard
+--type after restricting to 10–15 heavy atoms and non-null standard values.
+SELECT 
+  a."assay_id",
+  a."standard_type",
+  COUNT(*) AS "n_activities"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND a."standard_value" IS NOT NULL
+GROUP BY 
+  a."assay_id", a."standard_type"
+HAVING 
+  COUNT(*) < 5
+LIMIT 20;
+Answer:
+assay_id,standard_type,n_activities
+1359256,TIME,1
+679194,Km,2
+1873065,CC50,1
+1989625,Km,4
+838308,Km,1
+430868,Kd,2
+1566690,Kd,4
+1520489,Activity,2
+1437733,Kd,1
+1557018,CC50,2
+1452075,CC50,3
+1299116,CC50,1
+32989,Kd,3
+609049,MIC80,3
+1436493,Kd,2
+1301698,Potency,4
+338917,EC50,3
+172935,EC50,1
+163023,EC50,2
+216983,EC50,4
+Query:
+--Description: 6) Check for duplicate-flagged rows inside the same assay so that we can
+--later keep only assays with <2 duplicate activities.
+SELECT 
+  a."assay_id",
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) AS "dup_cnt"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+GROUP BY 
+  a."assay_id"
+HAVING 
+  SUM(CASE WHEN a."potential_duplicate" = '1' THEN 1 ELSE 0 END) < 2
+LIMIT 20;
+Answer:
+assay_id,dup_cnt
+1663373,0
+829301,0
+1670511,0
+1769518,0
+880523,0
+933982,0
+984871,0
+1896840,0
+1466367,0
+1697571,0
+1699718,0
+1295651,0
+1474946,0
+1625611,0
+1895058,0
+1623239,0
+1911881,0
+922402,0
+1339624,0
+1616805,0
+Query:
+--Description: 7) Produce all pairs of *different* molecules tested in exactly the same
+--assay & standard_type that satisfy the heavy-atom and pChEMBL filters.  No change
+--classification yet – this is to verify that such pairs actually exist.
+SELECT DISTINCT
+  a1."activity_id"        AS "activity_id_1",
+  a2."activity_id"        AS "activity_id_2",
+  a1."assay_id",
+  a1."standard_type",
+  a1."standard_value"     AS "std_val_1",
+  a2."standard_value"     AS "std_val_2"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a1
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a2
+    ON a1."assay_id"      = a2."assay_id"
+   AND a1."standard_type" = a2."standard_type"
+   AND a1."molregno"     <> a2."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp1
+    ON a1."molregno" = cp1."molregno"
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp2
+    ON a2."molregno" = cp2."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp1."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(cp2."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a1."pchembl_value") > 10
+  AND TRY_TO_NUMBER(a2."pchembl_value") > 10
+LIMIT 20;
+Answer:
+activity_id_1,activity_id_2,assay_id,standard_type,std_val_1,std_val_2
+1081396,1074398,143097,Ki,0.027,0.015
+1909028,1909011,439959,Ki,0.027,0.01349
+1086886,1082696,143097,Ki,0.025,0.026
+1210176,1198202,143855,Ki,0.023,0.025
+1195606,1198202,143855,Ki,0.021,0.025
+1136349,1107495,157,Ki,0.02239,0.01698
+549563,516979,142899,Kd,0.028,0.027
+1909040,1908977,439959,Ki,0.028,0.0182
+1909012,1909007,439959,Ki,0.014,0.0182
+Query:
+--Description: 8) Grab the highest (latest) document ID per assay among rows that pass
+--all basic filters; this will later let us take “latest publication” for each pair.
+SELECT 
+  a."assay_id",
+  MAX(TRY_TO_NUMBER(a."doc_id")) AS "max_doc_id"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"        a
+JOIN 
+  EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+    ON a."molregno" = cp."molregno"
+WHERE 
+  TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+  AND TRY_TO_NUMBER(a."pchembl_value") > 10
+GROUP BY 
+  a."assay_id"
+LIMIT 20;
+Answer:
+assay_id,max_doc_id
+303546,21501
+143871,6774
+142930,2344
+435003,35664
+143854,6774
+1454459,90223
+33684,15882
+143415,16491
+615093,50377
+1454461,90223
+714883,55203
+143393,16851
+578992,47891
+452154,37247
+501117,47212
+157,16992
+302242,21562
+143227,6768
+320936,30035
+833017,62804
+Query:
+--Description: 9) Explore the text relations (‘=’, ‘<’, ‘>’, etc.) so we can reliably
+--classify increases vs decreases in the final step.
+SELECT DISTINCT 
+  a."standard_relation"
+FROM 
+  EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29" a
+WHERE 
+  a."standard_relation" IS NOT NULL
+LIMIT 20;
+Answer:
+standard_relation
+>
+<
+=
+>>
+~
+<=
+>=
+<<
+Task: Find pairs of different molecules tested in the same assay and standard type, where both have 10–15 heavy atoms, fewer than 5 activities in that assay, fewer than 2 duplicate activities, non-null standard values, and pChEMBL values over 10. For each pair, report the maximum heavy atom count, the latest publication date (calculated based on the document's rank within the same journal and year, and map it to a synthetic month and day), the highest document ID, classify the change in standard values as 'increase', 'decrease', or 'no-change' based on their values and relations, and generate UUIDs from their activity IDs and canonical SMILES.
+
+Please think step by step and answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'EBI_CHEMBL': {'EBI_CHEMBL': ['ACTIVITY_PROPERTIES', 'ACTIVITY_PROPERTIES_29', 'ACTIVITY_PROPERTIES_30', 'COMPOUND_STRUCTURES_30', 'COMPOUND_STRUCTURES', 'ACTIVITIES_27', 'ACTIVITY_SUPP_28', 'ACTIVITIES_28', 'ACTIVITY_SUPP_27', 'ACTIVITIES_29', 'ACTIVITIES_26', 'ASSAY_PARAMETERS_30', 'COMPOUND_PROPERTIES', 'ACTIVITIES', 'ACTIVITIES_23', 'ACTIVITIES_25', 'ACTIVITIES_30', 'ACTIVITIES_33', 'ACTIVITY_PROPERTIES_33', 'ACTIVITIES_24', 'ACTIVITY_SUPP_24', 'ACTIVITY_SUPP_29', 'COMPOUND_STRUCTURES_26', 'COMPOUND_STRUCTURES_33', 'COMPOUND_PROPERTIES_29']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-07 06:38:13 - Thread-416 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------------------
+   Pairs of different molecules (10–15 heavy atoms) measured in the same assay
+   & standard_type that satisfy all task constraints together with
+   – UUIDs for the pair (by activity-ids and by SMILES)
+   – change-classification of the standard values
+   – max heavy-atom count of the pair
+   – latest (synthetic) publication date
+   – highest document-id seen in the pair
+---------------------------------------------------------------------------- */
+WITH docs_enhanced AS (   -- normalise core bibliographic fields
+    SELECT  "doc_id",
+            COALESCE(TRY_TO_NUMBER("year"),1970)              AS yr,
+            "journal",
+            TRY_TO_NUMBER("first_page")                       AS first_pg
+    FROM    EBI_CHEMBL.EBI_CHEMBL."DOCS_29"
+), ranked_docs AS (        -- percent-rank each paper inside its journal-year
+    SELECT  doc_id,
+            yr,
+            journal,
+            first_pg,
+            PERCENT_RANK() OVER (PARTITION BY journal,yr ORDER BY first_pg) AS pct_rk
+    FROM    docs_enhanced
+), docs_date AS (          -- build synthetic YYYY-MM-DD string per spec
+    SELECT  doc_id,
+            TO_CHAR(yr) || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 ELSE FLOOR(pct_rk*11)+1 END),2,'0')
+                 || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 ELSE MOD(FLOOR(pct_rk*308),28)+1 END),2,'0')
+                 AS pub_date
+    FROM    ranked_docs
+), acts_filtered AS (      -- activity rows that meet the atomic / value filters
+    SELECT  a."activity_id",
+            a."assay_id",
+            a."standard_type",
+            a."standard_relation",
+            TRY_TO_NUMBER(a."standard_value")          AS std_val,
+            TRY_TO_NUMBER(a."pchembl_value")           AS pchembl,
+            a."molregno",
+            TRY_TO_NUMBER(cp."heavy_atoms")            AS heavy_atoms,
+            a."potential_duplicate",
+            TRY_TO_NUMBER(a."doc_id")                  AS doc_id,
+            cs."canonical_smiles"
+    FROM    EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"         a
+    JOIN    EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+              ON a."molregno" = cp."molregno"
+    JOIN    EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+              ON a."molregno" = cs."molregno"
+    WHERE   cp."heavy_atoms" IS NOT NULL
+      AND   TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+      AND   a."standard_value" IS NOT NULL
+      AND   a."pchembl_value" IS NOT NULL
+      AND   TRY_TO_NUMBER(a."pchembl_value") > 10
+), assays_ok AS (          -- assays with <5 qualifying rows and <2 duplicates
+    SELECT  assay_id
+    FROM    acts_filtered
+    GROUP BY assay_id
+    HAVING  COUNT(*) < 5
+       AND  SUM(CASE WHEN potential_duplicate='1' THEN 1 ELSE 0 END) < 2
+), acts_ok AS (SELECT f.* FROM acts_filtered f JOIN assays_ok u USING(assay_id)),
+pairs AS (                 -- unique unordered molecule pairs inside each assay/type
+    SELECT
+        a1.activity_id          AS activity_id_1,
+        a2.activity_id          AS activity_id_2,
+        a1.canonical_smiles     AS smiles_1,
+        a2.canonical_smiles     AS smiles_2,
+        a1.assay_id,
+        a1.standard_type,
+        a1.standard_relation    AS rel_1,
+        a2.standard_relation    AS rel_2,
+        a1.std_val              AS val_1,
+        a2.std_val              AS val_2,
+        GREATEST(a1.heavy_atoms,a2.heavy_atoms)          AS max_heavy_atoms,
+        GREATEST(a1.doc_id,a2.doc_id)                    AS latest_doc_id,
+        a1.doc_id                                        AS doc1,
+        a2.doc_id                                        AS doc2
+    FROM   acts_ok a1
+    JOIN   acts_ok a2
+           ON  a1.assay_id      = a2.assay_id
+           AND a1.standard_type = a2.standard_type
+           AND a1.activity_id   < a2.activity_id        -- enforce uniqueness
+           AND a1.molregno      <> a2.molregno
+)
+SELECT
+    p.activity_id_1,
+    p.activity_id_2,
+
+    /* UUID built from activity-ids */
+    TO_HEX(MD5('["'||p.activity_id_1||'","'||p.activity_id_2||'"]'))   AS activity_pair_uuid,
+
+    /* UUID built from canonical SMILES */
+    TO_HEX(MD5('["'||p.smiles_1||'","'||p.smiles_2||'"]'))             AS smiles_pair_uuid,
+
+    /* change classification */
+    CASE
+        WHEN p.val_1 > p.val_2
+             AND p.rel_1 IN ('=','>','>>','>=') 
+             AND p.rel_2 IN ('=','<','<<','<=')                      THEN 'decrease'
+        WHEN p.val_1 < p.val_2
+             AND p.rel_1 IN ('=','<','<<','<=') 
+             AND p.rel_2 IN ('=','>','>>','>=')                      THEN 'increase'
+        WHEN p.val_1 = p.val_2
+             AND p.rel_1 = '=' AND p.rel_2 = '='                     THEN 'no-change'
+        ELSE 'no-change'
+    END                                                                AS standard_change,
+
+    p.max_heavy_atoms,
+
+    /* latest synthetic publication date */
+    COALESCE(
+        CASE
+            WHEN d1.pub_date IS NOT NULL AND (d2.pub_date IS NULL OR d1.pub_date >= d2.pub_date)
+                 THEN d1.pub_date
+            ELSE d2.pub_date
+        END,
+        '1970-01-01'
+    )                                                                  AS latest_publication_date,
+
+    p.latest_doc_id
+FROM
+    pairs            p
+LEFT JOIN docs_date  d1 ON p.doc1 = d1.doc_id
+LEFT JOIN docs_date  d2 ON p.doc2 = d2.doc_id;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:38:14 - Thread-416 (execute) - INFO - itercount: 1
+2025-05-07 06:38:14 - Thread-416 (execute) - INFO - [Self-refine]
+Input sql:
+/* ---------------------------------------------------------------------------
+   Pairs of different molecules (10–15 heavy atoms) measured in the same assay
+   & standard_type that satisfy all task constraints together with
+   – UUIDs for the pair (by activity-ids and by SMILES)
+   – change-classification of the standard values
+   – max heavy-atom count of the pair
+   – latest (synthetic) publication date
+   – highest document-id seen in the pair
+---------------------------------------------------------------------------- */
+WITH docs_enhanced AS (   -- normalise core bibliographic fields
+    SELECT  "doc_id",
+            COALESCE(TRY_TO_NUMBER("year"),1970)              AS yr,
+            "journal",
+            TRY_TO_NUMBER("first_page")                       AS first_pg
+    FROM    EBI_CHEMBL.EBI_CHEMBL."DOCS_29"
+), ranked_docs AS (        -- percent-rank each paper inside its journal-year
+    SELECT  doc_id,
+            yr,
+            journal,
+            first_pg,
+            PERCENT_RANK() OVER (PARTITION BY journal,yr ORDER BY first_pg) AS pct_rk
+    FROM    docs_enhanced
+), docs_date AS (          -- build synthetic YYYY-MM-DD string per spec
+    SELECT  doc_id,
+            TO_CHAR(yr) || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 ELSE FLOOR(pct_rk*11)+1 END),2,'0')
+                 || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 ELSE MOD(FLOOR(pct_rk*308),28)+1 END),2,'0')
+                 AS pub_date
+    FROM    ranked_docs
+), acts_filtered AS (      -- activity rows that meet the atomic / value filters
+    SELECT  a."activity_id",
+            a."assay_id",
+            a."standard_type",
+            a."standard_relation",
+            TRY_TO_NUMBER(a."standard_value")          AS std_val,
+            TRY_TO_NUMBER(a."pchembl_value")           AS pchembl,
+            a."molregno",
+            TRY_TO_NUMBER(cp."heavy_atoms")            AS heavy_atoms,
+            a."potential_duplicate",
+            TRY_TO_NUMBER(a."doc_id")                  AS doc_id,
+            cs."canonical_smiles"
+    FROM    EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"         a
+    JOIN    EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+              ON a."molregno" = cp."molregno"
+    JOIN    EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+              ON a."molregno" = cs."molregno"
+    WHERE   cp."heavy_atoms" IS NOT NULL
+      AND   TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+      AND   a."standard_value" IS NOT NULL
+      AND   a."pchembl_value" IS NOT NULL
+      AND   TRY_TO_NUMBER(a."pchembl_value") > 10
+), assays_ok AS (          -- assays with <5 qualifying rows and <2 duplicates
+    SELECT  assay_id
+    FROM    acts_filtered
+    GROUP BY assay_id
+    HAVING  COUNT(*) < 5
+       AND  SUM(CASE WHEN potential_duplicate='1' THEN 1 ELSE 0 END) < 2
+), acts_ok AS (SELECT f.* FROM acts_filtered f JOIN assays_ok u USING(assay_id)),
+pairs AS (                 -- unique unordered molecule pairs inside each assay/type
+    SELECT
+        a1.activity_id          AS activity_id_1,
+        a2.activity_id          AS activity_id_2,
+        a1.canonical_smiles     AS smiles_1,
+        a2.canonical_smiles     AS smiles_2,
+        a1.assay_id,
+        a1.standard_type,
+        a1.standard_relation    AS rel_1,
+        a2.standard_relation    AS rel_2,
+        a1.std_val              AS val_1,
+        a2.std_val              AS val_2,
+        GREATEST(a1.heavy_atoms,a2.heavy_atoms)          AS max_heavy_atoms,
+        GREATEST(a1.doc_id,a2.doc_id)                    AS latest_doc_id,
+        a1.doc_id                                        AS doc1,
+        a2.doc_id                                        AS doc2
+    FROM   acts_ok a1
+    JOIN   acts_ok a2
+           ON  a1.assay_id      = a2.assay_id
+           AND a1.standard_type = a2.standard_type
+           AND a1.activity_id   < a2.activity_id        -- enforce uniqueness
+           AND a1.molregno      <> a2.molregno
+)
+SELECT
+    p.activity_id_1,
+    p.activity_id_2,
+
+    /* UUID built from activity-ids */
+    TO_HEX(MD5('["'||p.activity_id_1||'","'||p.activity_id_2||'"]'))   AS activity_pair_uuid,
+
+    /* UUID built from canonical SMILES */
+    TO_HEX(MD5('["'||p.smiles_1||'","'||p.smiles_2||'"]'))             AS smiles_pair_uuid,
+
+    /* change classification */
+    CASE
+        WHEN p.val_1 > p.val_2
+             AND p.rel_1 IN ('=','>','>>','>=') 
+             AND p.rel_2 IN ('=','<','<<','<=')                      THEN 'decrease'
+        WHEN p.val_1 < p.val_2
+             AND p.rel_1 IN ('=','<','<<','<=') 
+             AND p.rel_2 IN ('=','>','>>','>=')                      THEN 'increase'
+        WHEN p.val_1 = p.val_2
+             AND p.rel_1 = '=' AND p.rel_2 = '='                     THEN 'no-change'
+        ELSE 'no-change'
+    END                                                                AS standard_change,
+
+    p.max_heavy_atoms,
+
+    /* latest synthetic publication date */
+    COALESCE(
+        CASE
+            WHEN d1.pub_date IS NOT NULL AND (d2.pub_date IS NULL OR d1.pub_date >= d2.pub_date)
+                 THEN d1.pub_date
+            ELSE d2.pub_date
+        END,
+        '1970-01-01'
+    )                                                                  AS latest_publication_date,
+
+    p.latest_doc_id
+FROM
+    pairs            p
+LEFT JOIN docs_date  d1 ON p.doc1 = d1.doc_id
+LEFT JOIN docs_date  d2 ON p.doc2 = d2.doc_id;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 8 at position 12\ninvalid identifier 'DOC_ID'"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 06:39:09 - Thread-416 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------------------
+   Produce qualifying molecule-pairs with UUIDs, change-class, heavy-atom max,
+   latest synthetic publication date and largest document-id.
+--------------------------------------------------------------------------- */
+WITH docs_enhanced AS (          -- basic numeric cleanup of documents
+    SELECT  DOC_ID                       AS doc_id,
+            COALESCE(TRY_TO_NUMBER(YEAR),1970)                 AS yr,
+            JOURNAL                                              journal,
+            TRY_TO_NUMBER(FIRST_PAGE)                           AS first_pg
+    FROM    EBI_CHEMBL.EBI_CHEMBL.DOCS_29
+), ranked_docs AS (              -- percent-rank within (journal,year)
+    SELECT  doc_id,
+            yr,
+            journal,
+            first_pg,
+            PERCENT_RANK() OVER (PARTITION BY journal, yr ORDER BY first_pg) AS pct_rk
+    FROM    docs_enhanced
+), docs_date AS (                -- synthetic publication date YYYY-MM-DD
+    SELECT  doc_id,
+            TO_CHAR(yr) || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 
+                               ELSE FLOOR(pct_rk*11)+1 END),2,'0')
+            || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 
+                               ELSE MOD(FLOOR(pct_rk*308),28)+1 END),2,'0')  AS pub_date
+    FROM    ranked_docs
+), acts_filtered AS (            -- activities that pass atomic / value filters
+    SELECT  a.ACTIVITY_ID,
+            a.ASSAY_ID,
+            a.STANDARD_TYPE,
+            a.STANDARD_RELATION,
+            TRY_TO_NUMBER(a.STANDARD_VALUE)                     AS std_val,
+            TRY_TO_NUMBER(a.PCHEMBL_VALUE)                      AS pchembl,
+            a.MOLREGNO,
+            TRY_TO_NUMBER(cp.HEAVY_ATOMS)                       AS heavy_atoms,
+            a.POTENTIAL_DUPLICATE,
+            TRY_TO_NUMBER(a.DOC_ID)                             AS doc_id,
+            cs.CANONICAL_SMILES
+    FROM    EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_29              a
+    JOIN    EBI_CHEMBL.EBI_CHEMBL.COMPOUND_PROPERTIES_29    cp
+           ON a.MOLREGNO = cp.MOLREGNO
+    JOIN    EBI_CHEMBL.EBI_CHEMBL.COMPOUND_STRUCTURES_33    cs
+           ON a.MOLREGNO = cs.MOLREGNO
+    WHERE   cp.HEAVY_ATOMS IS NOT NULL
+      AND   TRY_TO_NUMBER(cp.HEAVY_ATOMS) BETWEEN 10 AND 15
+      AND   a.STANDARD_VALUE IS NOT NULL
+      AND   a.PCHEMBL_VALUE IS NOT NULL
+      AND   TRY_TO_NUMBER(a.PCHEMBL_VALUE) > 10
+), assays_ok AS (                -- assays with <5 rows & <2 duplicates
+    SELECT  ASSAY_ID
+    FROM    acts_filtered
+    GROUP BY ASSAY_ID
+    HAVING  COUNT(*) < 5
+       AND  SUM(CASE WHEN POTENTIAL_DUPLICATE = '1' THEN 1 ELSE 0 END) < 2
+), acts_ok AS (
+    SELECT f.*
+    FROM   acts_filtered f
+    JOIN   assays_ok     u  ON f.ASSAY_ID = u.ASSAY_ID
+), pairs AS (                    -- distinct unordered molecule-pairs
+    SELECT
+        a1.ACTIVITY_ID                 AS activity_id_1,
+        a2.ACTIVITY_ID                 AS activity_id_2,
+        a1.CANONICAL_SMILES            AS smiles_1,
+        a2.CANONICAL_SMILES            AS smiles_2,
+        a1.ASSAY_ID,
+        a1.STANDARD_TYPE,
+        a1.STANDARD_RELATION           AS rel_1,
+        a2.STANDARD_RELATION           AS rel_2,
+        a1.std_val                     AS val_1,
+        a2.std_val                     AS val_2,
+        GREATEST(a1.heavy_atoms, a2.heavy_atoms)        AS max_heavy_atoms,
+        GREATEST(a1.doc_id, a2.doc_id)                  AS latest_doc_id,
+        a1.doc_id                                       AS doc1,
+        a2.doc_id                                       AS doc2
+    FROM   acts_ok a1
+    JOIN   acts_ok a2
+           ON  a1.ASSAY_ID      = a2.ASSAY_ID
+           AND a1.STANDARD_TYPE = a2.STANDARD_TYPE
+           AND a1.ACTIVITY_ID   < a2.ACTIVITY_ID       -- uniqueness
+           AND a1.MOLREGNO      <> a2.MOLREGNO
+)
+SELECT
+    p.activity_id_1,
+    p.activity_id_2,
+
+    /* UUID from activity IDs */
+    TO_HEX(MD5('[\"' || p.activity_id_1 || '\",\"' || p.activity_id_2 || '\"]')) AS activity_pair_uuid,
+
+    /* UUID from canonical SMILES */
+    TO_HEX(MD5('[\"' || p.smiles_1 || '\",\"' || p.smiles_2 || '\"]'))            AS smiles_pair_uuid,
+
+    /* direction of standard value change */
+    CASE
+        WHEN p.val_1 > p.val_2
+             AND p.rel_1 IN ('=','>','>>','>=')
+             AND p.rel_2 IN ('=','<','<<','<=')                THEN 'decrease'
+        WHEN p.val_1 < p.val_2
+             AND p.rel_1 IN ('=','<','<<','<=')
+             AND p.rel_2 IN ('=','>','>>','>=')                THEN 'increase'
+        WHEN p.val_1 = p.val_2
+             AND p.rel_1 = '=' AND p.rel_2 = '='               THEN 'no-change'
+        ELSE 'no-change'
+    END                                                       AS standard_change,
+
+    p.max_heavy_atoms,
+
+    /* most-recent synthetic publication date */
+    COALESCE(
+        CASE
+            WHEN d1.pub_date IS NOT NULL 
+                 AND (d2.pub_date IS NULL OR d1.pub_date >= d2.pub_date)
+                 THEN d1.pub_date
+            ELSE d2.pub_date
+        END,
+        '1970-01-01'
+    )                                                         AS latest_publication_date,
+
+    p.latest_doc_id
+FROM   pairs       p
+LEFT JOIN docs_date d1 ON p.doc1 = d1.doc_id
+LEFT JOIN docs_date d2 ON p.doc2 = d2.doc_id;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:39:09 - Thread-416 (execute) - INFO - itercount: 2
+2025-05-07 06:39:09 - Thread-416 (execute) - INFO - [Self-refine]
+Input sql:
+/* ---------------------------------------------------------------------------
+   Produce qualifying molecule-pairs with UUIDs, change-class, heavy-atom max,
+   latest synthetic publication date and largest document-id.
+--------------------------------------------------------------------------- */
+WITH docs_enhanced AS (          -- basic numeric cleanup of documents
+    SELECT  DOC_ID                       AS doc_id,
+            COALESCE(TRY_TO_NUMBER(YEAR),1970)                 AS yr,
+            JOURNAL                                              journal,
+            TRY_TO_NUMBER(FIRST_PAGE)                           AS first_pg
+    FROM    EBI_CHEMBL.EBI_CHEMBL.DOCS_29
+), ranked_docs AS (              -- percent-rank within (journal,year)
+    SELECT  doc_id,
+            yr,
+            journal,
+            first_pg,
+            PERCENT_RANK() OVER (PARTITION BY journal, yr ORDER BY first_pg) AS pct_rk
+    FROM    docs_enhanced
+), docs_date AS (                -- synthetic publication date YYYY-MM-DD
+    SELECT  doc_id,
+            TO_CHAR(yr) || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 
+                               ELSE FLOOR(pct_rk*11)+1 END),2,'0')
+            || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL THEN 1 
+                               ELSE MOD(FLOOR(pct_rk*308),28)+1 END),2,'0')  AS pub_date
+    FROM    ranked_docs
+), acts_filtered AS (            -- activities that pass atomic / value filters
+    SELECT  a.ACTIVITY_ID,
+            a.ASSAY_ID,
+            a.STANDARD_TYPE,
+            a.STANDARD_RELATION,
+            TRY_TO_NUMBER(a.STANDARD_VALUE)                     AS std_val,
+            TRY_TO_NUMBER(a.PCHEMBL_VALUE)                      AS pchembl,
+            a.MOLREGNO,
+            TRY_TO_NUMBER(cp.HEAVY_ATOMS)                       AS heavy_atoms,
+            a.POTENTIAL_DUPLICATE,
+            TRY_TO_NUMBER(a.DOC_ID)                             AS doc_id,
+            cs.CANONICAL_SMILES
+    FROM    EBI_CHEMBL.EBI_CHEMBL.ACTIVITIES_29              a
+    JOIN    EBI_CHEMBL.EBI_CHEMBL.COMPOUND_PROPERTIES_29    cp
+           ON a.MOLREGNO = cp.MOLREGNO
+    JOIN    EBI_CHEMBL.EBI_CHEMBL.COMPOUND_STRUCTURES_33    cs
+           ON a.MOLREGNO = cs.MOLREGNO
+    WHERE   cp.HEAVY_ATOMS IS NOT NULL
+      AND   TRY_TO_NUMBER(cp.HEAVY_ATOMS) BETWEEN 10 AND 15
+      AND   a.STANDARD_VALUE IS NOT NULL
+      AND   a.PCHEMBL_VALUE IS NOT NULL
+      AND   TRY_TO_NUMBER(a.PCHEMBL_VALUE) > 10
+), assays_ok AS (                -- assays with <5 rows & <2 duplicates
+    SELECT  ASSAY_ID
+    FROM    acts_filtered
+    GROUP BY ASSAY_ID
+    HAVING  COUNT(*) < 5
+       AND  SUM(CASE WHEN POTENTIAL_DUPLICATE = '1' THEN 1 ELSE 0 END) < 2
+), acts_ok AS (
+    SELECT f.*
+    FROM   acts_filtered f
+    JOIN   assays_ok     u  ON f.ASSAY_ID = u.ASSAY_ID
+), pairs AS (                    -- distinct unordered molecule-pairs
+    SELECT
+        a1.ACTIVITY_ID                 AS activity_id_1,
+        a2.ACTIVITY_ID                 AS activity_id_2,
+        a1.CANONICAL_SMILES            AS smiles_1,
+        a2.CANONICAL_SMILES            AS smiles_2,
+        a1.ASSAY_ID,
+        a1.STANDARD_TYPE,
+        a1.STANDARD_RELATION           AS rel_1,
+        a2.STANDARD_RELATION           AS rel_2,
+        a1.std_val                     AS val_1,
+        a2.std_val                     AS val_2,
+        GREATEST(a1.heavy_atoms, a2.heavy_atoms)        AS max_heavy_atoms,
+        GREATEST(a1.doc_id, a2.doc_id)                  AS latest_doc_id,
+        a1.doc_id                                       AS doc1,
+        a2.doc_id                                       AS doc2
+    FROM   acts_ok a1
+    JOIN   acts_ok a2
+           ON  a1.ASSAY_ID      = a2.ASSAY_ID
+           AND a1.STANDARD_TYPE = a2.STANDARD_TYPE
+           AND a1.ACTIVITY_ID   < a2.ACTIVITY_ID       -- uniqueness
+           AND a1.MOLREGNO      <> a2.MOLREGNO
+)
+SELECT
+    p.activity_id_1,
+    p.activity_id_2,
+
+    /* UUID from activity IDs */
+    TO_HEX(MD5('[\"' || p.activity_id_1 || '\",\"' || p.activity_id_2 || '\"]')) AS activity_pair_uuid,
+
+    /* UUID from canonical SMILES */
+    TO_HEX(MD5('[\"' || p.smiles_1 || '\",\"' || p.smiles_2 || '\"]'))            AS smiles_pair_uuid,
+
+    /* direction of standard value change */
+    CASE
+        WHEN p.val_1 > p.val_2
+             AND p.rel_1 IN ('=','>','>>','>=')
+             AND p.rel_2 IN ('=','<','<<','<=')                THEN 'decrease'
+        WHEN p.val_1 < p.val_2
+             AND p.rel_1 IN ('=','<','<<','<=')
+             AND p.rel_2 IN ('=','>','>>','>=')                THEN 'increase'
+        WHEN p.val_1 = p.val_2
+             AND p.rel_1 = '=' AND p.rel_2 = '='               THEN 'no-change'
+        ELSE 'no-change'
+    END                                                       AS standard_change,
+
+    p.max_heavy_atoms,
+
+    /* most-recent synthetic publication date */
+    COALESCE(
+        CASE
+            WHEN d1.pub_date IS NOT NULL 
+                 AND (d2.pub_date IS NULL OR d1.pub_date >= d2.pub_date)
+                 THEN d1.pub_date
+            ELSE d2.pub_date
+        END,
+        '1970-01-01'
+    )                                                         AS latest_publication_date,
+
+    p.latest_doc_id
+FROM   pairs       p
+LEFT JOIN docs_date d1 ON p.doc1 = d1.doc_id
+LEFT JOIN docs_date d2 ON p.doc2 = d2.doc_id;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 2 at position 12\ninvalid identifier 'DOC_ID'"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 06:40:35 - Thread-416 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------------------
+   Produce qualifying molecule-pairs together with
+   – two UUIDs (activity-IDs & SMILES based)
+   – change classification of standard values
+   – maximum heavy-atom count in the pair
+   – latest synthetic publication date
+   – highest document-id observed in the pair
+--------------------------------------------------------------------------- */
+WITH docs_enhanced AS (          -- clean up bibliographic fields
+    SELECT  "doc_id"                                 AS doc_id,
+            COALESCE(TRY_TO_NUMBER("year"),1970)      AS yr,
+            "journal"                                AS journal,
+            TRY_TO_NUMBER("first_page")              AS first_pg
+    FROM    EBI_CHEMBL.EBI_CHEMBL."DOCS_29"
+), ranked_docs AS (              -- percent-rank within (journal, year)
+    SELECT  doc_id,
+            yr,
+            journal,
+            first_pg,
+            PERCENT_RANK() OVER (PARTITION BY journal, yr
+                                 ORDER BY first_pg)  AS pct_rk
+    FROM    docs_enhanced
+), docs_date AS (                -- synthetic publication date YYYY-MM-DD
+    SELECT  doc_id,
+            TO_CHAR(yr) || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL
+                               THEN 1
+                               ELSE FLOOR(pct_rk * 11) + 1 END), 2, '0')
+            || '-' ||
+            LPAD(TO_CHAR(CASE WHEN pct_rk IS NULL
+                               THEN 1
+                               ELSE MOD(FLOOR(pct_rk * 308), 28) + 1 END), 2, '0')
+            AS pub_date
+    FROM    ranked_docs
+), acts_filtered AS (            -- activities passing base filters
+    SELECT  a."activity_id",
+            a."assay_id",
+            a."standard_type",
+            a."standard_relation",
+            TRY_TO_NUMBER(a."standard_value")        AS std_val,
+            TRY_TO_NUMBER(a."pchembl_value")         AS pchembl,
+            a."molregno",
+            TRY_TO_NUMBER(cp."heavy_atoms")          AS heavy_atoms,
+            a."potential_duplicate",
+            TRY_TO_NUMBER(a."doc_id")                AS doc_id,
+            cs."canonical_smiles"
+    FROM    EBI_CHEMBL.EBI_CHEMBL."ACTIVITIES_29"          a
+    JOIN    EBI_CHEMBL.EBI_CHEMBL."COMPOUND_PROPERTIES_29" cp
+            ON a."molregno" = cp."molregno"
+    JOIN    EBI_CHEMBL.EBI_CHEMBL."COMPOUND_STRUCTURES_33" cs
+            ON a."molregno" = cs."molregno"
+    WHERE   cp."heavy_atoms" IS NOT NULL
+      AND   TRY_TO_NUMBER(cp."heavy_atoms") BETWEEN 10 AND 15
+      AND   a."standard_value" IS NOT NULL
+      AND   a."pchembl_value" IS NOT NULL
+      AND   TRY_TO_NUMBER(a."pchembl_value") > 10
+), assays_ok AS (                -- keep assays with <5 rows & <2 duplicates
+    SELECT  "assay_id"
+    FROM    acts_filtered
+    GROUP BY "assay_id"
+    HAVING  COUNT(*) < 5
+       AND  SUM(CASE WHEN "potential_duplicate" = '1' THEN 1 ELSE 0 END) < 2
+), acts_ok AS (                  -- qualifying activity rows
+    SELECT  f.*
+    FROM    acts_filtered f
+    JOIN    assays_ok     u
+        ON  f."assay_id" = u."assay_id"
+), pairs AS (                    -- unique unordered pairs in same assay/type
+    SELECT
+        a1."activity_id"                         AS activity_id_1,
+        a2."activity_id"                         AS activity_id_2,
+        a1."canonical_smiles"                    AS smiles_1,
+        a2."canonical_smiles"                    AS smiles_2,
+        a1."assay_id",
+        a1."standard_type",
+        a1."standard_relation"                   AS rel_1,
+        a2."standard_relation"                   AS rel_2,
+        a1.std_val                               AS val_1,
+        a2.std_val                               AS val_2,
+        GREATEST(a1.heavy_atoms, a2.heavy_atoms) AS max_heavy_atoms,
+        GREATEST(a1.doc_id, a2.doc_id)           AS latest_doc_id,
+        a1.doc_id                                AS doc1,
+        a2.doc_id                                AS doc2
+    FROM   acts_ok a1
+    JOIN   acts_ok a2
+           ON  a1."assay_id"      = a2."assay_id"
+           AND a1."standard_type" = a2."standard_type"
+           AND a1."activity_id"   < a2."activity_id"   -- enforce uniqueness
+           AND a1."molregno"      <> a2."molregno"
+)
+SELECT
+    p.activity_id_1,
+    p.activity_id_2,
+
+    /* UUID from activity IDs (MD5 hex string) */
+    MD5('[\"' || p.activity_id_1 || '\",\"' || p.activity_id_2 || '\"]')
+        AS activity_pair_uuid,
+
+    /* UUID from canonical SMILES (MD5 hex string) */
+    MD5('[\"' || p.smiles_1 || '\",\"' || p.smiles_2 || '\"]')
+        AS smiles_pair_uuid,
+
+    /* classify change in standard_value */
+    CASE
+        WHEN p.val_1 > p.val_2
+             AND p.rel_1 IN ('=', '>', '>>', '>=') 
+             AND p.rel_2 IN ('=', '<', '<<', '<=')          THEN 'decrease'
+        WHEN p.val_1 < p.val_2
+             AND p.rel_1 IN ('=', '<', '<<', '<=') 
+             AND p.rel_2 IN ('=', '>', '>>', '>=')          THEN 'increase'
+        WHEN p.val_1 = p.val_2
+             AND p.rel_1 = '=' AND p.rel_2 = '='             THEN 'no-change'
+        ELSE 'no-change'
+    END                                                     AS standard_change,
+
+    p.max_heavy_atoms,
+
+    /* latest synthetic publication date */
+    COALESCE(
+        CASE
+            WHEN d1.pub_date IS NOT NULL
+                 AND (d2.pub_date IS NULL OR d1.pub_date >= d2.pub_date)
+            THEN d1.pub_date
+            ELSE d2.pub_date
+        END,
+        '1970-01-01'
+    )                                                       AS latest_publication_date,
+
+    p.latest_doc_id
+FROM   pairs      p
+LEFT JOIN docs_date d1 ON p.doc1 = d1.doc_id
+LEFT JOIN docs_date d2 ON p.doc2 = d2.doc_id;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:40:37 - Thread-416 (execute) - INFO - Total iteration counts: 2

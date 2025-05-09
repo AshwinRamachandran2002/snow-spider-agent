@@ -1,0 +1,4 @@
+SELECT COUNT(DISTINCT "StudyInstanceUID") AS "unique_studies"
+FROM   IDC.IDC_V17.DICOM_PIVOT
+WHERE  TRIM(UPPER("SegmentedPropertyTypeCodeSequence")) = '15825003'
+  AND  UPPER("collection_id") IN ('COMMUNITY', 'NSCLC_RADIOMICS');

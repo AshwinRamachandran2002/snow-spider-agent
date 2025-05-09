@@ -1,0 +1,2649 @@
+2025-05-02 04:31:07 - ThreadPoolExecutor-0_7 - INFO - [Exploration]
+Below is an example walk‑through – from simple exploration to the final correlation – expressed as at most 10 different BigQuery SQL queries.  
+Replace the project/dataset names that begin with `isb-cgc` by the exact TCGA copy–number tables available in your environment (left as placeholders here).  
+Every query is limited to 20 rows (except the last one that produces the final correlation table).
+
+```sql
+--Description: 1) Inspect a few CYTOGEN rows to verify the (morph, topo) codes we need
+SELECT `RefNo`, `CaseNo`, `Morph`, `Topo`, `SpecMorph`
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401'
+LIMIT 20;
+```
+
+```sql
+--Description: 2) Count how many unique Mitelman cases (RefNo–CaseNo) match morph 3111 / topo 0401
+SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`)) AS mitelman_total_cases
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401';
+```
+
+```sql
+--Description: 3) See which copy‑number “Type” values exist in CytoConverted for those cases
+SELECT DISTINCT `Type`
+FROM `mitelman-db.prod.CytoConverted` AS cc
+JOIN `mitelman-db.prod.Cytogen` AS cg
+  ON cc.`RefNo` = cg.`RefNo` AND cc.`CaseNo` = cg.`CaseNo`
+WHERE cg.`Morph` = '3111' AND cg.`Topo` = '0401'
+LIMIT 20;
+```
+
+```sql
+--Description: 4) Build the Mitelman frequency table (per chromosome & aberration type)
+WITH mit_cases AS (
+  SELECT DISTINCT `RefNo`, `CaseNo`
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE `Morph` = '3111' AND `Topo` = '0401'
+),
+mit_counts AS (
+  SELECT cc.`ChrOrd`              AS chr_ord,
+         cc.`Type`                AS aberr_type,
+         COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`)) AS cases_with_abn
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.`RefNo` = mc.`RefNo` AND cc.`CaseNo` = mc.`CaseNo`
+  GROUP BY chr_ord, aberr_type
+),
+tot AS (
+  SELECT COUNT(*) AS n_cases FROM mit_cases
+)
+SELECT mc.*, ROUND(100.0*cases_with_abn/tot.n_cases,2) AS mit_freq_pct
+FROM mit_counts mc CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+```
+
+```sql
+--Description: 5) Peek at TCGA cytoband‑level copy‑number data (placeholder table name shown)
+SELECT `sample_barcode`,
+       `chromosome`   AS chr_ord,
+       `alteration`   AS aberr_type      -- e.g. AMP/Gain/Loss/Del/Neutral
+FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+LIMIT 20;
+```
+
+```sql
+--Description: 6) Build the TCGA frequency table (Breast cancer = BRCA)
+WITH tcga_brca AS (
+  SELECT *
+  FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+  WHERE cancer_type = 'BRCA'                  -- adjust if column name differs
+),
+tcga_counts AS (
+  SELECT CAST(`chromosome` AS INT64)        AS chr_ord,
+         CASE
+           WHEN `alteration` IN ('AMP','GA')    THEN 'Amp'
+           WHEN `alteration` IN ('GAIN','G')    THEN 'Gain'
+           WHEN `alteration` IN ('LOSS','L')    THEN 'Loss'
+           WHEN `alteration` IN ('DEL','D')     THEN 'Del'
+         END                                   AS aberr_type,
+         COUNT(DISTINCT `sample_barcode`)      AS samples_with_abn
+  FROM tcga_brca
+  GROUP BY chr_ord, aberr_type
+),
+tot AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_brca )
+SELECT tc.*, ROUND(100.0*samples_with_abn/tot.n_samples,2) AS tcga_freq_pct
+FROM tcga_counts tc CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Join Mitelman and TCGA frequency tables (only rows present in both)
+WITH mit_freq AS (  -- from query 4, without the LIMIT
+  SELECT chr_ord, aberr_type, ROUND(100.0*cases_with_abn/total_cases,4) AS mit_pct
+  FROM (
+    SELECT cc.`ChrOrd` AS chr_ord,
+           cc.`Type`   AS aberr_type,
+           COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`)) AS cases_with_abn
+    FROM `mitelman-db.prod.CytoConverted` cc
+    JOIN (
+      SELECT DISTINCT `RefNo`, `CaseNo`
+      FROM `mitelman-db.prod.Cytogen`
+      WHERE `Morph`='3111' AND `Topo`='0401'
+    ) AS s
+      ON cc.`RefNo`=s.`RefNo` AND cc.`CaseNo`=s.`CaseNo`
+    GROUP BY chr_ord, aberr_type
+  ), (SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`)) AS total_cases
+      FROM `mitelman-db.prod.Cytogen`
+      WHERE `Morph`='3111' AND `Topo`='0401')
+),
+tcga_freq AS (      -- from query 6, without the LIMIT
+  SELECT chr_ord, aberr_type, ROUND(100.0*samples_with_abn/total_samples,4) AS tcga_pct
+  FROM (
+    SELECT CAST(`chromosome` AS INT64) AS chr_ord,
+           CASE WHEN `alteration` IN ('AMP','GA')   THEN 'Amp'
+                WHEN `alteration` IN ('GAIN','G')   THEN 'Gain'
+                WHEN `alteration` IN ('LOSS','L')   THEN 'Loss'
+                WHEN `alteration` IN ('DEL','D')    THEN 'Del'
+           END AS aberr_type,
+           COUNT(DISTINCT sample_barcode) AS samples_with_abn
+    FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+    WHERE cancer_type='BRCA'
+    GROUP BY chr_ord, aberr_type
+  ), (SELECT COUNT(DISTINCT sample_barcode) AS total_samples
+      FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+      WHERE cancer_type='BRCA')
+)
+SELECT m.chr_ord, m.aberr_type, m.mit_pct, t.tcga_pct
+FROM mit_freq m
+JOIN tcga_freq t
+  USING (chr_ord, aberr_type)
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Compute Pearson correlation & p‑value for GAINs across chromosomes
+WITH joined AS (   -- query 7 without LIMIT but WHERE aberr_type = 'Gain'
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM (
+    -- Mitelman Gain freq
+    SELECT cc.`ChrOrd` AS chr_ord,
+           ROUND(100.0*COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`))
+                 / (SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`))
+                    FROM `mitelman-db.prod.Cytogen`
+                    WHERE `Morph`='3111' AND `Topo`='0401'),4) AS mit_pct
+    FROM `mitelman-db.prod.CytoConverted` cc
+    JOIN `mitelman-db.prod.Cytogen` cg
+      ON cc.`RefNo`=cg.`RefNo` AND cc.`CaseNo`=cg.`CaseNo`
+    WHERE cg.`Morph`='3111' AND cg.`Topo`='0401' AND cc.`Type`='Gain'
+    GROUP BY chr_ord
+  ) m
+  JOIN (
+    -- TCGA Gain freq
+    SELECT CAST(`chromosome` AS INT64) AS chr_ord,
+           ROUND(100.0*COUNT(DISTINCT sample_barcode)
+                 / (SELECT COUNT(DISTINCT sample_barcode)
+                    FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+                    WHERE cancer_type='BRCA'),4) AS tcga_pct
+    FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+    WHERE cancer_type='BRCA'
+      AND `alteration` IN ('GAIN','G')
+    GROUP BY chr_ord
+  ) t USING (chr_ord)
+)
+SELECT
+  CORR(mit_pct, tcga_pct)                                AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(
+      ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))    AS p_value,
+  COUNT(*)                                               AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+```
+
+```sql
+--Description: 9) Repeat correlation for LOSSES (example for 'Loss')
+--            (structure identical to query 8, change Type/alteration filter)
+SELECT -- similar SELECT block here
+LIMIT 20;
+```
+
+```sql
+--Description: 10) Final – one shot: correlations for all 4 aberration types,
+--                 keep only those with ≥5 matching chromosomes
+WITH
+mit AS (
+  SELECT cc.`ChrOrd` AS chr_ord,
+         cc.`Type`   AS aberr_type,
+         COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`)) AS mit_cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.`RefNo`=cg.`RefNo` AND cc.`CaseNo`=cg.`CaseNo`
+  WHERE cg.`Morph`='3111' AND cg.`Topo`='0401'
+    AND cc.`Type` IN ('Amp','Gain','Loss','Del')
+  GROUP BY chr_ord, aberr_type
+),
+mit_total AS (
+  SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`)) AS n FROM `mitelman-db.prod.Cytogen`
+  WHERE `Morph`='3111' AND `Topo`='0401'
+),
+mit_freq AS (
+  SELECT chr_ord, aberr_type, mit_cases / mit_total.n AS mit_freq
+  FROM mit, mit_total
+),
+tcga AS (
+  SELECT CAST(`chromosome` AS INT64) AS chr_ord,
+         CASE WHEN alteration IN ('AMP','GA')   THEN 'Amp'
+              WHEN alteration IN ('GAIN','G')   THEN 'Gain'
+              WHEN alteration IN ('LOSS','L')   THEN 'Loss'
+              WHEN alteration IN ('DEL','D')    THEN 'Del'
+         END AS aberr_type,
+         COUNT(DISTINCT sample_barcode) AS tcga_cases
+  FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+  WHERE cancer_type = 'BRCA'
+  GROUP BY chr_ord, aberr_type
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n
+  FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+  WHERE cancer_type = 'BRCA'
+),
+tcga_freq AS (
+  SELECT chr_ord, aberr_type, tcga_cases / tcga_total.n AS tcga_freq
+  FROM tcga, tcga_total
+),
+joined AS (
+  SELECT m.chr_ord, m.aberr_type, m.mit_freq, t.tcga_freq
+  FROM mit_freq m JOIN tcga_freq t
+  USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_freq, tcga_freq)                                         AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(
+      ARRAY_AGG(STRUCT(mit_freq AS x, tcga_freq AS y)))             AS p_value,
+  COUNT(*)                                                          AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+
+The last query returns, for each aberration type (Amp, Gain, Loss, Del), the Pearson correlation coefficient (`pearson_r`) and its p‑value, using only chromosomes present in both data sets and ensuring that at least five chromosomes contribute to every reported correlation.
+[Exploration]
+2025-05-02 04:31:07 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 1) Inspect a few CYTOGEN rows to verify the (morph, topo) codes we need
+SELECT `RefNo`, `CaseNo`, `Morph`, `Topo`, `SpecMorph`
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401'
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:31:09 - ThreadPoolExecutor-0_7 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1) Inspect a few CYTOGEN rows to verify the (morph, topo) codes we need
+SELECT `RefNo`, `CaseNo`, `Morph`, `Topo`, `SpecMorph`
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401'
+LIMIT 20;
+Results:
+RefNo,CaseNo,Morph,Topo,SpecMorph
+182,1,3111,0401,
+370,1,3111,0401,
+370,2,3111,0401,
+370,3,3111,0401,
+370,4,3111,0401,
+370,5,3111,0401,
+370,6,3111,0401,
+
+[Successfully executed]
+2025-05-02 04:31:09 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 2) Count how many unique Mitelman cases (RefNo–CaseNo) match morph 3111 / topo 0401
+SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`)) AS mitelman_total_cases
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401';
+[Try to execute]
+2025-05-02 04:31:11 - ThreadPoolExecutor-0_7 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2) Count how many unique Mitelman cases (RefNo–CaseNo) match morph 3111 / topo 0401
+SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`)) AS mitelman_total_cases
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401';
+Results:
+mitelman_total_cases
+764
+
+[Successfully executed]
+2025-05-02 04:31:11 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 3) See which copy‑number “Type” values exist in CytoConverted for those cases
+SELECT DISTINCT `Type`
+FROM `mitelman-db.prod.CytoConverted` AS cc
+JOIN `mitelman-db.prod.Cytogen` AS cg
+  ON cc.`RefNo` = cg.`RefNo` AND cc.`CaseNo` = cg.`CaseNo`
+WHERE cg.`Morph` = '3111' AND cg.`Topo` = '0401'
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:31:12 - ThreadPoolExecutor-0_7 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3) See which copy‑number “Type” values exist in CytoConverted for those cases
+SELECT DISTINCT `Type`
+FROM `mitelman-db.prod.CytoConverted` AS cc
+JOIN `mitelman-db.prod.Cytogen` AS cg
+  ON cc.`RefNo` = cg.`RefNo` AND cc.`CaseNo` = cg.`CaseNo`
+WHERE cg.`Morph` = '3111' AND cg.`Topo` = '0401'
+LIMIT 20;
+Results:
+Type
+Gain
+Loss
+
+[Successfully executed]
+2025-05-02 04:31:12 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 4) Build the Mitelman frequency table (per chromosome & aberration type)
+WITH mit_cases AS (
+  SELECT DISTINCT `RefNo`, `CaseNo`
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE `Morph` = '3111' AND `Topo` = '0401'
+),
+mit_counts AS (
+  SELECT cc.`ChrOrd`              AS chr_ord,
+         cc.`Type`                AS aberr_type,
+         COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`)) AS cases_with_abn
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.`RefNo` = mc.`RefNo` AND cc.`CaseNo` = mc.`CaseNo`
+  GROUP BY chr_ord, aberr_type
+),
+tot AS (
+  SELECT COUNT(*) AS n_cases FROM mit_cases
+)
+SELECT mc.*, ROUND(100.0*cases_with_abn/tot.n_cases,2) AS mit_freq_pct
+FROM mit_counts mc CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:31:15 - ThreadPoolExecutor-0_7 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4) Build the Mitelman frequency table (per chromosome & aberration type)
+WITH mit_cases AS (
+  SELECT DISTINCT `RefNo`, `CaseNo`
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE `Morph` = '3111' AND `Topo` = '0401'
+),
+mit_counts AS (
+  SELECT cc.`ChrOrd`              AS chr_ord,
+         cc.`Type`                AS aberr_type,
+         COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`)) AS cases_with_abn
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.`RefNo` = mc.`RefNo` AND cc.`CaseNo` = mc.`CaseNo`
+  GROUP BY chr_ord, aberr_type
+),
+tot AS (
+  SELECT COUNT(*) AS n_cases FROM mit_cases
+)
+SELECT mc.*, ROUND(100.0*cases_with_abn/tot.n_cases,2) AS mit_freq_pct
+FROM mit_counts mc CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+Results:
+chr_ord,aberr_type,cases_with_abn,mit_freq_pct
+1,Gain,252,32.98
+2,Gain,145,18.98
+3,Gain,160,20.94
+4,Gain,135,17.67
+5,Gain,148,19.37
+6,Gain,155,20.29
+7,Gain,204,26.7
+
+[Successfully executed]
+2025-05-02 04:31:15 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 5) Peek at TCGA cytoband‑level copy‑number data (placeholder table name shown)
+SELECT `sample_barcode`,
+       `chromosome`   AS chr_ord,
+       `alteration`   AS aberr_type      -- e.g. AMP/Gain/Loss/Del/Neutral
+FROM `isb-cgc.TCGA_CopyNumber.cytoband_thresholded`
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:31:16 - ThreadPoolExecutor-0_7 - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table isb-cgc:TCGA_CopyNumber.cytoband_thresholded: User does not have permission to query table isb-cgc:TCGA_CopyNumber.cytoband_thresholded, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table isb-cgc:TCGA_CopyNumber.cytoband_thresholded: User does not have permission to query table isb-cgc:TCGA_CopyNumber.cytoband_thresholded, or perhaps it does not exist.\n\nLocation: US\nJob ID: 0c677444-3627-4104-a655-4f4014cadb26\n'}
+[Error occurred]
+2025-05-02 04:32:16 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  (Thinking process)  Because direct access to a cytoband‑thresholded table is not
+--              permitted, we will confirm the structure of a public TCGA copy‑number source that
+--              we *can* query:  `TCGA_hg38_data_v0.CopyNumberSegment_Masked`.  Inspecting a few
+--              breast‑cancer (TCGA‑BRCA) rows lets us verify that fields such as Chromosome,
+--              SegmentMean, Start, End, and SampleBarcode exist; these will be required for
+--              deriving amplification / gain / loss / deletion calls by applying log2 thresholds
+--              in later steps.
+SELECT
+  SampleBarcode,
+  CAST(Chromosome AS INT64) AS chr_ord,
+  Start,
+  End,
+  SegmentMean
+FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment_Masked`
+WHERE Project = 'TCGA-BRCA'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-02 04:32:17 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##400 Syntax error: Expected end of input but got keyword END at [12:3]; reason: invalidQuery, location: query, message: Syntax error: Expected end of input but got keyword END at [12:3]\n\nLocation: US\nJob ID: a0357e58-f461-43cf-86ca-7838e7181d26\n'}
+[Results for corrected sql]
+2025-05-02 04:32:54 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  Verify the layout of a publicly readable TCGA copy‑number table we are allowed
+--              to query (`TCGA_hg38_data_v0.CopyNumberSegment_Masked`).  Seeing a handful of
+--              BRCA rows will confirm that the columns we need for later thresholding
+--              (SampleBarcode, Chromosome, Start, End, SegmentMean) are present and that the
+--              reserved word End must be quoted with back‑ticks to avoid syntax errors.
+SELECT
+  SampleBarcode,
+  CAST(Chromosome AS INT64) AS chr_ord,
+  `Start`  AS segment_start,
+  `End`    AS segment_end,
+  SegmentMean
+FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment_Masked`
+WHERE Project = 'TCGA-BRCA'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-02 04:32:55 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##404 Not found: Table isb-cgc:TCGA_hg38_data_v0.CopyNumberSegment_Masked was not found in location US; reason: notFound, message: Not found: Table isb-cgc:TCGA_hg38_data_v0.CopyNumberSegment_Masked was not found in location US\n\nLocation: US\nJob ID: 52faf6cb-7f98-42f1-b766-7ee1824de176\n'}
+[Results for corrected sql]
+2025-05-02 04:34:19 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  Identify the exact copy‑number table name by listing the tables that
+--              exist in the public dataset `isb-cgc.TCGA_hg38_data_v0`; this avoids
+--              further “table not found” errors when we reference TCGA copy‑number data.
+SELECT
+  table_id
+FROM `isb-cgc.TCGA_hg38_data_v0.__TABLES__`
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-02 04:34:21 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+table_id
+Copy_Number_Segment_Masked
+Copy_Number_Segment_Masked_r14
+DNA_Methylation
+DNA_Methylation_chr1
+DNA_Methylation_chr10
+DNA_Methylation_chr11
+DNA_Methylation_chr12
+DNA_Methylation_chr13
+DNA_Methylation_chr14
+DNA_Methylation_chr15
+DNA_Methylation_chr16
+DNA_Methylation_chr17
+DNA_Methylation_chr18
+DNA_Methylation_chr19
+
+[Results for corrected sql]
+2025-05-02 04:35:07 - ThreadPoolExecutor-0_7 - INFO - [Corrected other sqls]
+```sql
+--Description: 6) Build the TCGA copy‑number frequency table for breast‑cancer (TCGA‑BRCA)
+--              using the public masked‑segment file.  SegmentMean thresholds are applied to
+--              classify segments into Amp, Gain, Loss, Del.  Both `Start` and `End` are
+--              wrapped in back‑ticks to avoid keyword conflicts.
+WITH tcga_brca AS (
+    SELECT
+        SampleBarcode,
+        CAST(Chromosome AS INT64)               AS chr_ord,
+        CASE
+            WHEN SegmentMean >=  0.90 THEN 'Amp'
+            WHEN SegmentMean >=  0.15 THEN 'Gain'
+            WHEN SegmentMean <= -0.90 THEN 'Del'
+            WHEN SegmentMean <= -0.15 THEN 'Loss'
+        END                                      AS aberr_type
+    FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+    WHERE Project = 'TCGA-BRCA'
+),
+tcga_counts AS (
+    SELECT
+        chr_ord,
+        aberr_type,
+        COUNT(DISTINCT SampleBarcode)           AS samples_with_abn
+    FROM tcga_brca
+    WHERE aberr_type IS NOT NULL               -- ignore Neutral segments
+    GROUP BY chr_ord, aberr_type
+),
+tot AS (
+    SELECT COUNT(DISTINCT SampleBarcode) AS n_samples
+    FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+    WHERE Project = 'TCGA-BRCA'
+)
+SELECT
+    tcga_counts.*,
+    ROUND(100.0 * samples_with_abn / tot.n_samples, 2) AS tcga_freq_pct
+FROM tcga_counts CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Join Mitelman and TCGA frequency tables (updated to use the segment table above);
+--              shows Mitelman % vs TCGA % for chromosomes where both have data.
+WITH mit_freq AS (
+    -- Mitelman frequencies from query 4 (unchanged logic but without LIMIT)
+    SELECT
+        cc.ChrOrd  AS chr_ord,
+        cc.Type    AS aberr_type,
+        COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))    / 764.0   AS mit_pct   -- 764 cases pre‑computed
+    FROM `mitelman-db.prod.CytoConverted` cc
+    JOIN `mitelman-db.prod.Cytogen` cg
+      ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+    WHERE cg.Morph='3111' AND cg.Topo='0401'
+      AND cc.Type IN ('Gain','Loss')                      -- only CNV categories present in Mitelman
+    GROUP BY chr_ord, aberr_type
+),
+tcga_freq AS (      -- derived from query 6, without LIMIT
+    SELECT
+        chr_ord,
+        aberr_type,
+        samples_with_abn / tot_sample                     AS tcga_pct
+    FROM (
+        SELECT
+            chr_ord,
+            aberr_type,
+            COUNT(DISTINCT SampleBarcode) AS samples_with_abn
+        FROM (
+            SELECT
+                SampleBarcode,
+                CAST(Chromosome AS INT64) AS chr_ord,
+                CASE
+                    WHEN SegmentMean >=  0.90 THEN 'Amp'
+                    WHEN SegmentMean >=  0.15 THEN 'Gain'
+                    WHEN SegmentMean <= -0.90 THEN 'Del'
+                    WHEN SegmentMean <= -0.15 THEN 'Loss'
+                END AS aberr_type
+            FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+            WHERE Project='TCGA-BRCA'
+        )
+        WHERE aberr_type IS NOT NULL
+        GROUP BY chr_ord, aberr_type
+    ),
+    (SELECT COUNT(DISTINCT SampleBarcode) AS tot_sample
+     FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+     WHERE Project='TCGA-BRCA')
+)
+SELECT
+    m.chr_ord,
+    m.aberr_type,
+    ROUND(m.mit_pct*100,2)  AS mit_pct,
+    ROUND(t.tcga_pct*100,2) AS tcga_pct
+FROM mit_freq m
+JOIN tcga_freq t
+  USING (chr_ord, aberr_type)
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Pearson correlation between Mitelman and TCGA chromosome‑level GAIN
+--              frequencies (uses updated TCGA segment table).
+WITH joined AS (
+    SELECT
+        m.chr_ord,
+        (COUNT(DISTINCT CONCAT(m.RefNo,'-',m.CaseNo)) / 764.0)         AS mit_pct,
+        (COUNT(DISTINCT s.SampleBarcode) / tcga_total.n)               AS tcga_pct
+    FROM `mitelman-db.prod.CytoConverted` m
+    JOIN `mitelman-db.prod.Cytogen` c
+      ON m.RefNo = c.RefNo AND m.CaseNo = c.CaseNo
+    JOIN (
+        SELECT
+            SampleBarcode,
+            CAST(Chromosome AS INT64) AS chr_ord
+        FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+        WHERE Project='TCGA-BRCA' AND SegmentMean >= 0.15
+    ) s
+      ON m.ChrOrd = s.chr_ord
+    CROSS JOIN (SELECT COUNT(DISTINCT SampleBarcode) AS n FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment` WHERE Project='TCGA-BRCA') tcga_total
+    WHERE c.Morph='3111' AND c.Topo='0401' AND m.Type='Gain'
+    GROUP BY m.chr_ord, tcga_total.n
+)
+SELECT
+    CORR(mit_pct, tcga_pct)                                  AS pearson_r,
+    `isb-cgc-bq.functions.corr_pvalue_current`(
+        ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))      AS p_value,
+    COUNT(*)                                                 AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+```
+
+```sql
+--Description: 9) Pearson correlation for chromosome‑level LOSS frequencies
+--              (same structure as query 8, but SegmentMean ≤ ‑0.15 and Mitelman Type='Loss').
+WITH joined AS (
+    SELECT
+        m.ChrOrd                                         AS chr_ord,
+        COUNT(DISTINCT CONCAT(m.RefNo,'-',m.CaseNo)) / 764.0  AS mit_pct,
+        COUNT(DISTINCT s.SampleBarcode) / tcga_total.n        AS tcga_pct
+    FROM `mitelman-db.prod.CytoConverted` m
+    JOIN `mitelman-db.prod.Cytogen` c
+      ON m.RefNo = c.RefNo AND m.CaseNo = c.CaseNo
+    JOIN (
+        SELECT
+            SampleBarcode,
+            CAST(Chromosome AS INT64) AS chr_ord
+        FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+        WHERE Project='TCGA-BRCA' AND SegmentMean <= -0.15
+    ) s
+      ON m.ChrOrd = s.chr_ord
+    CROSS JOIN (SELECT COUNT(DISTINCT SampleBarcode) AS n FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment` WHERE Project='TCGA-BRCA') tcga_total
+    WHERE c.Morph='3111' AND c.Topo='0401' AND m.Type='Loss'
+    GROUP BY m.ChrOrd, tcga_total.n
+)
+SELECT
+    CORR(mit_pct, tcga_pct)                                  AS pearson_r,
+    `isb-cgc-bq.functions.corr_pvalue_current`(
+        ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))      AS p_value,
+    COUNT(*)                                                 AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+```
+
+```sql
+--Description: 10) One‑shot correlation table for Amp, Gain, Loss, Del – ensures ≥5 chromosomes
+WITH
+-- Mitelman frequencies ------------------------------------------------------
+mit_raw AS (
+    SELECT
+        ChrOrd                                 AS chr_ord,
+        Type                                   AS aberr_type,
+        COUNT(DISTINCT CONCAT(RefNo,'-',CaseNo)) AS mit_cases
+    FROM `mitelman-db.prod.CytoConverted`       cc
+    JOIN `mitelman-db.prod.Cytogen`             cg
+      ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+    WHERE cg.Morph='3111' AND cg.Topo='0401'
+      AND cc.Type IN ('Gain','Loss')   -- Mitelman has only Gain/Loss for CNV
+    GROUP BY chr_ord, aberr_type
+), mit_total AS (SELECT 764 AS n_cases),          -- from earlier count
+mit_freq AS (
+    SELECT
+        chr_ord,
+        aberr_type,
+        mit_cases / mit_total.n_cases AS mit_pct
+    FROM mit_raw, mit_total
+),
+-- TCGA frequencies ----------------------------------------------------------
+tcga_seg AS (
+    SELECT
+        SampleBarcode,
+        CAST(Chromosome AS INT64) AS chr_ord,
+        CASE
+            WHEN SegmentMean >=  0.90 THEN 'Amp'
+            WHEN SegmentMean >=  0.15 THEN 'Gain'
+            WHEN SegmentMean <= -0.90 THEN 'Del'
+            WHEN SegmentMean <= -0.15 THEN 'Loss'
+        END AS aberr_type
+    FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+    WHERE Project='TCGA-BRCA'
+),
+tcga_raw AS (
+    SELECT
+        chr_ord,
+        aberr_type,
+        COUNT(DISTINCT SampleBarcode) AS tcga_cases
+    FROM tcga_seg
+    WHERE aberr_type IS NOT NULL
+    GROUP BY chr_ord, aberr_type
+), tcga_total AS (
+    SELECT COUNT(DISTINCT SampleBarcode) AS n_samples
+    FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+    WHERE Project='TCGA-BRCA'
+), tcga_freq AS (
+    SELECT
+        chr_ord,
+        aberr_type,
+        tcga_cases / n_samples AS tcga_pct
+    FROM tcga_raw, tcga_total
+),
+-- Join and correlate --------------------------------------------------------
+joined AS (
+    SELECT
+        m.chr_ord,
+        m.aberr_type,
+        m.mit_pct,
+        t.tcga_pct
+    FROM mit_freq m
+    JOIN tcga_freq t
+      USING (chr_ord, aberr_type)
+)
+SELECT
+    aberr_type,
+    CORR(mit_pct, tcga_pct)                                  AS pearson_r,
+    `isb-cgc-bq.functions.corr_pvalue_current`(
+        ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))      AS p_value,
+    COUNT(*)                                                 AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Corrected other sqls]
+2025-05-02 04:35:07 - ThreadPoolExecutor-0_7 - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Identify the exact copy‑number table name by listing the tables that
+--              exist in the public dataset `isb-cgc.TCGA_hg38_data_v0`; this avoids
+--              further “table not found” errors when we reference TCGA copy‑number data.
+SELECT
+  table_id
+FROM `isb-cgc.TCGA_hg38_data_v0.__TABLES__`
+LIMIT 20;
+Results:
+table_id
+Copy_Number_Segment_Masked
+Copy_Number_Segment_Masked_r14
+DNA_Methylation
+DNA_Methylation_chr1
+DNA_Methylation_chr10
+DNA_Methylation_chr11
+DNA_Methylation_chr12
+DNA_Methylation_chr13
+DNA_Methylation_chr14
+DNA_Methylation_chr15
+DNA_Methylation_chr16
+DNA_Methylation_chr17
+DNA_Methylation_chr18
+DNA_Methylation_chr19
+
+[Successfully corrected]
+2025-05-02 04:35:07 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 6) Build the TCGA copy‑number frequency table for breast‑cancer (TCGA‑BRCA)
+--              using the public masked‑segment file.  SegmentMean thresholds are applied to
+--              classify segments into Amp, Gain, Loss, Del.  Both `Start` and `End` are
+--              wrapped in back‑ticks to avoid keyword conflicts.
+WITH tcga_brca AS (
+    SELECT
+        SampleBarcode,
+        CAST(Chromosome AS INT64)               AS chr_ord,
+        CASE
+            WHEN SegmentMean >=  0.90 THEN 'Amp'
+            WHEN SegmentMean >=  0.15 THEN 'Gain'
+            WHEN SegmentMean <= -0.90 THEN 'Del'
+            WHEN SegmentMean <= -0.15 THEN 'Loss'
+        END                                      AS aberr_type
+    FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+    WHERE Project = 'TCGA-BRCA'
+),
+tcga_counts AS (
+    SELECT
+        chr_ord,
+        aberr_type,
+        COUNT(DISTINCT SampleBarcode)           AS samples_with_abn
+    FROM tcga_brca
+    WHERE aberr_type IS NOT NULL               -- ignore Neutral segments
+    GROUP BY chr_ord, aberr_type
+),
+tot AS (
+    SELECT COUNT(DISTINCT SampleBarcode) AS n_samples
+    FROM `isb-cgc.TCGA_hg38_data_v0.CopyNumberSegment`
+    WHERE Project = 'TCGA-BRCA'
+)
+SELECT
+    tcga_counts.*,
+    ROUND(100.0 * samples_with_abn / tot.n_samples, 2) AS tcga_freq_pct
+FROM tcga_counts CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20
+[Try to execute]
+2025-05-02 04:35:08 - ThreadPoolExecutor-0_7 - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##404 Not found: Table isb-cgc:TCGA_hg38_data_v0.CopyNumberSegment was not found in location US; reason: notFound, message: Not found: Table isb-cgc:TCGA_hg38_data_v0.CopyNumberSegment was not found in location US\n\nLocation: US\nJob ID: 1970eaa6-d53c-4105-9d72-c2c38143e953\n'}
+[Error occurred]
+2025-05-02 04:36:11 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  Single, self‑contained query that (i) derives chromosome‑level copy‑number
+--              frequencies for Mitelman breast‑carcinoma cases (morph 3111 / topo 0401),
+--              (ii) derives the same frequencies for TCGA‑BRCA samples using the public
+--              table `Copy_Number_Segment_Masked`, and (iii) computes, for every
+--              aberration type appearing in BOTH datasets, the Pearson correlation
+--              coefficient and its p‑value—reporting only those aberration types that
+--              have data for at least five chromosomes.
+WITH
+/* ====================== 1.  Mitelman breast‑cancer cohort ====================== */
+mit_cases AS (
+  SELECT DISTINCT RefNo, CaseNo
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE Morph = '3111' AND Topo = '0401'
+),
+mit_total AS (SELECT COUNT(*) AS n_cases FROM mit_cases),            -- 764 cases
+mit_freq AS (
+  SELECT
+    cc.ChrOrd                                        AS chr_ord,
+    cc.Type                                          AS aberr_type,   -- Gain / Loss
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / mit_total.n_cases
+                                                   AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.RefNo = mc.RefNo AND cc.CaseNo = mc.CaseNo
+  CROSS JOIN mit_total
+  WHERE cc.Type IN ('Gain','Loss')                                   -- Mitelman CNV types
+  GROUP BY chr_ord, aberr_type, mit_total.n_cases
+),
+/* ====================== 2.  TCGA‑BRCA masked segments ========================== */
+tcga_seg AS (
+  SELECT
+    SampleBarcode,
+    CAST(Chromosome AS INT64) AS chr_ord,
+    CASE
+      WHEN SegmentMean >=  0.90 THEN 'Amp'
+      WHEN SegmentMean >=  0.15 THEN 'Gain'
+      WHEN SegmentMean <= -0.90 THEN 'Del'
+      WHEN SegmentMean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE Project = 'TCGA-BRCA'
+),
+tcga_total AS (SELECT COUNT(DISTINCT SampleBarcode) AS n_samples FROM tcga_seg),
+tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT SampleBarcode) / tcga_total.n_samples AS tcga_pct
+  FROM tcga_seg, tcga_total
+  WHERE aberr_type IS NOT NULL
+  GROUP BY chr_ord, aberr_type, tcga_total.n_samples
+),
+/* ====================== 3.  Join & calculate correlations ===================== */
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t
+    USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                  AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))     AS p_value,
+  COUNT(*)                                                 AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Corrected SQL]
+2025-05-02 04:36:13 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##400 Unrecognized name: Project at [41:9]; reason: invalidQuery, location: query, message: Unrecognized name: Project at [41:9]\n\nLocation: US\nJob ID: 5ea54cec-aab9-49e6-ab8e-3e25e5f82d1d\n'}
+[Results for corrected sql]
+2025-05-02 04:36:53 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  Show the column names (and their order/types) for the table
+--              `Copy_Number_Segment_Masked` so we know the exact spelling of
+--              the sample‑identifier field (e.g. SampleBarcode vs case_barcode)
+--              and the project / cancer‑type field.  This avoids further
+--              “Unrecognized name” errors when filtering for TCGA‑BRCA data.
+SELECT
+  column_name,
+  ordinal_position,
+  data_type
+FROM `isb-cgc.TCGA_hg38_data_v0.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'Copy_Number_Segment_Masked'
+ORDER BY ordinal_position
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-02 04:36:55 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+column_name,ordinal_position,data_type
+project_short_name,1,STRING
+case_barcode,2,STRING
+sample_barcode,3,STRING
+aliquot_barcode,4,STRING
+chromosome,5,STRING
+start_pos,6,INT64
+end_pos,7,INT64
+
+[Results for corrected sql]
+2025-05-02 04:37:49 - ThreadPoolExecutor-0_7 - INFO - [Corrected other sqls]
+```sql
+--Description:  7 – 10 revised.  All references to the TCGA table now use the
+--              valid name `Copy_Number_Segment_Masked`, the sample identifier
+--              column `sample_barcode`, and the numeric‐value column
+--              `segment_mean`.  Instead of a missing “Project” column we
+--              select breast‑cancer samples by the prefix `TCGA‑BRCA%`.
+--              (Query‑specific comments are inline.)
+
+/* ──────────────────────────── 7. Mitelman vs TCGA percentages ─────────────────────────── */
+WITH mit_freq AS (
+  SELECT
+    cc.ChrOrd                    AS chr_ord,
+    cc.Type                      AS aberr_type,          -- Gain / Loss
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / 764.0  AS mit_pct   -- 764 cases
+  FROM  `mitelman-db.prod.CytoConverted` cc
+  JOIN  `mitelman-db.prod.Cytogen` cg
+    ON  cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph='3111' AND cg.Topo='0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type
+),
+tcga_seg AS (
+  SELECT
+    sample_barcode,
+    CAST(chromosome AS INT64) AS chr_ord,
+    CASE
+      WHEN segment_mean >=  0.90 THEN 'Amp'
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.90 THEN 'Del'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE sample_barcode LIKE 'TCGA-BRCA%'
+), tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg
+), tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode)/tcga_total.n_samples AS tcga_pct
+  FROM  tcga_seg, tcga_total
+  WHERE aberr_type IS NOT NULL
+  GROUP BY chr_ord, aberr_type, tcga_total.n_samples
+)
+SELECT
+  m.chr_ord,
+  m.aberr_type,
+  ROUND(m.mit_pct*100,2)  AS mit_pct,
+  ROUND(t.tcga_pct*100,2) AS tcga_pct
+FROM mit_freq m
+JOIN tcga_freq t USING(chr_ord, aberr_type)
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+
+/* ──────────────────────────── 8. Pearson correlation for GAINS ────────────────────────── */
+WITH joined AS (
+  SELECT
+    cc.ChrOrd                                            AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))/764.0 AS mit_pct,
+    COUNT(DISTINCT ts.sample_barcode)/tot.n_samples      AS tcga_pct
+  FROM  `mitelman-db.prod.CytoConverted` cc
+  JOIN  `mitelman-db.prod.Cytogen` cg
+    ON  cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  JOIN  ( SELECT sample_barcode, CAST(chromosome AS INT64) AS chr_ord
+          FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+          WHERE sample_barcode LIKE 'TCGA-BRCA%' AND segment_mean >= 0.15 ) ts
+    ON  cc.ChrOrd = ts.chr_ord
+  CROSS JOIN ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+               FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+               WHERE sample_barcode LIKE 'TCGA-BRCA%' ) tot
+  WHERE cg.Morph='3111' AND cg.Topo='0401' AND cc.Type='Gain'
+  GROUP BY chr_ord, tot.n_samples
+)
+SELECT
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y))) AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+
+/* ──────────────────────────── 9. Pearson correlation for LOSSES ───────────────────────── */
+WITH joined AS (
+  SELECT
+    cc.ChrOrd                                            AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))/764.0 AS mit_pct,
+    COUNT(DISTINCT ts.sample_barcode)/tot.n_samples      AS tcga_pct
+  FROM  `mitelman-db.prod.CytoConverted` cc
+  JOIN  `mitelman-db.prod.Cytogen` cg
+    ON  cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  JOIN  ( SELECT sample_barcode, CAST(chromosome AS INT64) AS chr_ord
+          FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+          WHERE sample_barcode LIKE 'TCGA-BRCA%' AND segment_mean <= -0.15 ) ts
+    ON  cc.ChrOrd = ts.chr_ord
+  CROSS JOIN ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+               FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+               WHERE sample_barcode LIKE 'TCGA-BRCA%' ) tot
+  WHERE cg.Morph='3111' AND cg.Topo='0401' AND cc.Type='Loss'
+  GROUP BY chr_ord, tot.n_samples
+)
+SELECT
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y))) AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+
+/* ────────────────────────────10. One‑shot correlations for all CNV classes─────────────── */
+WITH
+mit AS (
+  SELECT
+    ChrOrd                                     AS chr_ord,
+    Type                                       AS aberr_type,          -- Gain / Loss
+    COUNT(DISTINCT CONCAT(RefNo,'-',CaseNo))   AS mit_cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph='3111' AND cg.Topo='0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type
+), mit_total AS ( SELECT 764 AS n_cases ),
+mit_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    mit_cases / n_cases AS mit_pct
+  FROM mit, mit_total
+),
+tcga_seg AS (
+  SELECT
+    sample_barcode,
+    CAST(chromosome AS INT64) AS chr_ord,
+    CASE
+      WHEN segment_mean >=  0.90 THEN 'Amp'
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.90 THEN 'Del'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE sample_barcode LIKE 'TCGA-BRCA%'
+), tcga_total AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg ),
+tcga_raw AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) AS tcga_cases
+  FROM tcga_seg
+  WHERE aberr_type IS NOT NULL
+  GROUP BY chr_ord, aberr_type
+), tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    tcga_cases / n_samples AS tcga_pct
+  FROM tcga_raw, tcga_total
+),
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t USING(chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(
+      ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))     AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Corrected other sqls]
+2025-05-02 04:37:49 - ThreadPoolExecutor-0_7 - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Show the column names (and their order/types) for the table
+--              `Copy_Number_Segment_Masked` so we know the exact spelling of
+--              the sample‑identifier field (e.g. SampleBarcode vs case_barcode)
+--              and the project / cancer‑type field.  This avoids further
+--              “Unrecognized name” errors when filtering for TCGA‑BRCA data.
+SELECT
+  column_name,
+  ordinal_position,
+  data_type
+FROM `isb-cgc.TCGA_hg38_data_v0.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'Copy_Number_Segment_Masked'
+ORDER BY ordinal_position
+LIMIT 20;
+Results:
+column_name,ordinal_position,data_type
+project_short_name,1,STRING
+case_barcode,2,STRING
+sample_barcode,3,STRING
+aliquot_barcode,4,STRING
+chromosome,5,STRING
+start_pos,6,INT64
+end_pos,7,INT64
+
+[Successfully corrected]
+2025-05-02 04:37:49 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description:  7 – 10 revised.  All references to the TCGA table now use the
+--              valid name `Copy_Number_Segment_Masked`, the sample identifier
+--              column `sample_barcode`, and the numeric‐value column
+--              `segment_mean`.  Instead of a missing “Project” column we
+--              select breast‑cancer samples by the prefix `TCGA‑BRCA%`.
+--              (Query‑specific comments are inline.)
+
+/* ──────────────────────────── 7. Mitelman vs TCGA percentages ─────────────────────────── */
+WITH mit_freq AS (
+  SELECT
+    cc.ChrOrd                    AS chr_ord,
+    cc.Type                      AS aberr_type,          -- Gain / Loss
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / 764.0  AS mit_pct   -- 764 cases
+  FROM  `mitelman-db.prod.CytoConverted` cc
+  JOIN  `mitelman-db.prod.Cytogen` cg
+    ON  cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph='3111' AND cg.Topo='0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type
+),
+tcga_seg AS (
+  SELECT
+    sample_barcode,
+    CAST(chromosome AS INT64) AS chr_ord,
+    CASE
+      WHEN segment_mean >=  0.90 THEN 'Amp'
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.90 THEN 'Del'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE sample_barcode LIKE 'TCGA-BRCA%'
+), tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg
+), tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode)/tcga_total.n_samples AS tcga_pct
+  FROM  tcga_seg, tcga_total
+  WHERE aberr_type IS NOT NULL
+  GROUP BY chr_ord, aberr_type, tcga_total.n_samples
+)
+SELECT
+  m.chr_ord,
+  m.aberr_type,
+  ROUND(m.mit_pct*100,2)  AS mit_pct,
+  ROUND(t.tcga_pct*100,2) AS tcga_pct
+FROM mit_freq m
+JOIN tcga_freq t USING(chr_ord, aberr_type)
+ORDER BY aberr_type, chr_ord
+LIMIT 20
+[Try to execute]
+2025-05-02 04:37:51 - ThreadPoolExecutor-0_7 - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-02 04:39:16 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  List the columns that appear AFTER position 20 in
+--              `Copy_Number_Segment_Masked`, so we can locate the numeric
+--              copy‑number value field (e.g. segment_mean or log2_copy_ratio)
+--              needed to apply Gain/Loss thresholds.  Seeing columns 21‑60
+--              should expose the correct name.
+SELECT
+  column_name,
+  ordinal_position,
+  data_type
+FROM `isb-cgc.TCGA_hg38_data_v0.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'Copy_Number_Segment_Masked'
+  AND ordinal_position > 20
+ORDER BY ordinal_position
+LIMIT 40;
+```
+[Corrected SQL]
+2025-05-02 04:39:18 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-02 04:40:14 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  Display all FLOAT64 columns in the TCGA table
+--              `Copy_Number_Segment_Masked` so we can discover the exact
+--              name of the numeric copy‑number value field (needed to set
+--              gain/loss thresholds in later analyses).
+SELECT
+  column_name,
+  ordinal_position,
+  data_type
+FROM `isb-cgc.TCGA_hg38_data_v0.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'Copy_Number_Segment_Masked'
+  AND data_type = 'FLOAT64'
+ORDER BY ordinal_position
+LIMIT 50;
+```
+[Corrected SQL]
+2025-05-02 04:40:16 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+column_name,ordinal_position,data_type
+segment_mean,9,FLOAT64
+
+[Results for corrected sql]
+2025-05-02 04:40:49 - ThreadPoolExecutor-0_7 - INFO - [Corrected other sqls]
+```sql
+--Description: 8) Pearson correlation for GAINS – Mitelman breast carcinoma (morph 3111 / topo 0401)
+--              vs TCGA‑BRCA (project_short_name = 'TCGA-BRCA').  Uses the correct TCGA
+--              table `Copy_Number_Segment_Masked`, the numeric column `segment_mean`,
+--              and converts chromosome strings to integers with SAFE_CAST.
+WITH
+mit_gain AS (
+  SELECT
+    cc.ChrOrd                                       AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / 764.0 AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'   -- breast carcinoma
+    AND cc.Type = 'Gain'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_gain AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean >= 0.15                                     -- Gain threshold
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_gain m
+  JOIN tcga_gain t USING (chr_ord)
+)
+SELECT
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))    AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+```
+
+```sql
+--Description: 9) Pearson correlation for LOSSES – same cohorts and logic as query 8, but
+--              using Mitelman Type = 'Loss' and TCGA segments with segment_mean ≤ ‑0.15.
+WITH
+mit_loss AS (
+  SELECT
+    cc.ChrOrd                                       AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / 764.0 AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type = 'Loss'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_loss AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean <= -0.15                                    -- Loss threshold
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_loss m
+  JOIN tcga_loss t USING (chr_ord)
+)
+SELECT
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))    AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+HAVING matched_chr >= 5;
+```
+
+```sql
+--Description: 10) One‑shot table – correlations for Gain and Loss (the two CNV types
+--               present in Mitelman).  Reports aberration_type, Pearson r, p‑value,
+--               and number of matching chromosomes (≥5 required).
+WITH
+/* Mitelman frequencies ---------------------------------------------------- */
+mit_raw AS (
+  SELECT
+    cc.ChrOrd                 AS chr_ord,
+    cc.Type                   AS aberr_type,  -- Gain / Loss
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) AS mit_cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph='3111' AND cg.Topo='0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type
+), mit_total AS (
+  SELECT 764 AS n_cases
+), mit_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    mit_cases / n_cases AS mit_pct
+  FROM mit_raw, mit_total
+),
+/* TCGA frequencies -------------------------------------------------------- */
+tcga_seg AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    sample_barcode,
+    CASE
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_total AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg ),
+tcga_raw AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) AS tcga_cases
+  FROM tcga_seg
+  WHERE aberr_type IS NOT NULL
+  GROUP BY chr_ord, aberr_type
+), tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    tcga_cases / n_samples AS tcga_pct
+  FROM tcga_raw, tcga_total
+),
+/* Join & correlate -------------------------------------------------------- */
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))    AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Corrected other sqls]
+2025-05-02 04:40:49 - ThreadPoolExecutor-0_7 - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Display all FLOAT64 columns in the TCGA table
+--              `Copy_Number_Segment_Masked` so we can discover the exact
+--              name of the numeric copy‑number value field (needed to set
+--              gain/loss thresholds in later analyses).
+SELECT
+  column_name,
+  ordinal_position,
+  data_type
+FROM `isb-cgc.TCGA_hg38_data_v0.INFORMATION_SCHEMA.COLUMNS`
+WHERE table_name = 'Copy_Number_Segment_Masked'
+  AND data_type = 'FLOAT64'
+ORDER BY ordinal_position
+LIMIT 50;
+Results:
+column_name,ordinal_position,data_type
+segment_mean,9,FLOAT64
+
+[Successfully corrected]
+2025-05-02 04:40:49 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 8) Pearson correlation for GAINS – Mitelman breast carcinoma (morph 3111 / topo 0401)
+--              vs TCGA‑BRCA (project_short_name = 'TCGA-BRCA').  Uses the correct TCGA
+--              table `Copy_Number_Segment_Masked`, the numeric column `segment_mean`,
+--              and converts chromosome strings to integers with SAFE_CAST.
+WITH
+mit_gain AS (
+  SELECT
+    cc.ChrOrd                                       AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / 764.0 AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'   -- breast carcinoma
+    AND cc.Type = 'Gain'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_gain AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean >= 0.15                                     -- Gain threshold
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_gain m
+  JOIN tcga_gain t USING (chr_ord)
+)
+SELECT
+  CORR(mit_pct, tcga_pct)                                 AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (ARRAY_AGG(STRUCT(mit_pct AS x, tcga_pct AS y)))    AS p_value,
+  COUNT(*)                                                AS matched_chr
+FROM joined
+HAVING matched_chr >= 5
+[Try to execute]
+2025-05-02 04:40:50 - ThreadPoolExecutor-0_7 - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##400 No matching signature for function isb-cgc-bq.functions.corr_pvalue_current\n  Argument types: ARRAY<STRUCT<x FLOAT64, y FLOAT64>>\n  Signature: isb-cgc-bq.functions.corr_pvalue_current(FLOAT64, INT64)\n    Signature requires at least 2 arguments, found 1 argument at [39:3]; reason: invalidQuery, location: query, message: No matching signature for function isb-cgc-bq.functions.corr_pvalue_current\n  Argument types: ARRAY<STRUCT<x FLOAT64, y FLOAT64>>\n  Signature: isb-cgc-bq.functions.corr_pvalue_current(FLOAT64, INT64)\n    Signature requires at least 2 arguments, found 1 argument at [39:3]\n\nLocation: US\nJob ID: 36cb7564-d53f-4a3b-a0c9-48f9e984d72c\n'}
+[Error occurred]
+2025-05-02 04:41:59 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  Correlate chromosome‑level “Gain” frequencies between Mitelman
+--              breast‑carcinoma cases (morph 3111 / topo 0401) and TCGA‑BRCA
+--              copy‑number data.  
+--              • Mitelman: % of 3111/0401 cases (764 total) having a Gain per chromosome  
+--              • TCGA:   % of BRCA samples whose masked segment_mean ≥ 0.15 per chromosome  
+--              • Join on numeric chromosome (chr_ord) after stripping non‑digits  
+--              • Compute Pearson r with BigQuery’s CORR, then two‑tailed p‑value via
+--                ISB‑CGC UDF corr_pvalue_current(r FLOAT64, n INT64).  Result displayed
+--                only if at least five chromosomes are compared.
+WITH
+/* 1. Mitelman breast‑cancer cases ----------------------------------------- */
+mit_cases AS (
+  SELECT DISTINCT RefNo, CaseNo
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE Morph = '3111' AND Topo = '0401'
+),
+mit_gain AS (
+  SELECT
+    cc.ChrOrd AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))
+      / (SELECT COUNT(*) FROM mit_cases)       AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.RefNo = mc.RefNo AND cc.CaseNo = mc.CaseNo
+  WHERE cc.Type = 'Gain'
+  GROUP BY chr_ord
+),
+/* 2. TCGA‑BRCA samples ----------------------------------------------------- */
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_gain AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean >= 0.15
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+/* 3. Join datasets -------------------------------------------------------- */
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_gain m
+  JOIN tcga_gain t USING (chr_ord)
+),
+/* 4. Pearson correlation & p‑value --------------------------------------- */
+stats AS (
+  SELECT
+    CORR(mit_pct, tcga_pct) AS pearson_r,
+    COUNT(*)               AS matched_chr
+  FROM joined
+)
+SELECT
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM stats
+WHERE matched_chr >= 5;
+```
+[Corrected SQL]
+2025-05-02 04:42:03 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+pearson_r,p_value,matched_chr
+0.699762697503809,0.00032155988188843637,22
+
+[Results for corrected sql]
+2025-05-02 04:42:24 - ThreadPoolExecutor-0_7 - INFO - [Corrected other sqls]
+```sql
+--Description: 9) Pearson correlation for LOSSES – Mitelman breast carcinoma (morph 3111 / topo 0401)
+--              vs TCGA‑BRCA masked copy‑number segments (segment_mean ≤ ‑0.15).  Uses
+--              ISB‑CGC UDF corr_pvalue_current(r FLOAT64, n INT64) to compute p‑value.
+WITH
+mit_loss AS (
+  SELECT
+    cc.ChrOrd AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))
+      / 764.0                                       AS mit_pct        -- 764 cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen`      cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type  = 'Loss'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_loss AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean <= -0.15
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_loss m
+  JOIN tcga_loss t USING (chr_ord)
+),
+stats AS (
+  SELECT
+    CORR(mit_pct, tcga_pct) AS pearson_r,
+    COUNT(*)               AS matched_chr
+  FROM joined
+)
+SELECT
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM stats
+WHERE matched_chr >= 5;
+```
+
+```sql
+--Description: 10) One‑shot table – correlations for Gain and Loss (the two CNV types
+--              present in Mitelman) across chromosomes.  Uses correct p‑value UDF
+--              signature corr_pvalue_current(r, n).  Only aberration types with at
+--              least five matching chromosomes are reported.
+WITH
+-- Mitelman -----------------------------------------------------------------
+mit_raw AS (
+  SELECT
+    ChrOrd                       AS chr_ord,
+    Type                         AS aberr_type,      -- Gain / Loss
+    COUNT(DISTINCT CONCAT(RefNo,'-',CaseNo)) AS mit_cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type
+), mit_total AS ( SELECT 764 AS n_cases ),
+mit_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    mit_cases / n_cases AS mit_pct
+  FROM mit_raw, mit_total
+),
+-- TCGA ---------------------------------------------------------------------
+tcga_seg AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    sample_barcode,
+    CASE
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_total AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg ),
+tcga_raw AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) AS tcga_cases
+  FROM tcga_seg
+  WHERE aberr_type IS NOT NULL AND chr_ord IS NOT NULL
+  GROUP BY chr_ord, aberr_type
+), tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    tcga_cases / n_samples AS tcga_pct
+  FROM tcga_raw, tcga_total
+),
+-- Join & per‑type correlation ---------------------------------------------
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                                AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (CORR(mit_pct, tcga_pct), COUNT(*))                                AS p_value,
+  COUNT(*)                                                               AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Corrected other sqls]
+2025-05-02 04:42:24 - ThreadPoolExecutor-0_7 - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Correlate chromosome‑level “Gain” frequencies between Mitelman
+--              breast‑carcinoma cases (morph 3111 / topo 0401) and TCGA‑BRCA
+--              copy‑number data.  
+--              • Mitelman: % of 3111/0401 cases (764 total) having a Gain per chromosome  
+--              • TCGA:   % of BRCA samples whose masked segment_mean ≥ 0.15 per chromosome  
+--              • Join on numeric chromosome (chr_ord) after stripping non‑digits  
+--              • Compute Pearson r with BigQuery’s CORR, then two‑tailed p‑value via
+--                ISB‑CGC UDF corr_pvalue_current(r FLOAT64, n INT64).  Result displayed
+--                only if at least five chromosomes are compared.
+WITH
+/* 1. Mitelman breast‑cancer cases ----------------------------------------- */
+mit_cases AS (
+  SELECT DISTINCT RefNo, CaseNo
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE Morph = '3111' AND Topo = '0401'
+),
+mit_gain AS (
+  SELECT
+    cc.ChrOrd AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))
+      / (SELECT COUNT(*) FROM mit_cases)       AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.RefNo = mc.RefNo AND cc.CaseNo = mc.CaseNo
+  WHERE cc.Type = 'Gain'
+  GROUP BY chr_ord
+),
+/* 2. TCGA‑BRCA samples ----------------------------------------------------- */
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_gain AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean >= 0.15
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+/* 3. Join datasets -------------------------------------------------------- */
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_gain m
+  JOIN tcga_gain t USING (chr_ord)
+),
+/* 4. Pearson correlation & p‑value --------------------------------------- */
+stats AS (
+  SELECT
+    CORR(mit_pct, tcga_pct) AS pearson_r,
+    COUNT(*)               AS matched_chr
+  FROM joined
+)
+SELECT
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM stats
+WHERE matched_chr >= 5;
+Results:
+pearson_r,p_value,matched_chr
+0.699762697503809,0.00032155988188843637,22
+
+[Successfully corrected]
+2025-05-02 04:42:24 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 9) Pearson correlation for LOSSES – Mitelman breast carcinoma (morph 3111 / topo 0401)
+--              vs TCGA‑BRCA masked copy‑number segments (segment_mean ≤ ‑0.15).  Uses
+--              ISB‑CGC UDF corr_pvalue_current(r FLOAT64, n INT64) to compute p‑value.
+WITH
+mit_loss AS (
+  SELECT
+    cc.ChrOrd AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))
+      / 764.0                                       AS mit_pct        -- 764 cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen`      cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type  = 'Loss'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_loss AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean <= -0.15
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_loss m
+  JOIN tcga_loss t USING (chr_ord)
+),
+stats AS (
+  SELECT
+    CORR(mit_pct, tcga_pct) AS pearson_r,
+    COUNT(*)               AS matched_chr
+  FROM joined
+)
+SELECT
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM stats
+WHERE matched_chr >= 5
+[Try to execute]
+2025-05-02 04:42:26 - ThreadPoolExecutor-0_7 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 9) Pearson correlation for LOSSES – Mitelman breast carcinoma (morph 3111 / topo 0401)
+--              vs TCGA‑BRCA masked copy‑number segments (segment_mean ≤ ‑0.15).  Uses
+--              ISB‑CGC UDF corr_pvalue_current(r FLOAT64, n INT64) to compute p‑value.
+WITH
+mit_loss AS (
+  SELECT
+    cc.ChrOrd AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))
+      / 764.0                                       AS mit_pct        -- 764 cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen`      cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type  = 'Loss'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_loss AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean <= -0.15
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_loss m
+  JOIN tcga_loss t USING (chr_ord)
+),
+stats AS (
+  SELECT
+    CORR(mit_pct, tcga_pct) AS pearson_r,
+    COUNT(*)               AS matched_chr
+  FROM joined
+)
+SELECT
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM stats
+WHERE matched_chr >= 5
+Results:
+pearson_r,p_value,matched_chr
+0.49899506135101723,0.018544334286173535,22
+
+[Successfully executed]
+2025-05-02 04:42:26 - ThreadPoolExecutor-0_7 - INFO - [Try to execute]
+--Description: 10) One‑shot table – correlations for Gain and Loss (the two CNV types
+--              present in Mitelman) across chromosomes.  Uses correct p‑value UDF
+--              signature corr_pvalue_current(r, n).  Only aberration types with at
+--              least five matching chromosomes are reported.
+WITH
+-- Mitelman -----------------------------------------------------------------
+mit_raw AS (
+  SELECT
+    ChrOrd                       AS chr_ord,
+    Type                         AS aberr_type,      -- Gain / Loss
+    COUNT(DISTINCT CONCAT(RefNo,'-',CaseNo)) AS mit_cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen` cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type
+), mit_total AS ( SELECT 764 AS n_cases ),
+mit_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    mit_cases / n_cases AS mit_pct
+  FROM mit_raw, mit_total
+),
+-- TCGA ---------------------------------------------------------------------
+tcga_seg AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    sample_barcode,
+    CASE
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_total AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg ),
+tcga_raw AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) AS tcga_cases
+  FROM tcga_seg
+  WHERE aberr_type IS NOT NULL AND chr_ord IS NOT NULL
+  GROUP BY chr_ord, aberr_type
+), tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    tcga_cases / n_samples AS tcga_pct
+  FROM tcga_raw, tcga_total
+),
+-- Join & per‑type correlation ---------------------------------------------
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                                AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (CORR(mit_pct, tcga_pct), COUNT(*))                                AS p_value,
+  COUNT(*)                                                               AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type
+[Try to execute]
+2025-05-02 04:42:27 - ThreadPoolExecutor-0_7 - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##400 Column name RefNo is ambiguous at [11:27]; reason: invalidQuery, location: query, message: Column name RefNo is ambiguous at [11:27]\n\nLocation: US\nJob ID: 40a88fe8-c120-4099-9f9b-e45ce1438ab3\n'}
+[Error occurred]
+2025-05-02 04:43:38 - ThreadPoolExecutor-0_7 - INFO - [Corrected SQL]
+```sql
+--Description:  One‑query solution that delivers the requested result:
+--              Pearson correlation (and p‑value) between Mitelman and TCGA
+--              chromosome‑level copy‑number frequencies, separately for
+--              “Gain” and “Loss”, keeping only aberration types with at least
+--              five chromosomes shared by both datasets.
+--
+-- 1)  Mitelman cohort: all breast‑carcinoma cases (morph 3111, topo 0401).
+--     • Count how many of the 764 cases show a Gain or Loss on each chromosome.
+--     • Divide by 764 → mit_pct.
+--
+-- 2)  TCGA cohort: all BRCA samples in Copy_Number_Segment_Masked.
+--     • Convert chromosome strings to integers (drop “chr”, “X”, etc.).
+--     • Classify segments:  segment_mean ≥ 0.15  → Gain
+--                           segment_mean ≤ ‑0.15 → Loss
+--     • Count distinct samples with Gain/Loss per chromosome; divide by
+--       total BRCA samples → tcga_pct.
+--
+-- 3)  Join on (chr_ord, aberr_type) and compute:
+--        Pearson r  = CORR(mit_pct, tcga_pct)
+--        p‑value    = isb‑cgc‑bq.functions.corr_pvalue_current(r, n)
+--                   where n = number of matching chromosomes.
+WITH
+/* ─────────── Mitelman frequencies ─────────── */
+mit_total AS (
+  SELECT COUNT(DISTINCT CONCAT(RefNo,'-',CaseNo)) AS n_cases
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE Morph = '3111' AND Topo = '0401'
+),
+mit_freq AS (
+  SELECT
+    cc.ChrOrd                                                   AS chr_ord,
+    cc.Type                                                     AS aberr_type,   -- Gain / Loss
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / mt.n_cases AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen`        cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  CROSS JOIN mit_total mt
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type, mt.n_cases
+),
+/* ─────────── TCGA‑BRCA frequencies ────────── */
+tcga_seg AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    sample_barcode,
+    CASE
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_total AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg ),
+tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) / n_samples AS tcga_pct
+  FROM tcga_seg, tcga_total
+  WHERE aberr_type IS NOT NULL AND chr_ord IS NOT NULL
+  GROUP BY chr_ord, aberr_type, n_samples
+),
+/* ─────────── Join & correlate ─────────────── */
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                            AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (CORR(mit_pct, tcga_pct), COUNT(*))                            AS p_value,
+  COUNT(*)                                                           AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Corrected SQL]
+2025-05-02 04:43:41 - ThreadPoolExecutor-0_7 - INFO - [Results for corrected sql]
+aberr_type,pearson_r,p_value,matched_chr
+Gain,0.6997626975038086,0.0003215598818884405,22
+Loss,0.49899506135101723,0.018544334286173535,22
+
+[Results for corrected sql]
+2025-05-02 04:43:41 - ThreadPoolExecutor-0_7 - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  One‑query solution that delivers the requested result:
+--              Pearson correlation (and p‑value) between Mitelman and TCGA
+--              chromosome‑level copy‑number frequencies, separately for
+--              “Gain” and “Loss”, keeping only aberration types with at least
+--              five chromosomes shared by both datasets.
+--
+-- 1)  Mitelman cohort: all breast‑carcinoma cases (morph 3111, topo 0401).
+--     • Count how many of the 764 cases show a Gain or Loss on each chromosome.
+--     • Divide by 764 → mit_pct.
+--
+-- 2)  TCGA cohort: all BRCA samples in Copy_Number_Segment_Masked.
+--     • Convert chromosome strings to integers (drop “chr”, “X”, etc.).
+--     • Classify segments:  segment_mean ≥ 0.15  → Gain
+--                           segment_mean ≤ ‑0.15 → Loss
+--     • Count distinct samples with Gain/Loss per chromosome; divide by
+--       total BRCA samples → tcga_pct.
+--
+-- 3)  Join on (chr_ord, aberr_type) and compute:
+--        Pearson r  = CORR(mit_pct, tcga_pct)
+--        p‑value    = isb‑cgc‑bq.functions.corr_pvalue_current(r, n)
+--                   where n = number of matching chromosomes.
+WITH
+/* ─────────── Mitelman frequencies ─────────── */
+mit_total AS (
+  SELECT COUNT(DISTINCT CONCAT(RefNo,'-',CaseNo)) AS n_cases
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE Morph = '3111' AND Topo = '0401'
+),
+mit_freq AS (
+  SELECT
+    cc.ChrOrd                                                   AS chr_ord,
+    cc.Type                                                     AS aberr_type,   -- Gain / Loss
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) / mt.n_cases AS mit_pct
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen`        cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  CROSS JOIN mit_total mt
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type IN ('Gain','Loss')
+  GROUP BY chr_ord, aberr_type, mt.n_cases
+),
+/* ─────────── TCGA‑BRCA frequencies ────────── */
+tcga_seg AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    sample_barcode,
+    CASE
+      WHEN segment_mean >=  0.15 THEN 'Gain'
+      WHEN segment_mean <= -0.15 THEN 'Loss'
+    END AS aberr_type
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_total AS ( SELECT COUNT(DISTINCT sample_barcode) AS n_samples FROM tcga_seg ),
+tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) / n_samples AS tcga_pct
+  FROM tcga_seg, tcga_total
+  WHERE aberr_type IS NOT NULL AND chr_ord IS NOT NULL
+  GROUP BY chr_ord, aberr_type, n_samples
+),
+/* ─────────── Join & correlate ─────────────── */
+joined AS (
+  SELECT
+    m.chr_ord,
+    m.aberr_type,
+    m.mit_pct,
+    t.tcga_pct
+  FROM mit_freq m
+  JOIN tcga_freq t USING (chr_ord, aberr_type)
+)
+SELECT
+  aberr_type,
+  CORR(mit_pct, tcga_pct)                                            AS pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`
+      (CORR(mit_pct, tcga_pct), COUNT(*))                            AS p_value,
+  COUNT(*)                                                           AS matched_chr
+FROM joined
+GROUP BY aberr_type
+HAVING matched_chr >= 5
+ORDER BY aberr_type;
+Results:
+aberr_type,pearson_r,p_value,matched_chr
+Gain,0.6997626975038086,0.0003215598818884405,22
+Loss,0.49899506135101723,0.018544334286173535,22
+
+[Successfully corrected]
+2025-05-02 04:43:41 - ThreadPoolExecutor-0_7 - INFO - itercount: 0
+2025-05-02 04:43:41 - ThreadPoolExecutor-0_7 - INFO - [Self-refine]
+Table full name: mitelman-db.prod.AuthorReference
+Column name: Refno Type: INT64 Description: this reference number is always an integer, between 1 and 50000
+Column name: Name Type: STRING Description: eg 'Mitelman F', or 'Rowley JD'
+Column name: NameOrder Type: INT64 Description: an integer between 1 and 228, indicating the position of this author's name in the list of authors for this reference
+Sample rows:
+[{'Refno': 1, 'Name': 'LUND UNPUBLISHED', 'NameOrder': 1}, {'Refno': 1, 'Name': 'LUND UNPUBLISHED', 'NameOrder': 1}, {'Refno': 10, 'Name': 'Hayata I', 'NameOrder': 1}, {'Refno': 11, 'Name': 'Hayata I', 'NameOrder': 1}, {'Refno': 12, 'Name': 'Muldal S', 'NameOrder': 1}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.CytoConvertedLog
+Column name: RefNo Type: INT64
+Column name: CaseNo Type: STRING
+Column name: InvNo Type: INT64
+Column name: Clone Type: INT64
+Column name: Type Type: STRING
+Column name: Message Type: STRING
+Sample rows:
+[{'RefNo': 777, 'CaseNo': '1', 'InvNo': 1, 'Clone': 1, 'Type': 'Warning', 'Message': 'Warning in some chromosomes unaccounted for'}, {'RefNo': 5316, 'CaseNo': '1', 'InvNo': 1, 'Clone': 1, 'Type': 'Warning', 'Message': 'Warning in some chromosomes unaccounted for'}, {'RefNo': 7214, 'CaseNo': '1', 'InvNo': 1, 'Clone': 2, 'Type': 'Warning', 'Message': 'Warning in some chromosomes unaccounted for'}, {'RefNo': 7214, 'CaseNo': '1', 'InvNo': 1, 'Clone': 3, 'Type': 'Warning', 'Message': 'Warning in some chromosomes unaccounted for'}, {'RefNo': 7214, 'CaseNo': '1', 'InvNo': 1, 'Clone': 4, 'Type': 'Warning', 'Message': 'Warning in some chromosomes unaccounted for'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.KaryBreak
+Column name: RefNo Type: INT64 Description: reference number, eg '14617'
+Column name: CaseNo Type: STRING Description: case number, usually between 1 and 10, but can also be an arbitrary string, eg 'A11'
+Column name: InvNo Type: INT64 Description: investigation number, between 1 and 9
+Column name: CloneNo Type: INT64 Description: clone number, between 1 and 58
+Column name: OrderNo Type: INT64 Description: order number, between 1 and 392
+Column name: Breakpoint Type: STRING Description: arbitrary string, eg '14q32', or '9', or '?10q?11'
+Sample rows:
+[{'RefNo': 4169, 'CaseNo': '384', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Breakpoint': '?'}, {'RefNo': 5553, 'CaseNo': '56', 'InvNo': 1, 'CloneNo': 2, 'OrderNo': 1, 'Breakpoint': '?'}, {'RefNo': 7703, 'CaseNo': '254', 'InvNo': 1, 'CloneNo': 2, 'OrderNo': 1, 'Breakpoint': '?'}, {'RefNo': 8463, 'CaseNo': '43', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Breakpoint': '?'}, {'RefNo': 8473, 'CaseNo': '1B', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Breakpoint': '?'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.CytoConverted
+Column name: RefNo Type: INT64
+Column name: CaseNo Type: STRING
+Column name: InvNo Type: INT64
+Column name: Clone Type: INT64
+Column name: Chr Type: STRING
+Column name: ChrOrd Type: INT64
+Column name: Start Type: INT64
+Column name: End Type: INT64
+Column name: Type Type: STRING
+Column name: CellsPresent Type: STRING
+Sample rows:
+[{'RefNo': 9843, 'CaseNo': '1', 'InvNo': 1, 'Clone': 1, 'Chr': 'chr14', 'ChrOrd': 14, 'Start': 0, 'End': 50400000, 'Type': 'Gain', 'CellsPresent': 'unknown'}, {'RefNo': 1486, 'CaseNo': '3', 'InvNo': 2, 'Clone': 1, 'Chr': 'chr14', 'ChrOrd': 14, 'Start': 0, 'End': 50400000, 'Type': 'Gain', 'CellsPresent': 'unknown'}, {'RefNo': 10708, 'CaseNo': '1', 'InvNo': 1, 'Clone': 1, 'Chr': 'chr14', 'ChrOrd': 14, 'Start': 17200000, 'End': 50400000, 'Type': 'Gain', 'CellsPresent': 'unknown'}, {'RefNo': 7836, 'CaseNo': '32', 'InvNo': 1, 'Clone': 2, 'Chr': 'chr14', 'ChrOrd': 14, 'Start': 0, 'End': 50400000, 'Type': 'Gain', 'CellsPresent': 'unknown'}, {'RefNo': 12067, 'CaseNo': '56', 'InvNo': 1, 'Clone': 1, 'Chr': 'chr14', 'ChrOrd': 14, 'Start': 0, 'End': 50400000, 'Type': 'Gain', 'CellsPresent': 'unknown'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.KaryBit
+Column name: RefNo Type: INT64 Description: reference number
+Column name: CaseNo Type: STRING Description: case number, usually an integer but can be a string, eg 'A11'
+Column name: InvNo Type: INT64 Description: investigation number
+Column name: CloneNo Type: INT64 Description: clone number
+Column name: OrderNo Type: INT64 Description: order number
+Column name: Bit Type: STRING Description: karyotype 'bit', eg '46', or 'Xy', or 'idem', etc
+Sample rows:
+[{'RefNo': 500, 'CaseNo': '1', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Bit': '??'}, {'RefNo': 524, 'CaseNo': '1', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Bit': '??'}, {'RefNo': 623, 'CaseNo': '1', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Bit': '??'}, {'RefNo': 631, 'CaseNo': '1', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Bit': '??'}, {'RefNo': 632, 'CaseNo': '1', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Bit': '??'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.Koder
+Column name: Kod Type: STRING Description: this field contains the 'code' which can be something like '5230' or '02' or 'O' -- there are 470 unique codes
+Column name: KodTyp Type: STRING Description: this field indicates the type of the code -- there are 7 types: 'MORPH' (morphology), 'GEO' (geography), 'TOP' (topography), 'HER' (heredity), 'TISSUE', 'TREAT' (treatment), and 'RACE'
+Column name: Aktiv Type: STRING Description: whether or not this code is active -- almost always 'J' (yes), but is 'N' once and blank once
+Column name: Intern Type: STRING Description: whether or not this code is internal -- almost always 'J' (yes), but is 'N' once and blank once
+Column name: Benamning Type: STRING Description: the 'long' name corresponding to this code, eg 'Vascular and perivascular tumors (all subtypes)'
+Column name: Kortnamn Type: STRING Description: the 'short' name corresponding to this code, eg 'Adipo'
+Column name: Notering Type: STRING Description: this field is always blank
+Column name: Inregdatum Type: STRING Description: this field contains a date, eg 'Jul 7 2000 12:00AM' or 'Jan 9 2014 12:00AM'
+Column name: GiltigFran Type: STRING Description: this field appears to contain the same date
+Column name: GiltigTill Type: STRING Description: this field contains a date far into the future, eg 'Dec 27 2063 12:00AM'
+Column name: Flagga1 Type: STRING Description: unknown field -- either blank (443 rows) or '1' (41 rows)
+Column name: Flagga2 Type: STRING Description: this field is always blank
+Column name: Flagga3 Type: STRING Description: this field is always blank
+Column name: Flagga4 Type: STRING Description: this field is always blank
+Sample rows:
+[{'Kod': ' ', 'KodTyp': 'GEO', 'Aktiv': ' ', 'Intern': ' ', 'Benamning': ' ', 'Kortnamn': None, 'Notering': None, 'Inregdatum': None, 'GiltigFran': None, 'GiltigTill': None, 'Flagga1': None, 'Flagga2': None, 'Flagga3': None, 'Flagga4': None}, {'Kod': '1000', 'KodTyp': 'GEO', 'Aktiv': 'J', 'Intern': 'N', 'Benamning': 'Africa unspec', 'Kortnamn': 'Afr', 'Notering': None, 'Inregdatum': None, 'GiltigFran': None, 'GiltigTill': None, 'Flagga1': None, 'Flagga2': None, 'Flagga3': None, 'Flagga4': None}, {'Kod': '1075', 'KodTyp': 'GEO', 'Aktiv': 'J', 'Intern': 'N', 'Benamning': 'Tunisia', 'Kortnamn': 'TN', 'Notering': None, 'Inregdatum': None, 'GiltigFran': None, 'GiltigTill': None, 'Flagga1': None, 'Flagga2': None, 'Flagga3': None, 'Flagga4': None}, {'Kod': '2000', 'KodTyp': 'GEO', 'Aktiv': 'J', 'Intern': 'N', 'Benamning': 'Latin America unspec', 'Kortnamn': 'Lat Am', 'Notering': None, 'Inregdatum': None, 'GiltigFran': None, 'GiltigTill': None, 'Flagga1': None, 'Flagga2': None, 'Flagga3': None, 'Flagga4': None}, {'Kod': '2043', 'KodTyp': 'GEO', 'Aktiv': 'J', 'Intern': 'N', 'Benamning': 'Dominican Republic', 'Kortnamn': 'DO', 'Notering': None, 'Inregdatum': None, 'GiltigFran': None, 'GiltigTill': None, 'Flagga1': None, 'Flagga2': None, 'Flagga3': None, 'Flagga4': None}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.RecurrentNumData
+Column name: Chromosome Type: STRING Description: number between 1 and 48
+Column name: Abnormality Type: STRING Description: abnormality description, eg '-22', or '-X', or '+15', etc
+Column name: Morph Type: STRING Description: morphology code, eg '3111'
+Column name: Topo Type: STRING Description: topography code, eg '0902' (or blank)
+Column name: TotalCases Type: STRING Description: total number of cases (up to 2211)
+Column name: ChrOrder Type: INT64 Description: numeric order of the chromosome
+Sample rows:
+[{'Chromosome': '1', 'Abnormality': '+1', 'Morph': '1101', 'Topo': None, 'TotalCases': '182', 'ChrOrder': 1}, {'Chromosome': '1', 'Abnormality': '+1', 'Morph': '1104', 'Topo': None, 'TotalCases': '37', 'ChrOrder': 1}, {'Chromosome': '1', 'Abnormality': '+1', 'Morph': '1107', 'Topo': None, 'TotalCases': '32', 'ChrOrder': 1}, {'Chromosome': '1', 'Abnormality': '+1', 'Morph': '1112', 'Topo': None, 'TotalCases': '37', 'ChrOrder': 1}, {'Chromosome': '1', 'Abnormality': '+1', 'Morph': '1202', 'Topo': None, 'TotalCases': '36', 'ChrOrder': 1}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.CytoBands_hg38
+Column name: chromosome Type: STRING
+Column name: cytoband_name Type: STRING
+Column name: hg38_start Type: INT64
+Column name: hg38_stop Type: INT64
+Sample rows:
+[{'chromosome': 'chr1', 'cytoband_name': '1p36', 'hg38_start': 0, 'hg38_stop': 27600000}, {'chromosome': 'chr1', 'cytoband_name': '1p35', 'hg38_start': 27600000, 'hg38_stop': 34300000}, {'chromosome': 'chr1', 'cytoband_name': '1p34', 'hg38_start': 34300000, 'hg38_stop': 46300000}, {'chromosome': 'chr1', 'cytoband_name': '1p33', 'hg38_start': 46300000, 'hg38_stop': 50200000}, {'chromosome': 'chr1', 'cytoband_name': '1p32', 'hg38_start': 50200000, 'hg38_stop': 60800000}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.KaryClone
+Column name: RefNo Type: INT64 Description: reference number, eg '14620'
+Column name: CaseNo Type: STRING Description: case number, usually between 1 and 10, but can also be an arbitrary string, eg 'A11'
+Column name: InvNo Type: INT64 Description: investigation number, between 1 and 9
+Column name: CloneNo Type: INT64 Description: clone number, between 1 and 58
+Column name: ChromoMin Type: INT64 Description: most common values are between '42' and '51', but minimum value is '0' and maximum is '409'
+Column name: ChromoMax Type: INT64 Description: most common values are between '43' and '52', but minimum value is '0' and maximum is '409'
+Column name: CloneShort Type: STRING Description: shorter, sometimes truncated clone description, eg '45,X,-Y' or '46,Xy,t(8;21)(q22;q22)'
+Column name: CloneLong Type: STRING Description: usually blank, but if the clone description is very long, that string will be stored here
+Column name: CloneLength Type: INT64 Description: length of clone description string -- usually between 8 and 24 characters, but can be up to 2199 characters
+Column name: Sole Type: STRING Description: T/F flag indicating whether or not this is the sole abnormality
+Sample rows:
+[{'RefNo': 3822, 'CaseNo': '1', 'InvNo': 1, 'CloneNo': 5, 'ChromoMin': 45, 'ChromoMax': 45, 'CloneShort': '45,X,-X', 'CloneLong': None, 'CloneLength': 7, 'Sole': 'T'}, {'RefNo': 4018, 'CaseNo': '33', 'InvNo': 1, 'CloneNo': 6, 'ChromoMin': 45, 'ChromoMax': 45, 'CloneShort': '45,X,-X', 'CloneLong': None, 'CloneLength': 7, 'Sole': 'T'}, {'RefNo': 8240, 'CaseNo': '8B', 'InvNo': 1, 'CloneNo': 7, 'ChromoMin': 45, 'ChromoMax': 45, 'CloneShort': '45,X,-X', 'CloneLong': None, 'CloneLength': 7, 'Sole': 'T'}, {'RefNo': 11389, 'CaseNo': '8', 'InvNo': 1, 'CloneNo': 5, 'ChromoMin': 45, 'ChromoMax': 45, 'CloneShort': '45,X,-X', 'CloneLong': None, 'CloneLength': 7, 'Sole': 'T'}, {'RefNo': 9341, 'CaseNo': '5', 'InvNo': 1, 'CloneNo': 9, 'ChromoMin': 45, 'ChromoMax': 45, 'CloneShort': '45,X,-Y', 'CloneLong': None, 'CloneLength': 7, 'Sole': 'T'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.Cytogen
+Column name: RefNo Type: INT64 Description: reference number (but treated as a string)
+Column name: CaseNo Type: STRING Description: case number (usually a number, but can be a string, therefore treating as string)
+Column name: Sex Type: STRING Description: one of 'M', 'F', or blank
+Column name: Age Type: INT64 Description: can be blank, otherwise an integer between 0 and 100
+Column name: Race Type: STRING Description: one of 'W', 'A', 'B', or 'O' (or blank)
+Column name: Series Type: STRING Description: one of 'U', 'S', or 'D' (never blank)
+Column name: Country Type: STRING Description: country code, eg '3020'
+Column name: PrevTum Type: STRING Description: previous-tumor flag, either blank or 'Y'
+Column name: PrevMorph Type: STRING Description: morphology code (eg '3111') for previous-tumor (frequently blank)
+Column name: PrevTopo Type: STRING Description: topology code (eg '0401') for previous-tumor (frequently blank)
+Column name: PrevTreat Type: STRING Description: one or more characters indicating previous treatment type(s), eg 'C', or 'C,R', or 'R,S' (or blank)
+Column name: HerDis Type: STRING Description: hereditary disease code (eg '110')
+Column name: SpecHerDis Type: STRING Description: specific hereditary disease, eg 'Fanconi anemia' or 'inv(9)(p11q13)'
+Column name: Morph Type: STRING Description: morphology code, eg '1602'
+Column name: SpecMorph Type: STRING Description: specific morphology, eg 'Aplastic anemia', or 'AML with cup-like nuclei'
+Column name: Topo Type: STRING Description: topology code, eg '0902'
+Column name: Immunology Type: STRING Description: most frequently blank, otherwise 'B' or 'T'
+Column name: SpecObs Type: STRING Description: unknown/unnecessary field -- always blank
+Column name: Origin Type: STRING Description: blank about half the time, otherwise 'L'
+Column name: PatientID Type: STRING Description: unknown/unnecessary field -- always blank
+Column name: PatientName Type: STRING Description: unknown/unnecessary field -- always blank
+Column name: CaseOrder Type: INT64 Description: unknown integer field between 0 and 991807
+Sample rows:
+[{'RefNo': 223, 'CaseNo': '1', 'Sex': 'M', 'Age': 60, 'Race': 'W', 'Series': 'S', 'Country': '3020', 'PrevTum': ' ', 'PrevMorph': None, 'PrevTopo': None, 'PrevTreat': None, 'HerDis': None, 'SpecHerDis': None, 'Morph': '1010', 'SpecMorph': None, 'Topo': ' ', 'Immunology': None, 'SpecObs': None, 'Origin': ' ', 'PatientID': None, 'PatientName': None, 'CaseOrder': 1}, {'RefNo': 234, 'CaseNo': '4', 'Sex': 'F', 'Age': 67, 'Race': None, 'Series': 'U', 'Country': '6101', 'PrevTum': ' ', 'PrevMorph': None, 'PrevTopo': None, 'PrevTreat': None, 'HerDis': None, 'SpecHerDis': None, 'Morph': '1010', 'SpecMorph': None, 'Topo': ' ', 'Immunology': None, 'SpecObs': None, 'Origin': ' ', 'PatientID': None, 'PatientName': None, 'CaseOrder': 4}, {'RefNo': 427, 'CaseNo': '1', 'Sex': 'F', 'Age': 3, 'Race': None, 'Series': 'S', 'Country': '5270', 'PrevTum': ' ', 'PrevMorph': None, 'PrevTopo': None, 'PrevTreat': None, 'HerDis': None, 'SpecHerDis': None, 'Morph': '1010', 'SpecMorph': None, 'Topo': ' ', 'Immunology': None, 'SpecObs': None, 'Origin': ' ', 'PatientID': None, 'PatientName': None, 'CaseOrder': 1}, {'RefNo': 427, 'CaseNo': '2', 'Sex': 'F', 'Age': 2, 'Race': None, 'Series': 'S', 'Country': '5270', 'PrevTum': ' ', 'PrevMorph': None, 'PrevTopo': None, 'PrevTreat': None, 'HerDis': None, 'SpecHerDis': None, 'Morph': '1010', 'SpecMorph': None, 'Topo': ' ', 'Immunology': None, 'SpecObs': None, 'Origin': ' ', 'PatientID': None, 'PatientName': None, 'CaseOrder': 2}, {'RefNo': 428, 'CaseNo': '1', 'Sex': 'M', 'Age': 76, 'Race': None, 'Series': 'S', 'Country': '5260', 'PrevTum': ' ', 'PrevMorph': None, 'PrevTopo': None, 'PrevTreat': None, 'HerDis': None, 'SpecHerDis': None, 'Morph': '1010', 'SpecMorph': None, 'Topo': ' ', 'Immunology': None, 'SpecObs': None, 'Origin': ' ', 'PatientID': None, 'PatientName': None, 'CaseOrder': 1}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.MolClinGene
+Column name: MolClin Type: STRING Description: flag indicating either molecular 'M', or clinical 'C'
+Column name: RefNo Type: INT64 Description: reference number, eg '15563'
+Column name: InvNo Type: INT64 Description: investigation number, usually between 1 and 10
+Column name: OrderNo Type: INT64 Description: order number, between 1 and 15
+Column name: Prefix Type: STRING Description: prefix string -- either blank or '+' 
+Column name: Gene Type: STRING Description: gene symbol(s), eg 'KMT2A' or 'BCR/ABL1'
+Column name: Suffix Type: STRING Description: suffix string -- either blank or '+'
+Sample rows:
+[{'MolClin': 'C', 'RefNo': 3967, 'InvNo': 1, 'OrderNo': 1, 'Prefix': None, 'Gene': 'BCR::ABL1', 'Suffix': None}, {'MolClin': 'C', 'RefNo': 3976, 'InvNo': 1, 'OrderNo': 1, 'Prefix': None, 'Gene': 'BCR::ABL1', 'Suffix': None}, {'MolClin': 'C', 'RefNo': 3976, 'InvNo': 2, 'OrderNo': 1, 'Prefix': None, 'Gene': 'BCR::ABL1', 'Suffix': None}, {'MolClin': 'C', 'RefNo': 4541, 'InvNo': 1, 'OrderNo': 1, 'Prefix': None, 'Gene': 'PML::RARA', 'Suffix': None}, {'MolClin': 'C', 'RefNo': 4624, 'InvNo': 1, 'OrderNo': 1, 'Prefix': None, 'Gene': 'BCR::ABL1', 'Suffix': None}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.RecurrentData
+Column name: Chromosome Type: STRING Description: chromosome number (1- 22, X or Y)
+Column name: Arm Type: STRING Description: arm of the chromosome (p or q)
+Column name: Band Type: STRING Description: position of the gene on the p or q arm
+Column name: Abnormality Type: STRING Description: abnormality description, eg 'add(19)(q13)' or 'del(20)(q11q13)'
+Column name: Morph Type: STRING Description: morphology code, eg '1602'
+Column name: Topo Type: STRING Description: topography code, eg '0902' (or blank)
+Column name: TotalCases Type: STRING Description: total number of cases (up to 2150)
+Column name: Gene Type: STRING Description: gene symbol(s), eg 'KMT2A+' or 'BCR/ABL1' or blank
+Column name: ChrOrder Type: INT64 Description: numeric order of the chromosome
+Column name: Type Type: STRING Description: indicate balanced ('B') or unbalanced ('U')
+Sample rows:
+[{'Chromosome': 'Y', 'Arm': 'q', 'Band': '10', 'Abnormality': 'i(Y)(q10)', 'Morph': '1820', 'Topo': None, 'TotalCases': '2', 'Gene': None, 'ChrOrder': 24, 'Type': 'U'}, {'Chromosome': '1', 'Arm': 'q', 'Band': '10', 'Abnormality': 'der(1;2)(q10;p10)', 'Morph': '1702', 'Topo': None, 'TotalCases': '2', 'Gene': None, 'ChrOrder': 1, 'Type': 'U'}, {'Chromosome': '1', 'Arm': 'q', 'Band': '10', 'Abnormality': 'der(1;2)(q10;q10)', 'Morph': '8804', 'Topo': '0801', 'TotalCases': '2', 'Gene': None, 'ChrOrder': 1, 'Type': 'U'}, {'Chromosome': '1', 'Arm': 'q', 'Band': '10', 'Abnormality': 'der(1;3)(q10;q10)', 'Morph': '1702', 'Topo': None, 'TotalCases': '2', 'Gene': None, 'ChrOrder': 1, 'Type': 'U'}, {'Chromosome': '1', 'Arm': 'q', 'Band': '10', 'Abnormality': 'der(1;3)(q10;q10)', 'Morph': '3111', 'Topo': '0401', 'TotalCases': '2', 'Gene': None, 'ChrOrder': 1, 'Type': 'U'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.KaryAbnorm
+Column name: RefNo Type: INT64 Description: reference number, eg '14620'
+Column name: CaseNo Type: STRING Description: case number, most frequently an integer between 1 and 10, but can also be an arbitrary string, eg '11H046'
+Column name: InvNo Type: INT64 Description: investigation number (between 1 and 9)
+Column name: CloneNo Type: INT64 Description: clone number (between 1 and 58)
+Column name: OrderNo Type: INT64 Description: order number (between 1 and 198)
+Column name: Abnormality Type: STRING Description: eg '46', or 'XY', or 'XX', or '-22', etc
+Sample rows:
+[{'RefNo': 401, 'CaseNo': '109', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Abnormality': '??'}, {'RefNo': 737, 'CaseNo': '105', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Abnormality': '??'}, {'RefNo': 737, 'CaseNo': '124', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Abnormality': '??'}, {'RefNo': 737, 'CaseNo': '63', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Abnormality': '??'}, {'RefNo': 737, 'CaseNo': '66', 'InvNo': 1, 'CloneNo': 1, 'OrderNo': 1, 'Abnormality': '??'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.MolClinBreak
+Column name: MolClin Type: STRING Description: flag indicating either molecular 'M', or clinical 'C'
+Column name: RefNo Type: INT64 Description: reference number, eg '15563'
+Column name: InvNo Type: INT64 Description: investigation number, usually between 1 and 10
+Column name: OrderNo Type: INT64 Description: order number, between 1 and 68
+Column name: Breakpoint Type: STRING Description: breakpoint description, eg '19p13' or '12q2?3', etc
+Sample rows:
+[{'MolClin': 'C', 'RefNo': 579, 'InvNo': 1, 'OrderNo': 1, 'Breakpoint': '1'}, {'MolClin': 'C', 'RefNo': 2514, 'InvNo': 1, 'OrderNo': 1, 'Breakpoint': '1'}, {'MolClin': 'C', 'RefNo': 5581, 'InvNo': 1, 'OrderNo': 1, 'Breakpoint': '1'}, {'MolClin': 'C', 'RefNo': 6551, 'InvNo': 1, 'OrderNo': 1, 'Breakpoint': '1'}, {'MolClin': 'C', 'RefNo': 7542, 'InvNo': 1, 'OrderNo': 1, 'Breakpoint': '1'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.Reference
+Column name: RefNo Type: INT64 Description: reference number from 10 to 15880
+Column name: TitleLength Type: INT64 Description: length of title, up to 334
+Column name: TitleShort Type: STRING Description: short or truncated title, eg aThe myeloperoxidase gene in acute promyelocytic leukemia'
+Column name: TitleLong Type: STRING Description: blank for shorter titles, otherwise the full title is in this field
+Column name: Volume Type: STRING Description: journal volume, eg '95:96-101'
+Column name: Year Type: INT64 Description: publication year, eg '1998'
+Column name: Journal Type: STRING Description: journal name abbreviation, eg 'Cancer Genet Cytogenet'
+Column name: Text Type: STRING Description: this field is always blank
+Column name: Abbreviation Type: STRING Description: author abbreviation, eg 'Park et al 2009'
+Column name: AuthorsLength Type: STRING Description: author string length, up to 2411
+Column name: AuthorsShort Type: STRING Description: short or truncated author string, eg 'Atkin NB, Baker MC'
+Column name: AuthorsLong Type: STRING Description: blank or complete, long author string
+Column name: Flag Type: STRING Description: this field is always blank
+Column name: Pubmed Type: STRING Description: PubMed identifier, if available, eg '17334343'
+Sample rows:
+[{'RefNo': 79, 'TitleLength': 130, 'TitleShort': 'An extra C chromosome and various metabolic abnormalities in the bone marrow from a patient with refractory sideroblastic anaemia.', 'TitleLong': None, 'Volume': '8:293-306', 'Year': 1971, 'Journal': 'Scand J Haematol', 'Text': None, 'Abbreviation': 'Hellstrom et al 1971', 'AuthorsLength': '71', 'AuthorsShort': 'Hellstrom K, Hagenfeldt L, Larsson A, Lindsten J, Sundelin P, Tiepolo L', 'AuthorsLong': None, 'Flag': ' ', 'Pubmed': '5134476'}, {'RefNo': 114, 'TitleLength': 98, 'TitleShort': 'On the specificity of the G abnormality in human meningomas studied by the fluorescence technique.', 'TitleLong': None, 'Volume': '80:812-820', 'Year': 1972, 'Journal': 'APMIS', 'Text': None, 'Abbreviation': 'Mark et al 1972', 'AuthorsLength': '27', 'AuthorsShort': 'Mark J, Mitelman F, Levan G', 'AuthorsLong': None, 'Flag': ' ', 'Pubmed': None}, {'RefNo': 32, 'TitleLength': 56, 'TitleShort': 'Identification of isochromosome 17 in myeloid leukaemia.', 'TitleLong': None, 'Volume': '(1):849-850', 'Year': 1972, 'Journal': 'Lancet', 'Text': None, 'Abbreviation': 'Lobb et al 1972', 'AuthorsLength': '29', 'AuthorsShort': 'Lobb DS, Reeves BR, Lawler SD', 'AuthorsLong': None, 'Flag': ' ', 'Pubmed': '4111610'}, {'RefNo': 106, 'TitleLength': 56, 'TitleShort': 'Marker band in one chromosome 14 from Burkitt lymphomas.', 'TitleLong': None, 'Volume': '237:33-34', 'Year': 1972, 'Journal': 'Nature', 'Text': None, 'Abbreviation': 'Manolov & Manolova 1972', 'AuthorsLength': '21', 'AuthorsShort': 'Manolov G, Manolova Y', 'AuthorsLong': None, 'Flag': ' ', 'Pubmed': '4113130'}, {'RefNo': 102, 'TitleLength': 60, 'TitleShort': 'Multiple chromosome aberrations in a lymphosarcomatous tumor', 'TitleLong': None, 'Volume': '70:243-258', 'Year': 1972, 'Journal': 'Hereditas', 'Text': None, 'Abbreviation': 'Fleischmann et al 1972', 'AuthorsLength': '46', 'AuthorsShort': 'Fleischmann T, Hakansson CH, Levan A, Moller T', 'AuthorsLong': None, 'Flag': ' ', 'Pubmed': '4681795'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.MolClinAbnorm
+Column name: MolClin Type: STRING Description: flag indicating molecular 'M', or clinical 'C'
+Column name: RefNo Type: INT64 Description: reference number, eg '15563'
+Column name: InvNo Type: INT64 Description: investigation number, usually between 1 and 10
+Column name: OrderNo Type: INT64 Description: order number, between 1 and 54
+Column name: Abnormality Type: STRING Description: abnormality description, eg 't(19;19)(p13;p13)' or 'del(7)(q?)'
+Sample rows:
+[{'MolClin': 'C', 'RefNo': 1696, 'InvNo': 1, 'OrderNo': 1, 'Abnormality': 'r'}, {'MolClin': 'C', 'RefNo': 2844, 'InvNo': 1, 'OrderNo': 1, 'Abnormality': 'r'}, {'MolClin': 'C', 'RefNo': 4556, 'InvNo': 1, 'OrderNo': 11, 'Abnormality': 'r'}, {'MolClin': 'C', 'RefNo': 15564, 'InvNo': 1, 'OrderNo': 1, 'Abnormality': 'r'}, {'MolClin': 'C', 'RefNo': 15564, 'InvNo': 2, 'OrderNo': 1, 'Abnormality': 'r'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.CytogenInv
+Column name: RefNo Type: INT64 Description: reference number
+Column name: CaseNo Type: STRING Description: case number -- usually an intger, but can also be an arbitrary string
+Column name: InvNo Type: INT64 Description: investigation number -- always an integer between 1 and 9
+Column name: InvDate Type: STRING Description: investigation date -- eg '19730327' or '20170627' but can also be blank or simply '1'
+Column name: Tissue Type: STRING Description: one of: 'BM', 'TB', 'LN', 'EX', or 'CSF' or (rarely) blank
+Column name: Clones Type: INT64 Description: an integer between 1 and 58
+Column name: KaryLength Type: INT64 Description: length of the karyotype description -- can be as long as thousands of characters, but is usually < 30
+Column name: KaryShort Type: STRING Description: short (possibly truncated) karyotype description
+Column name: KaryLong Type: STRING Description: if the karyotype description exceeds a certain length, the full string is in this column, otherwise this field is null
+Column name: CaseOrder Type: STRING Description: unknown integer field between 0 and 9638369
+Sample rows:
+[{'RefNo': 23, 'CaseNo': '1', 'InvNo': 1, 'InvDate': '1', 'Tissue': 'BM', 'Clones': 1, 'KaryLength': 72, 'KaryShort': '48,XX,t(9;22)(q34;q11),t(13;14)(q14;q24-32),+19,+der(22)t(9;22)(q34;q11)', 'KaryLong': None, 'CaseOrder': '1'}, {'RefNo': 48, 'CaseNo': '1', 'InvNo': 1, 'InvDate': '1', 'Tissue': 'BM', 'Clones': 1, 'KaryLength': 80, 'KaryShort': '52-54,XY,+3,+6,+7,+8,t(9;22)(q34;q11),+19,+21,+der(22)t(9;22)(q34;q11)x2,+1-3mar', 'KaryLong': None, 'CaseOrder': '1'}, {'RefNo': 96, 'CaseNo': '1', 'InvNo': 1, 'InvDate': '1', 'Tissue': 'LN', 'Clones': 1, 'KaryLength': 80, 'KaryShort': '48,XX,del(1)(q22q25),+ider(1)(q10)del(1)(q22q25),+5,del(12)(p12),dup(14)(q24q32)', 'KaryLong': None, 'CaseOrder': '1'}, {'RefNo': 99, 'CaseNo': '1', 'InvNo': 1, 'InvDate': '1', 'Tissue': 'LN', 'Clones': 1, 'KaryLength': 156, 'KaryShort': '82,XXX,-X,-1,-2,-4,del(6)(q21),-7,-9,t(9;15)(q11-12;p12),-10,-11,-11,-12,-13,-13,add(14)(q32),-15,-15,del(16)(q13),-17,-18,i(18)(p10),i(18)(q10),-19,-22,inc', 'KaryLong': None, 'CaseOrder': '1'}, {'RefNo': 107, 'CaseNo': '1', 'InvNo': 1, 'InvDate': '1', 'Tissue': 'TB', 'Clones': 1, 'KaryLength': 91, 'KaryShort': '54,XY,+del(2)(q11),t(2;14)(q11;q32),t(3;11)(p13;p15),+i(5)(p10),+8,+9,+12,+16,+17,+21,+2mar', 'KaryLong': None, 'CaseOrder': '1'}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.MolBiolClinAssoc
+Column name: MolClin Type: STRING Description: this flag indicates whether this row describes a molecular 'M' or clinical 'C' association
+Column name: RefNo Type: INT64 Description: reference number, eg '15563'
+Column name: InvNo Type: INT64 Description: investigation number, usually between 1 and 10
+Column name: Morph Type: STRING Description: morphology code, eg '3111'
+Column name: Topo Type: STRING Description: topography code, eg '0401'
+Column name: Immunology Type: STRING Description: immunology flag, usually blank, other values are 'B' or 'T'
+Column name: GeneLength Type: STRING Description: length of gene string -- usually an integer between 0 and 15
+Column name: GeneShort Type: STRING Description: gene symbol(s), eg 'BCR/ABL1', or 'IGH+', etc
+Column name: GeneLong Type: STRING Description: this field is always blank (never needed)
+Column name: KaryLength Type: INT64 Description: length of karyotype description string (up to 569)
+Column name: KaryShort Type: STRING Description: short or truncated karyotype string, eg 't(19;19)(p13;p13)' or '+12,+19'
+Column name: KaryLong Type: STRING Description: blank or long karyotype description
+Sample rows:
+[{'MolClin': 'C', 'RefNo': 2578, 'InvNo': 1, 'Morph': '1501', 'Topo': ' ', 'Immunology': ' ', 'GeneLength': None, 'GeneShort': None, 'GeneLong': None, 'KaryLength': None, 'KaryShort': None, 'KaryLong': None}, {'MolClin': 'C', 'RefNo': 2668, 'InvNo': 1, 'Morph': '1602', 'Topo': ' ', 'Immunology': ' ', 'GeneLength': None, 'GeneShort': None, 'GeneLong': None, 'KaryLength': None, 'KaryShort': None, 'KaryLong': None}, {'MolClin': 'C', 'RefNo': 2889, 'InvNo': 1, 'Morph': '1602', 'Topo': ' ', 'Immunology': ' ', 'GeneLength': None, 'GeneShort': None, 'GeneLong': None, 'KaryLength': None, 'KaryShort': None, 'KaryLong': None}, {'MolClin': 'C', 'RefNo': 2993, 'InvNo': 1, 'Morph': '1501', 'Topo': ' ', 'Immunology': ' ', 'GeneLength': None, 'GeneShort': None, 'GeneLong': None, 'KaryLength': None, 'KaryShort': None, 'KaryLong': None}, {'MolClin': 'C', 'RefNo': 2994, 'InvNo': 1, 'Morph': '1602', 'Topo': ' ', 'Immunology': ' ', 'GeneLength': None, 'GeneShort': None, 'GeneLong': None, 'KaryLength': None, 'KaryShort': None, 'KaryLong': None}]
+
+--------------------------------------------------
+Table full name: mitelman-db.prod.CytogenInvValid
+Column name: RefNo Type: INT64 Description: reference number
+Column name: CaseNo Type: STRING Description: case number -- usually an intger, but can also be an arbitrary string
+Column name: InvNo Type: INT64 Description: investigation number -- always an integer between 1 and 9
+Column name: KaryLength Type: INT64 Description: length of the karyotype description -- can be as long as thousands of characters, but is usually < 30
+Column name: KaryShort Type: STRING Description: short (possibly truncated) karyotype description
+Column name: KaryLong Type: STRING Description: if the karyotype description exceeds a certain length, the full string is in this column, otherwise this field is null
+Column name: Message Type: STRING Description: Indicates if the karyotype has been corrected by the syntax checker
+Column name: Reason Type: STRING Description: Error Messages
+Column name: CytoConvInput Type: STRING Description: A full karyotype value adjusted to work with CytoConverter's tool
+Sample rows:
+[{'RefNo': 17264, 'CaseNo': '403', 'InvNo': 1, 'KaryLength': 256, 'KaryShort': '45,XY,der(4)t(4;11)(p15;q21)t(4;11)(q13;q21)t(4;11)(q13;q14),der(5)t(5;17)(q11;q11),del(7)(q22q36),der(9)t(9;15)(q34;q26),r(11)(p11q11),der(15)t(11;15)(q14;p11)t(11;15)(q14;q14),der(16)t(15;16)(q21;q24)t(12;15)(q24;q21),del(17)(q11),der(20)t(4;20)(p15;p11', 'KaryLong': '45,XY,der(4)t(4;11)(p15;q21)t(4;11)(q13;q21)t(4;11)(q13;q14),der(5)t(5;17)(q11;q11),del(7)(q22q36),der(9)t(9;15)(q34;q26),r(11)(p11q11),der(15)t(11;15)(q14;p11)t(11;15)(q14;q14),der(16)t(15;16)(q21;q24)t(12;15)(q24;q21),del(17)(q11),der(20)t(4;20)(p15;p11)', 'Message': 'Original', 'Reason': ' ', 'CytoConvInput': '45,XY,der(4)t(4;11)(p15;q21)t(4;11)(q13;q21)t(4;11)(q13;q14),der(5)t(5;17)(q11;q11),del(7)(q22q36),der(9)t(9;15)(q34;q26),r(11)(p11q11),der(15)t(11;15)(q14;p11)t(11;15)(q14;q14),der(16)t(15;16)(q21;q24)t(12;15)(q24;q21),del(17)(q11),der(20)t(4;20)(p15;p11)'}, {'RefNo': 14318, 'CaseNo': '6', 'InvNo': 3, 'KaryLength': 256, 'KaryShort': '46,XY,der(8)t(8;9)(p22;p24)t(8;22)(q24;q11),der(9)t(8;9)(p21;p24)x2,der(21)t(1;21)(q21;p11),der(22)t(8;22)(q24;q11)/46,XY,der(8)t(8;9)(p22;p24)t(8;22)(q24;q11),der(9)t(8;9)(p21;p24)x2,der(21)t(1;21)(q21;p11),der(22)t(8;22)(q24;q11),der(16)t(16;22)(q24;q11', 'KaryLong': '46,XY,der(8)t(8;9)(p22;p24)t(8;22)(q24;q11),der(9)t(8;9)(p21;p24)x2,der(21)t(1;21)(q21;p11),der(22)t(8;22)(q24;q11)/46,XY,der(8)t(8;9)(p22;p24)t(8;22)(q24;q11),der(9)t(8;9)(p21;p24)x2,der(21)t(1;21)(q21;p11),der(22)t(8;22)(q24;q11),der(16)t(16;22)(q24;q11)', 'Message': 'Has been altered', 'Reason': ' ', 'CytoConvInput': '46,XY,der(8)t(8;9)(p22;p24)t(8;22)(q24;q11),der(9)t(8;9)(p21;p24)x2,der(21)t(1;21)(q21;p11),der(22)t(8;22)(q24;q11)/46,XY,der(8)t(8;9)(p22;p24)t(8;22)(q24;q11),der(9)t(8;9)(p21;p24)x2,der(21)t(1;21)(q21;p11),der(22)t(8;22)(q24;q11),der(16)t(16;22)(q24;q11)'}, {'RefNo': 11275, 'CaseNo': '1', 'InvNo': 1, 'KaryLength': 0, 'KaryShort': ' ', 'KaryLong': ' ', 'Message': 'Original', 'Reason': ' ', 'CytoConvInput': ' '}, {'RefNo': 7355, 'CaseNo': '1', 'InvNo': 1, 'KaryLength': 0, 'KaryShort': ' ', 'KaryLong': ' ', 'Message': 'Original', 'Reason': ' ', 'CytoConvInput': ' '}, {'RefNo': 12035, 'CaseNo': '7', 'InvNo': 1, 'KaryLength': 0, 'KaryShort': ' ', 'KaryLong': ' ', 'Message': 'Original', 'Reason': ' ', 'CytoConvInput': ' '}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+# Correlations between Mitelman and TCGA datasets
+
+Check out other notebooks at our [Community Notebooks Repository](https://github.com/isb-cgc/Community-Notebooks)!
+
+- **Title:** Correlations between Mitelman DB and TCGA datasets
+- **Author:** Boris Aguilar
+- **Created:** 04-23-2022
+- **Purpose:** Compare Mitelman DB and TCGA datasets
+- **URL:**
+
+This notebook demonstrates how to compute correlations between Mitelman DB and TCGa datasets. The Mitelman DB is hosted by ISB-CGC and can be accessed at this URL: https://mitelmandatabase.isb-cgc.org/. This notebook replicates some of the analyses from the paper by Denomy et al: https://cancerres.aacrjournals.org/content/79/20/5181. Note, however that results are not replicated exactly as some of the underlying data has changed since publication.
+
+
+
+# Calculate Frequency of Gains and Losses of breast cancer samples in Mitelman DB
+
+We can use CytoConverter genomic coordinates to calculate the frequency of chromosomal gains and losses across a cohort of samples, e.g., across all breast cancer samples.
+
+In [ ]:
+
+```
+# Set parameters for this query
+cancer_type = 'BRCA' # Cancer type for TCGA
+bq_project = 'mitelman-db'  # project name of Mitelman-DB BigQuery table
+bq_dataset = 'prod' # Name of the dataset containing Mitelman-DB BigQuery tables
+morphology = '3111' # Breast cancer
+topology = '0401' # Adenocarcinoma
+```
+
+First, we identify all Mitelman DB cases related to the morphology and topology of interest.
+
+This query was copied from the new feature of the MitelmanDB interface: View Overall Gain/Loss in chromosome.
+
+```
+case_query = """
+# sql here
+"""
+
+# Run the query and put results in a data frame
+mysql = ( "WITH " + case_query + """
+SELECT *
+FROM mitelman
+""" )
+final_mitelman = client.query(mysql).result().to_dataframe()
+```
+
+# Calculate Frequency of TCGA Copy Number Gains and Losses in breast cancer samples.
+
+As a comparison to Mitelman DB gain and loss frequency, we can calculate similar frequencies using TCGA Copy Number data.
+
+```
+cnv_query = """
+# sql here
+"""
+
+# Execute query and put results into a data frame
+mysql = ( "WITH " + cnv_query + """
+SELECT *
+FROM tcga
+""" )
+cnv = client.query(mysql).result().to_dataframe()
+```
+
+|      | chromosome | cytoband_name | hg38_start | hg38_stop | total |  freq_amp | freq_gain | freq_homodel | freq_heterodel | freq_normal |
+| ---: | ---------: | ------------: | ---------: | --------: | ----: | --------: | --------: | -----------: | -------------: | ----------: |
+|    0 |       chr1 |          1p36 |          0 |  27600000 |  1067 | 11.902530 | 19.962512 |     0.000000 |      13.120900 |   55.014058 |
+|    1 |       chr1 |          1p35 |   27600000 |  34300000 |  1067 | 13.214620 | 21.462043 |     0.000000 |       9.372071 |   55.951265 |
+|    2 |       chr1 |          1p34 |   34300000 |  46300000 |  1067 | 18.650422 | 21.743205 |     0.000000 |       5.716963 |   53.889410 |
+|    3 |       chr1 |          1p33 |   46300000 |  50200000 |  1067 | 17.525773 | 22.774133 |     0.000000 |       6.373008 |   53.327085 |
+|    4 |       chr1 |          1p32 |   50200000 |  60800000 |  1067 | 19.119025 | 21.462043 |     0.000000 |       6.279288 |   53.139644 |
+|  ... |        ... |           ... |        ... |       ... |   ... |       ... |       ... |          ... |            ... |         ... |
+|  300 |       chrX |          Xq27 |  138900000 | 148000000 |  1067 | 24.273664 | 14.058107 |     0.281162 |      10.496720 |   50.890347 |
+|  301 |       chrX |          Xq28 |  148000000 | 156040895 |  1067 | 23.711340 | 14.526710 |     0.187441 |      10.309278 |   51.265230 |
+|  302 |       chrY |          Yp11 |          0 |  10400000 |  1067 |  0.374883 |  0.281162 |    96.438613 |       2.624180 |    0.281162 |
+|  303 |       chrY |          Yq11 |   10400000 |  26600000 |  1067 |  0.281162 |  0.281162 |    97.469541 |       1.593252 |    0.374883 |
+|  304 |       chrY |          Yq12 |   26600000 |  57227415 |  1067 |  0.281162 |  0.187441 |    96.438613 |       2.811621 |    0.281162 |
+
+305 rows × 10 columns
+
+# Compute Pearson correlation and p-values
+
+The following query compute Pearson correlation for each chromosome comparing Mitelman DB frequencies with those computed from TCGA. Moreover, for each correlation values, its respective p-values is computed by using the BigQuery function `isb-cgc-bq.functions.corr_pvalue_current`. The minimum number of cases for correlation computation was 5.
+
+```
+mysql = ( "WITH " + case_query + "," + cnv_query + """
+# sql here
+""")
+```
+
+The non a value results (NaN) represent cases in which the computed frequencies of TCGA are zero for all the cytobands.
+
+# Conclusion
+
+This notebook demonstrated usage of the Mitelman BigQuery dataset, which includes CytoConverter chromosomal coordinate data, in combination with TCGA BigQuery tables for a comparative analysis. Specifically, the notebook computes correlation (Pearson) coefficients between gains and losses obtained with Mitelam DB and TCGA datasets.
+
+We observed that the mayority (but not all) of the significan correlation shown in Denomy et al. paper (Table 1, https://doi.org/10.1158/0008-5472.CAN-19-0585) are also significan in this analysis.
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'mitelman-db': {'prod': ['AuthorReference', 'CytoConvertedLog', 'KaryBreak', 'CytoConverted', 'KaryBit', 'Koder', 'RecurrentNumData', 'CytoBands_hg38', 'KaryClone', 'Cytogen', 'MolClinGene', 'RecurrentData', 'KaryAbnorm', 'MolClinBreak', 'Reference', 'MolClinAbnorm', 'CytogenInv', 'MolBiolClinAssoc', 'CytogenInvValid']}}
+Some few-shot examples may be useful:
+Query:
+--Description: 1) Inspect a few CYTOGEN rows to verify the (morph, topo) codes we need
+SELECT `RefNo`, `CaseNo`, `Morph`, `Topo`, `SpecMorph`
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401'
+LIMIT 20;
+Answer:
+RefNo,CaseNo,Morph,Topo,SpecMorph
+182,1,3111,0401,
+370,1,3111,0401,
+370,2,3111,0401,
+370,3,3111,0401,
+370,4,3111,0401,
+370,5,3111,0401,
+370,6,3111,0401,
+Query:
+--Description: 2) Count how many unique Mitelman cases (RefNo–CaseNo) match morph 3111 / topo 0401
+SELECT COUNT(DISTINCT CONCAT(`RefNo`,'-',`CaseNo`)) AS mitelman_total_cases
+FROM `mitelman-db.prod.Cytogen`
+WHERE `Morph` = '3111' AND `Topo` = '0401';
+Answer:
+mitelman_total_cases
+764
+Query:
+--Description: 3) See which copy‑number “Type” values exist in CytoConverted for those cases
+SELECT DISTINCT `Type`
+FROM `mitelman-db.prod.CytoConverted` AS cc
+JOIN `mitelman-db.prod.Cytogen` AS cg
+  ON cc.`RefNo` = cg.`RefNo` AND cc.`CaseNo` = cg.`CaseNo`
+WHERE cg.`Morph` = '3111' AND cg.`Topo` = '0401'
+LIMIT 20;
+Answer:
+Type
+Gain
+Loss
+Query:
+--Description: 4) Build the Mitelman frequency table (per chromosome & aberration type)
+WITH mit_cases AS (
+  SELECT DISTINCT `RefNo`, `CaseNo`
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE `Morph` = '3111' AND `Topo` = '0401'
+),
+mit_counts AS (
+  SELECT cc.`ChrOrd`              AS chr_ord,
+         cc.`Type`                AS aberr_type,
+         COUNT(DISTINCT CONCAT(cc.`RefNo`,'-',cc.`CaseNo`)) AS cases_with_abn
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.`RefNo` = mc.`RefNo` AND cc.`CaseNo` = mc.`CaseNo`
+  GROUP BY chr_ord, aberr_type
+),
+tot AS (
+  SELECT COUNT(*) AS n_cases FROM mit_cases
+)
+SELECT mc.*, ROUND(100.0*cases_with_abn/tot.n_cases,2) AS mit_freq_pct
+FROM mit_counts mc CROSS JOIN tot
+ORDER BY aberr_type, chr_ord
+LIMIT 20;
+Answer:
+chr_ord,aberr_type,cases_with_abn,mit_freq_pct
+1,Gain,252,32.98
+2,Gain,145,18.98
+3,Gain,160,20.94
+4,Gain,135,17.67
+5,Gain,148,19.37
+6,Gain,155,20.29
+7,Gain,204,26.7
+Query:
+--Description: 9) Pearson correlation for LOSSES – Mitelman breast carcinoma (morph 3111 / topo 0401)
+--              vs TCGA‑BRCA masked copy‑number segments (segment_mean ≤ ‑0.15).  Uses
+--              ISB‑CGC UDF corr_pvalue_current(r FLOAT64, n INT64) to compute p‑value.
+WITH
+mit_loss AS (
+  SELECT
+    cc.ChrOrd AS chr_ord,
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo))
+      / 764.0                                       AS mit_pct        -- 764 cases
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN `mitelman-db.prod.Cytogen`      cg
+    ON cc.RefNo = cg.RefNo AND cc.CaseNo = cg.CaseNo
+  WHERE cg.Morph = '3111' AND cg.Topo = '0401'
+    AND cc.Type  = 'Loss'
+  GROUP BY chr_ord
+),
+tcga_total AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_loss AS (
+  SELECT
+    SAFE_CAST(REGEXP_REPLACE(chromosome, r'[^0-9]', '') AS INT64) AS chr_ord,
+    COUNT(DISTINCT sample_barcode) / tcga_total.n_samples          AS tcga_pct
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`, tcga_total
+  WHERE project_short_name = 'TCGA-BRCA'
+    AND segment_mean <= -0.15
+  GROUP BY chr_ord, tcga_total.n_samples
+  HAVING chr_ord IS NOT NULL
+),
+joined AS (
+  SELECT m.chr_ord, m.mit_pct, t.tcga_pct
+  FROM mit_loss m
+  JOIN tcga_loss t USING (chr_ord)
+),
+stats AS (
+  SELECT
+    CORR(mit_pct, tcga_pct) AS pearson_r,
+    COUNT(*)               AS matched_chr
+  FROM joined
+)
+SELECT
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM stats
+WHERE matched_chr >= 5
+Answer:
+pearson_r,p_value,matched_chr
+0.49899506135101723,0.018544334286173535,22
+Task: Could you compute, by chromosome, the Pearson correlation between the frequency of copy number aberrations (including amplifications, gains, losses, and deletions) from the Mitelman database for cases with morph = 3111 and topo = 0401, and those computed from TCGA data, returning correlation coefficients and corresponding p-values for each aberration type, ensuring only results with at least five matching records are shown.
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+Usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables with similar prefix, you can use a wildcard table to simplify your query. e.g., SELECT col1, col2 FROM `project_id.dataset_id.table_prefix*` WHERE _TABLE_SUFFIX IN ('table1_suffix', 'table2_suffix');. Avoid manually listing tables unless absolutely necessary.
+For string-matching scenarios, if the string is decided, don't use fuzzy query. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-02 04:44:25 - ThreadPoolExecutor-0_7 - INFO - [Try to run SQL in self-refine]
+```sql
+-- Compute Pearson correlations (and p‑values) between Mitelman and TCGA‑BRCA
+-- copy‑number aberration frequencies, per aberration category.
+-- Aberration categories handled: Amplification, Gain, Loss, Deletion.
+-- Only correlations based on ≥ 5 matching chromosomes are reported.
+
+WITH
+/* ----------  Mitelman (breast carcinoma: morph 3111, topo 0401)  ---------- */
+mit_cases AS (
+  SELECT DISTINCT RefNo, CaseNo
+  FROM `mitelman-db.prod.Cytogen`
+  WHERE Morph = '3111' AND Topo = '0401'
+),
+mit_by_chr AS (
+  SELECT
+    cc.ChrOrd                              AS chr_ord,
+    cc.Type                                AS aberr_type,          -- Gain/Loss/Amplification/Deletion
+    COUNT(DISTINCT CONCAT(cc.RefNo,'-',cc.CaseNo)) AS n_cases_abn
+  FROM `mitelman-db.prod.CytoConverted` cc
+  JOIN mit_cases mc
+    ON cc.RefNo = mc.RefNo AND cc.CaseNo = mc.CaseNo
+  WHERE cc.Type IN ('Gain','Loss','Amplification','Deletion')
+  GROUP BY chr_ord, aberr_type
+),
+mit_tot AS (
+  SELECT COUNT(*) AS n_cases FROM mit_cases
+),
+mit_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    n_cases_abn / mit_tot.n_cases AS mit_freq
+  FROM mit_by_chr, mit_tot
+),
+
+/* ---------------------------  TCGA‑BRCA --------------------------- */
+tcga_tot AS (
+  SELECT COUNT(DISTINCT sample_barcode) AS n_samples
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_abn AS (
+  /* classify each segment into an aberration category                    */
+  SELECT
+    CASE
+      WHEN chromosome IN ('X','x') THEN 23
+      WHEN chromosome IN ('Y','y') THEN 24
+      ELSE SAFE_CAST(chromosome AS INT64)
+    END                                                     AS chr_ord,
+    CASE
+      WHEN segment_mean >=  0.90                          THEN 'Amplification'
+      WHEN segment_mean >=  0.15  AND segment_mean < 0.90 THEN 'Gain'
+      WHEN segment_mean <= -0.90                          THEN 'Deletion'
+      WHEN segment_mean <= -0.15 AND segment_mean > -0.90 THEN 'Loss'
+    END                                                     AS aberr_type,
+    sample_barcode
+  FROM `isb-cgc.TCGA_hg38_data_v0.Copy_Number_Segment_Masked`
+  WHERE project_short_name = 'TCGA-BRCA'
+),
+tcga_by_chr AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    COUNT(DISTINCT sample_barcode) AS n_samples_abn
+  FROM tcga_abn
+  WHERE aberr_type IS NOT NULL AND chr_ord IS NOT NULL
+  GROUP BY chr_ord, aberr_type
+),
+tcga_freq AS (
+  SELECT
+    chr_ord,
+    aberr_type,
+    n_samples_abn / tcga_tot.n_samples AS tcga_freq
+  FROM tcga_by_chr, tcga_tot
+),
+
+/* -------------------  Join & compute correlations  ------------------- */
+joined AS (
+  SELECT
+    m.aberr_type,
+    m.chr_ord,
+    m.mit_freq,
+    t.tcga_freq
+  FROM mit_freq m
+  JOIN tcga_freq t
+    USING (chr_ord, aberr_type)
+),
+corr_by_type AS (
+  SELECT
+    aberr_type,
+    CORR(mit_freq, tcga_freq) AS pearson_r,
+    COUNT(*)                 AS matched_chr
+  FROM joined
+  GROUP BY aberr_type
+)
+
+SELECT
+  aberr_type,
+  pearson_r,
+  `isb-cgc-bq.functions.corr_pvalue_current`(pearson_r, matched_chr) AS p_value,
+  matched_chr
+FROM corr_by_type
+WHERE matched_chr >= 5
+ORDER BY aberr_type;
+```
+[Try to run SQL in self-refine]
+2025-05-02 04:44:28 - ThreadPoolExecutor-0_7 - INFO - Total iteration counts: 0

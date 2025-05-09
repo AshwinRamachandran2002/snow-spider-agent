@@ -1,0 +1,1867 @@
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Exploration]
+```sql
+-- 1. Races that have detailed pit‑stop information (is_pit_data_available = 1)
+SELECT DISTINCT "race_id", "year", "round", "name"
+FROM "races_ext"
+WHERE "is_pit_data_available" = 1
+LIMIT 20;
+```
+
+```sql
+-- 2. Lap‑by‑lap positions for one example race that has pit data (race_id = 1 shown as placeholder)
+SELECT DISTINCT "race_id", "driver_id", "lap", "position", "lap_type"
+FROM "lap_positions"
+WHERE "race_id" = 1
+ORDER BY "lap", "position"
+LIMIT 20;
+```
+
+```sql
+-- 3. All lap_type values that appear in lap_positions
+SELECT DISTINCT "lap_type"
+FROM "lap_positions"
+LIMIT 20;
+```
+
+```sql
+-- 4. Pit‑stop events for the same sample race (race_id = 1)
+SELECT DISTINCT "race_id", "driver_id", "stop", "lap", "time", "duration"
+FROM "pit_stops"
+WHERE "race_id" = 1
+ORDER BY "lap", "stop"
+LIMIT 20;
+```
+
+```sql
+-- 5. Retirement events for the same race (race_id = 1)
+SELECT DISTINCT r."race_id", r."driver_id", r."lap", r."status_id", s."status"
+FROM "retirements" r
+LEFT JOIN "status" s
+  ON r."status_id" = s."status_id"
+WHERE r."race_id" = 1
+ORDER BY r."lap"
+LIMIT 20;
+```
+
+```sql
+-- 6. Identify, for every driver and lap, the driver that was directly ahead on track
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"          AS "driver",
+       lp_now."position",
+       lp_prev."driver_id"         AS "prev_lap_driver_ahead"
+FROM   "lap_positions" lp_now
+LEFT JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id" = lp_now."race_id"
+      AND lp_prev."lap"     = lp_now."lap" - 1
+      AND lp_prev."position" = lp_now."position" - 1        -- driver that was ahead
+WHERE  lp_now."race_id" = 1
+ORDER BY lp_now."lap", lp_now."position"
+LIMIT 20;
+```
+
+```sql
+-- 7. Sample rows where a driver was NOT behind on lap‑1 but IS directly behind someone on lap N
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"                    AS "follower",
+       lp_now."position"                     AS "follower_pos",
+       lp_now_ahead."driver_id"              AS "leader",
+       lp_prev."position"                    AS "prev_pos_follower"
+FROM   "lap_positions" lp_now
+JOIN   "lap_positions" lp_now_ahead          -- driver ahead on same lap
+       ON lp_now_ahead."race_id" = lp_now."race_id"
+      AND lp_now_ahead."lap"     = lp_now."lap"
+      AND lp_now_ahead."position" = lp_now."position" - 1
+LEFT  JOIN "lap_positions" lp_prev           -- follower’s position on previous lap
+       ON lp_prev."race_id" = lp_now."race_id"
+      AND lp_prev."lap"     = lp_now."lap" - 1
+      AND lp_prev."driver_id" = lp_now."driver_id"
+WHERE  lp_now."race_id" = 1
+  AND (lp_prev."position" IS NULL            -- not behind because didn’t exist
+       OR lp_prev."position" - 1 <> lp_now."position") -- wasn’t directly behind
+ORDER BY lp_now."lap", lp_now."position"
+LIMIT 20;
+```
+
+```sql
+-- 8. Classify each “newly‑behind” event into overtake types
+--    (simplified illustration for one race; classification logic abbreviated)
+SELECT e."race_id",
+       e."lap",
+       e."follower",
+       e."leader",
+       CASE
+            WHEN ps_in."driver_id" IS NOT NULL                 THEN 'Leader entered pits'
+            WHEN ps_out."driver_id" IS NOT NULL                THEN 'Follower exited pits'
+            WHEN rt."driver_id" IS NOT NULL                    THEN 'Leader retirement'
+            WHEN e."lap" = 1                                   THEN 'Race start shuffle'
+            ELSE 'On‑track overtake'
+       END AS "overtake_type"
+FROM (
+      -- event set from query 7 (materialised here for clarity)
+      SELECT lp_now."race_id",
+             lp_now."lap",
+             lp_now."driver_id"          AS "follower",
+             lp_now_ahead."driver_id"    AS "leader"
+      FROM   "lap_positions" lp_now
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id" = lp_now."race_id"
+            AND lp_now_ahead."lap"     = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id" = lp_now."race_id"
+            AND lp_prev."lap"     = lp_now."lap" - 1
+            AND lp_prev."driver_id" = lp_now."driver_id"
+      WHERE  lp_now."race_id" = 1
+        AND (lp_prev."position" IS NULL
+             OR lp_prev."position" - 1 <> lp_now."position")
+     ) e
+LEFT JOIN "pit_stops" ps_in                  -- leader in‑lap pit entry
+       ON ps_in."race_id" = e."race_id"
+      AND ps_in."driver_id" = e."leader"
+      AND ps_in."lap"       = e."lap"
+LEFT JOIN "pit_stops" ps_out                 -- follower out‑lap pit exit
+       ON ps_out."race_id" = e."race_id"
+      AND ps_out."driver_id" = e."follower"
+      AND ps_out."lap"      = e."lap" - 1
+LEFT JOIN "retirements" rt                   -- leader retires this lap
+       ON rt."race_id" = e."race_id"
+      AND rt."driver_id" = e."leader"
+      AND rt."lap"       = e."lap"
+LIMIT 20;
+```
+
+```sql
+-- 9. Aggregate counts of each overtake type across ALL races with pit data
+SELECT agg."overtake_type",
+       COUNT(*) AS "num_occurrences"
+FROM (
+      -- Same logic as query 8 but over every eligible race (sub‑query compressed)
+      SELECT e."race_id",
+             e."lap",
+             CASE
+                  WHEN ps_in."driver_id" IS NOT NULL THEN 'Leader entered pits'
+                  WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+                  WHEN rt."driver_id" IS NOT NULL THEN 'Leader retirement'
+                  WHEN e."lap" = 1 THEN 'Race start shuffle'
+                  ELSE 'On‑track overtake'
+             END AS "overtake_type"
+      FROM  (
+            -- find “newly‑behind” situations
+            SELECT lp_now."race_id",
+                   lp_now."lap",
+                   lp_now."driver_id",
+                   lp_now_ahead."driver_id" AS "leader"
+            FROM   "lap_positions" lp_now
+            JOIN   "races_ext" re                        -- only races with pit data
+                   ON re."race_id" = lp_now."race_id"
+                  AND re."is_pit_data_available" = 1
+            JOIN   "lap_positions" lp_now_ahead
+                   ON lp_now_ahead."race_id" = lp_now."race_id"
+                  AND lp_now_ahead."lap"     = lp_now."lap"
+                  AND lp_now_ahead."position" = lp_now."position" - 1
+            LEFT  JOIN "lap_positions" lp_prev
+                   ON lp_prev."race_id" = lp_now."race_id"
+                  AND lp_prev."lap"     = lp_now."lap" - 1
+                  AND lp_prev."driver_id" = lp_now."driver_id"
+            WHERE  (lp_prev."position" IS NULL
+                   OR lp_prev."position" - 1 <> lp_now."position")
+           ) e
+      LEFT JOIN "pit_stops" ps_in
+             ON ps_in."race_id" = e."race_id"
+            AND ps_in."driver_id" = e."leader"
+            AND ps_in."lap"       = e."lap"
+      LEFT JOIN "pit_stops" ps_out
+             ON ps_out."race_id" = e."race_id"
+            AND ps_out."driver_id" = e."driver_id"
+            AND ps_out."lap"      = e."lap" - 1
+      LEFT JOIN "retirements" rt
+             ON rt."race_id" = e."race_id"
+            AND rt."driver_id" = e."leader"
+            AND rt."lap"       = e."lap"
+     ) agg
+GROUP BY agg."overtake_type"
+LIMIT 20;
+```
+
+```sql
+-- 10. (Optional) Verify the distribution of overtakes per Grand Prix to spot outliers
+SELECT re."year",
+       re."round",
+       re."short_name",
+       COUNT(*) AS "total_overtake_events"
+FROM (
+      -- Re‑use event detection logic (from query 9) but keep race granularity
+      SELECT DISTINCT lp_now."race_id",
+                      lp_now."lap",
+                      lp_now."driver_id"
+      FROM   "lap_positions" lp_now
+      JOIN   "races_ext" re
+             ON re."race_id" = lp_now."race_id"
+            AND re."is_pit_data_available" = 1
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id" = lp_now."race_id"
+            AND lp_now_ahead."lap"     = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id" = lp_now."race_id"
+            AND lp_prev."lap"     = lp_now."lap" - 1
+            AND lp_prev."driver_id" = lp_now."driver_id"
+      WHERE  (lp_prev."position" IS NULL
+             OR lp_prev."position" - 1 <> lp_now."position")
+     ) ev
+JOIN "races_ext" re
+  ON re."race_id" = ev."race_id"
+GROUP BY re."year", re."round", re."short_name"
+ORDER BY "total_overtake_events" DESC
+LIMIT 20;
+```
+[Exploration]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+-- 1. Races that have detailed pit‑stop information (is_pit_data_available = 1)
+SELECT DISTINCT "race_id", "year", "round", "name"
+FROM "races_ext"
+WHERE "is_pit_data_available" = 1
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Races that have detailed pit‑stop information (is_pit_data_available = 1)
+SELECT DISTINCT "race_id", "year", "round", "name"
+FROM "races_ext"
+WHERE "is_pit_data_available" = 1
+LIMIT 20;
+Results:
+race_id,year,round,name
+841,2011,1,Australian Grand Prix
+842,2011,2,Malaysian Grand Prix
+843,2011,3,Chinese Grand Prix
+844,2011,4,Turkish Grand Prix
+845,2011,5,Spanish Grand Prix
+846,2011,6,Monaco Grand Prix
+847,2011,7,Canadian Grand Prix
+848,2011,8,European Grand Prix
+849,2011,9,British Grand Prix
+850,2011,10,German Grand Prix
+851,2011,11,Hungarian Grand Prix
+852,2011,12,Belgian Grand Prix
+853,2011,13,Italian Grand Prix
+854,2011,14,Singapore Grand Prix
+
+[Successfully executed]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+-- 2. Lap‑by‑lap positions for one example race that has pit data (race_id = 1 shown as placeholder)
+SELECT DISTINCT "race_id", "driver_id", "lap", "position", "lap_type"
+FROM "lap_positions"
+WHERE "race_id" = 1
+ORDER BY "lap", "position"
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Lap‑by‑lap positions for one example race that has pit data (race_id = 1 shown as placeholder)
+SELECT DISTINCT "race_id", "driver_id", "lap", "position", "lap_type"
+FROM "lap_positions"
+WHERE "race_id" = 1
+ORDER BY "lap", "position"
+LIMIT 20;
+Results:
+race_id,driver_id,lap,position,lap_type
+1,18,0,1,Starting Position - Qualifying
+1,22,0,2,Starting Position - Qualifying
+1,20,0,3,Starting Position - Qualifying
+1,9,0,4,Starting Position - Qualifying
+1,3,0,5,Starting Position - Qualifying
+1,13,0,6,Starting Position - Grid Increase
+1,8,0,7,Starting Position - Grid Increase
+1,17,0,8,Starting Position - Grid Increase
+1,2,0,9,Starting Position - Grid Increase
+1,4,0,10,Starting Position - Grid Increase
+1,6,0,11,Starting Position - Grid Incr
+
+[Successfully executed]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+-- 3. All lap_type values that appear in lap_positions
+SELECT DISTINCT "lap_type"
+FROM "lap_positions"
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. All lap_type values that appear in lap_positions
+SELECT DISTINCT "lap_type"
+FROM "lap_positions"
+LIMIT 20;
+Results:
+lap_type
+Starting Position - Grid Drop
+Race
+Retirement (Disqualification)
+Starting Position - Grid Increase
+Starting Position - Qualifying
+Retirement (Driver Error)
+Retirement (Mechanical Problem)
+Starting Position - Pit Lane Start
+Starting Position - No Qualification
+
+[Successfully executed]
+2025-05-02 04:46:31 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+-- 4. Pit‑stop events for the same sample race (race_id = 1)
+SELECT DISTINCT "race_id", "driver_id", "stop", "lap", "time", "duration"
+FROM "pit_stops"
+WHERE "race_id" = 1
+ORDER BY "lap", "stop"
+LIMIT 20;
+[Try to execute]
+2025-05-02 04:46:32 - ThreadPoolExecutor-0_28 - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-02 04:46:53 - ThreadPoolExecutor-0_28 - INFO - [Corrected SQL]
+```sql
+--Description: The earlier attempt queried race_id = 1, which has no entries in "pit_stops".
+--             To guarantee results, this query first finds the smallest race_id that DOES
+--             appear in "pit_stops" (i.e., the earliest Grand Prix for which pit‑stop
+--             data exists) and then returns the first 20 pit‑stop records for that race,
+--             ordered by lap and stop number.
+SELECT  "race_id",
+        "driver_id",
+        "stop",
+        "lap",
+        "time",
+        "duration"
+FROM    "pit_stops"
+WHERE   "race_id" = (SELECT MIN("race_id") FROM "pit_stops")
+ORDER BY "lap", "stop"
+LIMIT   20;
+```
+[Corrected SQL]
+2025-05-02 04:46:53 - ThreadPoolExecutor-0_28 - INFO - [Results for corrected sql]
+race_id,driver_id,stop,lap,time,duration
+841,30,1,1,17:05:52,25.021
+841,153,1,1,17:05:23,26.898
+841,17,1,11,17:20:48,23.426
+841,4,1,12,17:22:34,23.251
+841,13,1,13,17:24:10,23.842
+841,22,1,13,17:24:29,23.643
+841,20,1,14,17:25:17,22.603
+841,814,1,14,17:26:03,24.863
+841,816,1,14,17:26:50,25.259
+841,2,1,15,17:27:41,22.994
+841,67,1,15,17:27:34,25.342
+841,1,1,16,17:28:24,23.227
+841,3,1,16,17:29:00,23.716
+841,15,1,16,17:29:49,24.899
+
+[Results for corrected sql]
+2025-05-02 04:47:36 - ThreadPoolExecutor-0_28 - INFO - [Corrected other sqls]
+```sql
+--Description: “Retirement events” sample query – instead of hard‑coding race_id = 1
+--             (which may have no retirements), use the earliest race that actually
+--             appears in the retirements table.
+SELECT DISTINCT r."race_id",
+                r."driver_id",
+                r."lap",
+                r."status_id",
+                s."status"
+FROM   "retirements" r
+LEFT JOIN "status" s
+       ON s."status_id" = r."status_id"
+WHERE  r."race_id" = (SELECT MIN("race_id") FROM "retirements")
+ORDER  BY r."lap"
+LIMIT  20;
+```
+
+```sql
+--Description: Identify, for every driver and lap, the driver that was directly
+--             ahead on track for the very first race that has lap‑by‑lap data,
+--             determined dynamically.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"  AS "driver",
+       lp_now."position",
+       lp_prev."driver_id" AS "prev_lap_driver_ahead"
+FROM   "lap_positions" lp_now
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."position" = lp_now."position" - 1
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20;
+```
+
+```sql
+--Description: Show examples where a driver was NOT behind on the previous lap
+--             but IS directly behind another car now, using the first race present
+--             in lap_positions.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"        AS "follower",
+       lp_now."position"         AS "follower_pos",
+       lp_now_ahead."driver_id"  AS "leader",
+       lp_prev."position"        AS "prev_pos_follower"
+FROM   "lap_positions" lp_now
+JOIN   "lap_positions" lp_now_ahead
+       ON lp_now_ahead."race_id"  = lp_now."race_id"
+      AND lp_now_ahead."lap"      = lp_now."lap"
+      AND lp_now_ahead."position" = lp_now."position" - 1
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."driver_id"     = lp_now."driver_id"
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+  AND (lp_prev."position" IS NULL
+       OR lp_prev."position" - 1 <> lp_now."position")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20;
+```
+
+```sql
+--Description: Classify each “newly‑behind” event into overtake types for the
+--             earliest race in lap_positions (instead of hard‑coded race_id = 1).
+SELECT e."race_id",
+       e."lap",
+       e."follower",
+       e."leader",
+       CASE
+            WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+            WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+            WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+            WHEN e."lap" = 1                      THEN 'Race start shuffle'
+            ELSE 'On‑track overtake'
+       END AS "overtake_type"
+FROM (
+      SELECT lp_now."race_id",
+             lp_now."lap",
+             lp_now."driver_id"       AS "follower",
+             lp_now_ahead."driver_id" AS "leader"
+      FROM   "lap_positions" lp_now
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+        AND (lp_prev."position" IS NULL
+             OR lp_prev."position" - 1 <> lp_now."position")
+     ) e
+LEFT JOIN "pit_stops" ps_in
+       ON ps_in."race_id"  = e."race_id"
+      AND ps_in."driver_id" = e."leader"
+      AND ps_in."lap"       = e."lap"
+LEFT JOIN "pit_stops" ps_out
+       ON ps_out."race_id"  = e."race_id"
+      AND ps_out."driver_id" = e."follower"
+      AND ps_out."lap"      = e."lap" - 1
+LEFT JOIN "retirements" rt
+       ON rt."race_id"      = e."race_id"
+      AND rt."driver_id"    = e."leader"
+      AND rt."lap"          = e."lap"
+LIMIT 20;
+```
+
+```sql
+--Description: Aggregate counts of each overtake type across ALL races with
+--             pit‑stop data – no hard‑coded race_id was used, so no change needed.
+SELECT agg."overtake_type",
+       COUNT(*) AS "num_occurrences"
+FROM (
+      SELECT e."race_id",
+             e."lap",
+             CASE
+                  WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+                  WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+                  WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+                  WHEN e."lap" = 1                      THEN 'Race start shuffle'
+                  ELSE 'On‑track overtake'
+             END AS "overtake_type"
+      FROM (
+            SELECT lp_now."race_id",
+                   lp_now."lap",
+                   lp_now."driver_id",
+                   lp_now_ahead."driver_id" AS "leader"
+            FROM   "lap_positions" lp_now
+            JOIN   "races_ext" re
+                   ON re."race_id" = lp_now."race_id"
+                  AND re."is_pit_data_available" = 1
+            JOIN   "lap_positions" lp_now_ahead
+                   ON lp_now_ahead."race_id"  = lp_now."race_id"
+                  AND lp_now_ahead."lap"      = lp_now."lap"
+                  AND lp_now_ahead."position" = lp_now."position" - 1
+            LEFT  JOIN "lap_positions" lp_prev
+                   ON lp_prev."race_id"  = lp_now."race_id"
+                  AND lp_prev."lap"      = lp_now."lap" - 1
+                  AND lp_prev."driver_id"     = lp_now."driver_id"
+            WHERE  lp_prev."position" IS NULL
+               OR  lp_prev."position" - 1 <> lp_now."position"
+           ) e
+      LEFT JOIN "pit_stops" ps_in
+             ON ps_in."race_id"  = e."race_id"
+            AND ps_in."driver_id" = e."leader"
+            AND ps_in."lap"       = e."lap"
+      LEFT JOIN "pit_stops" ps_out
+             ON ps_out."race_id"  = e."race_id"
+            AND ps_out."driver_id" = e."driver_id"
+            AND ps_out."lap"      = e."lap" - 1
+      LEFT JOIN "retirements" rt
+             ON rt."race_id"      = e."race_id"
+            AND rt."driver_id"    = e."leader"
+            AND rt."lap"          = e."lap"
+     ) agg
+GROUP BY agg."overtake_type"
+LIMIT 20;
+```
+
+```sql
+--Description: Verify the distribution of overtakes per Grand Prix; query already
+--             scans all races with pit data, so no hard‑coded race_id to fix.
+SELECT re."year",
+       re."round",
+       re."short_name",
+       COUNT(*) AS "total_overtake_events"
+FROM (
+      SELECT DISTINCT lp_now."race_id",
+                      lp_now."lap",
+                      lp_now."driver_id"
+      FROM   "lap_positions" lp_now
+      JOIN   "races_ext" re
+             ON re."race_id" = lp_now."race_id"
+            AND re."is_pit_data_available" = 1
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_prev."position" IS NULL
+         OR  lp_prev."position" - 1 <> lp_now."position"
+     ) ev
+JOIN "races_ext" re
+  ON re."race_id" = ev."race_id"
+GROUP BY re."year", re."round", re."short_name"
+ORDER BY "total_overtake_events" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-02 04:47:36 - ThreadPoolExecutor-0_28 - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: The earlier attempt queried race_id = 1, which has no entries in "pit_stops".
+--             To guarantee results, this query first finds the smallest race_id that DOES
+--             appear in "pit_stops" (i.e., the earliest Grand Prix for which pit‑stop
+--             data exists) and then returns the first 20 pit‑stop records for that race,
+--             ordered by lap and stop number.
+SELECT  "race_id",
+        "driver_id",
+        "stop",
+        "lap",
+        "time",
+        "duration"
+FROM    "pit_stops"
+WHERE   "race_id" = (SELECT MIN("race_id") FROM "pit_stops")
+ORDER BY "lap", "stop"
+LIMIT   20;
+Results:
+race_id,driver_id,stop,lap,time,duration
+841,30,1,1,17:05:52,25.021
+841,153,1,1,17:05:23,26.898
+841,17,1,11,17:20:48,23.426
+841,4,1,12,17:22:34,23.251
+841,13,1,13,17:24:10,23.842
+841,22,1,13,17:24:29,23.643
+841,20,1,14,17:25:17,22.603
+841,814,1,14,17:26:03,24.863
+841,816,1,14,17:26:50,25.259
+841,2,1,15,17:27:41,22.994
+841,67,1,15,17:27:34,25.342
+841,1,1,16,17:28:24,23.227
+841,3,1,16,17:29:00,23.716
+841,15,1,16,17:29:49,24.899
+
+[Successfully corrected]
+2025-05-02 04:47:36 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+--Description: “Retirement events” sample query – instead of hard‑coding race_id = 1
+--             (which may have no retirements), use the earliest race that actually
+--             appears in the retirements table.
+SELECT DISTINCT r."race_id",
+                r."driver_id",
+                r."lap",
+                r."status_id",
+                s."status"
+FROM   "retirements" r
+LEFT JOIN "status" s
+       ON s."status_id" = r."status_id"
+WHERE  r."race_id" = (SELECT MIN("race_id") FROM "retirements")
+ORDER  BY r."lap"
+LIMIT  20
+[Try to execute]
+2025-05-02 04:47:36 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: “Retirement events” sample query – instead of hard‑coding race_id = 1
+--             (which may have no retirements), use the earliest race that actually
+--             appears in the retirements table.
+SELECT DISTINCT r."race_id",
+                r."driver_id",
+                r."lap",
+                r."status_id",
+                s."status"
+FROM   "retirements" r
+LEFT JOIN "status" s
+       ON s."status_id" = r."status_id"
+WHERE  r."race_id" = (SELECT MIN("race_id") FROM "retirements")
+ORDER  BY r."lap"
+LIMIT  20
+Results:
+race_id,driver_id,lap,status_id,status
+1,5,1,4,Collision
+1,6,18,3,Accident
+1,12,25,20,Spun off
+1,13,46,22,Suspension
+1,9,56,4,Collision
+1,8,56,24,Differential
+1,20,57,4,Collision
+1,1,59,2,Disqualified
+
+[Successfully executed]
+2025-05-02 04:47:36 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+--Description: Identify, for every driver and lap, the driver that was directly
+--             ahead on track for the very first race that has lap‑by‑lap data,
+--             determined dynamically.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"  AS "driver",
+       lp_now."position",
+       lp_prev."driver_id" AS "prev_lap_driver_ahead"
+FROM   "lap_positions" lp_now
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."position" = lp_now."position" - 1
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20
+[Try to execute]
+2025-05-02 04:47:37 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Identify, for every driver and lap, the driver that was directly
+--             ahead on track for the very first race that has lap‑by‑lap data,
+--             determined dynamically.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"  AS "driver",
+       lp_now."position",
+       lp_prev."driver_id" AS "prev_lap_driver_ahead"
+FROM   "lap_positions" lp_now
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."position" = lp_now."position" - 1
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20
+Results:
+race_id,lap,driver,position,prev_lap_driver_ahead
+1,0,18,1,
+1,0,22,2,
+1,0,20,3,
+1,0,9,4,
+1,0,3,5,
+1,0,13,6,
+1,0,8,7,
+1,0,17,8,
+1,0,2,9,
+1,0,4,10,
+1,0,6,11,
+1,0,5,12,
+1,0,67,13,
+1,0,12,14,
+1,0,21,15,
+1,0,16,16,
+1,0,7,17,
+1,0,1,18,
+1,0,10,19,
+1,0,15,20,
+
+[Successfully executed]
+2025-05-02 04:47:37 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+--Description: Show examples where a driver was NOT behind on the previous lap
+--             but IS directly behind another car now, using the first race present
+--             in lap_positions.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"        AS "follower",
+       lp_now."position"         AS "follower_pos",
+       lp_now_ahead."driver_id"  AS "leader",
+       lp_prev."position"        AS "prev_pos_follower"
+FROM   "lap_positions" lp_now
+JOIN   "lap_positions" lp_now_ahead
+       ON lp_now_ahead."race_id"  = lp_now."race_id"
+      AND lp_now_ahead."lap"      = lp_now."lap"
+      AND lp_now_ahead."position" = lp_now."position" - 1
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."driver_id"     = lp_now."driver_id"
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+  AND (lp_prev."position" IS NULL
+       OR lp_prev."position" - 1 <> lp_now."position")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20
+[Try to execute]
+2025-05-02 04:47:38 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Show examples where a driver was NOT behind on the previous lap
+--             but IS directly behind another car now, using the first race present
+--             in lap_positions.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"        AS "follower",
+       lp_now."position"         AS "follower_pos",
+       lp_now_ahead."driver_id"  AS "leader",
+       lp_prev."position"        AS "prev_pos_follower"
+FROM   "lap_positions" lp_now
+JOIN   "lap_positions" lp_now_ahead
+       ON lp_now_ahead."race_id"  = lp_now."race_id"
+      AND lp_now_ahead."lap"      = lp_now."lap"
+      AND lp_now_ahead."position" = lp_now."position" - 1
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."driver_id"     = lp_now."driver_id"
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+  AND (lp_prev."position" IS NULL
+       OR lp_prev."position" - 1 <> lp_now."position")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20
+Results:
+race_id,lap,follower,follower_pos,leader,prev_pos_follower
+1,0,22,2,18,
+1,0,20,3,22,
+1,0,9,4,20,
+1,0,3,5,9,
+1,0,13,6,3,
+1,0,8,7,13,
+1,0,17,8,8,
+1,0,2,9,17,
+1,0,4,10,2,
+1,0,6,11,4,
+1,0,5,12,6,
+1,0,67,13,5,
+1,0,12,14,67,
+1,0,21,15,12,
+1,0,16,16,21,
+1,0,7,17,16,
+1,0,1,18,7,
+1,0,10,19,1,
+1,0,15,20,10,
+1,1,13,3,20,6
+
+[Successfully executed]
+2025-05-02 04:47:38 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+--Description: Classify each “newly‑behind” event into overtake types for the
+--             earliest race in lap_positions (instead of hard‑coded race_id = 1).
+SELECT e."race_id",
+       e."lap",
+       e."follower",
+       e."leader",
+       CASE
+            WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+            WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+            WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+            WHEN e."lap" = 1                      THEN 'Race start shuffle'
+            ELSE 'On‑track overtake'
+       END AS "overtake_type"
+FROM (
+      SELECT lp_now."race_id",
+             lp_now."lap",
+             lp_now."driver_id"       AS "follower",
+             lp_now_ahead."driver_id" AS "leader"
+      FROM   "lap_positions" lp_now
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+        AND (lp_prev."position" IS NULL
+             OR lp_prev."position" - 1 <> lp_now."position")
+     ) e
+LEFT JOIN "pit_stops" ps_in
+       ON ps_in."race_id"  = e."race_id"
+      AND ps_in."driver_id" = e."leader"
+      AND ps_in."lap"       = e."lap"
+LEFT JOIN "pit_stops" ps_out
+       ON ps_out."race_id"  = e."race_id"
+      AND ps_out."driver_id" = e."follower"
+      AND ps_out."lap"      = e."lap" - 1
+LEFT JOIN "retirements" rt
+       ON rt."race_id"      = e."race_id"
+      AND rt."driver_id"    = e."leader"
+      AND rt."lap"          = e."lap"
+LIMIT 20
+[Try to execute]
+2025-05-02 04:47:38 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Classify each “newly‑behind” event into overtake types for the
+--             earliest race in lap_positions (instead of hard‑coded race_id = 1).
+SELECT e."race_id",
+       e."lap",
+       e."follower",
+       e."leader",
+       CASE
+            WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+            WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+            WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+            WHEN e."lap" = 1                      THEN 'Race start shuffle'
+            ELSE 'On‑track overtake'
+       END AS "overtake_type"
+FROM (
+      SELECT lp_now."race_id",
+             lp_now."lap",
+             lp_now."driver_id"       AS "follower",
+             lp_now_ahead."driver_id" AS "leader"
+      FROM   "lap_positions" lp_now
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+        AND (lp_prev."position" IS NULL
+             OR lp_prev."position" - 1 <> lp_now."position")
+     ) e
+LEFT JOIN "pit_stops" ps_in
+       ON ps_in."race_id"  = e."race_id"
+      AND ps_in."driver_id" = e."leader"
+      AND ps_in."lap"       = e."lap"
+LEFT JOIN "pit_stops" ps_out
+       ON ps_out."race_id"  = e."race_id"
+      AND ps_out."driver_id" = e."follower"
+      AND ps_out."lap"      = e."lap" - 1
+LEFT JOIN "retirements" rt
+       ON rt."race_id"      = e."race_id"
+      AND rt."driver_id"    = e."leader"
+      AND rt."lap"          = e."lap"
+LIMIT 20
+Results:
+race_id,lap,follower,leader,overtake_type
+1,0,1,7,On‑track overtake
+1,1,1,7,Race start shuffle
+1,5,1,12,On‑track overtake
+1,7,1,6,On‑track overtake
+1,8,1,6,On‑track overtake
+1,9,1,6,On‑track overtake
+1,11,1,8,On‑track overtake
+1,12,1,15,On‑track overtake
+1,13,1,15,On‑track overtake
+1,14,1,15,On‑track overtake
+1,15,1,15,On‑track overtake
+1,16,1,15,On‑track overtake
+1,17,1,15,On‑track overtake
+1,21,1,10,On‑track overtake
+1,22,1,10,On‑track overtake
+
+[Successfully executed]
+2025-05-02 04:47:38 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+--Description: Aggregate counts of each overtake type across ALL races with
+--             pit‑stop data – no hard‑coded race_id was used, so no change needed.
+SELECT agg."overtake_type",
+       COUNT(*) AS "num_occurrences"
+FROM (
+      SELECT e."race_id",
+             e."lap",
+             CASE
+                  WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+                  WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+                  WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+                  WHEN e."lap" = 1                      THEN 'Race start shuffle'
+                  ELSE 'On‑track overtake'
+             END AS "overtake_type"
+      FROM (
+            SELECT lp_now."race_id",
+                   lp_now."lap",
+                   lp_now."driver_id",
+                   lp_now_ahead."driver_id" AS "leader"
+            FROM   "lap_positions" lp_now
+            JOIN   "races_ext" re
+                   ON re."race_id" = lp_now."race_id"
+                  AND re."is_pit_data_available" = 1
+            JOIN   "lap_positions" lp_now_ahead
+                   ON lp_now_ahead."race_id"  = lp_now."race_id"
+                  AND lp_now_ahead."lap"      = lp_now."lap"
+                  AND lp_now_ahead."position" = lp_now."position" - 1
+            LEFT  JOIN "lap_positions" lp_prev
+                   ON lp_prev."race_id"  = lp_now."race_id"
+                  AND lp_prev."lap"      = lp_now."lap" - 1
+                  AND lp_prev."driver_id"     = lp_now."driver_id"
+            WHERE  lp_prev."position" IS NULL
+               OR  lp_prev."position" - 1 <> lp_now."position"
+           ) e
+      LEFT JOIN "pit_stops" ps_in
+             ON ps_in."race_id"  = e."race_id"
+            AND ps_in."driver_id" = e."leader"
+            AND ps_in."lap"       = e."lap"
+      LEFT JOIN "pit_stops" ps_out
+             ON ps_out."race_id"  = e."race_id"
+            AND ps_out."driver_id" = e."driver_id"
+            AND ps_out."lap"      = e."lap" - 1
+      LEFT JOIN "retirements" rt
+             ON rt."race_id"      = e."race_id"
+            AND rt."driver_id"    = e."leader"
+            AND rt."lap"          = e."lap"
+     ) agg
+GROUP BY agg."overtake_type"
+LIMIT 20
+[Try to execute]
+2025-05-02 04:47:40 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Aggregate counts of each overtake type across ALL races with
+--             pit‑stop data – no hard‑coded race_id was used, so no change needed.
+SELECT agg."overtake_type",
+       COUNT(*) AS "num_occurrences"
+FROM (
+      SELECT e."race_id",
+             e."lap",
+             CASE
+                  WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+                  WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+                  WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+                  WHEN e."lap" = 1                      THEN 'Race start shuffle'
+                  ELSE 'On‑track overtake'
+             END AS "overtake_type"
+      FROM (
+            SELECT lp_now."race_id",
+                   lp_now."lap",
+                   lp_now."driver_id",
+                   lp_now_ahead."driver_id" AS "leader"
+            FROM   "lap_positions" lp_now
+            JOIN   "races_ext" re
+                   ON re."race_id" = lp_now."race_id"
+                  AND re."is_pit_data_available" = 1
+            JOIN   "lap_positions" lp_now_ahead
+                   ON lp_now_ahead."race_id"  = lp_now."race_id"
+                  AND lp_now_ahead."lap"      = lp_now."lap"
+                  AND lp_now_ahead."position" = lp_now."position" - 1
+            LEFT  JOIN "lap_positions" lp_prev
+                   ON lp_prev."race_id"  = lp_now."race_id"
+                  AND lp_prev."lap"      = lp_now."lap" - 1
+                  AND lp_prev."driver_id"     = lp_now."driver_id"
+            WHERE  lp_prev."position" IS NULL
+               OR  lp_prev."position" - 1 <> lp_now."position"
+           ) e
+      LEFT JOIN "pit_stops" ps_in
+             ON ps_in."race_id"  = e."race_id"
+            AND ps_in."driver_id" = e."leader"
+            AND ps_in."lap"       = e."lap"
+      LEFT JOIN "pit_stops" ps_out
+             ON ps_out."race_id"  = e."race_id"
+            AND ps_out."driver_id" = e."driver_id"
+            AND ps_out."lap"      = e."lap" - 1
+      LEFT JOIN "retirements" rt
+             ON rt."race_id"      = e."race_id"
+            AND rt."driver_id"    = e."leader"
+            AND rt."lap"          = e."lap"
+     ) agg
+GROUP BY agg."overtake_type"
+LIMIT 20
+Results:
+overtake_type,num_occurrences
+Follower exited pits,9152
+Leader entered pits,8243
+Leader retirement,114
+On‑track overtake,242570
+Race start shuffle,4109
+
+[Successfully executed]
+2025-05-02 04:47:40 - ThreadPoolExecutor-0_28 - INFO - [Try to execute]
+--Description: Verify the distribution of overtakes per Grand Prix; query already
+--             scans all races with pit data, so no hard‑coded race_id to fix.
+SELECT re."year",
+       re."round",
+       re."short_name",
+       COUNT(*) AS "total_overtake_events"
+FROM (
+      SELECT DISTINCT lp_now."race_id",
+                      lp_now."lap",
+                      lp_now."driver_id"
+      FROM   "lap_positions" lp_now
+      JOIN   "races_ext" re
+             ON re."race_id" = lp_now."race_id"
+            AND re."is_pit_data_available" = 1
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_prev."position" IS NULL
+         OR  lp_prev."position" - 1 <> lp_now."position"
+     ) ev
+JOIN "races_ext" re
+  ON re."race_id" = ev."race_id"
+GROUP BY re."year", re."round", re."short_name"
+ORDER BY "total_overtake_events" DESC
+LIMIT 20
+[Try to execute]
+2025-05-02 04:47:41 - ThreadPoolExecutor-0_28 - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Verify the distribution of overtakes per Grand Prix; query already
+--             scans all races with pit data, so no hard‑coded race_id to fix.
+SELECT re."year",
+       re."round",
+       re."short_name",
+       COUNT(*) AS "total_overtake_events"
+FROM (
+      SELECT DISTINCT lp_now."race_id",
+                      lp_now."lap",
+                      lp_now."driver_id"
+      FROM   "lap_positions" lp_now
+      JOIN   "races_ext" re
+             ON re."race_id" = lp_now."race_id"
+            AND re."is_pit_data_available" = 1
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_prev."position" IS NULL
+         OR  lp_prev."position" - 1 <> lp_now."position"
+     ) ev
+JOIN "races_ext" re
+  ON re."race_id" = ev."race_id"
+GROUP BY re."year", re."round", re."short_name"
+ORDER BY "total_overtake_events" DESC
+LIMIT 20
+Results:
+year,round,short_name,total_overtake_events
+2012,11,Hungary,1442
+2023,6,Monaco,1388
+2011,6,Monaco,1383
+2019,6,Monaco,1377
+2018,6,Monaco,1375
+2013,6,Monaco,1359
+2012,10,Germany,1346
+2016,11,Hungary,1346
+2011,19,Brazil,1333
+2012,7,Canada,1331
+2020,16,Sakhir,1329
+2017,6,Monaco,1314
+2015,6,Monaco,1313
+2021,5,Monaco,1312
+2016,19,Mexico,1310
+2011,11,Hungary,1302
+2012,6,Monaco,1302
+2013,7,Canada,1284
+2011,7,Canada,1267
+2011,5,Spain,1259
+
+[Successfully executed]
+2025-05-02 04:47:41 - ThreadPoolExecutor-0_28 - INFO - itercount: 0
+2025-05-02 04:47:41 - ThreadPoolExecutor-0_28 - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: circuits
+Column name: circuit_id Type: INT(11) Description: 
+Column name: circuit_ref Type: VARCHAR(255) Description: 
+Column name: name Type: VARCHAR(255) Description: 
+Column name: location Type: VARCHAR(255) Description: 
+Column name: country Type: VARCHAR(255) Description: 
+Column name: lat Type: FLOAT Description: 
+Column name: lng Type: FLOAT Description: 
+Column name: alt Type: INT(11) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'albert_park', 'Albert Park Grand Prix Circuit', 'Melbourne', 'Australia', -37.8497, 144.968, 10, 'http://en.wikipedia.org/wiki/Melbourne_Grand_Prix_Circuit'), (2, 'sepang', 'Sepang International Circuit', 'Kuala Lumpur', 'Malaysia', 2.76083, 101.738, 18, 'http://en.wikipedia.org/wiki/Sepang_International_Circuit'), (3, 'bahrain', 'Bahrain International Circuit', 'Sakhir', 'Bahrain', 26.0325, 50.5106, 7, 'http://en.wikipedia.org/wiki/Bahrain_International_Circuit')]
+
+--------------------------------------------------
+Table full name: constructor_results
+Column name: constructor_results_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: status Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 18, 1, 14.0, None), (2, 18, 2, 8.0, None), (3, 18, 3, 9.0, None)]
+
+--------------------------------------------------
+Table full name: constructor_standings
+Column name: constructor_standings_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: wins Type: INT(11) Description: 
+Sample rows:
+[(1, 18, 1, 14.0, 1, '1', 1), (2, 18, 2, 8.0, 3, '3', 0), (3, 18, 3, 9.0, 2, '2', 0)]
+
+--------------------------------------------------
+Table full name: constructors
+Column name: constructor_id Type: INT(11) Description: 
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: name Type: VARCHAR(255) Description: 
+Column name: nationality Type: VARCHAR(255) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'mclaren', 'McLaren', 'British', 'http://en.wikipedia.org/wiki/McLaren'), (2, 'bmw_sauber', 'BMW Sauber', 'German', 'http://en.wikipedia.org/wiki/BMW_Sauber'), (3, 'williams', 'Williams', 'British', 'http://en.wikipedia.org/wiki/Williams_Grand_Prix_Engineering')]
+
+--------------------------------------------------
+Table full name: driver_standings
+Column name: driver_standings_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: wins Type: INT(11) Description: 
+Sample rows:
+[(1, 18, 1, 10.0, 1, '1', 1), (2, 18, 2, 8.0, 2, '2', 0), (3, 18, 3, 6.0, 3, '3', 0)]
+
+--------------------------------------------------
+Table full name: drivers
+Column name: driver_id Type: INT(11) Description: 
+Column name: driver_ref Type: VARCHAR(255) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: code Type: VARCHAR(3) Description: 
+Column name: forename Type: VARCHAR(255) Description: 
+Column name: surname Type: VARCHAR(255) Description: 
+Column name: dob Type: DATE Description: 
+Column name: nationality Type: VARCHAR(255) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'hamilton', 44, 'HAM', 'Lewis', 'Hamilton', 'Lewis Hamilton', '1985-01-07', 'British', 'http://en.wikipedia.org/wiki/Lewis_Hamilton'), (2, 'heidfeld', None, 'HEI', 'Nick', 'Heidfeld', 'Nick Heidfeld', '1977-05-10', 'German', 'http://en.wikipedia.org/wiki/Nick_Heidfeld'), (3, 'rosberg', 6, 'ROS', 'Nico', 'Rosberg', 'Nico Rosberg', '1985-06-27', 'German', 'http://en.wikipedia.org/wiki/Nico_Rosberg')]
+
+--------------------------------------------------
+Table full name: lap_times
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: lap Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: time Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Sample rows:
+[(841, 20, 1, 1, '1:38.109', 98109, 98.109), (841, 20, 2, 1, '1:33.006', 93006, 93.006), (841, 20, 3, 1, '1:32.713', 92713, 92.713)]
+
+--------------------------------------------------
+Table full name: pit_stops
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: stop Type: INT(11) Description: 
+Column name: lap Type: INT(11) Description: 
+Column name: time Type: TIME Description: 
+Column name: duration Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Sample rows:
+[(841, 153, 1, 1, '17:05:23', '26.898', 26898, 26.898), (841, 30, 1, 1, '17:05:52', '25.021', 25021, 25.021), (841, 17, 1, 11, '17:20:48', '23.426', 23426, 23.426)]
+
+--------------------------------------------------
+Table full name: qualifying
+Column name: qualify_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: q1 Type: VARCHAR(255) Description: 
+Column name: q2 Type: VARCHAR(255) Description: 
+Column name: q3 Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 18, 1, 1, 22, 1, '1:26.572', '1:25.187', '1:26.714'), (2, 18, 9, 2, 4, 2, '1:26.103', '1:25.315', '1:26.869'), (3, 18, 5, 1, 23, 3, '1:25.664', '1:25.452', '1:27.079')]
+
+--------------------------------------------------
+Table full name: races
+Column name: race_id Type: INT(11) Description: 
+Column name: year Type: INT(11) Description: 
+Column name: round Type: INT(11) Description: 
+Column name: circuit_id Type: INT(11) Description: 
+Column name: name Type: VARCHAR(255) Description: 
+Column name: date Type: DATE Description: 
+Column name: time Type: TIME Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Column name: fp1_date Type: VARCHAR(255) Description: 
+Column name: fp1_time Type: VARCHAR(255) Description: 
+Column name: fp2_date Type: VARCHAR(255) Description: 
+Column name: fp2_time Type: VARCHAR(255) Description: 
+Column name: fp3_date Type: VARCHAR(255) Description: 
+Column name: fp3_time Type: VARCHAR(255) Description: 
+Column name: quali_date Type: VARCHAR(255) Description: 
+Column name: quali_time Type: VARCHAR(255) Description: 
+Column name: sprint_date Type: VARCHAR(255) Description: 
+Column name: sprint_time Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 2009, 1, 1, 'Australian Grand Prix', '2009-03-29', '06:00:00', 'http://en.wikipedia.org/wiki/2009_Australian_Grand_Prix', None, None, None, None, None, None, None, None, None, None), (2, 2009, 2, 2, 'Malaysian Grand Prix', '2009-04-05', '09:00:00', 'http://en.wikipedia.org/wiki/2009_Malaysian_Grand_Prix', None, None, None, None, None, None, None, None, None, None), (3, 2009, 3, 17, 'Chinese Grand Prix', '2009-04-19', '07:00:00', 'http://en.wikipedia.org/wiki/2009_Chinese_Grand_Prix', None, None, None, None, None, None, None, None, None, None)]
+
+--------------------------------------------------
+Table full name: results
+Column name: result_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: grid Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: position_order Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: laps Type: INT(11) Description: 
+Column name: time Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Column name: fastest_lap Type: INT(11) Description: 
+Column name: rank Type: INT(11) Description: 
+Column name: fastest_lap_time Type: VARCHAR(255) Description: 
+Column name: fastest_lap_speed Type: VARCHAR(255) Description: 
+Column name: status_id Type: INT(11) Description: 
+Sample rows:
+[(1, 18, 1, 1, 22, 1, 1, '1', 1, 10.0, 58, '1:34:50.616', 5690616, 39, 2, '1:27.452', '218.300', 1), (2, 18, 2, 2, 3, 5, 2, '2', 2, 8.0, 58, '+5.478', 5696094, 41, 3, '1:27.739', '217.586', 1), (3, 18, 3, 3, 7, 7, 3, '3', 3, 6.0, 58, '+8.163', 5698779, 41, 5, '1:28.090', '216.719', 1)]
+
+--------------------------------------------------
+Table full name: seasons
+Column name: year Type: INT(11) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(2009, 'http://en.wikipedia.org/wiki/2009_Formula_One_season'), (2008, 'http://en.wikipedia.org/wiki/2008_Formula_One_season'), (2007, 'http://en.wikipedia.org/wiki/2007_Formula_One_season')]
+
+--------------------------------------------------
+Table full name: status
+Column name: status_id Type: INT(11) Description: 
+Column name: status Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'Finished'), (2, 'Disqualified'), (3, 'Accident')]
+
+--------------------------------------------------
+Table full name: sprint_results
+Column name: result_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: grid Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: position_order Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: laps Type: INT(11) Description: 
+Column name: time Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Column name: fastest_lap Type: INT(11) Description: 
+Column name: fastest_lap_time Type: VARCHAR(255) Description: 
+Column name: fastest_lap_speed Type: VARCHAR(255) Description: 
+Column name: status_id Type: INT(11) Description: 
+Sample rows:
+[(1, 1061, 830, 9, 33, 2, 1, '1', 1, 3.0, 17, '25:38.426', 1538426, 14, '1:30.013', None, 1), (2, 1061, 1, 131, 44, 1, 2, '2', 2, 2.0, 17, '+1.430', 1539856, 17, '1:29.937', None, 1), (3, 1061, 822, 131, 77, 3, 3, '3', 3, 1.0, 17, '+7.502', 1545928, 17, '1:29.958', None, 1)]
+
+--------------------------------------------------
+Table full name: short_grand_prix_names
+Column name: full_name Type: VARCHAR(255) Description: 
+Column name: short_name Type: VARCHAR(255) Description: 
+Sample rows:
+[('Australian Grand Prix', 'Australia'), ('Malaysian Grand Prix', 'Malaysia'), ('Chinese Grand Prix', 'China')]
+
+--------------------------------------------------
+Table full name: short_constructor_names
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: short_name Type: VARCHAR(255) Description: 
+Sample rows:
+[('alphatauri', 'Alpha Tauri'), ('alpine', 'Alpine'), ('brabham-alfa_romeo', 'Brabham')]
+
+--------------------------------------------------
+Table full name: liveries
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: start_year Type: INT(11) Description: 
+Column name: end_year Type: INT(11) Description: 
+Column name: primary_hex_code Type: VARCHAR(255) Description: 
+Sample rows:
+[('alfa', 2019, None, '#900000'), ('alphatauri', 2020, None, '#000000'), ('alpine', 2021, None, '#F7A7D1')]
+
+--------------------------------------------------
+Table full name: tdr_overrides
+Column name: year Type: INT(11) Description: 
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: driver_ref Type: VARCHAR(255) Description: 
+Column name: team_driver_rank Type: INT(11) Description: 
+Sample rows:
+[(2004, 'toyota', 'matta', 1), (2004, 'toyota', 'panis', 2), (2004, 'toyota', 'trulli', 3)]
+
+--------------------------------------------------
+Table full name: circuits_ext
+Column name: circuit_id Type: INT Description: 
+Column name: circuit_ref Type: TEXT Description: 
+Column name: name Type: TEXT Description: 
+Column name: location Type: TEXT Description: 
+Column name: country Type: TEXT Description: 
+Column name: lat Type: REAL Description: 
+Column name: lng Type: REAL Description: 
+Column name: alt Type: INT Description: 
+Column name: url Type: TEXT Description: 
+Column name: last_race_year Type:  Description: 
+Column name: number_of_races Type:  Description: 
+Sample rows:
+[(1, 'albert_park', 'Albert Park Grand Prix Circuit', 'Melbourne', 'Australia', -37.8497, 144.968, 10, 'http://en.wikipedia.org/wiki/Melbourne_Grand_Prix_Circuit', 2024, 27), (2, 'sepang', 'Sepang International Circuit', 'Kuala Lumpur', 'Malaysia', 2.76083, 101.738, 18, 'http://en.wikipedia.org/wiki/Sepang_International_Circuit', 2017, 19), (3, 'bahrain', 'Bahrain International Circuit', 'Sakhir', 'Bahrain', 26.0325, 50.5106, 7, 'http://en.wikipedia.org/wiki/Bahrain_International_Circuit', 2024, 21)]
+
+--------------------------------------------------
+Table full name: constructors_ext
+Column name: constructor_id Type: INT Description: 
+Column name: constructor_ref Type: TEXT Description: 
+Column name: name Type: TEXT Description: 
+Column name: nationality Type: TEXT Description: 
+Column name: url Type: TEXT Description: 
+Column name: short_name Type:  Description: 
+Sample rows:
+[(1, 'mclaren', 'McLaren', 'British', 'http://en.wikipedia.org/wiki/McLaren', 'McLaren'), (2, 'bmw_sauber', 'BMW Sauber', 'German', 'http://en.wikipedia.org/wiki/BMW_Sauber', 'BMW Sauber'), (3, 'williams', 'Williams', 'British', 'http://en.wikipedia.org/wiki/Williams_Grand_Prix_Engineering', 'Williams')]
+
+--------------------------------------------------
+Table full name: drivers_ext
+Column name: driver_id Type: INT Description: 
+Column name: driver_ref Type: TEXT Description: 
+Column name: number Type: INT Description: 
+Column name: code Type:  Description: 
+Column name: forename Type: TEXT Description: 
+Column name: surname Type: TEXT Description: 
+Column name: full_name Type: TEXT Description: 
+Column name: dob Type: NUM Description: 
+Column name: nationality Type: TEXT Description: 
+Column name: url Type: TEXT Description: 
+Sample rows:
+[(1, 'hamilton', 44, 'HAM', 'Lewis', 'Hamilton', 'Lewis Hamilton', '1985-01-07', 'British', 'http://en.wikipedia.org/wiki/Lewis_Hamilton'), (2, 'heidfeld', None, 'HEI', 'Nick', 'Heidfeld', 'Nick Heidfeld', '1977-05-10', 'German', 'http://en.wikipedia.org/wiki/Nick_Heidfeld'), (3, 'rosberg', 6, 'ROS', 'Nico', 'Rosberg', 'Nico Rosberg', '1985-06-27', 'German', 'http://en.wikipedia.org/wiki/Nico_Rosberg')]
+
+--------------------------------------------------
+Table full name: driver_standings_ext
+Column name: driver_standings_id Type: INT Description: 
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: points Type: REAL Description: 
+Column name: position Type: INT Description: 
+Column name: position_text Type: TEXT Description: 
+Column name: wins Type: INT Description: 
+Sample rows:
+[(1, 18, 1, 10.0, 1, '1', 1), (2, 18, 2, 8.0, 2, '2', 0), (3, 18, 3, 6.0, 3, '3', 0)]
+
+--------------------------------------------------
+Table full name: lap_times_ext
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: lap Type: INT Description: 
+Column name: position Type: INT Description: 
+Column name: time Type: TEXT Description: 
+Column name: milliseconds Type: INT Description: 
+Column name: seconds Type: REAL Description: 
+Column name: running_milliseconds Type:  Description: 
+Sample rows:
+[(1, 1, 1, 13, '1:49.088', 109088, 109.088, 109088), (1, 1, 2, 12, '1:33.740', 93740, 93.74, 202828), (1, 1, 3, 11, '1:31.600', 91600, 91.6, 294428)]
+
+--------------------------------------------------
+Table full name: lap_time_stats
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: avg_milliseconds Type:  Description: 
+Column name: avg_seconds Type:  Description: 
+Column name: stdev_milliseconds Type:  Description: 
+Column name: stdev_seconds Type:  Description: 
+Sample rows:
+[(1, 1, 97563.75862068965, 97.56375862068965, 15927.054702406851, 15.927054702406851), (1, 2, 97635.6724137931, 97.63567241379309, 14152.06249911631, 14.152062499116306), (1, 3, 97612.1724137931, 97.61217241379309, 16170.377456130136, 16.170377456130137)]
+
+--------------------------------------------------
+Table full name: races_ext
+Column name: race_id Type: INT Description: 
+Column name: year Type: INT Description: 
+Column name: round Type: INT Description: 
+Column name: circuit_id Type: INT Description: 
+Column name: name Type: TEXT Description: 
+Column name: date Type: NUM Description: 
+Column name: time Type: NUM Description: 
+Column name: url Type: TEXT Description: 
+Column name: fp1_date Type: TEXT Description: 
+Column name: fp1_time Type: TEXT Description: 
+Column name: fp2_date Type: TEXT Description: 
+Column name: fp2_time Type: TEXT Description: 
+Column name: fp3_date Type: TEXT Description: 
+Column name: fp3_time Type: TEXT Description: 
+Column name: quali_date Type: TEXT Description: 
+Column name: quali_time Type: TEXT Description: 
+Column name: sprint_date Type: TEXT Description: 
+Column name: sprint_time Type: TEXT Description: 
+Column name: is_pit_data_available Type:  Description: 
+Column name: short_name Type:  Description: 
+Column name: has_sprint Type:  Description: 
+Column name: max_points Type:  Description: 
+Sample rows:
+[(1, 2009, 1, 1, 'Australian Grand Prix', '2009-03-29', '06:00:00', 'http://en.wikipedia.org/wiki/2009_Australian_Grand_Prix', None, None, None, None, None, None, None, None, None, None, 0, 'Australia', 0, 10), (2, 2009, 2, 2, 'Malaysian Grand Prix', '2009-04-05', '09:00:00', 'http://en.wikipedia.org/wiki/2009_Malaysian_Grand_Prix', None, None, None, None, None, None, None, None, None, None, 0, 'Malaysia', 0, 10), (3, 2009, 3, 17, 'Chinese Grand Prix', '2009-04-19', '07:00:00', 'http://en.wikipedia.org/wiki/2009_Chinese_Grand_Prix', None, None, None, None, None, None, None, None, None, None, 0, 'China', 0, 10)]
+
+--------------------------------------------------
+Table full name: team_driver_ranks
+Column name: year Type: INT Description: 
+Column name: constructor_id Type: INT Description: 
+Column name: constructor_ref Type: TEXT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: driver_ref Type: TEXT Description: 
+Column name: team_driver_rank Type:  Description: 
+Sample rows:
+[(1950, 6, 'ferrari', 647, 'ascari', 1), (1950, 6, 'ferrari', 687, 'whitehead', 2), (1950, 6, 'ferrari', 802, 'serafini', 3)]
+
+--------------------------------------------------
+Table full name: drives
+Column name: year Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: drive_id Type:  Description: 
+Column name: constructor_id Type: INT Description: 
+Column name: first_round Type: INT Description: 
+Column name: last_round Type: INT Description: 
+Column name: is_first_drive_of_season Type:  Description: 
+Column name: is_final_drive_of_season Type:  Description: 
+Sample rows:
+[(1950, 427, 1, 141, 2, 7, 1, 1), (1950, 498, 1, 105, 2, 6, 1, 1), (1950, 501, 1, 87, 2, 2, 1, 0)]
+
+--------------------------------------------------
+Table full name: retirements
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: lap Type:  Description: 
+Column name: position_order Type: INT Description: 
+Column name: status_id Type: INT Description: 
+Column name: retirement_type Type:  Description: 
+Sample rows:
+[(18, 7, 56, 7, 5, 'Retirement (Mechanical Problem)'), (18, 8, 54, 8, 5, 'Retirement (Mechanical Problem)'), (18, 9, 48, 9, 4, 'Retirement (Driver Error)')]
+
+--------------------------------------------------
+Table full name: lap_positions
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: lap Type: INT Description: 
+Column name: position Type: INT Description: 
+Column name: lap_type Type:  Description: 
+Sample rows:
+[(1, 1, 0, 18, 'Starting Position - Grid Drop'), (1, 1, 1, 13, 'Race'), (1, 1, 2, 12, 'Race')]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['circuits', 'constructor_results', 'constructor_standings', 'constructors', 'driver_standings', 'drivers', 'lap_times', 'pit_stops', 'qualifying', 'races', 'results', 'seasons', 'status', 'sprint_results', 'short_grand_prix_names', 'short_constructor_names', 'liveries', 'tdr_overrides', 'circuits_ext', 'constructors_ext', 'drivers_ext', 'driver_standings_ext', 'lap_times_ext', 'lap_time_stats', 'races_ext', 'team_driver_ranks', 'drives', 'retirements', 'lap_positions']
+Some few-shot examples may be useful:
+Query:
+-- 1. Races that have detailed pit‑stop information (is_pit_data_available = 1)
+SELECT DISTINCT "race_id", "year", "round", "name"
+FROM "races_ext"
+WHERE "is_pit_data_available" = 1
+LIMIT 20;
+Answer:
+race_id,year,round,name
+841,2011,1,Australian Grand Prix
+842,2011,2,Malaysian Grand Prix
+843,2011,3,Chinese Grand Prix
+844,2011,4,Turkish Grand Prix
+845,2011,5,Spanish Grand Prix
+846,2011,6,Monaco Grand Prix
+847,2011,7,Canadian Grand Prix
+848,2011,8,European Grand Prix
+849,2011,9,British Grand Prix
+850,2011,10,German Grand Prix
+851,2011,11,Hungarian Grand Prix
+852,2011,12,Belgian Grand Prix
+853,2011,13,Italian Grand Prix
+854,2011,14,Singapore Grand Prix
+Query:
+-- 2. Lap‑by‑lap positions for one example race that has pit data (race_id = 1 shown as placeholder)
+SELECT DISTINCT "race_id", "driver_id", "lap", "position", "lap_type"
+FROM "lap_positions"
+WHERE "race_id" = 1
+ORDER BY "lap", "position"
+LIMIT 20;
+Answer:
+race_id,driver_id,lap,position,lap_type
+1,18,0,1,Starting Position - Qualifying
+1,22,0,2,Starting Position - Qualifying
+1,20,0,3,Starting Position - Qualifying
+1,9,0,4,Starting Position - Qualifying
+1,3,0,5,Starting Position - Qualifying
+1,13,0,6,Starting Position - Grid Increase
+1,8,0,7,Starting Position - Grid Increase
+1,17,0,8,Starting Position - Grid Increase
+1,2,0,9,Starting Position - Grid Increase
+1,4,0,10,Starting Position - Grid Increase
+1,6,0,11,Starting Position - Grid Incr
+Query:
+-- 3. All lap_type values that appear in lap_positions
+SELECT DISTINCT "lap_type"
+FROM "lap_positions"
+LIMIT 20;
+Answer:
+lap_type
+Starting Position - Grid Drop
+Race
+Retirement (Disqualification)
+Starting Position - Grid Increase
+Starting Position - Qualifying
+Retirement (Driver Error)
+Retirement (Mechanical Problem)
+Starting Position - Pit Lane Start
+Starting Position - No Qualification
+Query:
+--Description: “Retirement events” sample query – instead of hard‑coding race_id = 1
+--             (which may have no retirements), use the earliest race that actually
+--             appears in the retirements table.
+SELECT DISTINCT r."race_id",
+                r."driver_id",
+                r."lap",
+                r."status_id",
+                s."status"
+FROM   "retirements" r
+LEFT JOIN "status" s
+       ON s."status_id" = r."status_id"
+WHERE  r."race_id" = (SELECT MIN("race_id") FROM "retirements")
+ORDER  BY r."lap"
+LIMIT  20
+Answer:
+race_id,driver_id,lap,status_id,status
+1,5,1,4,Collision
+1,6,18,3,Accident
+1,12,25,20,Spun off
+1,13,46,22,Suspension
+1,9,56,4,Collision
+1,8,56,24,Differential
+1,20,57,4,Collision
+1,1,59,2,Disqualified
+Query:
+--Description: Identify, for every driver and lap, the driver that was directly
+--             ahead on track for the very first race that has lap‑by‑lap data,
+--             determined dynamically.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"  AS "driver",
+       lp_now."position",
+       lp_prev."driver_id" AS "prev_lap_driver_ahead"
+FROM   "lap_positions" lp_now
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."position" = lp_now."position" - 1
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20
+Answer:
+race_id,lap,driver,position,prev_lap_driver_ahead
+1,0,18,1,
+1,0,22,2,
+1,0,20,3,
+1,0,9,4,
+1,0,3,5,
+1,0,13,6,
+1,0,8,7,
+1,0,17,8,
+1,0,2,9,
+1,0,4,10,
+1,0,6,11,
+1,0,5,12,
+1,0,67,13,
+1,0,12,14,
+1,0,21,15,
+1,0,16,16,
+1,0,7,17,
+1,0,1,18,
+1,0,10,19,
+1,0,15,20,
+Query:
+--Description: Show examples where a driver was NOT behind on the previous lap
+--             but IS directly behind another car now, using the first race present
+--             in lap_positions.
+SELECT lp_now."race_id",
+       lp_now."lap",
+       lp_now."driver_id"        AS "follower",
+       lp_now."position"         AS "follower_pos",
+       lp_now_ahead."driver_id"  AS "leader",
+       lp_prev."position"        AS "prev_pos_follower"
+FROM   "lap_positions" lp_now
+JOIN   "lap_positions" lp_now_ahead
+       ON lp_now_ahead."race_id"  = lp_now."race_id"
+      AND lp_now_ahead."lap"      = lp_now."lap"
+      AND lp_now_ahead."position" = lp_now."position" - 1
+LEFT  JOIN "lap_positions" lp_prev
+       ON lp_prev."race_id"  = lp_now."race_id"
+      AND lp_prev."lap"      = lp_now."lap" - 1
+      AND lp_prev."driver_id"     = lp_now."driver_id"
+WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+  AND (lp_prev."position" IS NULL
+       OR lp_prev."position" - 1 <> lp_now."position")
+ORDER  BY lp_now."lap", lp_now."position"
+LIMIT  20
+Answer:
+race_id,lap,follower,follower_pos,leader,prev_pos_follower
+1,0,22,2,18,
+1,0,20,3,22,
+1,0,9,4,20,
+1,0,3,5,9,
+1,0,13,6,3,
+1,0,8,7,13,
+1,0,17,8,8,
+1,0,2,9,17,
+1,0,4,10,2,
+1,0,6,11,4,
+1,0,5,12,6,
+1,0,67,13,5,
+1,0,12,14,67,
+1,0,21,15,12,
+1,0,16,16,21,
+1,0,7,17,16,
+1,0,1,18,7,
+1,0,10,19,1,
+1,0,15,20,10,
+1,1,13,3,20,6
+Query:
+--Description: Classify each “newly‑behind” event into overtake types for the
+--             earliest race in lap_positions (instead of hard‑coded race_id = 1).
+SELECT e."race_id",
+       e."lap",
+       e."follower",
+       e."leader",
+       CASE
+            WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+            WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+            WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+            WHEN e."lap" = 1                      THEN 'Race start shuffle'
+            ELSE 'On‑track overtake'
+       END AS "overtake_type"
+FROM (
+      SELECT lp_now."race_id",
+             lp_now."lap",
+             lp_now."driver_id"       AS "follower",
+             lp_now_ahead."driver_id" AS "leader"
+      FROM   "lap_positions" lp_now
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_now."race_id" = (SELECT MIN("race_id") FROM "lap_positions")
+        AND (lp_prev."position" IS NULL
+             OR lp_prev."position" - 1 <> lp_now."position")
+     ) e
+LEFT JOIN "pit_stops" ps_in
+       ON ps_in."race_id"  = e."race_id"
+      AND ps_in."driver_id" = e."leader"
+      AND ps_in."lap"       = e."lap"
+LEFT JOIN "pit_stops" ps_out
+       ON ps_out."race_id"  = e."race_id"
+      AND ps_out."driver_id" = e."follower"
+      AND ps_out."lap"      = e."lap" - 1
+LEFT JOIN "retirements" rt
+       ON rt."race_id"      = e."race_id"
+      AND rt."driver_id"    = e."leader"
+      AND rt."lap"          = e."lap"
+LIMIT 20
+Answer:
+race_id,lap,follower,leader,overtake_type
+1,0,1,7,On‑track overtake
+1,1,1,7,Race start shuffle
+1,5,1,12,On‑track overtake
+1,7,1,6,On‑track overtake
+1,8,1,6,On‑track overtake
+1,9,1,6,On‑track overtake
+1,11,1,8,On‑track overtake
+1,12,1,15,On‑track overtake
+1,13,1,15,On‑track overtake
+1,14,1,15,On‑track overtake
+1,15,1,15,On‑track overtake
+1,16,1,15,On‑track overtake
+1,17,1,15,On‑track overtake
+1,21,1,10,On‑track overtake
+1,22,1,10,On‑track overtake
+Query:
+--Description: Aggregate counts of each overtake type across ALL races with
+--             pit‑stop data – no hard‑coded race_id was used, so no change needed.
+SELECT agg."overtake_type",
+       COUNT(*) AS "num_occurrences"
+FROM (
+      SELECT e."race_id",
+             e."lap",
+             CASE
+                  WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+                  WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+                  WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+                  WHEN e."lap" = 1                      THEN 'Race start shuffle'
+                  ELSE 'On‑track overtake'
+             END AS "overtake_type"
+      FROM (
+            SELECT lp_now."race_id",
+                   lp_now."lap",
+                   lp_now."driver_id",
+                   lp_now_ahead."driver_id" AS "leader"
+            FROM   "lap_positions" lp_now
+            JOIN   "races_ext" re
+                   ON re."race_id" = lp_now."race_id"
+                  AND re."is_pit_data_available" = 1
+            JOIN   "lap_positions" lp_now_ahead
+                   ON lp_now_ahead."race_id"  = lp_now."race_id"
+                  AND lp_now_ahead."lap"      = lp_now."lap"
+                  AND lp_now_ahead."position" = lp_now."position" - 1
+            LEFT  JOIN "lap_positions" lp_prev
+                   ON lp_prev."race_id"  = lp_now."race_id"
+                  AND lp_prev."lap"      = lp_now."lap" - 1
+                  AND lp_prev."driver_id"     = lp_now."driver_id"
+            WHERE  lp_prev."position" IS NULL
+               OR  lp_prev."position" - 1 <> lp_now."position"
+           ) e
+      LEFT JOIN "pit_stops" ps_in
+             ON ps_in."race_id"  = e."race_id"
+            AND ps_in."driver_id" = e."leader"
+            AND ps_in."lap"       = e."lap"
+      LEFT JOIN "pit_stops" ps_out
+             ON ps_out."race_id"  = e."race_id"
+            AND ps_out."driver_id" = e."driver_id"
+            AND ps_out."lap"      = e."lap" - 1
+      LEFT JOIN "retirements" rt
+             ON rt."race_id"      = e."race_id"
+            AND rt."driver_id"    = e."leader"
+            AND rt."lap"          = e."lap"
+     ) agg
+GROUP BY agg."overtake_type"
+LIMIT 20
+Answer:
+overtake_type,num_occurrences
+Follower exited pits,9152
+Leader entered pits,8243
+Leader retirement,114
+On‑track overtake,242570
+Race start shuffle,4109
+Query:
+--Description: Verify the distribution of overtakes per Grand Prix; query already
+--             scans all races with pit data, so no hard‑coded race_id to fix.
+SELECT re."year",
+       re."round",
+       re."short_name",
+       COUNT(*) AS "total_overtake_events"
+FROM (
+      SELECT DISTINCT lp_now."race_id",
+                      lp_now."lap",
+                      lp_now."driver_id"
+      FROM   "lap_positions" lp_now
+      JOIN   "races_ext" re
+             ON re."race_id" = lp_now."race_id"
+            AND re."is_pit_data_available" = 1
+      JOIN   "lap_positions" lp_now_ahead
+             ON lp_now_ahead."race_id"  = lp_now."race_id"
+            AND lp_now_ahead."lap"      = lp_now."lap"
+            AND lp_now_ahead."position" = lp_now."position" - 1
+      LEFT  JOIN "lap_positions" lp_prev
+             ON lp_prev."race_id"  = lp_now."race_id"
+            AND lp_prev."lap"      = lp_now."lap" - 1
+            AND lp_prev."driver_id"     = lp_now."driver_id"
+      WHERE  lp_prev."position" IS NULL
+         OR  lp_prev."position" - 1 <> lp_now."position"
+     ) ev
+JOIN "races_ext" re
+  ON re."race_id" = ev."race_id"
+GROUP BY re."year", re."round", re."short_name"
+ORDER BY "total_overtake_events" DESC
+LIMIT 20
+Answer:
+year,round,short_name,total_overtake_events
+2012,11,Hungary,1442
+2023,6,Monaco,1388
+2011,6,Monaco,1383
+2019,6,Monaco,1377
+2018,6,Monaco,1375
+2013,6,Monaco,1359
+2012,10,Germany,1346
+2016,11,Hungary,1346
+2011,19,Brazil,1333
+2012,7,Canada,1331
+2020,16,Sakhir,1329
+2017,6,Monaco,1314
+2015,6,Monaco,1313
+2021,5,Monaco,1312
+2016,19,Mexico,1310
+2011,11,Hungary,1302
+2012,6,Monaco,1302
+2013,7,Canada,1284
+2011,7,Canada,1267
+2011,5,Spain,1259
+Task: Considering all races where pit stop data is available, and focusing on instances when a driver was not behind another car on the previous lap but is behind on the current lap (accounting for retirements, pit-stop entries, pit-stop exits, and race starts), how many times has each type of overtake occurred in Formula 1?
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+Usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Here are some useful tips for answering:
+For string-matching scenarios, if the string is decided, don't use fuzzy query. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-02 04:48:10 - ThreadPoolExecutor-0_28 - INFO - [Try to run SQL in self-refine]
+```sql
+WITH overtake_events AS (
+    /* laps where a driver was NOT directly behind the same car on the previous lap
+       but IS directly behind one now – only for races that have pit‑stop data      */
+    SELECT
+        lp_now."race_id",
+        lp_now."lap",
+        lp_now."driver_id"               AS "follower",
+        lp_now_ahead."driver_id"         AS "leader"
+    FROM   "lap_positions" lp_now
+    JOIN   "races_ext"     re
+           ON re."race_id" = lp_now."race_id"
+          AND re."is_pit_data_available" = 1
+    JOIN   "lap_positions" lp_now_ahead
+           ON lp_now_ahead."race_id"  = lp_now."race_id"
+          AND lp_now_ahead."lap"      = lp_now."lap"
+          AND lp_now_ahead."position" = lp_now."position" - 1   -- car directly ahead
+    LEFT  JOIN "lap_positions" lp_prev
+           ON lp_prev."race_id"  = lp_now."race_id"
+          AND lp_prev."lap"      = lp_now."lap" - 1             -- previous lap
+          AND lp_prev."driver_id"= lp_now."driver_id"
+    WHERE  lp_prev."position" IS NULL          -- was NOT behind same car last lap
+       OR  lp_prev."position" - 1 <> lp_now."position"
+),
+typed_events AS (
+    /* classify each “newly‑behind” event */
+    SELECT
+        oe."race_id",
+        oe."lap",
+        CASE
+             WHEN ps_in."driver_id"  IS NOT NULL THEN 'Leader entered pits'
+             WHEN ps_out."driver_id" IS NOT NULL THEN 'Follower exited pits'
+             WHEN rt."driver_id"     IS NOT NULL THEN 'Leader retirement'
+             WHEN oe."lap" = 1                      THEN 'Race start shuffle'
+             ELSE 'On‑track overtake'
+        END AS "overtake_type"
+    FROM   overtake_events oe
+    LEFT  JOIN "pit_stops" ps_in
+           ON ps_in."race_id"  = oe."race_id"
+          AND ps_in."driver_id"= oe."leader"
+          AND ps_in."lap"      = oe."lap"          -- leader dives into pits
+    LEFT  JOIN "pit_stops" ps_out
+           ON ps_out."race_id"  = oe."race_id"
+          AND ps_out."driver_id"= oe."follower"
+          AND ps_out."lap"      = oe."lap" - 1     -- follower exits pits
+    LEFT  JOIN "retirements" rt
+           ON rt."race_id"      = oe."race_id"
+          AND rt."driver_id"    = oe."leader"
+          AND rt."lap"          = oe."lap"         -- leader retires this lap
+)
+SELECT
+    "overtake_type",
+    COUNT(*) AS "num_occurrences"
+FROM   typed_events
+GROUP  BY "overtake_type"
+ORDER BY "num_occurrences" DESC;
+```
+[Try to run SQL in self-refine]
+2025-05-02 04:48:11 - ThreadPoolExecutor-0_28 - INFO - Total iteration counts: 0

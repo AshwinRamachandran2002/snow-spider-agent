@@ -1,0 +1,2226 @@
+2025-05-05 04:03:41 - Thread-2589 (execute) - INFO - [Exploration]
+```sql
+-- 1. Quick look at activity rows whose pChEMBL values are already > 10  
+--    (gives us an idea whether there is useful data to start with)
+SELECT activity_id,
+       assay_id,
+       molregno,
+       standard_type,
+       standard_relation,
+       standard_value,
+       pchembl_value
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+```
+
+```sql
+-- 2. Which standard_type values occur for those high-pChEMBL rows?
+SELECT DISTINCT standard_type
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+```
+
+```sql
+-- 3. Join activities_30 with compound_properties_29 to keep compounds
+--    that have 10-15 heavy atoms and pChEMBL > 10
+SELECT a.activity_id,
+       a.assay_id,
+       a.molregno,
+       CAST(cp.heavy_atoms AS INT64)            AS heavy_atoms,
+       a.standard_type,
+       a.standard_value,
+       a.pchembl_value
+FROM   `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON a.molregno = cp.molregno
+WHERE  a.pchembl_value > 10
+  AND  SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+LIMIT 20;
+```
+
+```sql
+-- 4. See the distribution of heavy atom counts among those rows
+SELECT SAFE_CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+       COUNT(*)                          AS n_rows
+FROM   `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON a.molregno = cp.molregno
+WHERE  a.pchembl_value > 10
+GROUP  BY heavy_atoms
+ORDER BY n_rows DESC
+LIMIT 20;
+```
+
+```sql
+-- 5. Bring in canonical SMILES so we can later create the MD5-based UUIDs
+SELECT a.activity_id,
+       a.assay_id,
+       a.molregno,
+       cs.canonical_smiles
+FROM   `bigquery-public-data.ebi_chembl.activities_30`       AS a
+JOIN   `bigquery-public-data.ebi_chembl.compound_structures_29` AS cs
+       ON a.molregno = cs.molregno
+WHERE  a.pchembl_value > 10
+LIMIT 20;
+```
+
+```sql
+-- 6. Count how many qualifying activities (10-15 heavy atoms, pChEMBL>10,
+--    non-NULL standard_value) each assay/standard_type pair contains.
+--    We only keep those with < 5 rows to satisfy the task requirement.
+SELECT a.assay_id,
+       a.standard_type,
+       COUNT(*) AS n_activities
+FROM   `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON a.molregno = cp.molregno
+WHERE  a.pchembl_value > 10
+  AND  a.standard_value IS NOT NULL
+  AND  SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+GROUP  BY a.assay_id, a.standard_type
+HAVING COUNT(*) < 5
+LIMIT 20;
+```
+
+```sql
+-- 7. Pull back the individual qualifying activity rows, additionally
+--    excluding cases with ≥2 duplicate flags (potential_duplicate < 2)
+SELECT a.activity_id,
+       a.assay_id,
+       a.molregno,
+       a.standard_relation,
+       CAST(a.standard_value AS FLOAT64)   AS standard_value,
+       a.standard_type,
+       a.pchembl_value,
+       CAST(cp.heavy_atoms AS INT64)       AS heavy_atoms
+FROM   `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON a.molregno = cp.molregno
+JOIN (
+      /* list from step-6 */
+      SELECT assay_id, standard_type
+      FROM (
+            SELECT a.assay_id,
+                   a.standard_type,
+                   COUNT(*) AS n_activities
+            FROM   `bigquery-public-data.ebi_chembl.activities_30` AS a
+            JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+                   ON a.molregno = cp.molregno
+            WHERE  a.pchembl_value > 10
+              AND  a.standard_value IS NOT NULL
+              AND  SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+            GROUP  BY a.assay_id, a.standard_type
+            HAVING COUNT(*) < 5
+      )
+) AS smallsets
+       ON a.assay_id     = smallsets.assay_id
+      AND a.standard_type = smallsets.standard_type
+WHERE  a.pchembl_value > 10
+  AND  a.standard_value IS NOT NULL
+  AND  SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  AND  a.potential_duplicate < 2
+LIMIT 20;
+```
+
+```sql
+-- 8. Generate all unordered pairs of *different* molecules that belong
+--    to the same assay & standard_type set selected above.
+--    Also classify the change in standard_value (increase/decrease/no-change)
+WITH qualified AS (
+  SELECT a.activity_id,
+         a.assay_id,
+         a.molregno,
+         a.standard_relation,
+         CAST(a.standard_value AS FLOAT64)   AS sv,
+         a.standard_type
+  FROM   `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+         ON a.molregno = cp.molregno
+  WHERE  a.pchembl_value > 10
+    AND  a.standard_value IS NOT NULL
+    AND  SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+    AND  a.potential_duplicate < 2
+)
+SELECT q1.activity_id AS act_id_1,
+       q2.activity_id AS act_id_2,
+       q1.sv          AS sv_1,
+       q2.sv          AS sv_2,
+       CASE
+         WHEN q1.standard_relation = '=' AND q2.standard_relation = '=' AND q1.sv = q2.sv
+              THEN 'no-change'
+         WHEN q1.sv > q2.sv THEN 'decrease'
+         WHEN q1.sv < q2.sv THEN 'increase'
+         ELSE 'undetermined'
+       END            AS change_class
+FROM   qualified AS q1
+JOIN   qualified AS q2
+       ON q1.assay_id      = q2.assay_id
+      AND q1.standard_type = q2.standard_type
+      AND q1.molregno     <> q2.molregno
+      AND q1.activity_id  <  q2.activity_id      -- avoid duplicates
+LIMIT 20;
+```
+
+```sql
+-- 9. Produce a UUID (MD5 hex of the JSON string of both activity_ids)
+--    for one example pair – this is what we will later use for mmp_delta_uuid
+SELECT to_hex(md5(to_json_string(STRUCT('A', 'B')))) AS example_uuid;
+```
+
+```sql
+-- 10. Inspect docs_29 so we can later compute the synthetic publication
+--     dates (rank inside journal+year) once we manage to join an assay
+--     to its document.  This just shows some raw rows.
+SELECT doc_id,
+       journal,
+       year,
+       first_page
+FROM   `bigquery-public-data.ebi_chembl.docs_29`
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 04:03:41 - Thread-2589 (execute) - INFO - [Try to execute]
+-- 1. Quick look at activity rows whose pChEMBL values are already > 10  
+--    (gives us an idea whether there is useful data to start with)
+SELECT activity_id,
+       assay_id,
+       molregno,
+       standard_type,
+       standard_relation,
+       standard_value,
+       pchembl_value
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:03:43 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Quick look at activity rows whose pChEMBL values are already > 10  
+--    (gives us an idea whether there is useful data to start with)
+SELECT activity_id,
+       assay_id,
+       molregno,
+       standard_type,
+       standard_relation,
+       standard_value,
+       pchembl_value
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+Results:
+activity_id,assay_id,molregno,standard_type,standard_relation,standard_value,pchembl_value
+1699617,342330,5535,Ki,=,0.02344,10.63
+1654802,326439,331980,Kd,=,0.03388,10.47
+13937026,1293221,1621277,EC50,=,0.03981,10.4
+19108671,1868964,2421304,IC50,=,0.09772,10.01
+
+[Successfully executed]
+2025-05-05 04:03:43 - Thread-2589 (execute) - INFO - [Try to execute]
+-- 2. Which standard_type values occur for those high-pChEMBL rows?
+SELECT DISTINCT standard_type
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:03:46 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Which standard_type values occur for those high-pChEMBL rows?
+SELECT DISTINCT standard_type
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+Results:
+standard_type
+Kd
+IC50
+Ki
+EC50
+AC50
+
+[Successfully executed]
+2025-05-05 04:03:46 - Thread-2589 (execute) - INFO - [Try to execute]
+-- 3. Join activities_30 with compound_properties_29 to keep compounds
+--    that have 10-15 heavy atoms and pChEMBL > 10
+SELECT a.activity_id,
+       a.assay_id,
+       a.molregno,
+       CAST(cp.heavy_atoms AS INT64)            AS heavy_atoms,
+       a.standard_type,
+       a.standard_value,
+       a.pchembl_value
+FROM   `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN   `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON a.molregno = cp.molregno
+WHERE  a.pchembl_value > 10
+  AND  SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:03:48 - Thread-2589 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##400 No matching signature for operator = for argument types: INT64, STRING\n  Signature: T1 = T1\n    Unable to find common supertype for templated argument <T1>\n      Input types for <T1>: {INT64, STRING} at [12:11]; reason: invalidQuery, location: query, message: No matching signature for operator = for argument types: INT64, STRING\n  Signature: T1 = T1\n    Unable to find common supertype for templated argument <T1>\n      Input types for <T1>: {INT64, STRING} at [12:11]\n\nLocation: US\nJob ID: b590093b-01d1-4bb5-acbe-af48a4f86f9a\n'}
+[Error occurred]
+2025-05-05 04:04:24 - Thread-2589 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / thinking process:
+--  Goal: redo the join between `activities_30` and `compound_properties_29`
+--        after noticing the data–type mismatch (INT64 vs STRING) on molregno.
+--  • CAST a.molregno (INT64) to STRING so equality works.
+--  • Keep rows where pChEMBL > 10 (task prerequisite).
+--  • Require 10–15 heavy atoms (task prerequisite) – CAST heavy_atoms to INT64
+--    before the BETWEEN test because that field is stored as STRING.
+--  • LIMIT 20 just to inspect a small sample and confirm the fix.
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+  a.standard_type,
+  a.standard_value,
+  a.pchembl_value
+FROM `bigquery-public-data.ebi_chembl.activities_30` AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+      ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:04:27 - Thread-2589 (execute) - INFO - [Results for corrected sql]
+activity_id,assay_id,molregno,heavy_atoms,standard_type,standard_value,pchembl_value
+1214075,143855,154575,13,Ki,0.057,10.24
+1457092,303641,310535,14,Ki,0.03,10.52
+15687524,1512513,1959748,15,Ki,0.05,10.3
+72866,217460,154716,13,Ki,0.021,10.68
+
+[Results for corrected sql]
+2025-05-05 04:05:08 - Thread-2589 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  (Corrected version of SQL #4)
+--  Show how many activities with pChEMBL > 10 fall into each heavy-atom
+--  count bucket, after fixing the molregno INT64-vs-STRING join.
+SELECT
+  SAFE_CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+  COUNT(*)                           AS n_rows
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+GROUP BY heavy_atoms
+ORDER BY n_rows DESC
+LIMIT 20;
+```
+
+```sql
+--Description:  (Corrected version of SQL #5)
+--  Bring in canonical SMILES for the high-pChEMBL activities, using the
+--  correct STRING cast on molregno for the join to compound_structures_29.
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  cs.canonical_smiles
+FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+     ON CAST(a.molregno AS STRING) = cs.molregno
+WHERE a.pchembl_value > 10
+LIMIT 20;
+```
+
+```sql
+--Description:  (Corrected version of SQL #6)
+--  Count qualifying activities (10–15 heavy atoms, pChEMBL > 10, non-NULL
+--  standard_value) per assay / standard_type.  Use CAST on molregno so the
+--  join to compound_properties_29 works and filter to < 5 rows per group.
+SELECT
+  a.assay_id,
+  a.standard_type,
+  COUNT(*) AS n_activities
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+GROUP BY a.assay_id, a.standard_type
+HAVING COUNT(*) < 5
+LIMIT 20;
+```
+
+```sql
+--Description:  (Corrected version of SQL #7)
+--  Pull back individual qualifying activity rows (10–15 heavy atoms,
+--  pChEMBL > 10, < 2 duplicate flags) whose assay/standard_type combo
+--  meets the “< 5 activities” criterion from the previous query.
+WITH smallsets AS (
+  SELECT
+    a.assay_id,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  GROUP BY a.assay_id, a.standard_type
+  HAVING COUNT(*) < 5
+)
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  a.standard_relation,
+  CAST(a.standard_value AS FLOAT64) AS standard_value,
+  a.standard_type,
+  a.pchembl_value,
+  CAST(cp.heavy_atoms AS INT64)     AS heavy_atoms
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+JOIN smallsets
+     ON a.assay_id      = smallsets.assay_id
+    AND a.standard_type = smallsets.standard_type
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  AND a.potential_duplicate < 2
+LIMIT 20;
+```
+
+```sql
+--Description:  (Corrected version of SQL #8)
+--  Generate unordered pairs of different molecules that satisfy all
+--  earlier filters, and classify the change in standard_value.  The CAST
+--  fix is applied inside the qualified CTE’s join.
+WITH qualified AS (
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64) AS sv,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+    AND a.potential_duplicate < 2
+)
+SELECT
+  q1.activity_id AS act_id_1,
+  q2.activity_id AS act_id_2,
+  q1.sv          AS sv_1,
+  q2.sv          AS sv_2,
+  CASE
+    WHEN q1.standard_relation = '=' AND q2.standard_relation = '=' AND q1.sv = q2.sv
+      THEN 'no-change'
+    WHEN q1.sv > q2.sv THEN 'decrease'
+    WHEN q1.sv < q2.sv THEN 'increase'
+    ELSE 'undetermined'
+  END AS change_class
+FROM qualified AS q1
+JOIN qualified AS q2
+  ON q1.assay_id      = q2.assay_id
+ AND q1.standard_type = q2.standard_type
+ AND q1.molregno     <> q2.molregno
+ AND q1.activity_id  <  q2.activity_id   -- avoid duplicate ordering
+LIMIT 20;
+```
+
+```sql
+--Description:  (SQL #9 unchanged)
+--  Simple demonstration of creating a UUID from two strings via MD5-hex of
+--  a JSON struct (placeholder values 'A' and 'B').
+SELECT TO_HEX(MD5(TO_JSON_STRING(STRUCT('A', 'B')))) AS example_uuid;
+```
+
+```sql
+--Description:  (SQL #10 unchanged)
+--  Inspect some rows of docs_29 (journal, year, first_page) that are later
+--  needed for synthetic publication-date calculations.
+SELECT
+  doc_id,
+  journal,
+  year,
+  first_page
+FROM `bigquery-public-data.ebi_chembl.docs_29`
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 04:05:08 - Thread-2589 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description / thinking process:
+--  Goal: redo the join between `activities_30` and `compound_properties_29`
+--        after noticing the data–type mismatch (INT64 vs STRING) on molregno.
+--  • CAST a.molregno (INT64) to STRING so equality works.
+--  • Keep rows where pChEMBL > 10 (task prerequisite).
+--  • Require 10–15 heavy atoms (task prerequisite) – CAST heavy_atoms to INT64
+--    before the BETWEEN test because that field is stored as STRING.
+--  • LIMIT 20 just to inspect a small sample and confirm the fix.
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+  a.standard_type,
+  a.standard_value,
+  a.pchembl_value
+FROM `bigquery-public-data.ebi_chembl.activities_30` AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+      ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+LIMIT 20;
+Results:
+activity_id,assay_id,molregno,heavy_atoms,standard_type,standard_value,pchembl_value
+1214075,143855,154575,13,Ki,0.057,10.24
+1457092,303641,310535,14,Ki,0.03,10.52
+15687524,1512513,1959748,15,Ki,0.05,10.3
+72866,217460,154716,13,Ki,0.021,10.68
+
+[Successfully corrected]
+2025-05-05 04:05:08 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (Corrected version of SQL #4)
+--  Show how many activities with pChEMBL > 10 fall into each heavy-atom
+--  count bucket, after fixing the molregno INT64-vs-STRING join.
+SELECT
+  SAFE_CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+  COUNT(*)                           AS n_rows
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+GROUP BY heavy_atoms
+ORDER BY n_rows DESC
+LIMIT 20
+[Try to execute]
+2025-05-05 04:05:11 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (Corrected version of SQL #4)
+--  Show how many activities with pChEMBL > 10 fall into each heavy-atom
+--  count bucket, after fixing the molregno INT64-vs-STRING join.
+SELECT
+  SAFE_CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+  COUNT(*)                           AS n_rows
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+GROUP BY heavy_atoms
+ORDER BY n_rows DESC
+LIMIT 20
+Results:
+heavy_atoms,n_rows
+,1727
+33.0,634
+35.0,611
+34.0,577
+31.0,565
+30.0,558
+32.0,535
+36.0,490
+29.0,476
+37.0,465
+28.0,455
+26.0,401
+27.0,385
+38.0,367
+25.0,305
+
+[Successfully executed]
+2025-05-05 04:05:11 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (Corrected version of SQL #5)
+--  Bring in canonical SMILES for the high-pChEMBL activities, using the
+--  correct STRING cast on molregno for the join to compound_structures_29.
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  cs.canonical_smiles
+FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+     ON CAST(a.molregno AS STRING) = cs.molregno
+WHERE a.pchembl_value > 10
+LIMIT 20
+[Try to execute]
+2025-05-05 04:05:13 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (Corrected version of SQL #5)
+--  Bring in canonical SMILES for the high-pChEMBL activities, using the
+--  correct STRING cast on molregno for the join to compound_structures_29.
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  cs.canonical_smiles
+FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+     ON CAST(a.molregno AS STRING) = cs.molregno
+WHERE a.pchembl_value > 10
+LIMIT 20
+Results:
+activity_id,assay_id,molregno,canonical_smiles
+1264019,208337,2627,CS(=O)(=O)N[C@H](CC1CCCCC1)C(=O)N1CCC[C@H]1C(=O)NCc1ccc(C(=N)N)cc1
+13974910,1299429,25246,O=C(O)CCn1ccnc1
+829515,70353,67883,CCCCCCCCCCCCCCCC(=O)NCCCC(=O)NCCCC[C@H](NC(=O)[C@H](C)NC(=O)[C@H](C)NC(=O)[C@H](CCC(N)=O)NC(=O)CNC(=O)[C@H](CCC(=O)O)NC(=O)[C@H](CC(C)C)NC(=O)[C@H](Cc1ccc(O)cc1)NC(=O)[C@H](CO)NC(=O)[C@H](CO)NC(=O)[C@@H](NC(=O)[C@H](CC(=O)O)NC(=O)[C@H](CO)NC(=O)[C@@H](NC(=O)[C@H](Cc1ccccc1)NC(=O)[C@@H](NC(=O)CNC(=O)[C@H](CC
+
+[Successfully executed]
+2025-05-05 04:05:13 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (Corrected version of SQL #6)
+--  Count qualifying activities (10–15 heavy atoms, pChEMBL > 10, non-NULL
+--  standard_value) per assay / standard_type.  Use CAST on molregno so the
+--  join to compound_properties_29 works and filter to < 5 rows per group.
+SELECT
+  a.assay_id,
+  a.standard_type,
+  COUNT(*) AS n_activities
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+GROUP BY a.assay_id, a.standard_type
+HAVING COUNT(*) < 5
+LIMIT 20
+[Try to execute]
+2025-05-05 04:05:16 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (Corrected version of SQL #6)
+--  Count qualifying activities (10–15 heavy atoms, pChEMBL > 10, non-NULL
+--  standard_value) per assay / standard_type.  Use CAST on molregno so the
+--  join to compound_properties_29 works and filter to < 5 rows per group.
+SELECT
+  a.assay_id,
+  a.standard_type,
+  COUNT(*) AS n_activities
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+GROUP BY a.assay_id, a.standard_type
+HAVING COUNT(*) < 5
+LIMIT 20
+Results:
+assay_id,standard_type,n_activities
+143227,Ki,3
+143861,Ki,1
+310491,EC50,1
+33684,Ki,1
+492915,Ki,3
+142931,Ki,1
+1454440,Ki,1
+1454461,Ki,1
+360240,Ki,2
+
+[Successfully executed]
+2025-05-05 04:05:16 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (Corrected version of SQL #7)
+--  Pull back individual qualifying activity rows (10–15 heavy atoms,
+--  pChEMBL > 10, < 2 duplicate flags) whose assay/standard_type combo
+--  meets the “< 5 activities” criterion from the previous query.
+WITH smallsets AS (
+  SELECT
+    a.assay_id,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  GROUP BY a.assay_id, a.standard_type
+  HAVING COUNT(*) < 5
+)
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  a.standard_relation,
+  CAST(a.standard_value AS FLOAT64) AS standard_value,
+  a.standard_type,
+  a.pchembl_value,
+  CAST(cp.heavy_atoms AS INT64)     AS heavy_atoms
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+JOIN smallsets
+     ON a.assay_id      = smallsets.assay_id
+    AND a.standard_type = smallsets.standard_type
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  AND a.potential_duplicate < 2
+LIMIT 20
+[Try to execute]
+2025-05-05 04:05:19 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (Corrected version of SQL #7)
+--  Pull back individual qualifying activity rows (10–15 heavy atoms,
+--  pChEMBL > 10, < 2 duplicate flags) whose assay/standard_type combo
+--  meets the “< 5 activities” criterion from the previous query.
+WITH smallsets AS (
+  SELECT
+    a.assay_id,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  GROUP BY a.assay_id, a.standard_type
+  HAVING COUNT(*) < 5
+)
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  a.standard_relation,
+  CAST(a.standard_value AS FLOAT64) AS standard_value,
+  a.standard_type,
+  a.pchembl_value,
+  CAST(cp.heavy_atoms AS INT64)     AS heavy_atoms
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+JOIN smallsets
+     ON a.assay_id      = smallsets.assay_id
+    AND a.standard_type = smallsets.standard_type
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  AND a.potential_duplicate < 2
+LIMIT 20
+Results:
+activity_id,assay_id,molregno,standard_relation,standard_value,standard_type,pchembl_value,heavy_atoms
+2559041,489288,675,=,0.025,Ki,10.6,14
+1861474,435005,11595,=,0.04,Ki,10.4,13
+2583808,558025,675,=,0.046,Ki,10.34,14
+
+[Successfully executed]
+2025-05-05 04:05:19 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (Corrected version of SQL #8)
+--  Generate unordered pairs of different molecules that satisfy all
+--  earlier filters, and classify the change in standard_value.  The CAST
+--  fix is applied inside the qualified CTE’s join.
+WITH qualified AS (
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64) AS sv,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+    AND a.potential_duplicate < 2
+)
+SELECT
+  q1.activity_id AS act_id_1,
+  q2.activity_id AS act_id_2,
+  q1.sv          AS sv_1,
+  q2.sv          AS sv_2,
+  CASE
+    WHEN q1.standard_relation = '=' AND q2.standard_relation = '=' AND q1.sv = q2.sv
+      THEN 'no-change'
+    WHEN q1.sv > q2.sv THEN 'decrease'
+    WHEN q1.sv < q2.sv THEN 'increase'
+    ELSE 'undetermined'
+  END AS change_class
+FROM qualified AS q1
+JOIN qualified AS q2
+  ON q1.assay_id      = q2.assay_id
+ AND q1.standard_type = q2.standard_type
+ AND q1.molregno     <> q2.molregno
+ AND q1.activity_id  <  q2.activity_id   -- avoid duplicate ordering
+LIMIT 20
+[Try to execute]
+2025-05-05 04:05:21 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (Corrected version of SQL #8)
+--  Generate unordered pairs of different molecules that satisfy all
+--  earlier filters, and classify the change in standard_value.  The CAST
+--  fix is applied inside the qualified CTE’s join.
+WITH qualified AS (
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64) AS sv,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+    AND a.potential_duplicate < 2
+)
+SELECT
+  q1.activity_id AS act_id_1,
+  q2.activity_id AS act_id_2,
+  q1.sv          AS sv_1,
+  q2.sv          AS sv_2,
+  CASE
+    WHEN q1.standard_relation = '=' AND q2.standard_relation = '=' AND q1.sv = q2.sv
+      THEN 'no-change'
+    WHEN q1.sv > q2.sv THEN 'decrease'
+    WHEN q1.sv < q2.sv THEN 'increase'
+    ELSE 'undetermined'
+  END AS change_class
+FROM qualified AS q1
+JOIN qualified AS q2
+  ON q1.assay_id      = q2.assay_id
+ AND q1.standard_type = q2.standard_type
+ AND q1.molregno     <> q2.molregno
+ AND q1.activity_id  <  q2.activity_id   -- avoid duplicate ordering
+LIMIT 20
+Results:
+act_id_1,act_id_2,sv_1,sv_2,change_class
+276165,300845,0.063,0.062,decrease
+499051,501767,0.018,0.027,increase
+644303,656094,0.027,0.018,decrease
+644303,663564,0.027,0.02,decrease
+644303,647678,0.027,0.023,decrease
+644303,650001,0.027,0.026,decrease
+
+[Successfully executed]
+2025-05-05 04:05:21 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (SQL #9 unchanged)
+--  Simple demonstration of creating a UUID from two strings via MD5-hex of
+--  a JSON struct (placeholder values 'A' and 'B').
+SELECT TO_HEX(MD5(TO_JSON_STRING(STRUCT('A', 'B')))) AS example_uuid
+[Try to execute]
+2025-05-05 04:05:23 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (SQL #9 unchanged)
+--  Simple demonstration of creating a UUID from two strings via MD5-hex of
+--  a JSON struct (placeholder values 'A' and 'B').
+SELECT TO_HEX(MD5(TO_JSON_STRING(STRUCT('A', 'B')))) AS example_uuid
+Results:
+example_uuid
+5eab9e7980e4dd97415351cf7d1101ce
+
+[Successfully executed]
+2025-05-05 04:05:23 - Thread-2589 (execute) - INFO - [Try to execute]
+--Description:  (SQL #10 unchanged)
+--  Inspect some rows of docs_29 (journal, year, first_page) that are later
+--  needed for synthetic publication-date calculations.
+SELECT
+  doc_id,
+  journal,
+  year,
+  first_page
+FROM `bigquery-public-data.ebi_chembl.docs_29`
+LIMIT 20
+[Try to execute]
+2025-05-05 04:05:25 - Thread-2589 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  (SQL #10 unchanged)
+--  Inspect some rows of docs_29 (journal, year, first_page) that are later
+--  needed for synthetic publication-date calculations.
+SELECT
+  doc_id,
+  journal,
+  year,
+  first_page
+FROM `bigquery-public-data.ebi_chembl.docs_29`
+LIMIT 20
+Results:
+doc_id,journal,year,first_page
+116888,PNAS,2015,10768
+116897,Nature,2010,1067
+116900,Nature,2010,1067
+69727,Chem Cent J,2012,
+59326,Drug Discovery Today,2011,697
+110494,Bioorg Med Chem,2018,6000
+110495,Bioorg Med Chem,2018,6067
+
+[Successfully executed]
+2025-05-05 04:05:25 - Thread-2589 (execute) - INFO - itercount: 0
+2025-05-05 04:05:25 - Thread-2589 (execute) - INFO - [Self-refine]
+Table full name: bigquery-public-data.ebi_chembl.docs_29
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '116888', 'journal': 'PNAS', 'year': '2015', 'first_page': '10768'}, {'doc_id': '116897', 'journal': 'Nature', 'year': '2010', 'first_page': '1067'}, {'doc_id': '116900', 'journal': 'Nature', 'year': '2010', 'first_page': '1067'}, {'doc_id': '69727', 'journal': 'Chem Cent J', 'year': '2012', 'first_page': None}, {'doc_id': '59326', 'journal': 'Drug Discovery Today', 'year': '2011', 'first_page': '697'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_28
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '69727', 'journal': 'Chem Cent J', 'year': '2012', 'first_page': None}, {'doc_id': '59326', 'journal': 'Drug Discovery Today', 'year': '2011', 'first_page': '697'}, {'doc_id': '110494', 'journal': 'Bioorg Med Chem', 'year': '2018', 'first_page': '6000'}, {'doc_id': '110495', 'journal': 'Bioorg Med Chem', 'year': '2018', 'first_page': '6067'}, {'doc_id': '110499', 'journal': 'Bioorg Med Chem', 'year': '2018', 'first_page': '6050'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_27
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '69727', 'journal': 'Chem Cent J', 'year': '2012', 'first_page': None}, {'doc_id': '59326', 'journal': 'Drug Discovery Today', 'year': '2011', 'first_page': '697'}, {'doc_id': '77450', 'journal': 'Gastroenterol Clin Biol', 'year': '2004', 'first_page': '720'}, {'doc_id': '109533', 'journal': 'Bioorg Med Chem Lett', 'year': '2018', 'first_page': '3798'}, {'doc_id': '109534', 'journal': 'Bioorg Med Chem Lett', 'year': '2018', 'first_page': '3793'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp_26
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: comments Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300', 'comments': 'SAMPLE_ID: I011106-013'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679', 'comments': 'SAMPLE_ID: I011106-014; LIVER_Affymetrix: 95321.CEL; KIDNEY_Affymetrix: 92456.CEL; HEART_Affymetrix: 97415.CEL'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850', 'comments': 'SAMPLE_ID: I011106-015; KIDNEY_Affymetrix: 92533.CEL'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320', 'comments': 'SAMPLE_ID: I011106-016; HEART_Affymetrix: 97391.CEL'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657', 'comments': 'SAMPLE_ID: I011106-017; LIVER_Affymetrix: 96875.CEL'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp_25
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: comments Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300', 'comments': 'SAMPLE_ID: I011106-013'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679', 'comments': 'SAMPLE_ID: I011106-014; LIVER_Affymetrix: 95321.CEL; KIDNEY_Affymetrix: 92456.CEL; HEART_Affymetrix: 97415.CEL'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850', 'comments': 'SAMPLE_ID: I011106-015; KIDNEY_Affymetrix: 92533.CEL'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320', 'comments': 'SAMPLE_ID: I011106-016; HEART_Affymetrix: 97391.CEL'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657', 'comments': 'SAMPLE_ID: I011106-017; LIVER_Affymetrix: 96875.CEL'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_24
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: published_relation Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '76627', 'assay_id': '4700', 'molregno': '2038629', 'standard_relation': '=', 'standard_value': '233', 'standard_type': 'CL', 'published_relation': '=', 'pchembl_value': None, 'relation': '='}, {'activity_id': '161314', 'assay_id': '4678', 'molregno': '23417', 'standard_relation': '=', 'standard_value': '33020', 'standard_type': 'AUC', 'published_relation': '=', 'pchembl_value': None, 'relation': '='}, {'activity_id': '165837', 'assay_id': '225838', 'molregno': '70151', 'standard_relation': '=', 'standard_value': '5.8', 'standard_type': 'Concentration', 'published_relation': '=', 'pchembl_value': None, 'relation': '='}, {'activity_id': '227370', 'assay_id': '5677', 'molregno': '165336', 'standard_relation': '=', 'standard_value': '3.774', 'standard_type': 'AUC', 'published_relation': '=', 'pchembl_value': None, 'relation': '='}, {'activity_id': '231894', 'assay_id': '4647', 'molregno': '43934', 'standard_relation': '=', 'standard_value': '6.72', 'standard_type': 'CL', 'published_relation': '=', 'pchembl_value': None, 'relation': '='}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_30
+Column name: doc_id Type: INT64 Description: Unique ID for the document
+Column name: journal Type: STRING Description: Abbreviated journal name for an article
+Column name: year Type: INT64 Description: Year of journal article publication
+Column name: first_page Type: STRING Description: First page number of journal article
+Sample rows:
+[{'doc_id': 116888, 'journal': 'PNAS', 'year': 2015, 'first_page': '10768'}, {'doc_id': 116897, 'journal': 'Nature', 'year': 2010, 'first_page': '1067'}, {'doc_id': 116900, 'journal': 'Nature', 'year': 2010, 'first_page': '1067'}, {'doc_id': 69727, 'journal': 'Chem Cent J', 'year': 2012, 'first_page': None}, {'doc_id': 118892, 'journal': 'ACS Med Chem Lett', 'year': 2016, 'first_page': '182'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_26
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '36007', 'assay_id': '18212', 'molregno': '677026', 'standard_relation': '=', 'standard_value': '1000', 'standard_type': 'Solubility', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '44018', 'assay_id': '18264', 'molregno': '290248', 'standard_relation': '=', 'standard_value': '177300', 'standard_type': 'Solubility', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '44744', 'assay_id': '25668', 'molregno': '45680', 'standard_relation': '=', 'standard_value': '1.39', 'standard_type': 'Concentration', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '152671', 'assay_id': '124501', 'molregno': '236385', 'standard_relation': '=', 'standard_value': '62.4', 'standard_type': 'Tm', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '160102', 'assay_id': '24531', 'molregno': '77891', 'standard_relation': '=', 'standard_value': '0.21', 'standard_type': 'T1/2', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_properties_29
+Column name: activity_id Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: units Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_units Type: STRING
+Column name: result_flag Type: STRING
+Sample rows:
+[{'activity_id': '17805440', 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': '2', 'standard_units': None, 'result_flag': '0'}, {'activity_id': '17805440', 'standard_type': 'N', 'standard_relation': '=', 'standard_value': '16', 'standard_units': None, 'result_flag': '0'}, {'activity_id': '17805440', 'standard_type': 'STUDY_DOSING_DURATION', 'standard_relation': '=', 'standard_value': '14', 'standard_units': 'day', 'result_flag': '0'}, {'activity_id': '17805437', 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': '2', 'standard_units': None, 'result_flag': '0'}, {'activity_id': '17805437', 'standard_type': 'N', 'standard_relation': '=', 'standard_value': '16', 'standard_units': None, 'result_flag': '0'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_properties_30
+Column name: activity_id Type: INT64 Description: FK to ACTIVITY_ID in ACTIVITIES table.
+Column name: type Type: STRING Description: The parameter or property type
+Column name: relation Type: STRING Description: Symbol constraining the value (e.g. >, <, =)
+Column name: value Type: FLOAT64 Description: Numberical value for the parameter or property
+Column name: standard_type Type: STRING Description:  Standardised form of the TYPE
+Column name: standard_relation Type: STRING Description: Standardised form of the RELATION
+Column name: standard_value Type: FLOAT64 Description: Standardised form of the VALUE
+Column name: result_flag Type: INT64 Description: A flag to indicate, if set to 1, that this type is a dependent variable/result (e.g., slope) rather than an independent variable/parameter (0, the default).
+Sample rows:
+[{'activity_id': 17805452, 'standard_type': 'N', 'standard_relation': '=', 'standard_value': 11.0, 'result_flag': 0}, {'activity_id': 17806042, 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': 40.0, 'result_flag': 0}, {'activity_id': 17806195, 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': 50.0, 'result_flag': 0}, {'activity_id': 17805740, 'standard_type': 'N', 'standard_relation': '=', 'standard_value': 38.0, 'result_flag': 0}, {'activity_id': 17805976, 'standard_type': 'N', 'standard_relation': '=', 'standard_value': 13.0, 'result_flag': 0}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.compound_structures_25
+Column name: canonical_smiles Type: STRING
+Sample rows:
+[{'canonical_smiles': 'Nc1ccc(cc1)S(=O)(=O)Nc2nnc(s2)S(=O)(=O)N'}, {'canonical_smiles': 'Nc1cc(c(cc1S(=O)(=O)N)S(=O)(=O)N)C(F)(F)F'}, {'canonical_smiles': 'COc1ccc(cc1)S(=O)(=O)N2CN(C(C)C)C(=O)C[C@@H]2C(=O)NO'}, {'canonical_smiles': 'COc1cc2ccccc2c3cc(oc13)[N+](=O)[O-]'}, {'canonical_smiles': 'Fc1ccc(nc1)c2oc3CCN(Cc3n2)C(=O)c4ccccc4'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_30
+Column name: activity_id Type: INT64 Description: Unique ID for the activity row
+Column name: assay_id Type: INT64 Description: Foreign key to the assays table (containing the assay description)
+Column name: molregno Type: INT64 Description: Foreign key to compounds table (for quick lookup of compound structure - can also link to compounds through compound_records table)
+Column name: standard_relation Type: STRING Description: Symbol constraining the activity value (e.g. >, <, =)
+Column name: standard_value Type: FLOAT64 Description: Same as PUBLISHED_VALUE but transformed to common units: e.g. mM concentrations converted to nM.
+Column name: standard_type Type: STRING Description:  Standardised version of the published_activity_type (e.g. IC50 rather than Ic-50/Ic50/ic50/ic-50)
+Column name: potential_duplicate Type: INT64 Description: When set to 1, indicates that the value is likely to be a repeat citation of a value reported in a previous ChEMBL paper, rather than a new, independent measurement. Note: value of zero does not guarantee that the measurement is novel/independent though
+Column name: pchembl_value Type: FLOAT64 Description: Negative log of selected concentration-response activity values (IC50/EC50/XC50/AC50/Ki/Kd/Potency)
+Column name: type Type: STRING Description: Type of end-point measurement: e.g. IC50, LD50, %inhibition etc, as it appears in the original dataset
+Column name: relation Type: STRING Description: Symbol constraining the activity value (e.g. >, <, =), as it appears in the original dataset
+Column name: value Type: FLOAT64 Description: Datapoint value as it appears in the original dataset.
+Column name: units Type: STRING Description:  Units of measurement as they appear in the original dataset
+Sample rows:
+[{'activity_id': 14533479, 'assay_id': 1327810, 'molregno': 1724870, 'standard_relation': '=', 'standard_value': 14.9, 'standard_type': 'permeability', 'potential_duplicate': 0, 'pchembl_value': nan}, {'activity_id': 14552144, 'assay_id': 1328175, 'molregno': 1727934, 'standard_relation': '=', 'standard_value': 30.0, 'standard_type': 'CL', 'potential_duplicate': 0, 'pchembl_value': nan}, {'activity_id': 14584908, 'assay_id': 1336038, 'molregno': 1736260, 'standard_relation': '=', 'standard_value': 2.0, 'standard_type': 'CL', 'potential_duplicate': 0, 'pchembl_value': nan}, {'activity_id': 14615592, 'assay_id': 1341036, 'molregno': 1738203, 'standard_relation': '>', 'standard_value': 1000.0, 'standard_type': 'LD50', 'potential_duplicate': 0, 'pchembl_value': nan}, {'activity_id': 14633014, 'assay_id': 1345169, 'molregno': 1738035, 'standard_relation': '=', 'standard_value': 0.037, 'standard_type': 'KA', 'potential_duplicate': 0, 'pchembl_value': nan}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp_27
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: comments Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300', 'comments': 'SAMPLE_ID: I011106-013'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679', 'comments': 'SAMPLE_ID: I011106-014; LIVER_Affymetrix: 95321.CEL; KIDNEY_Affymetrix: 92456.CEL; HEART_Affymetrix: 97415.CEL'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850', 'comments': 'SAMPLE_ID: I011106-015; KIDNEY_Affymetrix: 92533.CEL'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320', 'comments': 'SAMPLE_ID: I011106-016; HEART_Affymetrix: 97391.CEL'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657', 'comments': 'SAMPLE_ID: I011106-017; LIVER_Affymetrix: 96875.CEL'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp_29
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_33
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '410072', 'assay_id': '115373', 'molregno': '283190', 'standard_value': '4.23', 'standard_type': '%', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '188823', 'assay_id': '20581', 'molregno': '172665', 'standard_value': '0.34', 'standard_type': 'D', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '1464373', 'assay_id': '302096', 'molregno': '643252', 'standard_value': '0.6', 'standard_type': 'E', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '2360369', 'assay_id': '512564', 'molregno': '470377', 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '803901', 'assay_id': '24932', 'molregno': '70814', 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_23
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '45680', 'journal': 'Nature', 'year': '2000', 'first_page': '962'}, {'doc_id': '70539', 'journal': 'Biochemistry', 'year': '2004', 'first_page': '10414'}, {'doc_id': '70515', 'journal': 'J Agric Food Chem', 'year': '2003', 'first_page': '7271'}, {'doc_id': '69640', 'journal': 'J Agric Food Chem', 'year': '2007', 'first_page': '10323'}, {'doc_id': '69638', 'journal': 'J Agric Food Chem', 'year': '2007', 'first_page': '10331'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_23
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Sample rows:
+[{'activity_id': '33164', 'assay_id': '18264', 'molregno': '290461', 'standard_relation': '=', 'standard_value': '176200', 'standard_type': 'Solubility', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '34169', 'assay_id': '1691', 'molregno': '102087', 'standard_relation': '=', 'standard_value': '88', 'standard_type': 'Efficacy', 'potential_duplicate': '1', 'pchembl_value': None}, {'activity_id': '37773', 'assay_id': '145379', 'molregno': '243457', 'standard_relation': '=', 'standard_value': '8.1', 'standard_type': 'pKa', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '47524', 'assay_id': '22428', 'molregno': '11595', 'standard_relation': '=', 'standard_value': '10.09', 'standard_type': 'pKa', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '64894', 'assay_id': '11798', 'molregno': '179429', 'standard_relation': '=', 'standard_value': '3', 'standard_type': 'Concentration', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_28
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '32147', 'assay_id': '44400', 'molregno': '80863', 'standard_relation': '=', 'standard_value': '0.098', 'standard_type': 'IC80', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '86519', 'assay_id': '25807', 'molregno': '150194', 'standard_relation': '=', 'standard_value': '1', 'standard_type': 'logD', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '101054', 'assay_id': '170600', 'molregno': '30762', 'standard_relation': '=', 'standard_value': '0.61', 'standard_type': 'Concentration', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '101088', 'assay_id': '168006', 'molregno': '30762', 'standard_relation': '=', 'standard_value': '1.49', 'standard_type': 'Concentration', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '122320', 'assay_id': '4959', 'molregno': '62681', 'standard_relation': '=', 'standard_value': '0.12', 'standard_type': 'Vdss', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_29
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '52365', 'assay_id': '25053', 'molregno': '209242', 'standard_relation': '=', 'standard_value': '94', 'standard_type': 'CL', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '94271', 'assay_id': '5834', 'molregno': '281043', 'standard_relation': '=', 'standard_value': '37', 'standard_type': 'CL', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '94744', 'assay_id': '131986', 'molregno': '152713', 'standard_relation': '=', 'standard_value': '800', 'standard_type': 'LD50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '102707', 'assay_id': '27315', 'molregno': '52433', 'standard_relation': '=', 'standard_value': '0.2167', 'standard_type': 'T1/2', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '117563', 'assay_id': '20723', 'molregno': '231550', 'standard_relation': '=', 'standard_value': '1.3', 'standard_type': 'T1/2', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.compound_structures
+Column name: molregno Type: STRING
+Column name: canonical_smiles Type: STRING
+Sample rows:
+[{'molregno': '3198', 'canonical_smiles': 'CC1(C(=O)O)C2CCC(O2)C1C(=O)O'}, {'molregno': '1834716', 'canonical_smiles': 'O=C(/C=C/C=C/c1ccccc1)/C=C/c1ccccc1'}, {'molregno': '1836053', 'canonical_smiles': 'CCc1cnc(-n2nc(OC(C)C)c(Cc3cccc(F)c3)c2C)nc1'}, {'molregno': '18332', 'canonical_smiles': 'O=C(c1ccc(F)cc1)C1CCN(C2=Nc3ccccc3CC=C2c2ccc(Cl)cc2)CC1'}, {'molregno': '1856527', 'canonical_smiles': 'CNCc1ccc(Oc2cncc(C)n2)cc1'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_properties_27
+Column name: activity_id Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Sample rows:
+[{'activity_id': '17805440', 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': '2'}, {'activity_id': '17805440', 'standard_type': 'N', 'standard_relation': '=', 'standard_value': '16'}, {'activity_id': '17805440', 'standard_type': 'STUDY_DOSING_DURATION', 'standard_relation': '=', 'standard_value': '14'}, {'activity_id': '17805437', 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': '2'}, {'activity_id': '17805437', 'standard_type': 'N', 'standard_relation': '=', 'standard_value': '16'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.compound_structures_29
+Column name: molregno Type: STRING
+Column name: canonical_smiles Type: STRING
+Sample rows:
+[{'molregno': '1817415', 'canonical_smiles': 'O=c1c(-c2cccc3ccccc23)cc2cc(F)ccc2n1O'}, {'molregno': '1818744', 'canonical_smiles': 'OC[C@@H]1[C@@H](O)[C@H](O)[C@@H](O)CN1CCCCCOCc1ccc(-c2ccccc2)cc1F'}, {'molregno': '1821053', 'canonical_smiles': 'CCC(=O)NC1=NN(C(=O)CC)C(C)(c2ccccc2)S1'}, {'molregno': '1821381', 'canonical_smiles': 'COc1ccc(CNc2nc(N3CCCCC3)nc3ccccc23)cc1Cl'}, {'molregno': '1821409', 'canonical_smiles': 'Nc1ccc(N2CCN(c3nc(NCc4ccc(F)cc4)c4ccccc4n3)CC2)cc1'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp_24
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: comments Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300', 'comments': 'SAMPLE_ID: I011106-013'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679', 'comments': 'SAMPLE_ID: I011106-014; LIVER_Affymetrix: 95321.CEL; KIDNEY_Affymetrix: 92456.CEL; HEART_Affymetrix: 97415.CEL'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850', 'comments': 'SAMPLE_ID: I011106-015; KIDNEY_Affymetrix: 92533.CEL'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320', 'comments': 'SAMPLE_ID: I011106-016; HEART_Affymetrix: 97391.CEL'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657', 'comments': 'SAMPLE_ID: I011106-017; LIVER_Affymetrix: 96875.CEL'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.compound_structures_30
+Column name: canonical_smiles Type: STRING Description: Canonical smiles, generated using RDKit
+Sample rows:
+[{'canonical_smiles': 'CC(C)NCc1ccc(C[C@@H]2NC(=O)[C@H](Cc3c[nH]c4ccccc34)NC(=O)[C@H]3CCC(=O)NCC[C@H](NC(=O)[C@H](Cc4ccccc4)NC(=O)[C@@H]([C@@H](C)O)NC2=O)C(=O)N[C@@H](CO)C(=O)N[C@H](C(=O)O)CSSC[C@@H](NC(=O)[C@@H](N)Cc2ccc(O)cc2)C(=O)N[C@H](CCCCN)C(=O)N[C@H](Cc2ccccc2)C(=O)N3)cc1'}, {'canonical_smiles': 'CCCCCCCC(=O)N[C@@H](C(=O)N[C@H](CCCCN)C(=O)NCC(=O)N[C@H](CO)C(=O)N[C@H](Cc1c[nH]c2ccccc12)C(=O)N[C@@H](CO)C(=O)N[C@@H](CCCCN)C(=O)N[C@H](CCN)C(=O)N[C@@H](Cc1ccccc1)C(=O)N[C@@H](CCC(=O)O)C(=O)N[C@H](C(=O)N[C@@H](C(=O)N[C@@H](C)C(=O)O)[C@@H](C)CC)C(C)C)C(C)C'}, {'canonical_smiles': 'CCCC[C@H](NC(=O)[C@H](Cc1c[nH]c2ccccc12)NC(=O)[C@H](CCCCN)NC(=O)[C@H](CCCC)NC(=O)[C@H](Cc1ccc(OS(=O)(=O)O)cc1)NC(=O)[C@H](CC(=O)O)NC(=O)COCCOCCNC(=O)COCCOCCNC(=O)CC[C@H](NC(=O)CCCCCCCCCCCCCCCCC(=O)O)C(=O)O)C(=O)N[C@@H](CC(=O)O)C(=O)N[C@@H](Cc1ccccc1)C(N)=O'}, {'canonical_smiles': 'CC[C@H](C)[C@@H]1NC(=O)[C@H](CCCNC(=N)N)NC(=O)[C@H](CC(=O)O)NC(=O)[C@H]([C@@H](C)CC)NC(=O)[C@H](CCCNC(=N)N)NC(=O)CNC(=O)CNC(=O)[C@H](Cc2ccccc2)NC(=O)[C@@H](NC(=O)[C@H](CO)NC(=O)[C@H](CO)NC(=O)[C@@H](N)CCCNC(=N)N)CSSC[C@@H](C(=O)O)NC(=O)[C@H](C)NC(=O)CNC1=O'}, {'canonical_smiles': 'CC(=O)N[C@@H](CS)C(=O)N[C@H](CCCNC(=N)N)C(=O)N[C@@H](CCCNC(=N)N)C(=O)N[C@@H](CCCNC(=N)N)C(=O)N[C@@H](Cc1ccc2ccccc2c1)C(=O)N[C@@H](Cc1csc2ccccc12)C(=O)N1CCCC[C@H]1C(=O)N[C@H](C(=O)N[C@H](C(=O)N[C@@H](CCCNC(=N)N)C(=O)N[C@H](C(=O)O)C(C)(C)C)[C@@H](C)O)C(C)(C)S'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp_28
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: comments Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300', 'comments': 'SAMPLE_ID: I011106-013'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679', 'comments': 'SAMPLE_ID: I011106-014; LIVER_Affymetrix: 95321.CEL; KIDNEY_Affymetrix: 92456.CEL; HEART_Affymetrix: 97415.CEL'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850', 'comments': 'SAMPLE_ID: I011106-015; KIDNEY_Affymetrix: 92533.CEL'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320', 'comments': 'SAMPLE_ID: I011106-016; HEART_Affymetrix: 97391.CEL'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657', 'comments': 'SAMPLE_ID: I011106-017; LIVER_Affymetrix: 96875.CEL'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_33
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '-1', 'journal': None, 'year': None, 'first_page': None}, {'doc_id': '51886', 'journal': None, 'year': None, 'first_page': None}, {'doc_id': '51887', 'journal': None, 'year': None, 'first_page': None}, {'doc_id': '52546', 'journal': None, 'year': None, 'first_page': None}, {'doc_id': '54166', 'journal': None, 'year': None, 'first_page': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_properties_24
+Column name: activity_id Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Sample rows:
+[{'activity_id': '17805440', 'type': 'DOSED_COMPOUND_ID', 'relation': '=', 'value': '2', 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': '2'}, {'activity_id': '17805440', 'type': 'N', 'relation': '=', 'value': '16', 'standard_type': 'N', 'standard_relation': '=', 'standard_value': '16'}, {'activity_id': '17805440', 'type': 'STUDY_DOSING_DURATION', 'relation': '=', 'value': '14', 'standard_type': 'STUDY_DOSING_DURATION', 'standard_relation': '=', 'standard_value': '14'}, {'activity_id': '17805437', 'type': 'DOSED_COMPOUND_ID', 'relation': '=', 'value': '2', 'standard_type': 'DOSED_COMPOUND_ID', 'standard_relation': '=', 'standard_value': '2'}, {'activity_id': '17805437', 'type': 'N', 'relation': '=', 'value': '16', 'standard_type': 'N', 'standard_relation': '=', 'standard_value': '16'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_27
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '80151', 'assay_id': '114274', 'molregno': '34397', 'standard_value': '800', 'standard_type': 'LD50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '88499', 'assay_id': '114274', 'molregno': '34376', 'standard_value': '800', 'standard_type': 'LD50', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '102730', 'assay_id': '25519', 'molregno': '1279', 'standard_value': '590000', 'standard_type': 'Papp', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '125550', 'assay_id': '18394', 'molregno': '7583', 'standard_value': '0.003', 'standard_type': 'Permeability', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '140387', 'assay_id': '18394', 'molregno': '7624', 'standard_value': '0.006', 'standard_type': 'Permeability', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities_25
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '37646', 'assay_id': '168817', 'molregno': '149022', 'standard_relation': '=', 'standard_value': '-32', 'standard_type': 'Change', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '41771', 'assay_id': '47463', 'molregno': '81466', 'standard_relation': '=', 'standard_value': '0.38', 'standard_type': 'IC80', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '52279', 'assay_id': '19471', 'molregno': '125914', 'standard_relation': '=', 'standard_value': '7.14', 'standard_type': 'T1/2', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '53052', 'assay_id': '74389', 'molregno': '66828', 'standard_relation': '=', 'standard_value': '44', 'standard_type': 'Reduction', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '67030', 'assay_id': '18264', 'molregno': '292438', 'standard_relation': '=', 'standard_value': '174400', 'standard_type': 'Solubility', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activities
+Column name: activity_id Type: STRING
+Column name: assay_id Type: STRING
+Column name: molregno Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_type Type: STRING
+Column name: potential_duplicate Type: STRING
+Column name: pchembl_value Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Sample rows:
+[{'activity_id': '400977', 'assay_id': '115373', 'molregno': '283276', 'standard_relation': '=', 'standard_value': '2', 'standard_type': '%', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '794406', 'assay_id': '24932', 'molregno': '71172', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '1701575', 'assay_id': '341744', 'molregno': '343251', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '13396471', 'assay_id': '973467', 'molregno': '1573031', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}, {'activity_id': '12637343', 'assay_id': '937305', 'molregno': '1514445', 'standard_relation': None, 'standard_value': None, 'standard_type': 'F', 'potential_duplicate': '0', 'pchembl_value': None}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.compound_properties_29
+Column name: molregno Type: STRING
+Column name: heavy_atoms Type: STRING
+Sample rows:
+[{'molregno': '12135', 'heavy_atoms': '50'}, {'molregno': '15525', 'heavy_atoms': '64'}, {'molregno': '22927', 'heavy_atoms': '54'}, {'molregno': '23599', 'heavy_atoms': '54'}, {'molregno': '23641', 'heavy_atoms': '51'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.compound_structures_27
+Column name: molregno Type: STRING
+Column name: canonical_smiles Type: STRING
+Sample rows:
+[{'molregno': '967', 'canonical_smiles': 'COc1ccc2nc(N3CCNCC3)cnc2c1'}, {'molregno': '1779', 'canonical_smiles': 'O=C(c1cc2ccccc2[nH]1)c1cc2cc(OCCN3CCOCC3)ccc2[nH]1'}, {'molregno': '3891', 'canonical_smiles': 'CC(C)[C@H](N)C(=O)N[C@@H](Cc1ccccc1)C(=O)O'}, {'molregno': '3943', 'canonical_smiles': 'CC1=NN(CCOc2ccc3ccccc3c2)C(=O)C1'}, {'molregno': '5074', 'canonical_smiles': 'CC(C)N(CC[C@](C(N)=O)(c1ccccc1)c1ccccn1)C(C)C'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Column name: chembl_id Type: STRING
+Sample rows:
+[{'doc_id': '-1', 'journal': None, 'year': None, 'first_page': None, 'chembl_id': 'CHEMBL1158643'}, {'doc_id': '51886', 'journal': None, 'year': None, 'first_page': None, 'chembl_id': 'CHEMBL1201861'}, {'doc_id': '51887', 'journal': None, 'year': None, 'first_page': None, 'chembl_id': 'CHEMBL1201862'}, {'doc_id': '52546', 'journal': None, 'year': None, 'first_page': None, 'chembl_id': 'CHEMBL1229341'}, {'doc_id': '54166', 'journal': None, 'year': None, 'first_page': None, 'chembl_id': 'CHEMBL1615344'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_24
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '69727', 'journal': 'Chem Cent J', 'year': '2012', 'first_page': None}, {'doc_id': '59326', 'journal': 'Drug Discovery Today', 'year': '2011', 'first_page': '697'}, {'doc_id': '77450', 'journal': 'Gastroenterol Clin Biol', 'year': '2004', 'first_page': '720'}, {'doc_id': '11595', 'journal': 'J. Med. Chem.', 'year': '1992', 'first_page': '4651'}, {'doc_id': '11596', 'journal': 'J. Med. Chem.', 'year': '1992', 'first_page': '4665'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.activity_supp
+Column name: as_id Type: STRING
+Column name: smid Type: STRING
+Column name: type Type: STRING
+Column name: relation Type: STRING
+Column name: value Type: STRING
+Column name: units Type: STRING
+Column name: standard_type Type: STRING
+Column name: standard_relation Type: STRING
+Column name: standard_value Type: STRING
+Column name: standard_units Type: STRING
+Sample rows:
+[{'as_id': '1031369', 'smid': '1027719', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '300', 'standard_units': 'cells.uL-1'}, {'as_id': '1031407', 'smid': '1027757', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '679', 'standard_units': 'cells.uL-1'}, {'as_id': '1031445', 'smid': '1027795', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '850', 'standard_units': 'cells.uL-1'}, {'as_id': '1031483', 'smid': '1027833', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '320', 'standard_units': 'cells.uL-1'}, {'as_id': '1031521', 'smid': '1027871', 'standard_type': 'NEUTSG', 'standard_relation': '=', 'standard_value': '657', 'standard_units': 'cells.uL-1'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_26
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '69727', 'journal': 'Chem Cent J', 'year': '2012', 'first_page': None}, {'doc_id': '59326', 'journal': 'Drug Discovery Today', 'year': '2011', 'first_page': '697'}, {'doc_id': '77450', 'journal': 'Gastroenterol Clin Biol', 'year': '2004', 'first_page': '720'}, {'doc_id': '109533', 'journal': 'Bioorg Med Chem Lett', 'year': '2018', 'first_page': '3798'}, {'doc_id': '109534', 'journal': 'Bioorg Med Chem Lett', 'year': '2018', 'first_page': '3793'}]
+
+--------------------------------------------------
+Table full name: bigquery-public-data.ebi_chembl.docs_25
+Column name: doc_id Type: STRING
+Column name: journal Type: STRING
+Column name: year Type: STRING
+Column name: first_page Type: STRING
+Sample rows:
+[{'doc_id': '69727', 'journal': 'Chem Cent J', 'year': '2012', 'first_page': None}, {'doc_id': '59326', 'journal': 'Drug Discovery Today', 'year': '2011', 'first_page': '697'}, {'doc_id': '77450', 'journal': 'Gastroenterol Clin Biol', 'year': '2004', 'first_page': '720'}, {'doc_id': '11595', 'journal': 'J. Med. Chem.', 'year': '1992', 'first_page': '4651'}, {'doc_id': '11596', 'journal': 'J. Med. Chem.', 'year': '1992', 'first_page': '4665'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+### Data Sources:
+Part tables of ChEMBL database:
+- activity data: patents-public-data.ebi_chembl.activities_29
+- compound structures: patents-public-data.ebi_chembl.compound_structures_29 
+- compound properties: patents-public-data.ebi_chembl.compound_properties_29 
+- publication documents: patents-public-data.ebi_chembl.docs_29 
+
+### UUID Generation:
+Activity Pair UUID (mmp_delta_uuid):
+Generated using the MD5 hash of the JSON string of the pair's activity IDs:
+to_hex(md5(to_json_string(struct(A, B))))
+Both A and B can be activity id or canonical_smiles
+
+### Standard Change Classification:
+Determines whether the standard value between two molecules has increased, decreased, or stayed the same:
+'decrease': If standard_value_1 >(>>) standard_value_2 and measurement relations do not conflict.
+'increase': If standard_value_1 <(<<) standard_value_2 and measurement relations do not conflict.
+'no-change': If standard_value_1 =(~) standard_value_2 and both standard relations indicate equality.
+
+### How to Got the publication Date
+To compute a publication date for each document, we use the following method, which assigns a date based on the document's relative position within its journal and year, ordered by its first page number.
+
+#### 1. Year Calculation
+
+- **Year**: Use the document's publication year as the year in the date.
+  - If the document's year is known, use that year.
+  - If the year is missing or unavailable, default to **1970**.
+
+#### 2. Month Calculation
+
+- **Grouping**: For all documents within the same **journal** and **year**, group them together.
+- **Ordering**: Within each group, order the documents by their `first_page` number (converted to an integer).
+- **Percent Rank Computation**:
+  - Calculate the **percent rank** of each document in the ordered list.
+  - **Percent Rank Formula**:
+
+    $$\text{Percent Rank} = \frac{\text{Rank of Document} - 1}{\text{Total Documents in Group} - 1}$$
+
+    - The rank starts at 1 for the first document.
+    - The percent rank ranges from 0 to 1.
+- **Month Assignment**:
+  - Scale the percent rank to months by multiplying it by 11:
+
+    $$\text{Scaled Value} = \text{Percent Rank} \times 11$$
+
+  - Take the integer part of the scaled value (floor it):
+
+    $$\text{Floor Value} = \left\lfloor \text{Scaled Value} \right\rfloor$$
+
+  - Add 1 to get the month number (since months are from 1 to 12):
+
+    $$\text{Month} = \text{Floor Value} + 1$$
+
+  - **Note**: If the computed month is not available (e.g., due to missing data), default the month to **1**.
+
+#### 3. Day Calculation
+
+- **Using the Same Percent Rank**: Use the percent rank computed in the month calculation.
+- **Day Assignment**:
+  - Scale the percent rank to days by multiplying it by **308**:
+
+    $$\text{Scaled Value} = \text{Percent Rank} \times 308$$
+
+    - The number 308 is chosen because it is the product of 11 months and 28 days (11 × 28), representing the total number of days in an 11-month period with 28 days per month.
+  - Take the integer part of the scaled value (floor it):
+
+    $$\text{Floor Value} = \left\lfloor \text{Scaled Value} \right\rfloor$$
+
+  - Compute the modulus of the floor value with 28:
+
+    $$\text{Modulo Value} = \text{Floor Value} \bmod 28$$
+
+  - Add 1 to get the day number (since days are from 1 to 28):
+
+    $$\text{Day} = \text{Modulo Value} + 1$$
+
+  - **Note**: If the computed day is not available, default the day to **1**.
+
+### 4. Constructing the publication Date
+
+- Combine the computed **Year**, **Month**, and **Day** to form the publication date.
+
+  $$\text{publication Date} : \text{Year}-\text{Month}-\text{Day}$$
+
+  For example, 2002-06-15.
+
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'bigquery-public-data': {'ebi_chembl': ['docs_29', 'docs_28', 'docs_27', 'activity_supp_26', 'activity_supp_25', 'activities_24', 'docs_30', 'activities_26', 'activity_properties_29', 'activity_properties_30', 'compound_structures_25', 'activities_30', 'activity_supp_27', 'activity_supp_29', 'activities_33', 'docs_23', 'activities_23', 'activities_28', 'activities_29', 'compound_structures', 'activity_properties_27', 'compound_structures_29', 'activity_supp_24', 'compound_structures_30', 'activity_supp_28', 'docs_33', 'activity_properties_24', 'activities_27', 'activities_25', 'activities', 'compound_properties_29', 'compound_structures_27', 'docs', 'docs_24', 'activity_supp', 'docs_26', 'docs_25']}}
+Some few-shot examples may be useful:
+Query:
+-- 1. Quick look at activity rows whose pChEMBL values are already > 10  
+--    (gives us an idea whether there is useful data to start with)
+SELECT activity_id,
+       assay_id,
+       molregno,
+       standard_type,
+       standard_relation,
+       standard_value,
+       pchembl_value
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+Answer:
+activity_id,assay_id,molregno,standard_type,standard_relation,standard_value,pchembl_value
+1699617,342330,5535,Ki,=,0.02344,10.63
+1654802,326439,331980,Kd,=,0.03388,10.47
+13937026,1293221,1621277,EC50,=,0.03981,10.4
+19108671,1868964,2421304,IC50,=,0.09772,10.01
+Query:
+-- 2. Which standard_type values occur for those high-pChEMBL rows?
+SELECT DISTINCT standard_type
+FROM `bigquery-public-data.ebi_chembl.activities_30`
+WHERE pchembl_value > 10
+LIMIT 20;
+Answer:
+standard_type
+Kd
+IC50
+Ki
+EC50
+AC50
+Query:
+--Description:  (Corrected version of SQL #4)
+--  Show how many activities with pChEMBL > 10 fall into each heavy-atom
+--  count bucket, after fixing the molregno INT64-vs-STRING join.
+SELECT
+  SAFE_CAST(cp.heavy_atoms AS INT64) AS heavy_atoms,
+  COUNT(*)                           AS n_rows
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+GROUP BY heavy_atoms
+ORDER BY n_rows DESC
+LIMIT 20
+Answer:
+heavy_atoms,n_rows
+,1727
+33.0,634
+35.0,611
+34.0,577
+31.0,565
+30.0,558
+32.0,535
+36.0,490
+29.0,476
+37.0,465
+28.0,455
+26.0,401
+27.0,385
+38.0,367
+25.0,305
+Query:
+--Description:  (Corrected version of SQL #5)
+--  Bring in canonical SMILES for the high-pChEMBL activities, using the
+--  correct STRING cast on molregno for the join to compound_structures_29.
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  cs.canonical_smiles
+FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+     ON CAST(a.molregno AS STRING) = cs.molregno
+WHERE a.pchembl_value > 10
+LIMIT 20
+Answer:
+activity_id,assay_id,molregno,canonical_smiles
+1264019,208337,2627,CS(=O)(=O)N[C@H](CC1CCCCC1)C(=O)N1CCC[C@H]1C(=O)NCc1ccc(C(=N)N)cc1
+13974910,1299429,25246,O=C(O)CCn1ccnc1
+829515,70353,67883,CCCCCCCCCCCCCCCC(=O)NCCCC(=O)NCCCC[C@H](NC(=O)[C@H](C)NC(=O)[C@H](C)NC(=O)[C@H](CCC(N)=O)NC(=O)CNC(=O)[C@H](CCC(=O)O)NC(=O)[C@H](CC(C)C)NC(=O)[C@H](Cc1ccc(O)cc1)NC(=O)[C@H](CO)NC(=O)[C@H](CO)NC(=O)[C@@H](NC(=O)[C@H](CC(=O)O)NC(=O)[C@H](CO)NC(=O)[C@@H](NC(=O)[C@H](Cc1ccccc1)NC(=O)[C@@H](NC(=O)CNC(=O)[C@H](CC
+Query:
+--Description:  (Corrected version of SQL #6)
+--  Count qualifying activities (10–15 heavy atoms, pChEMBL > 10, non-NULL
+--  standard_value) per assay / standard_type.  Use CAST on molregno so the
+--  join to compound_properties_29 works and filter to < 5 rows per group.
+SELECT
+  a.assay_id,
+  a.standard_type,
+  COUNT(*) AS n_activities
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+GROUP BY a.assay_id, a.standard_type
+HAVING COUNT(*) < 5
+LIMIT 20
+Answer:
+assay_id,standard_type,n_activities
+143227,Ki,3
+143861,Ki,1
+310491,EC50,1
+33684,Ki,1
+492915,Ki,3
+142931,Ki,1
+1454440,Ki,1
+1454461,Ki,1
+360240,Ki,2
+Query:
+--Description:  (Corrected version of SQL #7)
+--  Pull back individual qualifying activity rows (10–15 heavy atoms,
+--  pChEMBL > 10, < 2 duplicate flags) whose assay/standard_type combo
+--  meets the “< 5 activities” criterion from the previous query.
+WITH smallsets AS (
+  SELECT
+    a.assay_id,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  GROUP BY a.assay_id, a.standard_type
+  HAVING COUNT(*) < 5
+)
+SELECT
+  a.activity_id,
+  a.assay_id,
+  a.molregno,
+  a.standard_relation,
+  CAST(a.standard_value AS FLOAT64) AS standard_value,
+  a.standard_type,
+  a.pchembl_value,
+  CAST(cp.heavy_atoms AS INT64)     AS heavy_atoms
+FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+     ON CAST(a.molregno AS STRING) = cp.molregno
+JOIN smallsets
+     ON a.assay_id      = smallsets.assay_id
+    AND a.standard_type = smallsets.standard_type
+WHERE a.pchembl_value > 10
+  AND a.standard_value IS NOT NULL
+  AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+  AND a.potential_duplicate < 2
+LIMIT 20
+Answer:
+activity_id,assay_id,molregno,standard_relation,standard_value,standard_type,pchembl_value,heavy_atoms
+2559041,489288,675,=,0.025,Ki,10.6,14
+1861474,435005,11595,=,0.04,Ki,10.4,13
+2583808,558025,675,=,0.046,Ki,10.34,14
+Query:
+--Description:  (Corrected version of SQL #8)
+--  Generate unordered pairs of different molecules that satisfy all
+--  earlier filters, and classify the change in standard_value.  The CAST
+--  fix is applied inside the qualified CTE’s join.
+WITH qualified AS (
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64) AS sv,
+    a.standard_type
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  WHERE a.pchembl_value > 10
+    AND a.standard_value IS NOT NULL
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+    AND a.potential_duplicate < 2
+)
+SELECT
+  q1.activity_id AS act_id_1,
+  q2.activity_id AS act_id_2,
+  q1.sv          AS sv_1,
+  q2.sv          AS sv_2,
+  CASE
+    WHEN q1.standard_relation = '=' AND q2.standard_relation = '=' AND q1.sv = q2.sv
+      THEN 'no-change'
+    WHEN q1.sv > q2.sv THEN 'decrease'
+    WHEN q1.sv < q2.sv THEN 'increase'
+    ELSE 'undetermined'
+  END AS change_class
+FROM qualified AS q1
+JOIN qualified AS q2
+  ON q1.assay_id      = q2.assay_id
+ AND q1.standard_type = q2.standard_type
+ AND q1.molregno     <> q2.molregno
+ AND q1.activity_id  <  q2.activity_id   -- avoid duplicate ordering
+LIMIT 20
+Answer:
+act_id_1,act_id_2,sv_1,sv_2,change_class
+276165,300845,0.063,0.062,decrease
+499051,501767,0.018,0.027,increase
+644303,656094,0.027,0.018,decrease
+644303,663564,0.027,0.02,decrease
+644303,647678,0.027,0.023,decrease
+644303,650001,0.027,0.026,decrease
+Query:
+--Description:  (SQL #9 unchanged)
+--  Simple demonstration of creating a UUID from two strings via MD5-hex of
+--  a JSON struct (placeholder values 'A' and 'B').
+SELECT TO_HEX(MD5(TO_JSON_STRING(STRUCT('A', 'B')))) AS example_uuid
+Answer:
+example_uuid
+5eab9e7980e4dd97415351cf7d1101ce
+Query:
+--Description:  (SQL #10 unchanged)
+--  Inspect some rows of docs_29 (journal, year, first_page) that are later
+--  needed for synthetic publication-date calculations.
+SELECT
+  doc_id,
+  journal,
+  year,
+  first_page
+FROM `bigquery-public-data.ebi_chembl.docs_29`
+LIMIT 20
+Answer:
+doc_id,journal,year,first_page
+116888,PNAS,2015,10768
+116897,Nature,2010,1067
+116900,Nature,2010,1067
+69727,Chem Cent J,2012,
+59326,Drug Discovery Today,2011,697
+110494,Bioorg Med Chem,2018,6000
+110495,Bioorg Med Chem,2018,6067
+Task: Find pairs of different molecules tested in the same assay and standard type, where both have 10–15 heavy atoms, fewer than 5 activities in that assay, fewer than 2 duplicate activities, non-null standard values, and pChEMBL values over 10. For each pair, report the maximum heavy atom count, the latest publication date (calculated based on the document's rank within the same journal and year, and map it to a synthetic month and day), the highest document ID, classify the change in standard values as 'increase', 'decrease', or 'no-change' based on their values and relations, and generate UUIDs from their activity IDs and canonical SMILES.
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables with similar prefix, you can use a wildcard table to simplify your query. e.g., SELECT col1, col2 FROM `project_id.dataset_id.table_prefix*` WHERE _TABLE_SUFFIX IN ('table1_suffix', 'table2_suffix');. Avoid manually listing tables unless absolutely necessary.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 04:06:38 - Thread-2589 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------------------
+   Pairs of different molecules measured in the same assay / standard_type that
+
+     • have pChEMBL > 10, 10-15 heavy atoms, non-NULL standard_value,
+       potential_duplicate < 2
+     • come from an assay / standard_type that has < 5 such qualifying
+       activities
+     • are classified as increase / decrease / no-change in standard_value
+     • bring back auxiliary information that is requested
+---------------------------------------------------------------------------- */
+
+/* ---------- 1.  Synthetic publication-date for every document ------------ */
+WITH docs_w_rank AS (
+  SELECT
+    doc_id,                                   -- INT64
+    COALESCE(year, 1970)                AS yr,
+    journal,
+    SAFE_CAST(first_page AS INT64)      AS first_pg,
+    PERCENT_RANK() OVER (
+        PARTITION BY journal, year
+        ORDER BY SAFE_CAST(first_page AS INT64)
+    )                                   AS pr
+  FROM `bigquery-public-data.ebi_chembl.docs_29`
+),
+docs_dates AS (                               -- final calendar date
+  SELECT
+    doc_id,
+    DATE(
+      yr,
+      1 + CAST(FLOOR(pr * 11) AS INT64),                      -- month
+      1 + CAST(MOD(FLOOR(pr * 308), 28) AS INT64)             -- day
+    ) AS pub_date
+  FROM docs_w_rank
+),
+
+/* ---------- 2.  Activities that satisfy all per-row filters -------------- */
+filtered AS (
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64)          AS sv,
+    a.standard_type,
+    SAFE_CAST(cp.heavy_atoms AS INT64)         AS heavy_atoms,
+    cs.canonical_smiles,
+    ass.doc_id,
+    dd.pub_date,
+    a.pchembl_value
+  FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29`   AS cp
+         ON CAST(a.molregno AS STRING) = cp.molregno
+  JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+         ON CAST(a.molregno AS STRING) = cs.molregno
+  JOIN `bigquery-public-data.ebi_chembl.assays`                   AS ass
+         ON a.assay_id = CAST(ass.assay_id AS INT64)
+  LEFT JOIN docs_dates                          AS dd
+         ON CAST(ass.doc_id AS INT64) = dd.doc_id
+  WHERE a.pchembl_value  > 10
+    AND a.standard_value IS NOT NULL
+    AND a.potential_duplicate < 2
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+),
+
+/* ---------- 3.  Keep only (assay, standard_type) having < 5 rows --------- */
+small_sets AS (
+  SELECT assay_id, standard_type
+  FROM filtered
+  GROUP BY assay_id, standard_type
+  HAVING COUNT(*) < 5
+),
+qualified AS (
+  SELECT f.*
+  FROM filtered  AS f
+  JOIN small_sets USING (assay_id, standard_type)
+),
+
+/* ---------- 4.  Form unordered pairs of DIFFERENT molecules -------------- */
+pairs AS (
+  SELECT
+    q1.activity_id         AS activity_id_1,
+    q2.activity_id         AS activity_id_2,
+    q1.canonical_smiles    AS smiles_1,
+    q2.canonical_smiles    AS smiles_2,
+    q1.sv                  AS sv_1,
+    q2.sv                  AS sv_2,
+    q1.standard_relation   AS rel_1,
+    q2.standard_relation   AS rel_2,
+    GREATEST(q1.heavy_atoms, q2.heavy_atoms)                AS max_heavy_atoms,
+    (CASE
+       WHEN q1.standard_relation = '=' AND q2.standard_relation = '='
+            AND q1.sv = q2.sv                     THEN 'no-change'
+       WHEN q1.sv > q2.sv                         THEN 'decrease'
+       WHEN q1.sv < q2.sv                         THEN 'increase'
+       ELSE 'undetermined'
+     END)                                         AS change_class,
+    -- latest publication date among the two rows
+    (CASE WHEN q1.pub_date >= q2.pub_date THEN q1.pub_date ELSE q2.pub_date END)
+                                                  AS latest_publication_date,
+    GREATEST(q1.doc_id, q2.doc_id)               AS highest_doc_id,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.activity_id, q2.activity_id))))
+                                                  AS activity_pair_uuid,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.canonical_smiles, q2.canonical_smiles))))
+                                                  AS smiles_pair_uuid
+  FROM qualified AS q1
+  JOIN qualified AS q2
+    ON q1.assay_id      = q2.assay_id
+   AND q1.standard_type = q2.standard_type
+   AND q1.molregno     <> q2.molregno
+   AND q1.activity_id  <  q2.activity_id          -- avoid duplicates / self-pair
+)
+
+/* ----------------------------- 5.  Output -------------------------------- */
+SELECT
+  activity_id_1,
+  activity_id_2,
+  change_class,
+  max_heavy_atoms,
+  latest_publication_date,
+  highest_doc_id,
+  activity_pair_uuid,
+  smiles_pair_uuid
+FROM pairs;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:06:39 - Thread-2589 (execute) - INFO - itercount: 1
+2025-05-05 04:06:39 - Thread-2589 (execute) - INFO - [Self-refine]
+Input sql:
+/* ---------------------------------------------------------------------------
+   Pairs of different molecules measured in the same assay / standard_type that
+
+     • have pChEMBL > 10, 10-15 heavy atoms, non-NULL standard_value,
+       potential_duplicate < 2
+     • come from an assay / standard_type that has < 5 such qualifying
+       activities
+     • are classified as increase / decrease / no-change in standard_value
+     • bring back auxiliary information that is requested
+---------------------------------------------------------------------------- */
+
+/* ---------- 1.  Synthetic publication-date for every document ------------ */
+WITH docs_w_rank AS (
+  SELECT
+    doc_id,                                   -- INT64
+    COALESCE(year, 1970)                AS yr,
+    journal,
+    SAFE_CAST(first_page AS INT64)      AS first_pg,
+    PERCENT_RANK() OVER (
+        PARTITION BY journal, year
+        ORDER BY SAFE_CAST(first_page AS INT64)
+    )                                   AS pr
+  FROM `bigquery-public-data.ebi_chembl.docs_29`
+),
+docs_dates AS (                               -- final calendar date
+  SELECT
+    doc_id,
+    DATE(
+      yr,
+      1 + CAST(FLOOR(pr * 11) AS INT64),                      -- month
+      1 + CAST(MOD(FLOOR(pr * 308), 28) AS INT64)             -- day
+    ) AS pub_date
+  FROM docs_w_rank
+),
+
+/* ---------- 2.  Activities that satisfy all per-row filters -------------- */
+filtered AS (
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64)          AS sv,
+    a.standard_type,
+    SAFE_CAST(cp.heavy_atoms AS INT64)         AS heavy_atoms,
+    cs.canonical_smiles,
+    ass.doc_id,
+    dd.pub_date,
+    a.pchembl_value
+  FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29`   AS cp
+         ON CAST(a.molregno AS STRING) = cp.molregno
+  JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+         ON CAST(a.molregno AS STRING) = cs.molregno
+  JOIN `bigquery-public-data.ebi_chembl.assays`                   AS ass
+         ON a.assay_id = CAST(ass.assay_id AS INT64)
+  LEFT JOIN docs_dates                          AS dd
+         ON CAST(ass.doc_id AS INT64) = dd.doc_id
+  WHERE a.pchembl_value  > 10
+    AND a.standard_value IS NOT NULL
+    AND a.potential_duplicate < 2
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+),
+
+/* ---------- 3.  Keep only (assay, standard_type) having < 5 rows --------- */
+small_sets AS (
+  SELECT assay_id, standard_type
+  FROM filtered
+  GROUP BY assay_id, standard_type
+  HAVING COUNT(*) < 5
+),
+qualified AS (
+  SELECT f.*
+  FROM filtered  AS f
+  JOIN small_sets USING (assay_id, standard_type)
+),
+
+/* ---------- 4.  Form unordered pairs of DIFFERENT molecules -------------- */
+pairs AS (
+  SELECT
+    q1.activity_id         AS activity_id_1,
+    q2.activity_id         AS activity_id_2,
+    q1.canonical_smiles    AS smiles_1,
+    q2.canonical_smiles    AS smiles_2,
+    q1.sv                  AS sv_1,
+    q2.sv                  AS sv_2,
+    q1.standard_relation   AS rel_1,
+    q2.standard_relation   AS rel_2,
+    GREATEST(q1.heavy_atoms, q2.heavy_atoms)                AS max_heavy_atoms,
+    (CASE
+       WHEN q1.standard_relation = '=' AND q2.standard_relation = '='
+            AND q1.sv = q2.sv                     THEN 'no-change'
+       WHEN q1.sv > q2.sv                         THEN 'decrease'
+       WHEN q1.sv < q2.sv                         THEN 'increase'
+       ELSE 'undetermined'
+     END)                                         AS change_class,
+    -- latest publication date among the two rows
+    (CASE WHEN q1.pub_date >= q2.pub_date THEN q1.pub_date ELSE q2.pub_date END)
+                                                  AS latest_publication_date,
+    GREATEST(q1.doc_id, q2.doc_id)               AS highest_doc_id,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.activity_id, q2.activity_id))))
+                                                  AS activity_pair_uuid,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.canonical_smiles, q2.canonical_smiles))))
+                                                  AS smiles_pair_uuid
+  FROM qualified AS q1
+  JOIN qualified AS q2
+    ON q1.assay_id      = q2.assay_id
+   AND q1.standard_type = q2.standard_type
+   AND q1.molregno     <> q2.molregno
+   AND q1.activity_id  <  q2.activity_id          -- avoid duplicates / self-pair
+)
+
+/* ----------------------------- 5.  Output -------------------------------- */
+SELECT
+  activity_id_1,
+  activity_id_2,
+  change_class,
+  max_heavy_atoms,
+  latest_publication_date,
+  highest_doc_id,
+  activity_pair_uuid,
+  smiles_pair_uuid
+FROM pairs;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##400 No matching signature for function COALESCE\n  Argument types: STRING, INT64\n  Signature: COALESCE([T1, ...])\n    Unable to find common supertype for templated argument <T1>\n      Input types for <T1>: {INT64, STRING} at [16:5]; reason: invalidQuery, location: query, message: No matching signature for function COALESCE\n  Argument types: STRING, INT64\n  Signature: COALESCE([T1, ...])\n    Unable to find common supertype for templated argument <T1>\n      Input types for <T1>: {INT64, STRING} at [16:5]\n\nLocation: US\nJob ID: 1a31c2f2-280d-4d64-bd16-39fd3bf1d313\n'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 04:07:07 - Thread-2589 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------------------
+   Corrected query – fixes the COALESCE type-mismatch (year is STRING)
+   and makes the doc_id consistently INT64 for joins / comparisons.
+---------------------------------------------------------------------------- */
+
+WITH docs_w_rank AS (      -- 1. prepare rank & percent-rank per journal/year
+  SELECT
+    SAFE_CAST(doc_id AS INT64)                                     AS doc_id,
+    COALESCE(SAFE_CAST(year AS INT64), 1970)                       AS yr,
+    journal,
+    SAFE_CAST(first_page AS INT64)                                 AS first_pg,
+    PERCENT_RANK() OVER (
+        PARTITION BY journal, SAFE_CAST(year AS INT64)
+        ORDER BY SAFE_CAST(first_page AS INT64)
+    )                                                              AS pr
+  FROM `bigquery-public-data.ebi_chembl.docs_29`
+),
+
+docs_dates AS (             -- 2. synthetic publication date
+  SELECT
+    doc_id,
+    DATE(
+      yr,
+      1 + CAST(FLOOR(pr * 11)  AS INT64),          -- month   (1-12)
+      1 + CAST(MOD(FLOOR(pr * 308), 28) AS INT64)  -- day     (1-28)
+    ) AS pub_date
+  FROM docs_w_rank
+),
+
+filtered AS (               -- 3. activities meeting all per-row criteria
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64)                AS sv,
+    a.standard_type,
+    SAFE_CAST(cp.heavy_atoms AS INT64)               AS heavy_atoms,
+    cs.canonical_smiles,
+    SAFE_CAST(ass.doc_id AS INT64)                   AS doc_id_int,
+    dd.pub_date,
+    a.pchembl_value
+  FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29`   AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+       ON CAST(a.molregno AS STRING) = cs.molregno
+  JOIN `bigquery-public-data.ebi_chembl.assays`                   AS ass
+       ON a.assay_id = CAST(ass.assay_id AS INT64)
+  LEFT JOIN docs_dates AS dd
+       ON SAFE_CAST(ass.doc_id AS INT64) = dd.doc_id
+  WHERE a.pchembl_value  > 10
+    AND a.standard_value IS NOT NULL
+    AND a.potential_duplicate < 2
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+),
+
+small_sets AS (             -- 4. keep assay/standard_type with < 5 rows
+  SELECT assay_id, standard_type
+  FROM filtered
+  GROUP BY assay_id, standard_type
+  HAVING COUNT(*) < 5
+),
+
+qualified AS (              -- 5. final qualifying rows
+  SELECT f.*
+  FROM filtered AS f
+  JOIN small_sets USING (assay_id, standard_type)
+),
+
+pairs AS (                  -- 6. unordered molecule pairs
+  SELECT
+    q1.activity_id                    AS activity_id_1,
+    q2.activity_id                    AS activity_id_2,
+    q1.canonical_smiles               AS smiles_1,
+    q2.canonical_smiles               AS smiles_2,
+    q1.sv                             AS sv_1,
+    q2.sv                             AS sv_2,
+    q1.standard_relation              AS rel_1,
+    q2.standard_relation              AS rel_2,
+    GREATEST(q1.heavy_atoms, q2.heavy_atoms)        AS max_heavy_atoms,
+    CASE
+      WHEN q1.standard_relation = '=' AND q2.standard_relation = '='
+           AND q1.sv = q2.sv                      THEN 'no-change'
+      WHEN q1.sv > q2.sv                          THEN 'decrease'
+      WHEN q1.sv < q2.sv                          THEN 'increase'
+      ELSE 'undetermined'
+    END                                           AS change_class,
+    CASE WHEN q1.pub_date >= q2.pub_date
+         THEN q1.pub_date ELSE q2.pub_date END    AS latest_publication_date,
+    GREATEST(q1.doc_id_int, q2.doc_id_int)        AS highest_doc_id,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.activity_id, q2.activity_id))))
+                                                 AS activity_pair_uuid,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.canonical_smiles,
+                                     q2.canonical_smiles))))
+                                                 AS smiles_pair_uuid
+  FROM qualified AS q1
+  JOIN qualified AS q2
+    ON q1.assay_id      = q2.assay_id
+   AND q1.standard_type = q2.standard_type
+   AND q1.molregno     <> q2.molregno
+   AND q1.activity_id  <  q2.activity_id          -- ensure unordered pairing
+)
+
+-- 7. final output -----------------------------------------------------------
+SELECT
+  activity_id_1,
+  activity_id_2,
+  change_class,
+  max_heavy_atoms,
+  latest_publication_date,
+  highest_doc_id,
+  activity_pair_uuid,
+  smiles_pair_uuid
+FROM pairs;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:07:08 - Thread-2589 (execute) - INFO - itercount: 2
+2025-05-05 04:07:08 - Thread-2589 (execute) - INFO - [Self-refine]
+Input sql:
+/* ---------------------------------------------------------------------------
+   Corrected query – fixes the COALESCE type-mismatch (year is STRING)
+   and makes the doc_id consistently INT64 for joins / comparisons.
+---------------------------------------------------------------------------- */
+
+WITH docs_w_rank AS (      -- 1. prepare rank & percent-rank per journal/year
+  SELECT
+    SAFE_CAST(doc_id AS INT64)                                     AS doc_id,
+    COALESCE(SAFE_CAST(year AS INT64), 1970)                       AS yr,
+    journal,
+    SAFE_CAST(first_page AS INT64)                                 AS first_pg,
+    PERCENT_RANK() OVER (
+        PARTITION BY journal, SAFE_CAST(year AS INT64)
+        ORDER BY SAFE_CAST(first_page AS INT64)
+    )                                                              AS pr
+  FROM `bigquery-public-data.ebi_chembl.docs_29`
+),
+
+docs_dates AS (             -- 2. synthetic publication date
+  SELECT
+    doc_id,
+    DATE(
+      yr,
+      1 + CAST(FLOOR(pr * 11)  AS INT64),          -- month   (1-12)
+      1 + CAST(MOD(FLOOR(pr * 308), 28) AS INT64)  -- day     (1-28)
+    ) AS pub_date
+  FROM docs_w_rank
+),
+
+filtered AS (               -- 3. activities meeting all per-row criteria
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64)                AS sv,
+    a.standard_type,
+    SAFE_CAST(cp.heavy_atoms AS INT64)               AS heavy_atoms,
+    cs.canonical_smiles,
+    SAFE_CAST(ass.doc_id AS INT64)                   AS doc_id_int,
+    dd.pub_date,
+    a.pchembl_value
+  FROM `bigquery-public-data.ebi_chembl.activities_30`            AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29`   AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  JOIN `bigquery-public-data.ebi_chembl.compound_structures_29`   AS cs
+       ON CAST(a.molregno AS STRING) = cs.molregno
+  JOIN `bigquery-public-data.ebi_chembl.assays`                   AS ass
+       ON a.assay_id = CAST(ass.assay_id AS INT64)
+  LEFT JOIN docs_dates AS dd
+       ON SAFE_CAST(ass.doc_id AS INT64) = dd.doc_id
+  WHERE a.pchembl_value  > 10
+    AND a.standard_value IS NOT NULL
+    AND a.potential_duplicate < 2
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+),
+
+small_sets AS (             -- 4. keep assay/standard_type with < 5 rows
+  SELECT assay_id, standard_type
+  FROM filtered
+  GROUP BY assay_id, standard_type
+  HAVING COUNT(*) < 5
+),
+
+qualified AS (              -- 5. final qualifying rows
+  SELECT f.*
+  FROM filtered AS f
+  JOIN small_sets USING (assay_id, standard_type)
+),
+
+pairs AS (                  -- 6. unordered molecule pairs
+  SELECT
+    q1.activity_id                    AS activity_id_1,
+    q2.activity_id                    AS activity_id_2,
+    q1.canonical_smiles               AS smiles_1,
+    q2.canonical_smiles               AS smiles_2,
+    q1.sv                             AS sv_1,
+    q2.sv                             AS sv_2,
+    q1.standard_relation              AS rel_1,
+    q2.standard_relation              AS rel_2,
+    GREATEST(q1.heavy_atoms, q2.heavy_atoms)        AS max_heavy_atoms,
+    CASE
+      WHEN q1.standard_relation = '=' AND q2.standard_relation = '='
+           AND q1.sv = q2.sv                      THEN 'no-change'
+      WHEN q1.sv > q2.sv                          THEN 'decrease'
+      WHEN q1.sv < q2.sv                          THEN 'increase'
+      ELSE 'undetermined'
+    END                                           AS change_class,
+    CASE WHEN q1.pub_date >= q2.pub_date
+         THEN q1.pub_date ELSE q2.pub_date END    AS latest_publication_date,
+    GREATEST(q1.doc_id_int, q2.doc_id_int)        AS highest_doc_id,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.activity_id, q2.activity_id))))
+                                                 AS activity_pair_uuid,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.canonical_smiles,
+                                     q2.canonical_smiles))))
+                                                 AS smiles_pair_uuid
+  FROM qualified AS q1
+  JOIN qualified AS q2
+    ON q1.assay_id      = q2.assay_id
+   AND q1.standard_type = q2.standard_type
+   AND q1.molregno     <> q2.molregno
+   AND q1.activity_id  <  q2.activity_id          -- ensure unordered pairing
+)
+
+-- 7. final output -----------------------------------------------------------
+SELECT
+  activity_id_1,
+  activity_id_2,
+  change_class,
+  max_heavy_atoms,
+  latest_publication_date,
+  highest_doc_id,
+  activity_pair_uuid,
+  smiles_pair_uuid
+FROM pairs;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##400 No matching signature for function MOD\n  Argument types: FLOAT64, INT64\n  Signature: MOD(INT64, INT64)\n    Argument 1: Unable to coerce type FLOAT64 to expected type INT64\n  Signature: MOD(NUMERIC, NUMERIC)\n    Argument 1: Unable to coerce type FLOAT64 to expected type NUMERIC\n  Signature: MOD(BIGNUMERIC, BIGNUMERIC)\n    Argument 1: Unable to coerce type FLOAT64 to expected type BIGNUMERIC at [25:16]; reason: invalidQuery, location: query, message: No matching signature for function MOD\n  Argument types: FLOAT64, INT64\n  Signature: MOD(INT64, INT64)\n    Argument 1: Unable to coerce type FLOAT64 to expected type INT64\n  Signature: MOD(NUMERIC, NUMERIC)\n    Argument 1: Unable to coerce type FLOAT64 to expected type NUMERIC\n  Signature: MOD(BIGNUMERIC, BIGNUMERIC)\n    Argument 1: Unable to coerce type FLOAT64 to expected type BIGNUMERIC at [25:16]\n\nLocation: US\nJob ID: 4d85272c-8844-435f-b395-27c8a0150060\n'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 04:07:57 - Thread-2589 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------------------
+   Final correction – MOD() now receives INT64 arguments
+---------------------------------------------------------------------------- */
+
+WITH docs_w_rank AS (      -- 1. rank & percent-rank inside journal/year
+  SELECT
+    SAFE_CAST(doc_id AS INT64)                       AS doc_id,
+    COALESCE(SAFE_CAST(year AS INT64), 1970)         AS yr,
+    journal,
+    SAFE_CAST(first_page AS INT64)                   AS first_pg,
+    PERCENT_RANK() OVER (
+        PARTITION BY journal, SAFE_CAST(year AS INT64)
+        ORDER BY SAFE_CAST(first_page AS INT64)
+    )                                               AS pr
+  FROM `bigquery-public-data.ebi_chembl.docs_29`
+),
+
+docs_dates AS (             -- 2. synthetic publication date (yr-mm-dd)
+  SELECT
+    doc_id,
+    DATE(
+      yr,
+      1 + CAST(FLOOR(pr * 11) AS INT64),                           -- month
+      1 + MOD(CAST(FLOOR(pr * 308) AS INT64), 28)                  -- day
+    ) AS pub_date
+  FROM docs_w_rank
+),
+
+filtered AS (               -- 3. activities meeting all row-level filters
+  SELECT
+    a.activity_id,
+    a.assay_id,
+    a.molregno,
+    a.standard_relation,
+    CAST(a.standard_value AS FLOAT64)           AS sv,
+    a.standard_type,
+    SAFE_CAST(cp.heavy_atoms AS INT64)          AS heavy_atoms,
+    cs.canonical_smiles,
+    SAFE_CAST(ass.doc_id AS INT64)              AS doc_id_int,
+    dd.pub_date,
+    a.pchembl_value
+  FROM `bigquery-public-data.ebi_chembl.activities_30`          AS a
+  JOIN `bigquery-public-data.ebi_chembl.compound_properties_29` AS cp
+       ON CAST(a.molregno AS STRING) = cp.molregno
+  JOIN `bigquery-public-data.ebi_chembl.compound_structures_29` AS cs
+       ON CAST(a.molregno AS STRING) = cs.molregno
+  JOIN `bigquery-public-data.ebi_chembl.assays`                 AS ass
+       ON a.assay_id = CAST(ass.assay_id AS INT64)
+  LEFT JOIN docs_dates             AS dd
+       ON SAFE_CAST(ass.doc_id AS INT64) = dd.doc_id
+  WHERE a.pchembl_value  > 10
+    AND a.standard_value IS NOT NULL
+    AND a.potential_duplicate < 2
+    AND SAFE_CAST(cp.heavy_atoms AS INT64) BETWEEN 10 AND 15
+),
+
+small_sets AS (             -- 4. keep assay / standard_type with < 5 rows
+  SELECT assay_id, standard_type
+  FROM filtered
+  GROUP BY assay_id, standard_type
+  HAVING COUNT(*) < 5
+),
+
+qualified AS (              -- 5. final qualifying rows
+  SELECT f.*
+  FROM filtered AS f
+  JOIN small_sets USING (assay_id, standard_type)
+),
+
+pairs AS (                  -- 6. unordered molecule pairs
+  SELECT
+    q1.activity_id                     AS activity_id_1,
+    q2.activity_id                     AS activity_id_2,
+    GREATEST(q1.heavy_atoms, q2.heavy_atoms)          AS max_heavy_atoms,
+    CASE
+      WHEN q1.standard_relation = '=' AND q2.standard_relation = '='
+           AND q1.sv = q2.sv                          THEN 'no-change'
+      WHEN q1.sv > q2.sv                              THEN 'decrease'
+      WHEN q1.sv < q2.sv                              THEN 'increase'
+      ELSE 'undetermined'
+    END                                              AS change_class,
+    CASE WHEN q1.pub_date >= q2.pub_date
+         THEN q1.pub_date ELSE q2.pub_date END       AS latest_publication_date,
+    GREATEST(q1.doc_id_int, q2.doc_id_int)           AS highest_doc_id,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.activity_id,
+                                     q2.activity_id))))          AS activity_pair_uuid,
+    TO_HEX(MD5(TO_JSON_STRING(STRUCT(q1.canonical_smiles,
+                                     q2.canonical_smiles))))     AS smiles_pair_uuid
+  FROM qualified AS q1
+  JOIN qualified AS q2
+    ON q1.assay_id      = q2.assay_id
+   AND q1.standard_type = q2.standard_type
+   AND q1.molregno     <> q2.molregno
+   AND q1.activity_id  <  q2.activity_id            -- avoid duplicates
+)
+
+-- 7. final output -----------------------------------------------------------
+SELECT
+  activity_id_1,
+  activity_id_2,
+  change_class,
+  max_heavy_atoms,
+  latest_publication_date,
+  highest_doc_id,
+  activity_pair_uuid,
+  smiles_pair_uuid
+FROM pairs;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:08:05 - Thread-2589 (execute) - INFO - Total iteration counts: 2

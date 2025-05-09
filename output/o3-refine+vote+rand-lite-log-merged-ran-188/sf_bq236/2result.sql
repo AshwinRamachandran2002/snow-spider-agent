@@ -1,0 +1,33 @@
+/*  Top-5 U.S. ZIP codes with the greatest number of hail-storm events
+    over the most recent 10 complete years (2014-2023), based on
+    NOAA Historic Severe Storms data.                                           */
+
+WITH hail_union AS (
+    /* ---- 10 separate yearly tables, unioned together ---- */
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2014" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2015" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2016" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2017" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2018" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2019" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2020" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2021" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2022" UNION ALL
+    SELECT * FROM NOAA_DATA_PLUS.NOAA_HISTORIC_SEVERE_STORMS."STORMS_2023"
+)
+
+SELECT
+       z."zip_code",
+       COUNT(*) AS "hail_events_last_10yrs"
+FROM hail_union                    AS s
+JOIN NOAA_DATA_PLUS.GEO_US_BOUNDARIES."ZIP_CODES"  AS z
+  ON ST_WITHIN(
+        ST_POINT(s."event_longitude", s."event_latitude"),
+        TO_GEOGRAPHY(z."zip_code_geom")
+     )
+WHERE s."event_type" ILIKE '%hail%'
+  AND s."event_longitude" IS NOT NULL
+  AND s."event_latitude"  IS NOT NULL
+GROUP BY z."zip_code"
+ORDER BY "hail_events_last_10yrs" DESC NULLS LAST
+LIMIT 5;

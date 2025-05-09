@@ -1,0 +1,1418 @@
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Exploration]
+```sql
+--Description: View all distinct month/year combinations in interest_metrics so we can confirm the
+--2018-09 to 2019-08 range exists.
+SELECT DISTINCT month_year
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+LIMIT 20;
+```
+
+```sql
+--Description: Inspect a sample of rows in September-2018 to understand the raw composition
+--and index_value numbers we will later aggregate.
+SELECT *
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+LIMIT 20;
+```
+
+```sql
+--Description: Calculate the composition-to-index ratio (protecting against divide-by-zero) for the
+--September-2018 rows as a worked example.
+SELECT
+       interest_id,
+       month_year,
+       ROUND(composition / NULLIF(index_value,0), 4) AS comp_idx_ratio
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+  AND index_value <> 0
+LIMIT 20;
+```
+
+```sql
+--Description: Aggregate the average comp/index ratio per month & per interest across the whole
+--Sep-2018 → Aug-2019 window.
+SELECT
+       month_year,
+       interest_id,
+       ROUND(AVG(composition / NULLIF(index_value,0)), 4) AS avg_ratio
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+   AND index_value <> 0
+GROUP BY month_year, interest_id
+LIMIT 20;
+```
+
+```sql
+--Description: Join the previous aggregation with interest_map to attach readable interest names.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+)
+SELECT
+       m.month_year,
+       im.interest_name,
+       m.avg_ratio
+FROM month_int_ratio AS m
+JOIN interest_map AS im
+  ON im.id = m.interest_id
+LIMIT 20;
+```
+
+```sql
+--Description: For every month, find the single interest that has the highest avg_ratio.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+ranked AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       month_year,
+       interest_id,
+       avg_ratio
+FROM ranked
+WHERE rnk = 1
+LIMIT 20;
+```
+
+```sql
+--Description: Add the interest name to the monthly winners from the previous query.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       w.month_year,
+       im.interest_name,
+       w.avg_ratio AS max_idx_composition
+FROM winners AS w
+JOIN interest_map AS im
+  ON im.id = w.interest_id
+WHERE w.rnk = 1
+LIMIT 20;
+```
+
+```sql
+--Description: Produce the final requested output.  For every month from Sep-2018 to Aug-2019:
+-- • top interest & its max index composition
+-- • three-month rolling average of those max compositions
+-- • names & compositions of the top interests one-month and two-months earlier.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+),
+top_monthly AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio
+  FROM winners
+  WHERE rnk = 1
+),
+with_names AS (
+  SELECT
+         tm.month_year,
+         im.interest_name,
+         tm.avg_ratio
+  FROM top_monthly AS tm
+  JOIN interest_map AS im
+    ON im.id = tm.interest_id
+),
+rolling AS (
+  SELECT
+         wn.month_year AS cur_month,
+         wn.interest_name  AS cur_interest,
+         wn.avg_ratio      AS cur_max_idx_comp,
+         -- Three-month rolling average including current month
+         ROUND(AVG(wn.avg_ratio)
+               OVER (ORDER BY wn.month_year
+                     ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),4) AS rolling_3m,
+         -- previous month winner
+         LAG(wn.interest_name,1) OVER (ORDER BY wn.month_year)  AS prev1_interest,
+         LAG(wn.avg_ratio,1)      OVER (ORDER BY wn.month_year) AS prev1_max_idx,
+         -- two months ago winner
+         LAG(wn.interest_name,2) OVER (ORDER BY wn.month_year)  AS prev2_interest,
+         LAG(wn.avg_ratio,2)      OVER (ORDER BY wn.month_year) AS prev2_max_idx
+  FROM with_names AS wn
+)
+SELECT
+       cur_month        AS month_year,
+       cur_interest     AS top_interest,
+       cur_max_idx_comp AS max_idx_composition,
+       rolling_3m       AS rolling_3m_avg,
+       prev1_interest,
+       prev1_max_idx,
+       prev2_interest,
+       prev2_max_idx
+FROM rolling
+ORDER BY cur_month
+LIMIT 20;
+```
+
+```sql
+--Description: Double-check a couple of months outside the requested window to confirm they’re
+--not being picked up inadvertently.
+SELECT DISTINCT month_year
+FROM interest_metrics
+WHERE _year = 2017
+LIMIT 20;
+```
+
+```sql
+--Description: Sanity-check interest names & IDs to validate join logic.
+SELECT id, interest_name
+FROM interest_map
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: View all distinct month/year combinations in interest_metrics so we can confirm the
+--2018-09 to 2019-08 range exists.
+SELECT DISTINCT month_year
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: View all distinct month/year combinations in interest_metrics so we can confirm the
+--2018-09 to 2019-08 range exists.
+SELECT DISTINCT month_year
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+LIMIT 20;
+Results:
+month_year
+09-2018
+10-2018
+11-2018
+12-2018
+01-2019
+02-2019
+03-2019
+04-2019
+05-2019
+06-2019
+07-2019
+08-2019
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Inspect a sample of rows in September-2018 to understand the raw composition
+--and index_value numbers we will later aggregate.
+SELECT *
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Inspect a sample of rows in September-2018 to understand the raw composition
+--and index_value numbers we will later aggregate.
+SELECT *
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+LIMIT 20;
+Results:
+_month,_year,month_year,interest_id,composition,index_value,ranking,percentile_ranking
+9.0,2018.0,09-2018,6218.0,4.61,2.84,1,99.87
+9.0,2018.0,09-2018,6285.0,7.06,2.82,2,99.74
+9.0,2018.0,09-2018,22502.0,6.49,2.76,3,99.62
+9.0,2018.0,09-2018,115.0,6.81,2.74,4,99.49
+9.0,2018.0,09-2018,6013.0,4.9,2.73,5,99.36
+9.0,2018.0,09-2018,6206.0,7.49,2.67,6,99.23
+9.0,2018.0,09-2018,4.0,6.05,2.58,7,99.1
+9.0,2018.0,09-2018,171.0,6.36,2.49,8,98.97
+9.0,2018.0,09-2018,38.0,4.67,2.46,9,98.85
+9.0,2018.0,09-2
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Calculate the composition-to-index ratio (protecting against divide-by-zero) for the
+--September-2018 rows as a worked example.
+SELECT
+       interest_id,
+       month_year,
+       ROUND(composition / NULLIF(index_value,0), 4) AS comp_idx_ratio
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+  AND index_value <> 0
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Calculate the composition-to-index ratio (protecting against divide-by-zero) for the
+--September-2018 rows as a worked example.
+SELECT
+       interest_id,
+       month_year,
+       ROUND(composition / NULLIF(index_value,0), 4) AS comp_idx_ratio
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+  AND index_value <> 0
+LIMIT 20;
+Results:
+interest_id,month_year,comp_idx_ratio
+6218.0,09-2018,1.6232
+6285.0,09-2018,2.5035
+22502.0,09-2018,2.3514
+115.0,09-2018,2.4854
+6013.0,09-2018,1.7949
+6206.0,09-2018,2.8052
+4.0,09-2018,2.345
+171.0,09-2018,2.5542
+38.0,09-2018,1.8984
+6219.0,09-2018,1.8136
+35904.0,09-2018,2.2179
+16137.0,09-2018,2.2727
+6110.0,09-2018,1.9478
+19250.0,09-2018,2.8908
+16.0,09-2018,1.6053
+5970.0,09-2018,3.0482
+21242.0,09-2018,2.5614
+17269.0,09-2018,2.3158
+21057.0,09-2018,8.2636
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Aggregate the average comp/index ratio per month & per interest across the whole
+--Sep-2018 → Aug-2019 window.
+SELECT
+       month_year,
+       interest_id,
+       ROUND(AVG(composition / NULLIF(index_value,0)), 4) AS avg_ratio
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+   AND index_value <> 0
+GROUP BY month_year, interest_id
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Aggregate the average comp/index ratio per month & per interest across the whole
+--Sep-2018 → Aug-2019 window.
+SELECT
+       month_year,
+       interest_id,
+       ROUND(AVG(composition / NULLIF(index_value,0)), 4) AS avg_ratio
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+   AND index_value <> 0
+GROUP BY month_year, interest_id
+LIMIT 20;
+Results:
+month_year,interest_id,avg_ratio
+01-2019,1.0,1.4969
+01-2019,2.0,4.3636
+01-2019,4.0,2.0418
+01-2019,5.0,2.3185
+01-2019,6.0,4.0043
+01-2019,7.0,1.9882
+01-2019,8.0,1.7712
+01-2019,12.0,2.0136
+01-2019,13.0,1.646
+01-2019,14.0,1.3554
+01-2019,15.0,1.5299
+01-2019,16.0,1.5054
+01-2019,17.0,1.4277
+01-2019,18.0,1.5752
+01-2019,20.0,1.9154
+01-2019,21.0,3.6325
+01-2019,22.0,1.8
+01-2019,24.0,1.6129
+01-2019,25.0,2.1575
+01-2019,26.0,2.1512
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Join the previous aggregation with interest_map to attach readable interest names.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+)
+SELECT
+       m.month_year,
+       im.interest_name,
+       m.avg_ratio
+FROM month_int_ratio AS m
+JOIN interest_map AS im
+  ON im.id = m.interest_id
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Join the previous aggregation with interest_map to attach readable interest names.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+)
+SELECT
+       m.month_year,
+       im.interest_name,
+       m.avg_ratio
+FROM month_int_ratio AS m
+JOIN interest_map AS im
+  ON im.id = m.interest_id
+LIMIT 20;
+Results:
+month_year,interest_name,avg_ratio
+01-2019,Fitness Enthusiasts,1.4969
+02-2019,Fitness Enthusiasts,1.9318
+03-2019,Fitness Enthusiasts,1.7922
+04-2019,Fitness Enthusiasts,1.52
+05-2019,Fitness Enthusiasts,1.037
+08-2019,Fitness Enthusiasts,1.4118
+09-2018,Fitness Enthusiasts,1.6828
+10-2018,Fitness Enthusiasts,2.0163
+11-2018,Fitness Enthusiasts,1.5163
+12-2018,Fitness Enthusiasts,1.6066
+01-2019,Gamers,4.3636
+02-2019,Gamers,5.2373
+03-2019,Gamers,4.7627
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: For every month, find the single interest that has the highest avg_ratio.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+ranked AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       month_year,
+       interest_id,
+       avg_ratio
+FROM ranked
+WHERE rnk = 1
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: For every month, find the single interest that has the highest avg_ratio.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+ranked AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       month_year,
+       interest_id,
+       avg_ratio
+FROM ranked
+WHERE rnk = 1
+LIMIT 20;
+Results:
+month_year,interest_id,avg_ratio
+01-2019,21057.0,7.6573
+02-2019,21057.0,7.6625
+03-2019,7541.0,6.543
+04-2019,6065.0,6.2759
+05-2019,21245.0,4.4091
+06-2019,6324.0,2.7651
+07-2019,6324.0,2.8176
+08-2019,4898.0,2.7285
+09-2018,21057.0,8.2636
+10-2018,21057.0,9.1351
+11-2018,21057.0,8.2766
+12-2018,21057.0,8.3137
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Add the interest name to the monthly winners from the previous query.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       w.month_year,
+       im.interest_name,
+       w.avg_ratio AS max_idx_composition
+FROM winners AS w
+JOIN interest_map AS im
+  ON im.id = w.interest_id
+WHERE w.rnk = 1
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Add the interest name to the monthly winners from the previous query.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       w.month_year,
+       im.interest_name,
+       w.avg_ratio AS max_idx_composition
+FROM winners AS w
+JOIN interest_map AS im
+  ON im.id = w.interest_id
+WHERE w.rnk = 1
+LIMIT 20;
+Results:
+month_year,interest_name,max_idx_composition
+08-2019,Cosmetics and Beauty Shoppers,2.7285
+04-2019,Solar Energy Researchers,6.2759
+06-2019,Las Vegas Trip Planners,2.7651
+07-2019,Las Vegas Trip Planners,2.8176
+03-2019,Alabama Trip Planners,6.543
+01-2019,Work Comes First Travelers,7.6573
+02-2019,Work Comes First Travelers,7.6625
+09-2018,Work Comes First Travelers,8.2636
+10-2018,Work Comes First Travelers,9.1351
+11-2018,Work Comes First Travelers,8.2766
+12-2018,Work Comes First Travelers,
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Produce the final requested output.  For every month from Sep-2018 to Aug-2019:
+-- • top interest & its max index composition
+-- • three-month rolling average of those max compositions
+-- • names & compositions of the top interests one-month and two-months earlier.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+),
+top_monthly AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio
+  FROM winners
+  WHERE rnk = 1
+),
+with_names AS (
+  SELECT
+         tm.month_year,
+         im.interest_name,
+         tm.avg_ratio
+  FROM top_monthly AS tm
+  JOIN interest_map AS im
+    ON im.id = tm.interest_id
+),
+rolling AS (
+  SELECT
+         wn.month_year AS cur_month,
+         wn.interest_name  AS cur_interest,
+         wn.avg_ratio      AS cur_max_idx_comp,
+         -- Three-month rolling average including current month
+         ROUND(AVG(wn.avg_ratio)
+               OVER (ORDER BY wn.month_year
+                     ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),4) AS rolling_3m,
+         -- previous month winner
+         LAG(wn.interest_name,1) OVER (ORDER BY wn.month_year)  AS prev1_interest,
+         LAG(wn.avg_ratio,1)      OVER (ORDER BY wn.month_year) AS prev1_max_idx,
+         -- two months ago winner
+         LAG(wn.interest_name,2) OVER (ORDER BY wn.month_year)  AS prev2_interest,
+         LAG(wn.avg_ratio,2)      OVER (ORDER BY wn.month_year) AS prev2_max_idx
+  FROM with_names AS wn
+)
+SELECT
+       cur_month        AS month_year,
+       cur_interest     AS top_interest,
+       cur_max_idx_comp AS max_idx_composition,
+       rolling_3m       AS rolling_3m_avg,
+       prev1_interest,
+       prev1_max_idx,
+       prev2_interest,
+       prev2_max_idx
+FROM rolling
+ORDER BY cur_month
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Produce the final requested output.  For every month from Sep-2018 to Aug-2019:
+-- • top interest & its max index composition
+-- • three-month rolling average of those max compositions
+-- • names & compositions of the top interests one-month and two-months earlier.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+),
+top_monthly AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio
+  FROM winners
+  WHERE rnk = 1
+),
+with_names AS (
+  SELECT
+         tm.month_year,
+         im.interest_name,
+         tm.avg_ratio
+  FROM top_monthly AS tm
+  JOIN interest_map AS im
+    ON im.id = tm.interest_id
+),
+rolling AS (
+  SELECT
+         wn.month_year AS cur_month,
+         wn.interest_name  AS cur_interest,
+         wn.avg_ratio      AS cur_max_idx_comp,
+         -- Three-month rolling average including current month
+         ROUND(AVG(wn.avg_ratio)
+               OVER (ORDER BY wn.month_year
+                     ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),4) AS rolling_3m,
+         -- previous month winner
+         LAG(wn.interest_name,1) OVER (ORDER BY wn.month_year)  AS prev1_interest,
+         LAG(wn.avg_ratio,1)      OVER (ORDER BY wn.month_year) AS prev1_max_idx,
+         -- two months ago winner
+         LAG(wn.interest_name,2) OVER (ORDER BY wn.month_year)  AS prev2_interest,
+         LAG(wn.avg_ratio,2)      OVER (ORDER BY wn.month_year) AS prev2_max_idx
+  FROM with_names AS wn
+)
+SELECT
+       cur_month        AS month_year,
+       cur_interest     AS top_interest,
+       cur_max_idx_comp AS max_idx_composition,
+       rolling_3m       AS rolling_3m_avg,
+       prev1_interest,
+       prev1_max_idx,
+       prev2_interest,
+       prev2_max_idx
+FROM rolling
+ORDER BY cur_month
+LIMIT 20;
+Results:
+month_year,top_interest,max_idx_composition,rolling_3m_avg,prev1_interest,prev1_max_idx,prev2_interest,prev2_max_idx
+01-2019,Work Comes First Travelers,7.6573,7.6573,,,,
+02-2019,Work Comes First Travelers,7.6625,7.6599,Work Comes First Travelers,7.6573,,
+03-2019,Alabama Trip Planners,6.543,7.2876,Work Comes First Travelers,7.6625,Work Comes First Travelers,7.6573
+04-2019,Solar Energy Researchers,6.2759,6.8271,Alabama Trip Planners,6.543,Work Comes First Travelers,7.6625
+05-2019,Readers of H
+
+[Successfully executed]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Double-check a couple of months outside the requested window to confirm they’re
+--not being picked up inadvertently.
+SELECT DISTINCT month_year
+FROM interest_metrics
+WHERE _year = 2017
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:38:39 - Thread-3612 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 04:39:05 - Thread-3612 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Determine the overall date span of interest_metrics by returning
+--the earliest and latest month_year values; this quickly confirms whether any
+--data exists outside the Sep-2018 to Aug-2019 window without additional filters.
+SELECT 
+    MIN(month_year) AS earliest_month,
+    MAX(month_year) AS latest_month
+FROM interest_metrics;
+```
+[Corrected SQL]
+2025-05-05 04:39:05 - Thread-3612 (execute) - INFO - [Results for corrected sql]
+earliest_month,latest_month
+01-2019,12-2018
+
+[Results for corrected sql]
+2025-05-05 04:39:10 - Thread-3612 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Sanity-check the mapping table by listing a sample of interest IDs and names,
+--ensuring the join key (id) contains data.
+SELECT
+    id,
+    interest_name
+FROM interest_map
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 04:39:10 - Thread-3612 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Determine the overall date span of interest_metrics by returning
+--the earliest and latest month_year values; this quickly confirms whether any
+--data exists outside the Sep-2018 to Aug-2019 window without additional filters.
+SELECT 
+    MIN(month_year) AS earliest_month,
+    MAX(month_year) AS latest_month
+FROM interest_metrics;
+Results:
+earliest_month,latest_month
+01-2019,12-2018
+
+[Successfully corrected]
+2025-05-05 04:39:10 - Thread-3612 (execute) - INFO - [Try to execute]
+--Description: Sanity-check the mapping table by listing a sample of interest IDs and names,
+--ensuring the join key (id) contains data.
+SELECT
+    id,
+    interest_name
+FROM interest_map
+LIMIT 20
+[Try to execute]
+2025-05-05 04:39:10 - Thread-3612 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Sanity-check the mapping table by listing a sample of interest IDs and names,
+--ensuring the join key (id) contains data.
+SELECT
+    id,
+    interest_name
+FROM interest_map
+LIMIT 20
+Results:
+id,interest_name
+1,Fitness Enthusiasts
+2,Gamers
+3,Car Enthusiasts
+4,Luxury Retail Researchers
+5,Brides & Wedding Planners
+6,Vacation Planners
+7,Motorcycle Enthusiasts
+8,Business News Readers
+12,Thrift Store Shoppers
+13,Advertising Professionals
+14,NFL Fans
+15,NBA Fans
+16,NCAA Fans
+17,MLB Fans
+18,Nascar Fans
+19,Eco-Conscious Consumers
+20,Moviegoers
+21,DIYers
+22,Grill Masters
+23,Techies
+
+[Successfully executed]
+2025-05-05 04:39:10 - Thread-3612 (execute) - INFO - itercount: 0
+2025-05-05 04:39:10 - Thread-3612 (execute) - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: weekly_sales
+Column name: week_date Type: TEXT
+Column name: region Type: TEXT
+Column name: platform Type: TEXT
+Column name: segment Type: TEXT
+Column name: customer_type Type: TEXT
+Column name: transactions Type: INTEGER
+Column name: sales Type: INTEGER
+Sample rows:
+[('31/8/20', 'ASIA', 'Retail', 'C3', 'New', 120631, 3656163), ('31/8/20', 'ASIA', 'Retail', 'F1', 'New', 31574, 996575), ('31/8/20', 'USA', 'Retail', None, 'Guest', 529151, 16509610)]
+
+--------------------------------------------------
+Table full name: shopping_cart_users
+Column name: user_id Type: INTEGER
+Column name: cookie_id Type: TEXT
+Column name: start_date Type: TEXT
+Sample rows:
+[(1, 'c4ca42', '2020-02-04'), (2, 'c81e72', '2020-01-18'), (3, 'eccbc8', '2020-02-21')]
+
+--------------------------------------------------
+Table full name: bitcoin_members
+Column name: member_id Type: TEXT
+Column name: first_name Type: TEXT
+Column name: region Type: TEXT
+Sample rows:
+[('c4ca42', 'Danny', 'Australia'), ('c81e72', 'Vipul', 'United States'), ('eccbc8', 'Charlie', 'United States')]
+
+--------------------------------------------------
+Table full name: interest_metrics
+Column name: _month Type: REAL
+Column name: _year Type: REAL
+Column name: month_year Type: TEXT
+Column name: interest_id Type: REAL
+Column name: composition Type: REAL
+Column name: index_value Type: REAL
+Column name: ranking Type: INTEGER
+Column name: percentile_ranking Type: REAL
+Sample rows:
+[(7.0, 2018.0, '07-2018', 32486.0, 11.89, 6.19, 1, 99.86), (7.0, 2018.0, '07-2018', 6106.0, 9.93, 5.31, 2, 99.73), (7.0, 2018.0, '07-2018', 18923.0, 10.85, 5.29, 3, 99.59)]
+
+--------------------------------------------------
+Table full name: customer_regions
+Column name: region_id Type: INTEGER
+Column name: region_name Type: TEXT
+Sample rows:
+[(1, 'Australia'), (2, 'America'), (3, 'Africa')]
+
+--------------------------------------------------
+Table full name: customer_transactions
+Column name: customer_id Type: INTEGER
+Column name: txn_date Type: TEXT
+Column name: txn_type Type: TEXT
+Column name: txn_amount Type: INTEGER
+Sample rows:
+[(429, '2020-01-21', 'deposit', 82), (155, '2020-01-10', 'deposit', 712), (398, '2020-01-01', 'deposit', 196)]
+
+--------------------------------------------------
+Table full name: bitcoin_transactions
+Column name: txn_id Type: INTEGER
+Column name: member_id Type: TEXT
+Column name: ticker Type: TEXT
+Column name: txn_date Type: TEXT
+Column name: txn_type Type: TEXT
+Column name: quantity Type: REAL
+Column name: percentage_fee Type: REAL
+Column name: txn_time Type: TEXT
+Sample rows:
+[(1, 'c81e72', 'BTC', '01-01-2017', 'BUY', 50.0, 0.3, '2017-01-01T00:00:00.000Z'), (2, 'eccbc8', 'BTC', '01-01-2017', 'BUY', 50.0, 0.3, '2017-01-01T00:00:00.000Z'), (3, 'a87ff6', 'BTC', '01-01-2017', 'BUY', 50.0, 0.0, '2017-01-01T00:00:00.000Z')]
+
+--------------------------------------------------
+Table full name: customer_nodes
+Column name: customer_id Type: INTEGER
+Column name: region_id Type: INTEGER
+Column name: node_id Type: INTEGER
+Column name: start_date Type: TEXT
+Column name: end_date Type: TEXT
+Sample rows:
+[(1, 3, 4, '2020-01-02', '2020-01-03'), (2, 3, 5, '2020-01-03', '2020-01-17'), (3, 5, 4, '2020-01-27', '2020-02-18')]
+
+--------------------------------------------------
+Table full name: cleaned_weekly_sales
+Column name: week_date_formatted Type: TEXT
+Column name: week_date Type: TEXT
+Column name: region Type: TEXT
+Column name: platform Type: TEXT
+Column name: segment Type: TEXT
+Column name: customer_type Type: TEXT
+Column name: transactions Type: INTEGER
+Column name: sales Type: INTEGER
+Column name: week_number Type: INTEGER
+Column name: month_number Type: INTEGER
+Column name: calendar_year Type: INTEGER
+Column name: age_band Type: TEXT
+Column name: demographic Type: TEXT
+Column name: avg_transaction Type: REAL
+Sample rows:
+[('2020-8-31', '2020-08-31', 'ASIA', 'Retail', 'C3', 'New', 120631, 3656163, 36, 8, 2020, 'Retirees', 'Couples', 30.31), ('2020-8-31', '2020-08-31', 'ASIA', 'Retail', 'F1', 'New', 31574, 996575, 36, 8, 2020, 'Young Adults', 'Families', 31.56), ('2020-8-31', '2020-08-31', 'USA', 'Retail', 'unknown', 'Guest', 529151, 16509610, 36, 8, 2020, 'unknown', 'unknown', 31.2)]
+
+--------------------------------------------------
+Table full name: veg_txn_df
+Column name: index Type: INTEGER
+Column name: txn_date Type: TEXT
+Column name: txn_time Type: TEXT
+Column name: item_code Type: INTEGER
+Column name: qty_sold(kg) Type: REAL
+Column name: unit_selling_px_rmb/kg Type: REAL
+Column name: sale/return Type: TEXT
+Column name: discount(%) Type: INTEGER
+Column name: day_of_week Type: TEXT
+Sample rows:
+[(0, '2020-07-01 00:00:00', '09:15:07', 102900005117056, 0.396, 7.6, 'sale', 1, 'Wednesday'), (1, '2020-07-01 00:00:00', '09:17:27', 102900005115960, 0.849, 3.2, 'sale', 1, 'Wednesday'), (2, '2020-07-01 00:00:00', '09:17:33', 102900005117056, 0.409, 7.6, 'sale', 1, 'Wednesday')]
+
+--------------------------------------------------
+Table full name: shopping_cart_events
+Column name: visit_id Type: TEXT
+Column name: cookie_id Type: TEXT
+Column name: page_id Type: INTEGER
+Column name: event_type Type: INTEGER
+Column name: sequence_number Type: INTEGER
+Column name: event_time Type: TEXT
+Sample rows:
+[('ccf365', 'c4ca42', 1, 1, 1, '2020-02-04 19:16:09.182546'), ('ccf365', 'c4ca42', 2, 1, 2, '2020-02-04 19:16:17.358191'), ('ccf365', 'c4ca42', 6, 1, 3, '2020-02-04 19:16:58.454669')]
+
+--------------------------------------------------
+Table full name: shopping_cart_page_hierarchy
+Column name: page_id Type: INTEGER
+Column name: page_name Type: TEXT
+Column name: product_category Type: TEXT
+Column name: product_id Type: REAL
+Sample rows:
+[(1, 'Home Page', None, None), (2, 'All Products', None, None), (3, 'Salmon', 'Fish', 1.0)]
+
+--------------------------------------------------
+Table full name: bitcoin_prices
+Column name: ticker Type: TEXT
+Column name: market_date Type: TEXT
+Column name: price Type: REAL
+Column name: open Type: REAL
+Column name: high Type: REAL
+Column name: low Type: REAL
+Column name: volume Type: TEXT
+Column name: change Type: TEXT
+Sample rows:
+[('ETH', '29-08-2021', 3177.84, 3243.96, 3282.21, 3162.79, '582.04K', '-2.04%'), ('ETH', '28-08-2021', 3243.9, 3273.78, 3284.58, 3212.24, '466.21K', '-0.91%'), ('ETH', '27-08-2021', 3273.58, 3093.78, 3279.93, 3063.37, '839.54K', '5.82%')]
+
+--------------------------------------------------
+Table full name: interest_map
+Column name: id Type: INTEGER
+Column name: interest_name Type: TEXT
+Column name: interest_summary Type: TEXT
+Column name: created_at Type: TEXT
+Column name: last_modified Type: TEXT
+Sample rows:
+[(1, 'Fitness Enthusiasts', 'Consumers using fitness tracking apps and websites.', '2016-05-26 14:57:59', '2018-05-23 11:30:12'), (2, 'Gamers', 'Consumers researching game reviews and cheat codes.', '2016-05-26 14:57:59', '2018-05-23 11:30:12'), (3, 'Car Enthusiasts', 'Readers of automotive news and car reviews.', '2016-05-26 14:57:59', '2018-05-23 11:30:12')]
+
+--------------------------------------------------
+Table full name: veg_loss_rate_df
+Column name: index Type: INTEGER
+Column name: item_code Type: INTEGER
+Column name: item_name Type: TEXT
+Column name: loss_rate_% Type: REAL
+Sample rows:
+[(0, 102900005115168, 'Niushou Shengcai', 4.39), (1, 102900005115199, 'Sichuan Red Cedar', 10.46), (2, 102900005115250, 'Xixia Black Mushroom (1)', 10.8)]
+
+--------------------------------------------------
+Table full name: shopping_cart_campaign_identifier
+Column name: campaign_id Type: INTEGER
+Column name: products Type: TEXT
+Column name: campaign_name Type: TEXT
+Column name: start_date Type: TEXT
+Column name: end_date Type: TEXT
+Sample rows:
+[(1, '1-3', 'BOGOF - Fishing For Compliments', '2020-01-01', '2020-01-14'), (2, '4-5', '25% Off - Living The Lux Life', '2020-01-15', '2020-01-28'), (3, '6-8', 'Half Off - Treat Your Shellf(ish)', '2020-02-01', '2020-03-31')]
+
+--------------------------------------------------
+Table full name: veg_cat
+Column name: index Type: INTEGER
+Column name: item_code Type: INTEGER
+Column name: item_name Type: TEXT
+Column name: category_code Type: INTEGER
+Column name: category_name Type: TEXT
+Sample rows:
+[(0, 102900005115168, 'Niushou Shengcai', 1011010101, 'Flower/Leaf\xa0Vegetables'), (1, 102900005115199, 'Sichuan Red Cedar', 1011010101, 'Flower/Leaf\xa0Vegetables'), (2, 102900005115625, 'Local Xiaomao Cabbage', 1011010101, 'Flower/Leaf\xa0Vegetables')]
+
+--------------------------------------------------
+Table full name: veg_whsle_df
+Column name: index Type: INTEGER
+Column name: whsle_date Type: TEXT
+Column name: item_code Type: INTEGER
+Column name: whsle_px_rmb-kg Type: REAL
+Sample rows:
+[(0, '2020-07-01 00:00:00', 102900005115762, 3.88), (1, '2020-07-01 00:00:00', 102900005115779, 6.72), (2, '2020-07-01 00:00:00', 102900005115786, 3.19)]
+
+--------------------------------------------------
+Table full name: shopping_cart_event_identifier
+Column name: event_type Type: INTEGER
+Column name: event_name Type: TEXT
+Sample rows:
+[(1, 'Page View'), (2, 'Add to Cart'), (3, 'Purchase')]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['weekly_sales', 'shopping_cart_users', 'bitcoin_members', 'interest_metrics', 'customer_regions', 'customer_transactions', 'bitcoin_transactions', 'customer_nodes', 'cleaned_weekly_sales', 'veg_txn_df', 'shopping_cart_events', 'shopping_cart_page_hierarchy', 'bitcoin_prices', 'interest_map', 'veg_loss_rate_df', 'shopping_cart_campaign_identifier', 'veg_cat', 'veg_whsle_df', 'shopping_cart_event_identifier']
+Some few-shot examples may be useful:
+Query:
+--Description: View all distinct month/year combinations in interest_metrics so we can confirm the
+--2018-09 to 2019-08 range exists.
+SELECT DISTINCT month_year
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+LIMIT 20;
+Answer:
+month_year
+09-2018
+10-2018
+11-2018
+12-2018
+01-2019
+02-2019
+03-2019
+04-2019
+05-2019
+06-2019
+07-2019
+08-2019
+Query:
+--Description: Inspect a sample of rows in September-2018 to understand the raw composition
+--and index_value numbers we will later aggregate.
+SELECT *
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+LIMIT 20;
+Answer:
+_month,_year,month_year,interest_id,composition,index_value,ranking,percentile_ranking
+9.0,2018.0,09-2018,6218.0,4.61,2.84,1,99.87
+9.0,2018.0,09-2018,6285.0,7.06,2.82,2,99.74
+9.0,2018.0,09-2018,22502.0,6.49,2.76,3,99.62
+9.0,2018.0,09-2018,115.0,6.81,2.74,4,99.49
+9.0,2018.0,09-2018,6013.0,4.9,2.73,5,99.36
+9.0,2018.0,09-2018,6206.0,7.49,2.67,6,99.23
+9.0,2018.0,09-2018,4.0,6.05,2.58,7,99.1
+9.0,2018.0,09-2018,171.0,6.36,2.49,8,98.97
+9.0,2018.0,09-2018,38.0,4.67,2.46,9,98.85
+9.0,2018.0,09-2
+Query:
+--Description: Calculate the composition-to-index ratio (protecting against divide-by-zero) for the
+--September-2018 rows as a worked example.
+SELECT
+       interest_id,
+       month_year,
+       ROUND(composition / NULLIF(index_value,0), 4) AS comp_idx_ratio
+FROM interest_metrics
+WHERE _year = 2018
+  AND _month = 9
+  AND index_value <> 0
+LIMIT 20;
+Answer:
+interest_id,month_year,comp_idx_ratio
+6218.0,09-2018,1.6232
+6285.0,09-2018,2.5035
+22502.0,09-2018,2.3514
+115.0,09-2018,2.4854
+6013.0,09-2018,1.7949
+6206.0,09-2018,2.8052
+4.0,09-2018,2.345
+171.0,09-2018,2.5542
+38.0,09-2018,1.8984
+6219.0,09-2018,1.8136
+35904.0,09-2018,2.2179
+16137.0,09-2018,2.2727
+6110.0,09-2018,1.9478
+19250.0,09-2018,2.8908
+16.0,09-2018,1.6053
+5970.0,09-2018,3.0482
+21242.0,09-2018,2.5614
+17269.0,09-2018,2.3158
+21057.0,09-2018,8.2636
+Query:
+--Description: Aggregate the average comp/index ratio per month & per interest across the whole
+--Sep-2018 → Aug-2019 window.
+SELECT
+       month_year,
+       interest_id,
+       ROUND(AVG(composition / NULLIF(index_value,0)), 4) AS avg_ratio
+FROM interest_metrics
+WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+   OR (_year=2019 AND _month BETWEEN 1 AND 8)
+   AND index_value <> 0
+GROUP BY month_year, interest_id
+LIMIT 20;
+Answer:
+month_year,interest_id,avg_ratio
+01-2019,1.0,1.4969
+01-2019,2.0,4.3636
+01-2019,4.0,2.0418
+01-2019,5.0,2.3185
+01-2019,6.0,4.0043
+01-2019,7.0,1.9882
+01-2019,8.0,1.7712
+01-2019,12.0,2.0136
+01-2019,13.0,1.646
+01-2019,14.0,1.3554
+01-2019,15.0,1.5299
+01-2019,16.0,1.5054
+01-2019,17.0,1.4277
+01-2019,18.0,1.5752
+01-2019,20.0,1.9154
+01-2019,21.0,3.6325
+01-2019,22.0,1.8
+01-2019,24.0,1.6129
+01-2019,25.0,2.1575
+01-2019,26.0,2.1512
+Query:
+--Description: Join the previous aggregation with interest_map to attach readable interest names.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+)
+SELECT
+       m.month_year,
+       im.interest_name,
+       m.avg_ratio
+FROM month_int_ratio AS m
+JOIN interest_map AS im
+  ON im.id = m.interest_id
+LIMIT 20;
+Answer:
+month_year,interest_name,avg_ratio
+01-2019,Fitness Enthusiasts,1.4969
+02-2019,Fitness Enthusiasts,1.9318
+03-2019,Fitness Enthusiasts,1.7922
+04-2019,Fitness Enthusiasts,1.52
+05-2019,Fitness Enthusiasts,1.037
+08-2019,Fitness Enthusiasts,1.4118
+09-2018,Fitness Enthusiasts,1.6828
+10-2018,Fitness Enthusiasts,2.0163
+11-2018,Fitness Enthusiasts,1.5163
+12-2018,Fitness Enthusiasts,1.6066
+01-2019,Gamers,4.3636
+02-2019,Gamers,5.2373
+03-2019,Gamers,4.7627
+Query:
+--Description: For every month, find the single interest that has the highest avg_ratio.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+ranked AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       month_year,
+       interest_id,
+       avg_ratio
+FROM ranked
+WHERE rnk = 1
+LIMIT 20;
+Answer:
+month_year,interest_id,avg_ratio
+01-2019,21057.0,7.6573
+02-2019,21057.0,7.6625
+03-2019,7541.0,6.543
+04-2019,6065.0,6.2759
+05-2019,21245.0,4.4091
+06-2019,6324.0,2.7651
+07-2019,6324.0,2.8176
+08-2019,4898.0,2.7285
+09-2018,21057.0,8.2636
+10-2018,21057.0,9.1351
+11-2018,21057.0,8.2766
+12-2018,21057.0,8.3137
+Query:
+--Description: Add the interest name to the monthly winners from the previous query.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year, interest_id, avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+)
+SELECT
+       w.month_year,
+       im.interest_name,
+       w.avg_ratio AS max_idx_composition
+FROM winners AS w
+JOIN interest_map AS im
+  ON im.id = w.interest_id
+WHERE w.rnk = 1
+LIMIT 20;
+Answer:
+month_year,interest_name,max_idx_composition
+08-2019,Cosmetics and Beauty Shoppers,2.7285
+04-2019,Solar Energy Researchers,6.2759
+06-2019,Las Vegas Trip Planners,2.7651
+07-2019,Las Vegas Trip Planners,2.8176
+03-2019,Alabama Trip Planners,6.543
+01-2019,Work Comes First Travelers,7.6573
+02-2019,Work Comes First Travelers,7.6625
+09-2018,Work Comes First Travelers,8.2636
+10-2018,Work Comes First Travelers,9.1351
+11-2018,Work Comes First Travelers,8.2766
+12-2018,Work Comes First Travelers,
+Query:
+--Description: Produce the final requested output.  For every month from Sep-2018 to Aug-2019:
+-- • top interest & its max index composition
+-- • three-month rolling average of those max compositions
+-- • names & compositions of the top interests one-month and two-months earlier.
+WITH month_int_ratio AS (
+  SELECT month_year, interest_id,
+         ROUND(AVG(composition / NULLIF(index_value,0)),4) AS avg_ratio
+  FROM interest_metrics
+  WHERE (_year=2018 AND _month BETWEEN 9 AND 12)
+     OR (_year=2019 AND _month BETWEEN 1 AND 8)
+     AND index_value <> 0
+  GROUP BY month_year, interest_id
+),
+winners AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio,
+         RANK() OVER (PARTITION BY month_year ORDER BY avg_ratio DESC) AS rnk
+  FROM month_int_ratio
+),
+top_monthly AS (
+  SELECT month_year,
+         interest_id,
+         avg_ratio
+  FROM winners
+  WHERE rnk = 1
+),
+with_names AS (
+  SELECT
+         tm.month_year,
+         im.interest_name,
+         tm.avg_ratio
+  FROM top_monthly AS tm
+  JOIN interest_map AS im
+    ON im.id = tm.interest_id
+),
+rolling AS (
+  SELECT
+         wn.month_year AS cur_month,
+         wn.interest_name  AS cur_interest,
+         wn.avg_ratio      AS cur_max_idx_comp,
+         -- Three-month rolling average including current month
+         ROUND(AVG(wn.avg_ratio)
+               OVER (ORDER BY wn.month_year
+                     ROWS BETWEEN 2 PRECEDING AND CURRENT ROW),4) AS rolling_3m,
+         -- previous month winner
+         LAG(wn.interest_name,1) OVER (ORDER BY wn.month_year)  AS prev1_interest,
+         LAG(wn.avg_ratio,1)      OVER (ORDER BY wn.month_year) AS prev1_max_idx,
+         -- two months ago winner
+         LAG(wn.interest_name,2) OVER (ORDER BY wn.month_year)  AS prev2_interest,
+         LAG(wn.avg_ratio,2)      OVER (ORDER BY wn.month_year) AS prev2_max_idx
+  FROM with_names AS wn
+)
+SELECT
+       cur_month        AS month_year,
+       cur_interest     AS top_interest,
+       cur_max_idx_comp AS max_idx_composition,
+       rolling_3m       AS rolling_3m_avg,
+       prev1_interest,
+       prev1_max_idx,
+       prev2_interest,
+       prev2_max_idx
+FROM rolling
+ORDER BY cur_month
+LIMIT 20;
+Answer:
+month_year,top_interest,max_idx_composition,rolling_3m_avg,prev1_interest,prev1_max_idx,prev2_interest,prev2_max_idx
+01-2019,Work Comes First Travelers,7.6573,7.6573,,,,
+02-2019,Work Comes First Travelers,7.6625,7.6599,Work Comes First Travelers,7.6573,,
+03-2019,Alabama Trip Planners,6.543,7.2876,Work Comes First Travelers,7.6625,Work Comes First Travelers,7.6573
+04-2019,Solar Energy Researchers,6.2759,6.8271,Alabama Trip Planners,6.543,Work Comes First Travelers,7.6625
+05-2019,Readers of H
+Query:
+--Description: Sanity-check the mapping table by listing a sample of interest IDs and names,
+--ensuring the join key (id) contains data.
+SELECT
+    id,
+    interest_name
+FROM interest_map
+LIMIT 20
+Answer:
+id,interest_name
+1,Fitness Enthusiasts
+2,Gamers
+3,Car Enthusiasts
+4,Luxury Retail Researchers
+5,Brides & Wedding Planners
+6,Vacation Planners
+7,Motorcycle Enthusiasts
+8,Business News Readers
+12,Thrift Store Shoppers
+13,Advertising Professionals
+14,NFL Fans
+15,NBA Fans
+16,NCAA Fans
+17,MLB Fans
+18,Nascar Fans
+19,Eco-Conscious Consumers
+20,Moviegoers
+21,DIYers
+22,Grill Masters
+23,Techies
+Task: Please analyze our interest data from September 2018 to August 2019. For each month, calculate the average composition for each interest by dividing the composition by the index value. Identify the interest with the highest average composition value each month and report its average composition as the max index composition for that month. Compute the three-month rolling average of these monthly max index compositions. Ensure the output includes the date, the interest name, the max index composition for that month, the rolling average, and the names and max index compositions of the top interests from one month ago and two months ago.
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Here are some useful tips for answering:
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 04:39:33 - Thread-3612 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH base AS (   -- keep only the required months and protect against divide-by-zero
+    SELECT
+        CAST(_year  AS INTEGER)              AS yr,
+        CAST(_month AS INTEGER)              AS mo,
+        month_year,
+        interest_id,
+        composition / NULLIF(index_value,0)  AS comp_to_idx
+    FROM interest_metrics
+    WHERE ( (_year = 2018 AND _month BETWEEN 9 AND 12)
+             OR (_year = 2019 AND _month BETWEEN 1 AND 8) )
+      AND index_value <> 0
+),
+avg_ratio AS (    -- average ratio for every interest in every month
+    SELECT
+        yr,
+        mo,
+        month_year,
+        interest_id,
+        AVG(comp_to_idx) AS avg_ratio
+    FROM base
+    GROUP BY yr, mo, month_year, interest_id
+),
+ranked AS (       -- pick the top-ranking interest each month
+    SELECT
+        *,
+        RANK() OVER (PARTITION BY yr, mo ORDER BY avg_ratio DESC) AS rnk
+    FROM avg_ratio
+),
+monthly_winner AS (
+    SELECT
+        yr,
+        mo,
+        month_year,
+        interest_id,
+        ROUND(avg_ratio,4) AS max_idx_comp
+    FROM ranked
+    WHERE rnk = 1
+),
+with_name AS (    -- attach readable interest names
+    SELECT
+        mw.*,
+        im.interest_name
+    FROM monthly_winner AS mw
+    JOIN interest_map  AS im
+      ON im.id = mw.interest_id
+),
+rolling_calc AS ( -- add 3-month rolling avg and previous winners
+    SELECT
+        yr,
+        mo,
+        month_year,
+        interest_name                      AS top_interest,
+        max_idx_comp                       AS max_idx_composition,
+        ROUND(
+            AVG(max_idx_comp)
+            OVER (ORDER BY yr, mo
+                  ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 4) AS rolling_3m_avg,
+        LAG(interest_name,1) OVER (ORDER BY yr, mo)  AS prev1_interest,
+        LAG(max_idx_comp,1) OVER (ORDER BY yr, mo)   AS prev1_max_idx,
+        LAG(interest_name,2) OVER (ORDER BY yr, mo)  AS prev2_interest,
+        LAG(max_idx_comp,2) OVER (ORDER BY yr, mo)   AS prev2_max_idx
+    FROM with_name
+)
+SELECT
+    month_year,
+    top_interest,
+    max_idx_composition,
+    rolling_3m_avg,
+    prev1_interest,
+    prev1_max_idx,
+    prev2_interest,
+    prev2_max_idx
+FROM rolling_calc
+ORDER BY yr, mo;
+```
+[Try to run SQL in self-refine]
+2025-05-05 04:39:33 - Thread-3612 (execute) - INFO - Total iteration counts: 0

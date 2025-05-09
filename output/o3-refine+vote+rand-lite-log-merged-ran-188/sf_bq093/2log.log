@@ -1,0 +1,356 @@
+2025-05-05 02:11:27 - Thread-939 (execute) - INFO - [Exploration]
+```sql
+--Description: 1) Preview a few Ethereum Classic transactions that were mined on 14-Oct-2016
+SELECT 
+  "hash",
+  "from_address",
+  "to_address",
+  "value",
+  "gas_price",
+  "receipt_gas_used",
+  "block_number",
+  "block_timestamp"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND "receipt_status" = 1
+LIMIT 20;
+```
+
+```sql
+--Description: 2) Total ETC sent (“credits”) by each address on 14-Oct-2016
+SELECT 
+  "from_address"  AS "address",
+  SUM("value")    AS "total_sent"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND "receipt_status" = 1
+GROUP BY "from_address"
+ORDER BY "total_sent" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 3) Total ETC received (“debits”) by each address on 14-Oct-2016
+SELECT 
+  "to_address"    AS "address",
+  SUM("value")    AS "total_received"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND "receipt_status" = 1
+GROUP BY "to_address"
+ORDER BY "total_received" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 4) Gas fees paid by every transaction sender on 14-Oct-2016  
+--   (gas_price * receipt_gas_used)
+SELECT
+  "from_address"                                AS "address",
+  SUM("gas_price" * "receipt_gas_used")         AS "total_gas_fee_paid"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND "receipt_status" = 1
+GROUP BY "from_address"
+ORDER BY "total_gas_fee_paid" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 5) Identify all blocks from 14-Oct-2016 and the miners who produced them
+SELECT 
+  "number"          AS "block_number",
+  "miner",
+  "gas_used",
+  "gas_limit",
+  "timestamp"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.BLOCKS
+WHERE "timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+ORDER BY "number"
+LIMIT 20;
+```
+
+```sql
+--Description: 6) Aggregate the gas fees earned by each miner on 14-Oct-2016  
+--   (sum over their blocks: Σ gas_used * average gas_price of txs in that block)
+SELECT 
+  b."miner"                                            AS "miner_address",
+  SUM(b."gas_used")                                    AS "total_gas_used",
+  AVG(t."gas_price")                                   AS "avg_gas_price",
+  SUM(b."gas_used") * AVG(t."gas_price")               AS "gas_fee_earned"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.BLOCKS       b
+JOIN CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS t
+     ON b."number" = t."block_number"
+WHERE b."timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND t."receipt_status" = 1
+GROUP BY b."miner"
+ORDER BY "gas_fee_earned" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 7) Compute per-address net value transfer (received − sent) on 14-Oct-2016
+WITH sent AS (
+  SELECT "from_address" AS addr, SUM("value") AS sent_val
+  FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+  WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+    AND "receipt_status" = 1
+  GROUP BY "from_address"
+),
+recv AS (
+  SELECT "to_address"   AS addr, SUM("value") AS recv_val
+  FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+  WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+    AND "receipt_status" = 1
+  GROUP BY "to_address"
+)
+SELECT
+  COALESCE(r.addr, s.addr)                                   AS "address",
+  COALESCE(recv_val, 0) - COALESCE(sent_val, 0)              AS "net_value"
+FROM recv r
+FULL OUTER JOIN sent s ON r.addr = s.addr
+ORDER BY "net_value" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 8) Include gas fees to get net balance change ( value + gas rewards – gas paid )
+WITH tx AS (
+  SELECT 
+     "from_address",
+     "to_address",
+     "value",
+     ("gas_price" * "receipt_gas_used") AS gas_fee,
+     "block_number"
+  FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+  WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+    AND "receipt_status" = 1
+),
+send AS (
+  SELECT "from_address" AS addr,
+         SUM("value" + gas_fee) AS debit          -- sent value plus fee paid
+  FROM tx
+  GROUP BY "from_address"
+),
+recv AS (
+  SELECT "to_address" AS addr,
+         SUM("value") AS credit                    -- received value (no fee)
+  FROM tx
+  GROUP BY "to_address"
+),
+miner_fee AS (
+  SELECT 
+     b."miner"       AS addr,
+     SUM(b."gas_used") * AVG(t."gas_price") AS miner_reward
+  FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.BLOCKS b
+  JOIN CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS t
+       ON b."number" = t."block_number"
+  WHERE b."timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+    AND t."receipt_status" = 1
+  GROUP BY b."miner"
+)
+SELECT 
+  COALESCE(r.addr,s.addr,m.addr)                                   AS "address",
+  COALESCE(credit,0) + COALESCE(miner_reward,0) - COALESCE(debit,0) AS "net_balance_change"
+FROM recv r
+FULL OUTER JOIN send s      ON r.addr = s.addr
+FULL OUTER JOIN miner_fee m ON COALESCE(r.addr,s.addr) = m.addr
+ORDER BY "net_balance_change" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: 9) Show addresses with the largest negative net balance change (most out-flows)
+SELECT *
+FROM (
+  -- reuse the CTE logic from query (8) but invert ordering
+  WITH tx AS (
+    SELECT 
+       "from_address",
+       "to_address",
+       "value",
+       ("gas_price" * "receipt_gas_used") AS gas_fee,
+       "block_number"
+    FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+    WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999999
+      AND "receipt_status" = 1
+  ),
+  send AS (
+    SELECT "from_address" AS addr,
+           SUM("value" + gas_fee) AS debit
+    FROM tx
+    GROUP BY "from_address"
+  ),
+  recv AS (
+    SELECT "to_address" AS addr,
+           SUM("value") AS credit
+    FROM tx
+    GROUP BY "to_address"
+  )
+  SELECT 
+     COALESCE(r.addr,s.addr)                             AS "address",
+     COALESCE(credit,0) - COALESCE(debit,0)              AS "net_value"
+  FROM recv r
+  FULL OUTER JOIN send s ON r.addr = s.addr
+)
+ORDER BY "net_value" ASC
+LIMIT 20;
+```
+
+```sql
+--Description: 10) Distinct list of all participant addresses (senders, receivers, miners) on 14-Oct-2016
+SELECT DISTINCT "address"
+FROM (
+    SELECT "from_address" AS "address"
+    FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+    WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+      AND "receipt_status" = 1
+    UNION
+    SELECT "to_address" AS "address"
+    FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+    WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+      AND "receipt_status" = 1
+    UNION
+    SELECT "miner" AS "address"
+    FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.BLOCKS
+    WHERE "timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+)
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 02:11:27 - Thread-939 (execute) - INFO - [Try to execute]
+--Description: 1) Preview a few Ethereum Classic transactions that were mined on 14-Oct-2016
+SELECT 
+  "hash",
+  "from_address",
+  "to_address",
+  "value",
+  "gas_price",
+  "receipt_gas_used",
+  "block_number",
+  "block_timestamp"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND "receipt_status" = 1
+LIMIT 20;
+[Try to execute]
+2025-05-05 02:11:29 - Thread-939 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 02:12:19 - Thread-939 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Find the overall earliest and latest block timestamps recorded in
+--             CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS.  
+--             This reveals whether data for October 14 2016 (Unix-μs ≈ 1476403200000000)
+--             is actually present and guides our next queries.
+SELECT
+    MIN("block_timestamp") AS "earliest_timestamp",
+    MAX("block_timestamp") AS "latest_timestamp"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS;
+```
+[Corrected SQL]
+2025-05-05 02:12:19 - Thread-939 (execute) - INFO - [Results for corrected sql]
+earliest_timestamp,latest_timestamp
+1441843284000000,1601942391000000
+
+[Results for corrected sql]
+2025-05-05 02:12:34 - Thread-939 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Find the overall earliest and latest block timestamps recorded in
+--             CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS.  
+--             This reveals whether data for October 14 2016 (Unix-μs ≈ 1476403200000000)
+--             is actually present and guides our next queries.
+SELECT
+    MIN("block_timestamp") AS "earliest_timestamp",
+    MAX("block_timestamp") AS "latest_timestamp"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS;
+Results:
+earliest_timestamp,latest_timestamp
+1441843284000000,1601942391000000
+
+[Successfully corrected]
+2025-05-05 02:12:34 - Thread-939 (execute) - INFO - [Try to execute]
+--Description: 2) Total ETC sent (“credits”) by each address on 14-Oct-2016
+SELECT 
+  "from_address"  AS "address",
+  SUM("value")    AS "total_sent"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476403200000000 AND 1476489599999999
+  AND "receipt_status" = 1
+GROUP BY "from_address"
+ORDER BY "total_sent" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-05 02:12:35 - Thread-939 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 02:13:35 - Thread-939 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Re-attempt “total ETC sent by each address” for the entire month of
+--             October 2016 (01-Oct to 31-Oct).  The previous 24-hour window
+--             returned no rows, so we broaden the range while still summing the
+--             “value” column for every sender.
+SELECT
+    "from_address"               AS "address",
+    SUM("value")                 AS "total_sent"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1475280000000000   -- 01-Oct-2016 00:00 UTC
+                           AND 1477958399000000   -- 31-Oct-2016 23:59 UTC
+GROUP BY "from_address"
+ORDER BY "total_sent" DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 02:13:36 - Thread-939 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-05 02:16:17 - Thread-939 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Broaden the window to two days (13-Oct-2016 00:00 UTC – 15-Oct-2016 00:00 UTC)
+--             and preview the first 20 Ethereum Classic transactions found.
+--             This checks whether any rows exist near 14-Oct-2016 before
+--             attempting narrower aggregates.
+SELECT
+    "hash",
+    "from_address",
+    "to_address",
+    "value",
+    "gas_price",
+    "receipt_gas_used",
+    "block_number",
+    "block_timestamp"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476316800000000   -- 13-Oct-2016 00:00:00 UTC
+                           AND 1476575999999999   -- 14-Oct-2016 23:59:59 UTC
+ORDER BY "block_timestamp" ASC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 02:16:17 - Thread-939 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-05 02:18:56 - Thread-939 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Aggregate the total ETC each sender transferred over a three-day
+--             window centred on 14-Oct-2016 (13-Oct 00:00 UTC – 15-Oct 00:00 UTC),
+--             without any `receipt_status` filter—this broader period and simpler
+--             criteria ensure rows are returned even if individual fields are NULL.
+SELECT
+    "from_address"                AS "address",
+    SUM("value")                  AS "total_sent"
+FROM CRYPTO.CRYPTO_ETHEREUM_CLASSIC.TRANSACTIONS
+WHERE "block_timestamp" BETWEEN 1476316800000000   -- 13-Oct-2016 00:00 UTC
+                           AND 1476575999999999   -- 14-Oct-2016 23:59 UTC
+GROUP BY "from_address"
+ORDER BY "total_sent" DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 02:18:56 - Thread-939 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]

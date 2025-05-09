@@ -1,0 +1,2323 @@
+2025-05-01 04:27:49 - Thread-151 (execute) - INFO - [Answer format]
+```csv
+driver_full_name
+```
+[Answer format]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Exploration]
+Relevant columns and their potential usage
+• lap_positions.lap_type : identify normal “Race” laps, pit‑related laps (“Pit In/Out”), and pre‑start laps (“Starting Position – Grid Drop”).  
+• lap_positions.lap, lap_positions.position : position of a driver on a given lap – needed to spot position changes.  
+• lap_positions.race_id, lap_positions.driver_id : primary keys to match consecutive laps belonging to the same driver and race.  
+• pit_stops.race_id, pit_stops.driver_id, pit_stops.lap : laps on which a driver enters/leaves the pit – laps to be ignored because position changes are pit‑stop related.  
+• retirements.race_id, retirements.driver_id, retirements.lap : laps on which a driver retires – ignore because they create artificial position changes.  
+• drivers_ext.driver_id, drivers_ext.full_name : final list of full driver names.  
+
+Typical conditions that will be useful
+• lp_curr.lap_type = 'Race' AND lp_prev.lap_type = 'Race'                       – on‑track race laps only.  
+• lp_curr.lap   > 1                                                              – ignore first‑lap position changes (start movements).  
+• lp_curr.lap  NOT IN (SELECT lap FROM pit_stops …)                             – discard pit‑entry/exit laps.  
+• lp_curr.lap  NOT IN (SELECT lap FROM retirements …)                           – discard retirement lap.  
+• CASE WHEN lp_prev.position > lp_curr.position …                               – positive delta = overtakes, negative delta = was overtaken.  
+
+Ten exploratory → final SQL queries
+All queries are limited to 20 rows so you can inspect the data step by step.
+
+```sql
+-- 1. Description: See all distinct lap types that exist in lap_positions.
+SELECT DISTINCT lp."lap_type"
+FROM "lap_positions" AS lp
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: Show raw lap‑by‑lap positions for Lewis Hamilton (driver_id = 1) in the 2009 Australian GP (race_id = 1).
+SELECT lp."race_id",
+       lp."driver_id",
+       lp."lap",
+       lp."position",
+       lp."lap_type"
+FROM   "lap_positions" AS lp
+WHERE  lp."race_id"  = 1
+  AND  lp."driver_id" = 1
+ORDER  BY lp."lap"
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: Inspect pit‑stop laps for the same race so we know which laps to ignore.
+SELECT ps."race_id",
+       ps."driver_id",
+       ps."lap",
+       ps."stop",
+       ps."duration"
+FROM   "pit_stops" AS ps
+WHERE  ps."race_id" = 1
+ORDER  BY ps."driver_id", ps."lap"
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: Check retirements to know which laps introduce non‑overtake position changes.
+SELECT r."race_id",
+       r."driver_id",
+       r."lap",
+       r."retirement_type"
+FROM   "retirements" AS r
+WHERE  r."race_id" = 18    -- example race
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: For Hamilton in race 1, show consecutive‑lap deltas (ignoring lap 1).
+SELECT lp_curr."race_id",
+       lp_curr."driver_id",
+       lp_curr."lap",
+       lp_prev."position" AS "pos_lap_minus_1",
+       lp_curr."position" AS "pos_lap",
+       (lp_prev."position" - lp_curr."position") AS "delta"
+FROM   "lap_positions" AS lp_curr
+JOIN   "lap_positions" AS lp_prev
+       ON lp_curr."race_id"   = lp_prev."race_id"
+      AND lp_curr."driver_id" = lp_prev."driver_id"
+      AND lp_curr."lap"       = lp_prev."lap" + 1
+WHERE  lp_curr."race_id"   = 1
+  AND  lp_curr."driver_id" = 1
+  AND  lp_curr."lap"      > 1
+  AND  lp_curr."lap_type"  = 'Race'
+  AND  lp_prev."lap_type"  = 'Race'
+LIMIT 20;
+```
+
+```sql
+-- 6. Description: Aggregate Hamilton’s overtakes vs times he was overtaken across ALL races.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE
+           WHEN (lp_prev."position" - lp_curr."position") > 0
+             THEN (lp_prev."position" - lp_curr."position")      -- he overtook others
+           ELSE 0
+         END AS overtakes,
+         CASE
+           WHEN (lp_prev."position" - lp_curr."position") < 0
+             THEN (lp_curr."position" - lp_prev."position")      -- he was overtaken
+           ELSE 0
+         END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"       > 1
+    AND  lp_curr."lap_type"   = 'Race'
+    AND  lp_prev."lap_type"   = 'Race'
+    AND  lp_curr."lap" NOT IN (
+          SELECT ps."lap" FROM "pit_stops" ps
+          WHERE ps."race_id" = lp_curr."race_id"
+            AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (
+          SELECT ps."lap" FROM "pit_stops" ps
+          WHERE ps."race_id" = lp_prev."race_id"
+            AND ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (
+          SELECT r."lap" FROM "retirements" r
+          WHERE r."race_id" = lp_curr."race_id"
+            AND r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+WHERE  d."driver_id" = 1
+GROUP  BY d."driver_id"
+LIMIT 20;
+```
+
+```sql
+-- 7. Description: Same aggregation as #6 but for every driver in one example race (race_id = 18).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."race_id" = 18
+    AND  lp_curr."lap"    > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS overtakes,
+       SUM(d.was_overtaken) AS times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+ORDER  BY times_overtaken DESC, overtakes ASC
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: Aggregate overtakes / times‑overtaken ACROSS ALL races for EVERY driver.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_curr."race_id"
+                                 AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_prev."race_id"
+                                 AND ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM "retirements" r
+                               WHERE r."race_id" = lp_curr."race_id"
+                                 AND r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+LIMIT 20;
+```
+
+```sql
+-- 9. Description: Return driver_ids where they are overtaken more than they overtake.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_curr."race_id"
+                                 AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_prev."race_id"
+                                 AND ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM "retirements" r
+                               WHERE r."race_id" = lp_curr."race_id"
+                                 AND r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id"
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+HAVING SUM(d.was_overtaken) > SUM(d.overtakes)
+LIMIT 20;
+```
+
+```sql
+-- 10. Description: FINAL – list the full names of those drivers who have been overtaken more than they overtake (all the exclusions applied).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1                -- ignore start‑lap
+    AND  lp_curr."lap_type" = 'Race'          -- on‑track laps
+    AND  lp_prev."lap_type" = 'Race'
+    -- ignore this lap & previous lap if the driver is in the pit
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_curr."race_id"
+                                 AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_prev."race_id"
+                                 AND ps."driver_id" = lp_prev."driver_id")
+    -- ignore if driver retires on this lap
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM "retirements" r
+                               WHERE r."race_id" = lp_curr."race_id"
+                                 AND r."driver_id" = lp_curr."driver_id")
+)
+, tot AS (
+  SELECT d."driver_id",
+         SUM(d.overtakes)     AS total_overtakes,
+         SUM(d.was_overtaken) AS total_times_overtaken
+  FROM   deltas AS d
+  GROUP  BY d."driver_id"
+)
+SELECT de."full_name"
+FROM   tot
+JOIN   "drivers_ext" AS de
+       ON de."driver_id" = tot."driver_id"
+WHERE  tot.total_times_overtaken > tot.total_overtakes
+ORDER  BY tot.total_times_overtaken - tot.total_overtakes DESC
+LIMIT 20;
+```
+
+You can run the final query (#10) to obtain the complete list of drivers whose on‑track “times‑overtaken” count exceeds their on‑track overtakes, after filtering out pit‑stop, retirement, and first‑lap position changes.
+[Exploration]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Try to execute]
+-- 1. Description: See all distinct lap types that exist in lap_positions.
+SELECT DISTINCT lp."lap_type"
+FROM "lap_positions" AS lp
+LIMIT 20;
+[Try to execute]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Description: See all distinct lap types that exist in lap_positions.
+SELECT DISTINCT lp."lap_type"
+FROM "lap_positions" AS lp
+LIMIT 20;
+Results:
+lap_type
+Starting Position - Grid Drop
+Race
+Retirement (Disqualification)
+Starting Position - Grid Increase
+Starting Position - Qualifying
+Retirement (Driver Error)
+Retirement (Mechanical Problem)
+Starting Position - Pit Lane Start
+Starting Position - No Qualification
+
+[Successfully executed]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Try to execute]
+-- 2. Description: Show raw lap‑by‑lap positions for Lewis Hamilton (driver_id = 1) in the 2009 Australian GP (race_id = 1).
+SELECT lp."race_id",
+       lp."driver_id",
+       lp."lap",
+       lp."position",
+       lp."lap_type"
+FROM   "lap_positions" AS lp
+WHERE  lp."race_id"  = 1
+  AND  lp."driver_id" = 1
+ORDER  BY lp."lap"
+LIMIT 20;
+[Try to execute]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Description: Show raw lap‑by‑lap positions for Lewis Hamilton (driver_id = 1) in the 2009 Australian GP (race_id = 1).
+SELECT lp."race_id",
+       lp."driver_id",
+       lp."lap",
+       lp."position",
+       lp."lap_type"
+FROM   "lap_positions" AS lp
+WHERE  lp."race_id"  = 1
+  AND  lp."driver_id" = 1
+ORDER  BY lp."lap"
+LIMIT 20;
+Results:
+race_id,driver_id,lap,position,lap_type
+1,1,0,18,Starting Position - Grid Drop
+1,1,1,13,Race
+1,1,2,12,Race
+1,1,3,11,Race
+1,1,4,10,Race
+1,1,5,10,Race
+1,1,6,9,Race
+1,1,7,9,Race
+1,1,8,9,Race
+1,1,9,9,Race
+1,1,10,8,Race
+1,1,11,14,Race
+1,1,12,15,Race
+1,1,13,15,Race
+1,1,14,15,Race
+1,1,15,15,Race
+1,1,16,15,Race
+1,1,17,15,Race
+1,1,18,14,Race
+1,1,19,13,Race
+
+[Successfully executed]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Try to execute]
+-- 3. Description: Inspect pit‑stop laps for the same race so we know which laps to ignore.
+SELECT ps."race_id",
+       ps."driver_id",
+       ps."lap",
+       ps."stop",
+       ps."duration"
+FROM   "pit_stops" AS ps
+WHERE  ps."race_id" = 1
+ORDER  BY ps."driver_id", ps."lap"
+LIMIT 20;
+[Try to execute]
+2025-05-01 04:30:07 - Thread-151 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 04:30:53 - Thread-151 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: The earlier attempt filtering on race_id = 1 returned no rows, indicating that race has no pit‑stop entries.  
+--First, list distinct race_id values present in pit_stops so we can identify a race that actually contains pit‑stop data for later use.
+SELECT DISTINCT ps."race_id"
+FROM   "pit_stops" AS ps
+ORDER  BY ps."race_id"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 04:30:53 - Thread-151 (execute) - INFO - [Results for corrected sql]
+race_id
+841
+842
+843
+844
+845
+846
+847
+848
+849
+850
+851
+852
+853
+854
+855
+856
+857
+858
+859
+860
+
+[Results for corrected sql]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Show retirements for the first 20 rows in the retirements table
+--(race_id = 18 is fine because sample data contains it, but dropping the filter
+--keeps the query resilient if other databases are used).
+SELECT r."race_id",
+       r."driver_id",
+       r."lap",
+       r."retirement_type"
+FROM   "retirements" AS r
+ORDER  BY r."race_id", r."driver_id", r."lap"
+LIMIT 20;
+```
+
+```sql
+--Description: Consecutive‑lap deltas for Lewis Hamilton (driver_id = 1) in the
+--2009 Australian GP (race_id = 1).  Lap‑by‑lap data exist for this combination
+--so the original query is retained.
+SELECT lp_curr."race_id",
+       lp_curr."driver_id",
+       lp_curr."lap",
+       lp_prev."position" AS "pos_lap_minus_1",
+       lp_curr."position" AS "pos_lap",
+       (lp_prev."position" - lp_curr."position") AS "delta"
+FROM   "lap_positions" AS lp_curr
+JOIN   "lap_positions" AS lp_prev
+       ON lp_curr."race_id"   = lp_prev."race_id"
+      AND lp_curr."driver_id" = lp_prev."driver_id"
+      AND lp_curr."lap"       = lp_prev."lap" + 1
+WHERE  lp_curr."race_id"   = 1
+  AND  lp_curr."driver_id" = 1
+  AND  lp_curr."lap"      > 1
+  AND  lp_curr."lap_type"  = 'Race'
+  AND  lp_prev."lap_type"  = 'Race'
+LIMIT 20;
+```
+
+```sql
+--Description: Hamilton’s aggregate overtakes vs. times‑overtaken across ALL
+--races.  No change needed; pit‑stop sub‑queries gracefully handle races
+--without pit‑stop entries.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+WHERE  d."driver_id" = 1
+GROUP  BY d."driver_id"
+LIMIT 20;
+```
+
+```sql
+--Description: Aggregate overtakes vs. times‑overtaken for EVERY driver over
+--the first 20 results, without fixing the race_id (the previous race_id = 18
+--filter might return no rows if lap_positions lacks that race).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS overtakes,
+       SUM(d.was_overtaken) AS times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+ORDER  BY times_overtaken DESC, overtakes ASC
+LIMIT 20;
+```
+
+```sql
+--Description: Aggregate overtakes / times‑overtaken across ALL races for EVERY
+--driver (unchanged; works regardless of pit‑stop availability).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+LIMIT 20;
+```
+
+```sql
+--Description: List driver_ids where they have been overtaken more times than
+--they overtake, across all races (unchanged; generic across the data set).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id"
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+HAVING SUM(d.was_overtaken) > SUM(d.overtakes)
+LIMIT 20;
+```
+
+```sql
+--Description: FINAL – full names of drivers who have been overtaken more than
+--they overtake, after all exclusions.  Works generically across the entire
+--dataset, unaffected by missing pit‑stop rows for individual races.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+, tot AS (
+  SELECT d."driver_id",
+         SUM(d.overtakes)     AS total_overtakes,
+         SUM(d.was_overtaken) AS total_times_overtaken
+  FROM   deltas AS d
+  GROUP  BY d."driver_id"
+)
+SELECT de."full_name"
+FROM   tot
+JOIN   "drivers_ext" AS de
+       ON de."driver_id" = tot."driver_id"
+WHERE  tot.total_times_overtaken > tot.total_overtakes
+ORDER  BY tot.total_times_overtaken - tot.total_overtakes DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: The earlier attempt filtering on race_id = 1 returned no rows, indicating that race has no pit‑stop entries.  
+--First, list distinct race_id values present in pit_stops so we can identify a race that actually contains pit‑stop data for later use.
+SELECT DISTINCT ps."race_id"
+FROM   "pit_stops" AS ps
+ORDER  BY ps."race_id"
+LIMIT 20;
+Results:
+race_id
+841
+842
+843
+844
+845
+846
+847
+848
+849
+850
+851
+852
+853
+854
+855
+856
+857
+858
+859
+860
+
+[Successfully corrected]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: Show retirements for the first 20 rows in the retirements table
+--(race_id = 18 is fine because sample data contains it, but dropping the filter
+--keeps the query resilient if other databases are used).
+SELECT r."race_id",
+       r."driver_id",
+       r."lap",
+       r."retirement_type"
+FROM   "retirements" AS r
+ORDER  BY r."race_id", r."driver_id", r."lap"
+LIMIT 20
+[Try to execute]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Show retirements for the first 20 rows in the retirements table
+--(race_id = 18 is fine because sample data contains it, but dropping the filter
+--keeps the query resilient if other databases are used).
+SELECT r."race_id",
+       r."driver_id",
+       r."lap",
+       r."retirement_type"
+FROM   "retirements" AS r
+ORDER  BY r."race_id", r."driver_id", r."lap"
+LIMIT 20
+Results:
+race_id,driver_id,lap,retirement_type
+1,1,59,Retirement (Disqualification)
+1,5,1,Retirement (Driver Error)
+1,6,18,Retirement (Driver Error)
+1,8,56,Retirement (Mechanical Problem)
+1,9,56,Retirement (Driver Error)
+1,12,25,Retirement (Driver Error)
+1,13,46,Retirement (Mechanical Problem)
+1,20,57,Retirement (Driver Error)
+2,5,1,Retirement (Driver Error)
+2,9,2,Retirement (Mechanical Problem)
+2,20,31,Retirement (Driver Error)
+2,21,30,Retirement (Driver Error)
+2,67,31,Retirement (Driver Er
+
+[Successfully executed]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: Consecutive‑lap deltas for Lewis Hamilton (driver_id = 1) in the
+--2009 Australian GP (race_id = 1).  Lap‑by‑lap data exist for this combination
+--so the original query is retained.
+SELECT lp_curr."race_id",
+       lp_curr."driver_id",
+       lp_curr."lap",
+       lp_prev."position" AS "pos_lap_minus_1",
+       lp_curr."position" AS "pos_lap",
+       (lp_prev."position" - lp_curr."position") AS "delta"
+FROM   "lap_positions" AS lp_curr
+JOIN   "lap_positions" AS lp_prev
+       ON lp_curr."race_id"   = lp_prev."race_id"
+      AND lp_curr."driver_id" = lp_prev."driver_id"
+      AND lp_curr."lap"       = lp_prev."lap" + 1
+WHERE  lp_curr."race_id"   = 1
+  AND  lp_curr."driver_id" = 1
+  AND  lp_curr."lap"      > 1
+  AND  lp_curr."lap_type"  = 'Race'
+  AND  lp_prev."lap_type"  = 'Race'
+LIMIT 20
+[Try to execute]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Consecutive‑lap deltas for Lewis Hamilton (driver_id = 1) in the
+--2009 Australian GP (race_id = 1).  Lap‑by‑lap data exist for this combination
+--so the original query is retained.
+SELECT lp_curr."race_id",
+       lp_curr."driver_id",
+       lp_curr."lap",
+       lp_prev."position" AS "pos_lap_minus_1",
+       lp_curr."position" AS "pos_lap",
+       (lp_prev."position" - lp_curr."position") AS "delta"
+FROM   "lap_positions" AS lp_curr
+JOIN   "lap_positions" AS lp_prev
+       ON lp_curr."race_id"   = lp_prev."race_id"
+      AND lp_curr."driver_id" = lp_prev."driver_id"
+      AND lp_curr."lap"       = lp_prev."lap" + 1
+WHERE  lp_curr."race_id"   = 1
+  AND  lp_curr."driver_id" = 1
+  AND  lp_curr."lap"      > 1
+  AND  lp_curr."lap_type"  = 'Race'
+  AND  lp_prev."lap_type"  = 'Race'
+LIMIT 20
+Results:
+race_id,driver_id,lap,pos_lap_minus_1,pos_lap,delta
+1,1,2,13,12,1
+1,1,3,12,11,1
+1,1,4,11,10,1
+1,1,5,10,10,0
+1,1,6,10,9,1
+1,1,7,9,9,0
+1,1,8,9,9,0
+1,1,9,9,9,0
+1,1,10,9,8,1
+1,1,11,8,14,-6
+1,1,12,14,15,-1
+1,1,13,15,15,0
+1,1,14,15,15,0
+1,1,15,15,15,0
+1,1,16,15,15,0
+1,1,17,15,15,0
+1,1,18,15,14,1
+1,1,19,14,13,1
+1,1,20,13,12,1
+1,1,21,12,12,0
+
+[Successfully executed]
+2025-05-01 04:32:56 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: Hamilton’s aggregate overtakes vs. times‑overtaken across ALL
+--races.  No change needed; pit‑stop sub‑queries gracefully handle races
+--without pit‑stop entries.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+WHERE  d."driver_id" = 1
+GROUP  BY d."driver_id"
+LIMIT 20
+[Try to execute]
+2025-05-01 04:33:02 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Hamilton’s aggregate overtakes vs. times‑overtaken across ALL
+--races.  No change needed; pit‑stop sub‑queries gracefully handle races
+--without pit‑stop entries.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+WHERE  d."driver_id" = 1
+GROUP  BY d."driver_id"
+LIMIT 20
+Results:
+driver_id,total_overtakes,total_times_overtaken
+1,1996,585
+
+[Successfully executed]
+2025-05-01 04:33:02 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: Aggregate overtakes vs. times‑overtaken for EVERY driver over
+--the first 20 results, without fixing the race_id (the previous race_id = 18
+--filter might return no rows if lap_positions lacks that race).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS overtakes,
+       SUM(d.was_overtaken) AS times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+ORDER  BY times_overtaken DESC, overtakes ASC
+LIMIT 20
+[Try to execute]
+2025-05-01 04:33:04 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Aggregate overtakes vs. times‑overtaken for EVERY driver over
+--the first 20 results, without fixing the race_id (the previous race_id = 18
+--filter might return no rows if lap_positions lacks that race).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS overtakes,
+       SUM(d.was_overtaken) AS times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+ORDER  BY times_overtaken DESC, overtakes ASC
+LIMIT 20
+Results:
+driver_id,overtakes,times_overtaken
+4,3113,2772
+8,2703,2441
+13,2481,2359
+18,2746,2334
+815,2573,2140
+817,2256,1962
+807,1898,1941
+20,2126,1897
+1,2064,1839
+15,1751,1765
+22,1970,1682
+17,1849,1665
+825,1556,1599
+822,1726,1582
+3,1583,1574
+832,1476,1388
+154,1549,1385
+21,1809,1373
+30,1503,1353
+2,1581,1290
+
+[Successfully executed]
+2025-05-01 04:33:04 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: Aggregate overtakes / times‑overtaken across ALL races for EVERY
+--driver (unchanged; works regardless of pit‑stop availability).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+LIMIT 20
+[Try to execute]
+2025-05-01 04:36:03 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Aggregate overtakes / times‑overtaken across ALL races for EVERY
+--driver (unchanged; works regardless of pit‑stop availability).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+LIMIT 20
+Results:
+driver_id,total_overtakes,total_times_overtaken
+1,1996,585
+2,1567,1186
+3,1541,823
+4,3024,1329
+5,1010,653
+6,313,253
+7,201,162
+8,2618,1206
+9,729,687
+10,745,489
+11,686,543
+12,245,210
+13,2418,1135
+14,1451,1184
+15,1742,1649
+16,1039,446
+17,1822,1168
+18,2668,1366
+19,173,126
+20,2044,622
+
+[Successfully executed]
+2025-05-01 04:36:03 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: List driver_ids where they have been overtaken more times than
+--they overtake, across all races (unchanged; generic across the data set).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id"
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+HAVING SUM(d.was_overtaken) > SUM(d.overtakes)
+LIMIT 20
+[Try to execute]
+2025-05-01 04:39:02 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: List driver_ids where they have been overtaken more times than
+--they overtake, across all races (unchanged; generic across the data set).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id"
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+HAVING SUM(d.was_overtaken) > SUM(d.overtakes)
+LIMIT 20
+Results:
+driver_id
+28
+
+[Successfully executed]
+2025-05-01 04:39:02 - Thread-151 (execute) - INFO - [Try to execute]
+--Description: FINAL – full names of drivers who have been overtaken more than
+--they overtake, after all exclusions.  Works generically across the entire
+--dataset, unaffected by missing pit‑stop rows for individual races.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+, tot AS (
+  SELECT d."driver_id",
+         SUM(d.overtakes)     AS total_overtakes,
+         SUM(d.was_overtaken) AS total_times_overtaken
+  FROM   deltas AS d
+  GROUP  BY d."driver_id"
+)
+SELECT de."full_name"
+FROM   tot
+JOIN   "drivers_ext" AS de
+       ON de."driver_id" = tot."driver_id"
+WHERE  tot.total_times_overtaken > tot.total_overtakes
+ORDER  BY tot.total_times_overtaken - tot.total_overtakes DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 04:42:02 - Thread-151 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: FINAL – full names of drivers who have been overtaken more than
+--they overtake, after all exclusions.  Works generically across the entire
+--dataset, unaffected by missing pit‑stop rows for individual races.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+, tot AS (
+  SELECT d."driver_id",
+         SUM(d.overtakes)     AS total_overtakes,
+         SUM(d.was_overtaken) AS total_times_overtaken
+  FROM   deltas AS d
+  GROUP  BY d."driver_id"
+)
+SELECT de."full_name"
+FROM   tot
+JOIN   "drivers_ext" AS de
+       ON de."driver_id" = tot."driver_id"
+WHERE  tot.total_times_overtaken > tot.total_overtakes
+ORDER  BY tot.total_times_overtaken - tot.total_overtakes DESC
+LIMIT 20
+Results:
+full_name
+Markus Winkelhock
+
+[Successfully executed]
+2025-05-01 04:42:02 - Thread-151 (execute) - INFO - itercount: 0
+2025-05-01 04:42:02 - Thread-151 (execute) - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: circuits
+Column name: circuit_id Type: INT(11) Description: 
+Column name: circuit_ref Type: VARCHAR(255) Description: 
+Column name: name Type: VARCHAR(255) Description: 
+Column name: location Type: VARCHAR(255) Description: 
+Column name: country Type: VARCHAR(255) Description: 
+Column name: lat Type: FLOAT Description: 
+Column name: lng Type: FLOAT Description: 
+Column name: alt Type: INT(11) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'albert_park', 'Albert Park Grand Prix Circuit', 'Melbourne', 'Australia', -37.8497, 144.968, 10, 'http://en.wikipedia.org/wiki/Melbourne_Grand_Prix_Circuit'), (2, 'sepang', 'Sepang International Circuit', 'Kuala Lumpur', 'Malaysia', 2.76083, 101.738, 18, 'http://en.wikipedia.org/wiki/Sepang_International_Circuit'), (3, 'bahrain', 'Bahrain International Circuit', 'Sakhir', 'Bahrain', 26.0325, 50.5106, 7, 'http://en.wikipedia.org/wiki/Bahrain_International_Circuit')]
+
+--------------------------------------------------
+Table full name: constructor_results
+Column name: constructor_results_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: status Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 18, 1, 14.0, None), (2, 18, 2, 8.0, None), (3, 18, 3, 9.0, None)]
+
+--------------------------------------------------
+Table full name: constructor_standings
+Column name: constructor_standings_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: wins Type: INT(11) Description: 
+Sample rows:
+[(1, 18, 1, 14.0, 1, '1', 1), (2, 18, 2, 8.0, 3, '3', 0), (3, 18, 3, 9.0, 2, '2', 0)]
+
+--------------------------------------------------
+Table full name: constructors
+Column name: constructor_id Type: INT(11) Description: 
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: name Type: VARCHAR(255) Description: 
+Column name: nationality Type: VARCHAR(255) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'mclaren', 'McLaren', 'British', 'http://en.wikipedia.org/wiki/McLaren'), (2, 'bmw_sauber', 'BMW Sauber', 'German', 'http://en.wikipedia.org/wiki/BMW_Sauber'), (3, 'williams', 'Williams', 'British', 'http://en.wikipedia.org/wiki/Williams_Grand_Prix_Engineering')]
+
+--------------------------------------------------
+Table full name: driver_standings
+Column name: driver_standings_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: wins Type: INT(11) Description: 
+Sample rows:
+[(1, 18, 1, 10.0, 1, '1', 1), (2, 18, 2, 8.0, 2, '2', 0), (3, 18, 3, 6.0, 3, '3', 0)]
+
+--------------------------------------------------
+Table full name: drivers
+Column name: driver_id Type: INT(11) Description: 
+Column name: driver_ref Type: VARCHAR(255) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: code Type: VARCHAR(3) Description: 
+Column name: forename Type: VARCHAR(255) Description: 
+Column name: surname Type: VARCHAR(255) Description: 
+Column name: dob Type: DATE Description: 
+Column name: nationality Type: VARCHAR(255) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'hamilton', 44, 'HAM', 'Lewis', 'Hamilton', 'Lewis Hamilton', '1985-01-07', 'British', 'http://en.wikipedia.org/wiki/Lewis_Hamilton'), (2, 'heidfeld', None, 'HEI', 'Nick', 'Heidfeld', 'Nick Heidfeld', '1977-05-10', 'German', 'http://en.wikipedia.org/wiki/Nick_Heidfeld'), (3, 'rosberg', 6, 'ROS', 'Nico', 'Rosberg', 'Nico Rosberg', '1985-06-27', 'German', 'http://en.wikipedia.org/wiki/Nico_Rosberg')]
+
+--------------------------------------------------
+Table full name: lap_times
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: lap Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: time Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Sample rows:
+[(841, 20, 1, 1, '1:38.109', 98109, 98.109), (841, 20, 2, 1, '1:33.006', 93006, 93.006), (841, 20, 3, 1, '1:32.713', 92713, 92.713)]
+
+--------------------------------------------------
+Table full name: pit_stops
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: stop Type: INT(11) Description: 
+Column name: lap Type: INT(11) Description: 
+Column name: time Type: TIME Description: 
+Column name: duration Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Sample rows:
+[(841, 153, 1, 1, '17:05:23', '26.898', 26898, 26.898), (841, 30, 1, 1, '17:05:52', '25.021', 25021, 25.021), (841, 17, 1, 11, '17:20:48', '23.426', 23426, 23.426)]
+
+--------------------------------------------------
+Table full name: qualifying
+Column name: qualify_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: q1 Type: VARCHAR(255) Description: 
+Column name: q2 Type: VARCHAR(255) Description: 
+Column name: q3 Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 18, 1, 1, 22, 1, '1:26.572', '1:25.187', '1:26.714'), (2, 18, 9, 2, 4, 2, '1:26.103', '1:25.315', '1:26.869'), (3, 18, 5, 1, 23, 3, '1:25.664', '1:25.452', '1:27.079')]
+
+--------------------------------------------------
+Table full name: races
+Column name: race_id Type: INT(11) Description: 
+Column name: year Type: INT(11) Description: 
+Column name: round Type: INT(11) Description: 
+Column name: circuit_id Type: INT(11) Description: 
+Column name: name Type: VARCHAR(255) Description: 
+Column name: date Type: DATE Description: 
+Column name: time Type: TIME Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Column name: fp1_date Type: VARCHAR(255) Description: 
+Column name: fp1_time Type: VARCHAR(255) Description: 
+Column name: fp2_date Type: VARCHAR(255) Description: 
+Column name: fp2_time Type: VARCHAR(255) Description: 
+Column name: fp3_date Type: VARCHAR(255) Description: 
+Column name: fp3_time Type: VARCHAR(255) Description: 
+Column name: quali_date Type: VARCHAR(255) Description: 
+Column name: quali_time Type: VARCHAR(255) Description: 
+Column name: sprint_date Type: VARCHAR(255) Description: 
+Column name: sprint_time Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 2009, 1, 1, 'Australian Grand Prix', '2009-03-29', '06:00:00', 'http://en.wikipedia.org/wiki/2009_Australian_Grand_Prix', None, None, None, None, None, None, None, None, None, None), (2, 2009, 2, 2, 'Malaysian Grand Prix', '2009-04-05', '09:00:00', 'http://en.wikipedia.org/wiki/2009_Malaysian_Grand_Prix', None, None, None, None, None, None, None, None, None, None), (3, 2009, 3, 17, 'Chinese Grand Prix', '2009-04-19', '07:00:00', 'http://en.wikipedia.org/wiki/2009_Chinese_Grand_Prix', None, None, None, None, None, None, None, None, None, None)]
+
+--------------------------------------------------
+Table full name: results
+Column name: result_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: grid Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: position_order Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: laps Type: INT(11) Description: 
+Column name: time Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Column name: fastest_lap Type: INT(11) Description: 
+Column name: rank Type: INT(11) Description: 
+Column name: fastest_lap_time Type: VARCHAR(255) Description: 
+Column name: fastest_lap_speed Type: VARCHAR(255) Description: 
+Column name: status_id Type: INT(11) Description: 
+Sample rows:
+[(1, 18, 1, 1, 22, 1, 1, '1', 1, 10.0, 58, '1:34:50.616', 5690616, 39, 2, '1:27.452', '218.300', 1), (2, 18, 2, 2, 3, 5, 2, '2', 2, 8.0, 58, '+5.478', 5696094, 41, 3, '1:27.739', '217.586', 1), (3, 18, 3, 3, 7, 7, 3, '3', 3, 6.0, 58, '+8.163', 5698779, 41, 5, '1:28.090', '216.719', 1)]
+
+--------------------------------------------------
+Table full name: seasons
+Column name: year Type: INT(11) Description: 
+Column name: url Type: VARCHAR(255) Description: 
+Sample rows:
+[(2009, 'http://en.wikipedia.org/wiki/2009_Formula_One_season'), (2008, 'http://en.wikipedia.org/wiki/2008_Formula_One_season'), (2007, 'http://en.wikipedia.org/wiki/2007_Formula_One_season')]
+
+--------------------------------------------------
+Table full name: status
+Column name: status_id Type: INT(11) Description: 
+Column name: status Type: VARCHAR(255) Description: 
+Sample rows:
+[(1, 'Finished'), (2, 'Disqualified'), (3, 'Accident')]
+
+--------------------------------------------------
+Table full name: sprint_results
+Column name: result_id Type: INT(11) Description: 
+Column name: race_id Type: INT(11) Description: 
+Column name: driver_id Type: INT(11) Description: 
+Column name: constructor_id Type: INT(11) Description: 
+Column name: number Type: INT(11) Description: 
+Column name: grid Type: INT(11) Description: 
+Column name: position Type: INT(11) Description: 
+Column name: position_text Type: VARCHAR(255) Description: 
+Column name: position_order Type: INT(11) Description: 
+Column name: points Type: FLOAT Description: 
+Column name: laps Type: INT(11) Description: 
+Column name: time Type: VARCHAR(255) Description: 
+Column name: milliseconds Type: INT(11) Description: 
+Column name: fastest_lap Type: INT(11) Description: 
+Column name: fastest_lap_time Type: VARCHAR(255) Description: 
+Column name: fastest_lap_speed Type: VARCHAR(255) Description: 
+Column name: status_id Type: INT(11) Description: 
+Sample rows:
+[(1, 1061, 830, 9, 33, 2, 1, '1', 1, 3.0, 17, '25:38.426', 1538426, 14, '1:30.013', None, 1), (2, 1061, 1, 131, 44, 1, 2, '2', 2, 2.0, 17, '+1.430', 1539856, 17, '1:29.937', None, 1), (3, 1061, 822, 131, 77, 3, 3, '3', 3, 1.0, 17, '+7.502', 1545928, 17, '1:29.958', None, 1)]
+
+--------------------------------------------------
+Table full name: short_grand_prix_names
+Column name: full_name Type: VARCHAR(255) Description: 
+Column name: short_name Type: VARCHAR(255) Description: 
+Sample rows:
+[('Australian Grand Prix', 'Australia'), ('Malaysian Grand Prix', 'Malaysia'), ('Chinese Grand Prix', 'China')]
+
+--------------------------------------------------
+Table full name: short_constructor_names
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: short_name Type: VARCHAR(255) Description: 
+Sample rows:
+[('alphatauri', 'Alpha Tauri'), ('alpine', 'Alpine'), ('brabham-alfa_romeo', 'Brabham')]
+
+--------------------------------------------------
+Table full name: liveries
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: start_year Type: INT(11) Description: 
+Column name: end_year Type: INT(11) Description: 
+Column name: primary_hex_code Type: VARCHAR(255) Description: 
+Sample rows:
+[('alfa', 2019, None, '#900000'), ('alphatauri', 2020, None, '#000000'), ('alpine', 2021, None, '#F7A7D1')]
+
+--------------------------------------------------
+Table full name: tdr_overrides
+Column name: year Type: INT(11) Description: 
+Column name: constructor_ref Type: VARCHAR(255) Description: 
+Column name: driver_ref Type: VARCHAR(255) Description: 
+Column name: team_driver_rank Type: INT(11) Description: 
+Sample rows:
+[(2004, 'toyota', 'matta', 1), (2004, 'toyota', 'panis', 2), (2004, 'toyota', 'trulli', 3)]
+
+--------------------------------------------------
+Table full name: circuits_ext
+Column name: circuit_id Type: INT Description: 
+Column name: circuit_ref Type: TEXT Description: 
+Column name: name Type: TEXT Description: 
+Column name: location Type: TEXT Description: 
+Column name: country Type: TEXT Description: 
+Column name: lat Type: REAL Description: 
+Column name: lng Type: REAL Description: 
+Column name: alt Type: INT Description: 
+Column name: url Type: TEXT Description: 
+Column name: last_race_year Type:  Description: 
+Column name: number_of_races Type:  Description: 
+Sample rows:
+[(1, 'albert_park', 'Albert Park Grand Prix Circuit', 'Melbourne', 'Australia', -37.8497, 144.968, 10, 'http://en.wikipedia.org/wiki/Melbourne_Grand_Prix_Circuit', 2024, 27), (2, 'sepang', 'Sepang International Circuit', 'Kuala Lumpur', 'Malaysia', 2.76083, 101.738, 18, 'http://en.wikipedia.org/wiki/Sepang_International_Circuit', 2017, 19), (3, 'bahrain', 'Bahrain International Circuit', 'Sakhir', 'Bahrain', 26.0325, 50.5106, 7, 'http://en.wikipedia.org/wiki/Bahrain_International_Circuit', 2024, 21)]
+
+--------------------------------------------------
+Table full name: constructors_ext
+Column name: constructor_id Type: INT Description: 
+Column name: constructor_ref Type: TEXT Description: 
+Column name: name Type: TEXT Description: 
+Column name: nationality Type: TEXT Description: 
+Column name: url Type: TEXT Description: 
+Column name: short_name Type:  Description: 
+Sample rows:
+[(1, 'mclaren', 'McLaren', 'British', 'http://en.wikipedia.org/wiki/McLaren', 'McLaren'), (2, 'bmw_sauber', 'BMW Sauber', 'German', 'http://en.wikipedia.org/wiki/BMW_Sauber', 'BMW Sauber'), (3, 'williams', 'Williams', 'British', 'http://en.wikipedia.org/wiki/Williams_Grand_Prix_Engineering', 'Williams')]
+
+--------------------------------------------------
+Table full name: drivers_ext
+Column name: driver_id Type: INT Description: 
+Column name: driver_ref Type: TEXT Description: 
+Column name: number Type: INT Description: 
+Column name: code Type:  Description: 
+Column name: forename Type: TEXT Description: 
+Column name: surname Type: TEXT Description: 
+Column name: full_name Type: TEXT Description: 
+Column name: dob Type: NUM Description: 
+Column name: nationality Type: TEXT Description: 
+Column name: url Type: TEXT Description: 
+Sample rows:
+[(1, 'hamilton', 44, 'HAM', 'Lewis', 'Hamilton', 'Lewis Hamilton', '1985-01-07', 'British', 'http://en.wikipedia.org/wiki/Lewis_Hamilton'), (2, 'heidfeld', None, 'HEI', 'Nick', 'Heidfeld', 'Nick Heidfeld', '1977-05-10', 'German', 'http://en.wikipedia.org/wiki/Nick_Heidfeld'), (3, 'rosberg', 6, 'ROS', 'Nico', 'Rosberg', 'Nico Rosberg', '1985-06-27', 'German', 'http://en.wikipedia.org/wiki/Nico_Rosberg')]
+
+--------------------------------------------------
+Table full name: driver_standings_ext
+Column name: driver_standings_id Type: INT Description: 
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: points Type: REAL Description: 
+Column name: position Type: INT Description: 
+Column name: position_text Type: TEXT Description: 
+Column name: wins Type: INT Description: 
+Sample rows:
+[(1, 18, 1, 10.0, 1, '1', 1), (2, 18, 2, 8.0, 2, '2', 0), (3, 18, 3, 6.0, 3, '3', 0)]
+
+--------------------------------------------------
+Table full name: lap_times_ext
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: lap Type: INT Description: 
+Column name: position Type: INT Description: 
+Column name: time Type: TEXT Description: 
+Column name: milliseconds Type: INT Description: 
+Column name: seconds Type: REAL Description: 
+Column name: running_milliseconds Type:  Description: 
+Sample rows:
+[(1, 1, 1, 13, '1:49.088', 109088, 109.088, 109088), (1, 1, 2, 12, '1:33.740', 93740, 93.74, 202828), (1, 1, 3, 11, '1:31.600', 91600, 91.6, 294428)]
+
+--------------------------------------------------
+Table full name: lap_time_stats
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: avg_milliseconds Type:  Description: 
+Column name: avg_seconds Type:  Description: 
+Column name: stdev_milliseconds Type:  Description: 
+Column name: stdev_seconds Type:  Description: 
+Sample rows:
+[(1, 1, 97563.75862068965, 97.56375862068965, 15927.054702406851, 15.927054702406851), (1, 2, 97635.6724137931, 97.63567241379309, 14152.06249911631, 14.152062499116306), (1, 3, 97612.1724137931, 97.61217241379309, 16170.377456130136, 16.170377456130137)]
+
+--------------------------------------------------
+Table full name: races_ext
+Column name: race_id Type: INT Description: 
+Column name: year Type: INT Description: 
+Column name: round Type: INT Description: 
+Column name: circuit_id Type: INT Description: 
+Column name: name Type: TEXT Description: 
+Column name: date Type: NUM Description: 
+Column name: time Type: NUM Description: 
+Column name: url Type: TEXT Description: 
+Column name: fp1_date Type: TEXT Description: 
+Column name: fp1_time Type: TEXT Description: 
+Column name: fp2_date Type: TEXT Description: 
+Column name: fp2_time Type: TEXT Description: 
+Column name: fp3_date Type: TEXT Description: 
+Column name: fp3_time Type: TEXT Description: 
+Column name: quali_date Type: TEXT Description: 
+Column name: quali_time Type: TEXT Description: 
+Column name: sprint_date Type: TEXT Description: 
+Column name: sprint_time Type: TEXT Description: 
+Column name: is_pit_data_available Type:  Description: 
+Column name: short_name Type:  Description: 
+Column name: has_sprint Type:  Description: 
+Column name: max_points Type:  Description: 
+Sample rows:
+[(1, 2009, 1, 1, 'Australian Grand Prix', '2009-03-29', '06:00:00', 'http://en.wikipedia.org/wiki/2009_Australian_Grand_Prix', None, None, None, None, None, None, None, None, None, None, 0, 'Australia', 0, 10), (2, 2009, 2, 2, 'Malaysian Grand Prix', '2009-04-05', '09:00:00', 'http://en.wikipedia.org/wiki/2009_Malaysian_Grand_Prix', None, None, None, None, None, None, None, None, None, None, 0, 'Malaysia', 0, 10), (3, 2009, 3, 17, 'Chinese Grand Prix', '2009-04-19', '07:00:00', 'http://en.wikipedia.org/wiki/2009_Chinese_Grand_Prix', None, None, None, None, None, None, None, None, None, None, 0, 'China', 0, 10)]
+
+--------------------------------------------------
+Table full name: team_driver_ranks
+Column name: year Type: INT Description: 
+Column name: constructor_id Type: INT Description: 
+Column name: constructor_ref Type: TEXT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: driver_ref Type: TEXT Description: 
+Column name: team_driver_rank Type:  Description: 
+Sample rows:
+[(1950, 6, 'ferrari', 647, 'ascari', 1), (1950, 6, 'ferrari', 687, 'whitehead', 2), (1950, 6, 'ferrari', 802, 'serafini', 3)]
+
+--------------------------------------------------
+Table full name: drives
+Column name: year Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: drive_id Type:  Description: 
+Column name: constructor_id Type: INT Description: 
+Column name: first_round Type: INT Description: 
+Column name: last_round Type: INT Description: 
+Column name: is_first_drive_of_season Type:  Description: 
+Column name: is_final_drive_of_season Type:  Description: 
+Sample rows:
+[(1950, 427, 1, 141, 2, 7, 1, 1), (1950, 498, 1, 105, 2, 6, 1, 1), (1950, 501, 1, 87, 2, 2, 1, 0)]
+
+--------------------------------------------------
+Table full name: retirements
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: lap Type:  Description: 
+Column name: position_order Type: INT Description: 
+Column name: status_id Type: INT Description: 
+Column name: retirement_type Type:  Description: 
+Sample rows:
+[(18, 7, 56, 7, 5, 'Retirement (Mechanical Problem)'), (18, 8, 54, 8, 5, 'Retirement (Mechanical Problem)'), (18, 9, 48, 9, 4, 'Retirement (Driver Error)')]
+
+--------------------------------------------------
+Table full name: lap_positions
+Column name: race_id Type: INT Description: 
+Column name: driver_id Type: INT Description: 
+Column name: lap Type: INT Description: 
+Column name: position Type: INT Description: 
+Column name: lap_type Type:  Description: 
+Sample rows:
+[(1, 1, 0, 18, 'Starting Position - Grid Drop'), (1, 1, 1, 13, 'Race'), (1, 1, 2, 12, 'Race')]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['circuits', 'constructor_results', 'constructor_standings', 'constructors', 'driver_standings', 'drivers', 'lap_times', 'pit_stops', 'qualifying', 'races', 'results', 'seasons', 'status', 'sprint_results', 'short_grand_prix_names', 'short_constructor_names', 'liveries', 'tdr_overrides', 'circuits_ext', 'constructors_ext', 'drivers_ext', 'driver_standings_ext', 'lap_times_ext', 'lap_time_stats', 'races_ext', 'team_driver_ranks', 'drives', 'retirements', 'lap_positions']
+Begin Exploring Related Columns
+Relevant columns and their potential usage
+• lap_positions.lap_type : identify normal “Race” laps, pit‑related laps (“Pit In/Out”), and pre‑start laps (“Starting Position – Grid Drop”).  
+• lap_positions.lap, lap_positions.position : position of a driver on a given lap – needed to spot position changes.  
+• lap_positions.race_id, lap_positions.driver_id : primary keys to match consecutive laps belonging to the same driver and race.  
+• pit_stops.race_id, pit_stops.driver_id, pit_stops.lap : laps on which a driver enters/leaves the pit – laps to be ignored because position changes are pit‑stop related.  
+• retirements.race_id, retirements.driver_id, retirements.lap : laps on which a driver retires – ignore because they create artificial position changes.  
+• drivers_ext.driver_id, drivers_ext.full_name : final list of full driver names.  
+
+Typical conditions that will be useful
+• lp_curr.lap_type = 'Race' AND lp_prev.lap_type = 'Race'                       – on‑track race laps only.  
+• lp_curr.lap   > 1                                                              – ignore first‑lap position changes (start movements).  
+• lp_curr.lap  NOT IN (SELECT lap FROM pit_stops …)                             – discard pit‑entry/exit laps.  
+• lp_curr.lap  NOT IN (SELECT lap FROM retirements …)                           – discard retirement lap.  
+• CASE WHEN lp_prev.position > lp_curr.position …                               – positive delta = overtakes, negative delta = was overtaken.  
+
+Ten exploratory → final SQL queries
+All queries are limited to 20 rows so you can inspect the data step by step.
+
+```sql
+-- 1. Description: See all distinct lap types that exist in lap_positions.
+SELECT DISTINCT lp."lap_type"
+FROM "lap_positions" AS lp
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: Show raw lap‑by‑lap positions for Lewis Hamilton (driver_id = 1) in the 2009 Australian GP (race_id = 1).
+SELECT lp."race_id",
+       lp."driver_id",
+       lp."lap",
+       lp."position",
+       lp."lap_type"
+FROM   "lap_positions" AS lp
+WHERE  lp."race_id"  = 1
+  AND  lp."driver_id" = 1
+ORDER  BY lp."lap"
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: Inspect pit‑stop laps for the same race so we know which laps to ignore.
+SELECT ps."race_id",
+       ps."driver_id",
+       ps."lap",
+       ps."stop",
+       ps."duration"
+FROM   "pit_stops" AS ps
+WHERE  ps."race_id" = 1
+ORDER  BY ps."driver_id", ps."lap"
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: Check retirements to know which laps introduce non‑overtake position changes.
+SELECT r."race_id",
+       r."driver_id",
+       r."lap",
+       r."retirement_type"
+FROM   "retirements" AS r
+WHERE  r."race_id" = 18    -- example race
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: For Hamilton in race 1, show consecutive‑lap deltas (ignoring lap 1).
+SELECT lp_curr."race_id",
+       lp_curr."driver_id",
+       lp_curr."lap",
+       lp_prev."position" AS "pos_lap_minus_1",
+       lp_curr."position" AS "pos_lap",
+       (lp_prev."position" - lp_curr."position") AS "delta"
+FROM   "lap_positions" AS lp_curr
+JOIN   "lap_positions" AS lp_prev
+       ON lp_curr."race_id"   = lp_prev."race_id"
+      AND lp_curr."driver_id" = lp_prev."driver_id"
+      AND lp_curr."lap"       = lp_prev."lap" + 1
+WHERE  lp_curr."race_id"   = 1
+  AND  lp_curr."driver_id" = 1
+  AND  lp_curr."lap"      > 1
+  AND  lp_curr."lap_type"  = 'Race'
+  AND  lp_prev."lap_type"  = 'Race'
+LIMIT 20;
+```
+
+```sql
+-- 6. Description: Aggregate Hamilton’s overtakes vs times he was overtaken across ALL races.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE
+           WHEN (lp_prev."position" - lp_curr."position") > 0
+             THEN (lp_prev."position" - lp_curr."position")      -- he overtook others
+           ELSE 0
+         END AS overtakes,
+         CASE
+           WHEN (lp_prev."position" - lp_curr."position") < 0
+             THEN (lp_curr."position" - lp_prev."position")      -- he was overtaken
+           ELSE 0
+         END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"       > 1
+    AND  lp_curr."lap_type"   = 'Race'
+    AND  lp_prev."lap_type"   = 'Race'
+    AND  lp_curr."lap" NOT IN (
+          SELECT ps."lap" FROM "pit_stops" ps
+          WHERE ps."race_id" = lp_curr."race_id"
+            AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (
+          SELECT ps."lap" FROM "pit_stops" ps
+          WHERE ps."race_id" = lp_prev."race_id"
+            AND ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (
+          SELECT r."lap" FROM "retirements" r
+          WHERE r."race_id" = lp_curr."race_id"
+            AND r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+WHERE  d."driver_id" = 1
+GROUP  BY d."driver_id"
+LIMIT 20;
+```
+
+```sql
+-- 7. Description: Same aggregation as #6 but for every driver in one example race (race_id = 18).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."race_id" = 18
+    AND  lp_curr."lap"    > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS overtakes,
+       SUM(d.was_overtaken) AS times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+ORDER  BY times_overtaken DESC, overtakes ASC
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: Aggregate overtakes / times‑overtaken ACROSS ALL races for EVERY driver.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_curr."race_id"
+                                 AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_prev."race_id"
+                                 AND ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM "retirements" r
+                               WHERE r."race_id" = lp_curr."race_id"
+                                 AND r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+LIMIT 20;
+```
+
+```sql
+-- 9. Description: Return driver_ids where they are overtaken more than they overtake.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_curr."race_id"
+                                 AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_prev."race_id"
+                                 AND ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM "retirements" r
+                               WHERE r."race_id" = lp_curr."race_id"
+                                 AND r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id"
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+HAVING SUM(d.was_overtaken) > SUM(d.overtakes)
+LIMIT 20;
+```
+
+```sql
+-- 10. Description: FINAL – list the full names of those drivers who have been overtaken more than they overtake (all the exclusions applied).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1                -- ignore start‑lap
+    AND  lp_curr."lap_type" = 'Race'          -- on‑track laps
+    AND  lp_prev."lap_type" = 'Race'
+    -- ignore this lap & previous lap if the driver is in the pit
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_curr."race_id"
+                                 AND ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM "pit_stops" ps
+                               WHERE ps."race_id" = lp_prev."race_id"
+                                 AND ps."driver_id" = lp_prev."driver_id")
+    -- ignore if driver retires on this lap
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM "retirements" r
+                               WHERE r."race_id" = lp_curr."race_id"
+                                 AND r."driver_id" = lp_curr."driver_id")
+)
+, tot AS (
+  SELECT d."driver_id",
+         SUM(d.overtakes)     AS total_overtakes,
+         SUM(d.was_overtaken) AS total_times_overtaken
+  FROM   deltas AS d
+  GROUP  BY d."driver_id"
+)
+SELECT de."full_name"
+FROM   tot
+JOIN   "drivers_ext" AS de
+       ON de."driver_id" = tot."driver_id"
+WHERE  tot.total_times_overtaken > tot.total_overtakes
+ORDER  BY tot.total_times_overtaken - tot.total_overtakes DESC
+LIMIT 20;
+```
+
+You can run the final query (#10) to obtain the complete list of drivers whose on‑track “times‑overtaken” count exceeds their on‑track overtakes, after filtering out pit‑stop, retirement, and first‑lap position changes.
+Refined SQLs and results:
+Query:
+-- 1. Description: See all distinct lap types that exist in lap_positions.
+SELECT DISTINCT lp."lap_type"
+FROM "lap_positions" AS lp
+LIMIT 20;
+Answer:
+lap_type
+Starting Position - Grid Drop
+Race
+Retirement (Disqualification)
+Starting Position - Grid Increase
+Starting Position - Qualifying
+Retirement (Driver Error)
+Retirement (Mechanical Problem)
+Starting Position - Pit Lane Start
+Starting Position - No Qualification
+Query:
+-- 2. Description: Show raw lap‑by‑lap positions for Lewis Hamilton (driver_id = 1) in the 2009 Australian GP (race_id = 1).
+SELECT lp."race_id",
+       lp."driver_id",
+       lp."lap",
+       lp."position",
+       lp."lap_type"
+FROM   "lap_positions" AS lp
+WHERE  lp."race_id"  = 1
+  AND  lp."driver_id" = 1
+ORDER  BY lp."lap"
+LIMIT 20;
+Answer:
+race_id,driver_id,lap,position,lap_type
+1,1,0,18,Starting Position - Grid Drop
+1,1,1,13,Race
+1,1,2,12,Race
+1,1,3,11,Race
+1,1,4,10,Race
+1,1,5,10,Race
+1,1,6,9,Race
+1,1,7,9,Race
+1,1,8,9,Race
+1,1,9,9,Race
+1,1,10,8,Race
+1,1,11,14,Race
+1,1,12,15,Race
+1,1,13,15,Race
+1,1,14,15,Race
+1,1,15,15,Race
+1,1,16,15,Race
+1,1,17,15,Race
+1,1,18,14,Race
+1,1,19,13,Race
+Query:
+--Description: Show retirements for the first 20 rows in the retirements table
+--(race_id = 18 is fine because sample data contains it, but dropping the filter
+--keeps the query resilient if other databases are used).
+SELECT r."race_id",
+       r."driver_id",
+       r."lap",
+       r."retirement_type"
+FROM   "retirements" AS r
+ORDER  BY r."race_id", r."driver_id", r."lap"
+LIMIT 20
+Answer:
+race_id,driver_id,lap,retirement_type
+1,1,59,Retirement (Disqualification)
+1,5,1,Retirement (Driver Error)
+1,6,18,Retirement (Driver Error)
+1,8,56,Retirement (Mechanical Problem)
+1,9,56,Retirement (Driver Error)
+1,12,25,Retirement (Driver Error)
+1,13,46,Retirement (Mechanical Problem)
+1,20,57,Retirement (Driver Error)
+2,5,1,Retirement (Driver Error)
+2,9,2,Retirement (Mechanical Problem)
+2,20,31,Retirement (Driver Error)
+2,21,30,Retirement (Driver Error)
+2,67,31,Retirement (Driver Er
+Query:
+--Description: Consecutive‑lap deltas for Lewis Hamilton (driver_id = 1) in the
+--2009 Australian GP (race_id = 1).  Lap‑by‑lap data exist for this combination
+--so the original query is retained.
+SELECT lp_curr."race_id",
+       lp_curr."driver_id",
+       lp_curr."lap",
+       lp_prev."position" AS "pos_lap_minus_1",
+       lp_curr."position" AS "pos_lap",
+       (lp_prev."position" - lp_curr."position") AS "delta"
+FROM   "lap_positions" AS lp_curr
+JOIN   "lap_positions" AS lp_prev
+       ON lp_curr."race_id"   = lp_prev."race_id"
+      AND lp_curr."driver_id" = lp_prev."driver_id"
+      AND lp_curr."lap"       = lp_prev."lap" + 1
+WHERE  lp_curr."race_id"   = 1
+  AND  lp_curr."driver_id" = 1
+  AND  lp_curr."lap"      > 1
+  AND  lp_curr."lap_type"  = 'Race'
+  AND  lp_prev."lap_type"  = 'Race'
+LIMIT 20
+Answer:
+race_id,driver_id,lap,pos_lap_minus_1,pos_lap,delta
+1,1,2,13,12,1
+1,1,3,12,11,1
+1,1,4,11,10,1
+1,1,5,10,10,0
+1,1,6,10,9,1
+1,1,7,9,9,0
+1,1,8,9,9,0
+1,1,9,9,9,0
+1,1,10,9,8,1
+1,1,11,8,14,-6
+1,1,12,14,15,-1
+1,1,13,15,15,0
+1,1,14,15,15,0
+1,1,15,15,15,0
+1,1,16,15,15,0
+1,1,17,15,15,0
+1,1,18,15,14,1
+1,1,19,14,13,1
+1,1,20,13,12,1
+1,1,21,12,12,0
+Query:
+--Description: Hamilton’s aggregate overtakes vs. times‑overtaken across ALL
+--races.  No change needed; pit‑stop sub‑queries gracefully handle races
+--without pit‑stop entries.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+WHERE  d."driver_id" = 1
+GROUP  BY d."driver_id"
+LIMIT 20
+Answer:
+driver_id,total_overtakes,total_times_overtaken
+1,1996,585
+Query:
+--Description: Aggregate overtakes vs. times‑overtaken for EVERY driver over
+--the first 20 results, without fixing the race_id (the previous race_id = 18
+--filter might return no rows if lap_positions lacks that race).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS overtakes,
+       SUM(d.was_overtaken) AS times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+ORDER  BY times_overtaken DESC, overtakes ASC
+LIMIT 20
+Answer:
+driver_id,overtakes,times_overtaken
+4,3113,2772
+8,2703,2441
+13,2481,2359
+18,2746,2334
+815,2573,2140
+817,2256,1962
+807,1898,1941
+20,2126,1897
+1,2064,1839
+15,1751,1765
+22,1970,1682
+17,1849,1665
+825,1556,1599
+822,1726,1582
+3,1583,1574
+832,1476,1388
+154,1549,1385
+21,1809,1373
+30,1503,1353
+2,1581,1290
+Query:
+--Description: Aggregate overtakes / times‑overtaken across ALL races for EVERY
+--driver (unchanged; works regardless of pit‑stop availability).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id",
+       SUM(d.overtakes)     AS total_overtakes,
+       SUM(d.was_overtaken) AS total_times_overtaken
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+LIMIT 20
+Answer:
+driver_id,total_overtakes,total_times_overtaken
+1,1996,585
+2,1567,1186
+3,1541,823
+4,3024,1329
+5,1010,653
+6,313,253
+7,201,162
+8,2618,1206
+9,729,687
+10,745,489
+11,686,543
+12,245,210
+13,2418,1135
+14,1451,1184
+15,1742,1649
+16,1039,446
+17,1822,1168
+18,2668,1366
+19,173,126
+20,2044,622
+Query:
+--Description: List driver_ids where they have been overtaken more times than
+--they overtake, across all races (unchanged; generic across the data set).
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+SELECT d."driver_id"
+FROM   deltas AS d
+GROUP  BY d."driver_id"
+HAVING SUM(d.was_overtaken) > SUM(d.overtakes)
+LIMIT 20
+Answer:
+driver_id
+28
+Query:
+--Description: FINAL – full names of drivers who have been overtaken more than
+--they overtake, after all exclusions.  Works generically across the entire
+--dataset, unaffected by missing pit‑stop rows for individual races.
+WITH deltas AS (
+  SELECT lp_curr."race_id",
+         lp_curr."driver_id",
+         CASE WHEN (lp_prev."position" - lp_curr."position") > 0
+              THEN (lp_prev."position" - lp_curr."position") ELSE 0 END AS overtakes,
+         CASE WHEN (lp_prev."position" - lp_curr."position") < 0
+              THEN (lp_curr."position" - lp_prev."position") ELSE 0 END AS was_overtaken
+  FROM   "lap_positions" AS lp_curr
+  JOIN   "lap_positions" AS lp_prev
+         ON lp_curr."race_id"   = lp_prev."race_id"
+        AND lp_curr."driver_id" = lp_prev."driver_id"
+        AND lp_curr."lap"       = lp_prev."lap" + 1
+  WHERE  lp_curr."lap"     > 1
+    AND  lp_curr."lap_type" = 'Race'
+    AND  lp_prev."lap_type" = 'Race'
+    AND  lp_curr."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_curr."race_id"
+                                 AND  ps."driver_id" = lp_curr."driver_id")
+    AND  lp_prev."lap" NOT IN (SELECT ps."lap"
+                               FROM   "pit_stops" ps
+                               WHERE  ps."race_id"   = lp_prev."race_id"
+                                 AND  ps."driver_id" = lp_prev."driver_id")
+    AND  lp_curr."lap" NOT IN (SELECT r."lap"
+                               FROM   "retirements" r
+                               WHERE  r."race_id"   = lp_curr."race_id"
+                                 AND  r."driver_id" = lp_curr."driver_id")
+)
+, tot AS (
+  SELECT d."driver_id",
+         SUM(d.overtakes)     AS total_overtakes,
+         SUM(d.was_overtaken) AS total_times_overtaken
+  FROM   deltas AS d
+  GROUP  BY d."driver_id"
+)
+SELECT de."full_name"
+FROM   tot
+JOIN   "drivers_ext" AS de
+       ON de."driver_id" = tot."driver_id"
+WHERE  tot.total_times_overtaken > tot.total_overtakes
+ORDER  BY tot.total_times_overtaken - tot.total_overtakes DESC
+LIMIT 20
+Answer:
+full_name
+Markus Winkelhock
+End Exploring Related Columns
+Task: Provide the full names of drivers who have been overtaken on track more times than they have overtaken others on track during race laps, excluding position changes due to pit stops (both at pit entry and exit), retirements, or position changes that occurred during the first lap of a race (considered as start movements).
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+Usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Follow the answer format like: ```csv
+driver_full_name
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is (table names): 
+['circuits', 'constructor_results', 'constructor_standings', 'constructors', 'driver_standings', 'drivers', 'lap_times', 'pit_stops', 'qualifying', 'races', 'results', 'seasons', 'status', 'sprint_results', 'short_grand_prix_names', 'short_constructor_names', 'liveries', 'tdr_overrides', 'circuits_ext', 'constructors_ext', 'drivers_ext', 'driver_standings_ext', 'lap_times_ext', 'lap_time_stats', 'races_ext', 'team_driver_ranks', 'drives', 'retirements', 'lap_positions']
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 04:42:21 - Thread-151 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH deltas AS (
+    SELECT
+        curr."race_id",
+        curr."driver_id",
+        CASE WHEN prev."position" - curr."position" > 0
+             THEN prev."position" - curr."position"      -- overtakes
+             ELSE 0
+        END AS overtakes,
+        CASE WHEN prev."position" - curr."position" < 0
+             THEN curr."position" - prev."position"      -- was overtaken
+             ELSE 0
+        END AS was_overtaken
+    FROM "lap_positions" AS curr
+    JOIN "lap_positions" AS prev
+         ON curr."race_id"   = prev."race_id"
+        AND curr."driver_id" = prev."driver_id"
+        AND curr."lap"       = prev."lap" + 1
+    WHERE curr."lap" > 1                       -- ignore start‑lap changes
+      AND curr."lap_type" = 'Race'
+      AND prev."lap_type" = 'Race'
+      -- exclude laps when the driver made a pit stop (entry or exit)
+      AND curr."lap" NOT IN (SELECT ps."lap"
+                             FROM "pit_stops" ps
+                             WHERE ps."race_id" = curr."race_id"
+                               AND ps."driver_id" = curr."driver_id")
+      AND prev."lap" NOT IN (SELECT ps."lap"
+                             FROM "pit_stops" ps
+                             WHERE ps."race_id" = prev."race_id"
+                               AND ps."driver_id" = prev."driver_id")
+      -- exclude the lap on which the driver retired
+      AND curr."lap" NOT IN (SELECT r."lap"
+                             FROM "retirements" r
+                             WHERE r."race_id" = curr."race_id"
+                               AND r."driver_id" = curr."driver_id")
+),
+totals AS (
+    SELECT
+        "driver_id",
+        SUM(overtakes)      AS overtakes,
+        SUM(was_overtaken)  AS was_overtaken
+    FROM deltas
+    GROUP BY "driver_id"
+)
+SELECT
+    de."full_name" AS driver_full_name
+FROM totals t
+JOIN "drivers_ext" de
+  ON de."driver_id" = t."driver_id"
+WHERE t.was_overtaken > t.overtakes
+ORDER BY (t.was_overtaken - t.overtakes) DESC,
+         de."full_name";
+```
+[Try to run SQL in self-refine]
+2025-05-01 04:45:17 - Thread-151 (execute) - INFO - Total iteration counts: 0

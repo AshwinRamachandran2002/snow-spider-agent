@@ -1,0 +1,10 @@
+SELECT DISTINCT "sample_repo_name" AS "repo_name"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "id" = (
+    SELECT "id"
+    FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+    WHERE "binary" = FALSE AND "sample_path" ILIKE '%.swift'
+    ORDER BY "copies" DESC NULLS LAST
+    LIMIT 1
+)
+LIMIT 1;

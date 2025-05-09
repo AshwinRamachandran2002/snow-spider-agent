@@ -1,0 +1,1901 @@
+2025-05-07 07:17:43 - Thread-714 (execute) - INFO - [Exploration]
+```sql
+-- 1) Inspect a few picking–line rows (order-requirements)
+SELECT 
+  "picklist_id",
+  "line_no",
+  "order_id",
+  "product_id",
+  "qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+LIMIT 20;
+```
+
+```sql
+-- 2) See the corresponding pick-lists to get the pick-time stamp
+SELECT 
+  "id"            AS "picklist_id",
+  "created",
+  "picker_emp_id"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LIST"
+LIMIT 20;
+```
+
+```sql
+-- 3) Combine picking lines with their pick-times (requirement-side)
+SELECT
+  pl."picklist_id",
+  l."created"     AS "pick_time",
+  pl."line_no",
+  pl."order_id",
+  pl."product_id",
+  pl."qty"        AS "pick_qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+  ON pl."picklist_id" = l."id"
+ORDER BY pl."product_id", l."created"
+LIMIT 20;
+```
+
+```sql
+-- 4) Inspect the inventory side together with purchase-date (supply-side)
+SELECT
+  i."id"          AS "inv_id",
+  i."product_id",
+  i."qty"         AS "inv_qty",
+  p."purchased"   AS "purchase_date",
+  i."location_id"
+FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"     i
+JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"     p
+  ON i."purchase_id" = p."id"
+ORDER BY i."product_id", p."purchased"
+LIMIT 20;
+```
+
+```sql
+-- 5) Build FIFO-ordered inventory lots with cumulative range for every product
+WITH inv AS (
+  SELECT
+    i."id"                    AS "inv_id",
+    i."product_id",
+    i."qty"                   AS "inv_qty",
+    TO_DATE(p."purchased")    AS "purchase_date",
+    SUM(i."qty") OVER (PARTITION BY i."product_id"
+                       ORDER BY TO_DATE(p."purchased"), i."id")               AS "inv_cum_end"
+  FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+  JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+    ON i."purchase_id" = p."id"
+)
+SELECT
+  "inv_id",
+  "product_id",
+  "inv_qty",
+  "purchase_date",
+  ("inv_cum_end" - "inv_qty") AS "inv_cum_start",
+  "inv_cum_end"
+FROM inv
+ORDER BY "product_id", "purchase_date"
+LIMIT 20;
+```
+
+```sql
+-- 6) Build FIFO-ordered picking requirements with cumulative range
+WITH req AS (
+  SELECT
+    pl."picklist_id",
+    pl."line_no",
+    pl."product_id",
+    pl."qty"                                                 AS "pick_qty",
+    TO_TIMESTAMP(l."created")                                AS "pick_time",
+    SUM(pl."qty") OVER (PARTITION BY pl."product_id"
+                        ORDER BY TO_TIMESTAMP(l."created"), pl."line_no")      AS "pick_cum_end"
+  FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+  JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+    ON pl."picklist_id" = l."id"
+)
+SELECT
+  "picklist_id",
+  "line_no",
+  "product_id",
+  "pick_qty",
+  "pick_time",
+  ("pick_cum_end" - "pick_qty") AS "pick_cum_start",
+  "pick_cum_end"
+FROM req
+ORDER BY "product_id", "pick_time"
+LIMIT 20;
+```
+
+```sql
+-- 7) Match requirement-ranges to inventory-ranges (FIFO overlap)
+WITH inv AS (
+  SELECT
+    i."id"                  AS "inv_id",
+    i."product_id",
+    i."qty"                 AS "inv_qty",
+    TO_DATE(p."purchased")  AS "purchase_date",
+    SUM(i."qty") OVER (PARTITION BY i."product_id"
+                       ORDER BY TO_DATE(p."purchased"), i."id")               AS "inv_cum_end"
+  FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+  JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+    ON i."purchase_id" = p."id"
+), inv_r AS (
+  SELECT
+    "inv_id",
+    "product_id",
+    "inv_qty",
+    ("inv_cum_end" - "inv_qty")                           AS "inv_cum_start",
+    "inv_cum_end"
+  FROM inv
+), req AS (
+  SELECT
+    pl."picklist_id",
+    pl."line_no",
+    pl."product_id",
+    pl."qty"                                               AS "pick_qty",
+    TO_TIMESTAMP(l."created")                              AS "pick_time",
+    SUM(pl."qty") OVER (PARTITION BY pl."product_id"
+                        ORDER BY TO_TIMESTAMP(l."created"), pl."line_no")     AS "pick_cum_end"
+  FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+  JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+    ON pl."picklist_id" = l."id"
+), req_r AS (
+  SELECT
+    "picklist_id",
+    "line_no",
+    "product_id",
+    "pick_qty",
+    ("pick_cum_end" - "pick_qty")                         AS "pick_cum_start",
+    "pick_cum_end"
+  FROM req
+)
+SELECT
+  r."product_id",
+  r."picklist_id",
+  r."line_no",
+  i."inv_id",
+  GREATEST(0,
+           LEAST(i."inv_cum_end", r."pick_cum_end") -
+           GREATEST(i."inv_cum_start", r."pick_cum_start"))               AS "picked_qty_overlap",
+  i."inv_qty"
+FROM req_r  r
+JOIN inv_r  i
+  ON r."product_id" = i."product_id"
+     AND i."inv_cum_start" < r."pick_cum_end"
+     AND r."pick_cum_start" < i."inv_cum_end"
+ORDER BY r."product_id", r."picklist_id", r."line_no", i."inv_cum_start"
+LIMIT 20;
+```
+
+```sql
+-- 8) Calculate per-lot pick-percentage (= picked / lot-qty)
+WITH overlap AS (
+  /* previous CTE from step-7 */
+  WITH inv AS (
+    SELECT
+      i."id"                  AS "inv_id",
+      i."product_id",
+      i."qty"                 AS "inv_qty",
+      TO_DATE(p."purchased")  AS "purchase_date",
+      SUM(i."qty") OVER (PARTITION BY i."product_id"
+                         ORDER BY TO_DATE(p."purchased"), i."id")             AS "inv_cum_end"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON i."purchase_id" = p."id"
+  ), inv_r AS (
+    SELECT
+      "inv_id",
+      "product_id",
+      "inv_qty",
+      ("inv_cum_end" - "inv_qty")                         AS "inv_cum_start",
+      "inv_cum_end"
+    FROM inv
+  ), req AS (
+    SELECT
+      pl."picklist_id",
+      pl."line_no",
+      pl."product_id",
+      pl."qty"                                             AS "pick_qty",
+      TO_TIMESTAMP(l."created")                            AS "pick_time",
+      SUM(pl."qty") OVER (PARTITION BY pl."product_id"
+                          ORDER BY TO_TIMESTAMP(l."created"), pl."line_no")   AS "pick_cum_end"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+    JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+      ON pl."picklist_id" = l."id"
+  ), req_r AS (
+    SELECT
+      "picklist_id",
+      "line_no",
+      "product_id",
+      "pick_qty",
+      ("pick_cum_end" - "pick_qty")                       AS "pick_cum_start",
+      "pick_cum_end"
+    FROM req
+  )
+  SELECT
+    r."product_id",
+    i."inv_id",
+    GREATEST(0,
+             LEAST(i."inv_cum_end", r."pick_cum_end") -
+             GREATEST(i."inv_cum_start", r."pick_cum_start"))         AS "picked_qty",
+    i."inv_qty"
+  FROM req_r  r
+  JOIN inv_r  i
+    ON r."product_id" = i."product_id"
+       AND i."inv_cum_start" < r."pick_cum_end"
+       AND r."pick_cum_start" < i."inv_cum_end"
+)
+SELECT
+  "product_id",
+  "inv_id",
+  "picked_qty",
+  "inv_qty",
+  CASE WHEN "inv_qty" = 0 THEN 0 ELSE "picked_qty" / "inv_qty" END  AS "pick_pct"
+FROM overlap
+ORDER BY "product_id", "inv_id"
+LIMIT 20;
+```
+
+```sql
+-- 9) Average pick-percentage per product-name (final result)
+WITH overlap AS (
+  /* identical CTE from step-8 (producing pick_pct for every inv-lot) */
+  WITH inv AS (
+    SELECT
+      i."id"                  AS "inv_id",
+      i."product_id",
+      i."qty"                 AS "inv_qty",
+      TO_DATE(p."purchased")  AS "purchase_date",
+      SUM(i."qty") OVER (PARTITION BY i."product_id"
+                         ORDER BY TO_DATE(p."purchased"), i."id")             AS "inv_cum_end"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON i."purchase_id" = p."id"
+  ), inv_r AS (
+    SELECT
+      "inv_id",
+      "product_id",
+      "inv_qty",
+      ("inv_cum_end" - "inv_qty")                       AS "inv_cum_start",
+      "inv_cum_end"
+    FROM inv
+  ), req AS (
+    SELECT
+      pl."picklist_id",
+      pl."line_no",
+      pl."product_id",
+      pl."qty"                                           AS "pick_qty",
+      TO_TIMESTAMP(l."created")                          AS "pick_time",
+      SUM(pl."qty") OVER (PARTITION BY pl."product_id"
+                          ORDER BY TO_TIMESTAMP(l."created"), pl."line_no")   AS "pick_cum_end"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+    JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+      ON pl."picklist_id" = l."id"
+  ), req_r AS (
+    SELECT
+      "picklist_id",
+      "line_no",
+      "product_id",
+      "pick_qty",
+      ("pick_cum_end" - "pick_qty")                     AS "pick_cum_start",
+      "pick_cum_end"
+    FROM req
+  )
+  SELECT
+    r."product_id",
+    i."inv_id",
+    GREATEST(0,
+             LEAST(i."inv_cum_end", r."pick_cum_end") -
+             GREATEST(i."inv_cum_start", r."pick_cum_start"))         AS "picked_qty",
+    i."inv_qty",
+    CASE WHEN i."inv_qty" = 0 THEN 0
+         ELSE GREATEST(0,
+                       LEAST(i."inv_cum_end", r."pick_cum_end") -
+                       GREATEST(i."inv_cum_start", r."pick_cum_start"))
+              / i."inv_qty"
+    END                                                               AS "pick_pct"
+  FROM req_r  r
+  JOIN inv_r  i
+    ON r."product_id" = i."product_id"
+       AND i."inv_cum_start" < r."pick_cum_end"
+       AND r."pick_cum_start" < i."inv_cum_end"
+)
+SELECT
+  pr."name"                                      AS "product_name",
+  AVG(o."pick_pct")                              AS "avg_pick_percentage"
+FROM overlap                o
+JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS"  pr
+  ON o."product_id" = pr."id"
+GROUP BY pr."name"
+ORDER BY pr."name"
+LIMIT 20;
+```
+[Exploration]
+2025-05-07 07:17:43 - Thread-714 (execute) - INFO - [Try to execute]
+-- 1) Inspect a few picking–line rows (order-requirements)
+SELECT 
+  "picklist_id",
+  "line_no",
+  "order_id",
+  "product_id",
+  "qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:17:44 - Thread-714 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1) Inspect a few picking–line rows (order-requirements)
+SELECT 
+  "picklist_id",
+  "line_no",
+  "order_id",
+  "product_id",
+  "qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+LIMIT 20;
+Results:
+picklist_id,line_no,order_id,product_id,qty
+841,1,421,6520,42.0
+841,2,421,6520,14.0
+841,3,421,6520,20.0
+841,4,421,4280,36.0
+841,5,421,4280,39.0
+841,6,421,6520,24.0
+841,7,421,6520,14.0
+841,8,421,4280,35.0
+841,9,421,6520,26.0
+842,1,423,6520,22.0
+842,2,422,6520,14.0
+842,3,422,6520,20.0
+842,4,422,4280,36.0
+842,5,422,4280,39.0
+842,6,422,6520,24.0
+842,7,422,6520,14.0
+842,8,422,4280,5.0
+842,9,423,4280,30.0
+842,10,423,4280,30.0
+842,11,422,6520,8.0
+
+[Successfully executed]
+2025-05-07 07:17:44 - Thread-714 (execute) - INFO - [Try to execute]
+-- 2) See the corresponding pick-lists to get the pick-time stamp
+SELECT 
+  "id"            AS "picklist_id",
+  "created",
+  "picker_emp_id"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LIST"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:17:45 - Thread-714 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2) See the corresponding pick-lists to get the pick-time stamp
+SELECT 
+  "id"            AS "picklist_id",
+  "created",
+  "picker_emp_id"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LIST"
+LIMIT 20;
+Results:
+picklist_id,created,picker_emp_id
+841,2019-01-16 14:03:41,149
+842,2019-01-19 15:57:42,152
+
+[Successfully executed]
+2025-05-07 07:17:45 - Thread-714 (execute) - INFO - [Try to execute]
+-- 3) Combine picking lines with their pick-times (requirement-side)
+SELECT
+  pl."picklist_id",
+  l."created"     AS "pick_time",
+  pl."line_no",
+  pl."order_id",
+  pl."product_id",
+  pl."qty"        AS "pick_qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+  ON pl."picklist_id" = l."id"
+ORDER BY pl."product_id", l."created"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:17:45 - Thread-714 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3) Combine picking lines with their pick-times (requirement-side)
+SELECT
+  pl."picklist_id",
+  l."created"     AS "pick_time",
+  pl."line_no",
+  pl."order_id",
+  pl."product_id",
+  pl."qty"        AS "pick_qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+  ON pl."picklist_id" = l."id"
+ORDER BY pl."product_id", l."created"
+LIMIT 20;
+Results:
+picklist_id,pick_time,line_no,order_id,product_id,pick_qty
+841,2019-01-16 14:03:41,4,421,4280,36.0
+841,2019-01-16 14:03:41,8,421,4280,35.0
+841,2019-01-16 14:03:41,5,421,4280,39.0
+842,2019-01-19 15:57:42,5,422,4280,39.0
+842,2019-01-19 15:57:42,8,422,4280,5.0
+842,2019-01-19 15:57:42,9,423,4280,30.0
+842,2019-01-19 15:57:42,4,422,4280,36.0
+842,2019-01-19 15:57:42,10,423,4280,30.0
+841,2019-01-16 14:03:41,1,421,6520,42.0
+841,2019-01-16 14:03:41,2,421,6520,14.0
+841,2019-01-16 14:03:41,3,421,
+
+[Successfully executed]
+2025-05-07 07:17:45 - Thread-714 (execute) - INFO - [Try to execute]
+-- 4) Inspect the inventory side together with purchase-date (supply-side)
+SELECT
+  i."id"          AS "inv_id",
+  i."product_id",
+  i."qty"         AS "inv_qty",
+  p."purchased"   AS "purchase_date",
+  i."location_id"
+FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"     i
+JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"     p
+  ON i."purchase_id" = p."id"
+ORDER BY i."product_id", p."purchased"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:17:46 - Thread-714 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 2 at position 2\ninvalid identifier \'I."id"\''}
+[Error occurred]
+2025-05-07 07:20:04 - Thread-714 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  (Thinking process embedded in steps)
+--  1) Create FIFO-ordered inventory lots (inv) with cumulative range so each lot
+--     occupies [inv_cum_start , inv_cum_end) on a running timeline per product.
+--  2) Create FIFO-ordered picking requirements (req) with cumulative range
+--     [pick_cum_start , pick_cum_end) on the same timeline per product.
+--  3) Join the two timelines where their ranges overlap; the length of the
+--     overlap is the quantity actually taken from that inventory lot.
+--  4) Convert that quantity to a pick-percentage for the lot
+--     (picked_qty / lot_qty).
+--  5) Finally average those percentages per product name.
+WITH inv AS (
+    SELECT
+        i."ID"                                 AS "INV_ID",
+        i."PRODUCT_ID",
+        i."QTY"                                AS "INV_QTY",
+        TO_DATE(p."PURCHASED")                 AS "PURCHASE_DATE",
+        SUM(i."QTY") OVER (
+            PARTITION BY i."PRODUCT_ID"
+            ORDER BY TO_DATE(p."PURCHASED"), i."ID"
+        )                                      AS "INV_CUM_END"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON i."PURCHASE_ID" = p."ID"
+), inv_r AS (
+    SELECT
+        "INV_ID",
+        "PRODUCT_ID",
+        "INV_QTY",
+        ("INV_CUM_END" - "INV_QTY")            AS "INV_CUM_START",
+        "INV_CUM_END"
+    FROM inv
+), req AS (
+    SELECT
+        pl."PICKLIST_ID",
+        pl."LINE_NO",
+        pl."PRODUCT_ID",
+        pl."QTY"                               AS "PICK_QTY",
+        TO_TIMESTAMP(l."CREATED")              AS "PICK_TIME",
+        SUM(pl."QTY") OVER (
+            PARTITION BY pl."PRODUCT_ID"
+            ORDER BY TO_TIMESTAMP(l."CREATED"), pl."LINE_NO"
+        )                                      AS "PICK_CUM_END"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE" pl
+    JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST" l
+      ON pl."PICKLIST_ID" = l."ID"
+), req_r AS (
+    SELECT
+        "PICKLIST_ID",
+        "LINE_NO",
+        "PRODUCT_ID",
+        "PICK_QTY",
+        ("PICK_CUM_END" - "PICK_QTY")          AS "PICK_CUM_START",
+        "PICK_CUM_END"
+    FROM req
+), overlap AS (
+    SELECT
+        r."PRODUCT_ID",
+        i."INV_ID",
+        GREATEST(
+            0,
+            LEAST(i."INV_CUM_END",  r."PICK_CUM_END")
+          - GREATEST(i."INV_CUM_START", r."PICK_CUM_START")
+        )                                       AS "PICKED_QTY",
+        i."INV_QTY"
+    FROM req_r r
+    JOIN inv_r i
+      ON i."PRODUCT_ID" = r."PRODUCT_ID"
+     AND i."INV_CUM_START" < r."PICK_CUM_END"
+     AND r."PICK_CUM_START" < i."INV_CUM_END"
+), lot_pct AS (
+    SELECT
+        "PRODUCT_ID",
+        CASE WHEN "INV_QTY" = 0 THEN 0
+             ELSE "PICKED_QTY" / "INV_QTY" END AS "PICK_PCT"
+    FROM overlap
+)
+SELECT
+    pr."NAME"                     AS "PRODUCT_NAME",
+    AVG(lp."PICK_PCT")            AS "AVG_PICK_PERCENTAGE"
+FROM lot_pct lp
+JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS" pr
+  ON lp."PRODUCT_ID" = pr."ID"
+GROUP BY pr."NAME"
+ORDER BY pr."NAME";
+```
+[Corrected SQL]
+2025-05-07 07:20:04 - Thread-714 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier 'I.ID'"}
+[Results for corrected sql]
+2025-05-07 07:21:50 - Thread-714 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Show the first 20 inventory records joined to their purchase information, fixing previous identifier-case issues; useful for confirming FIFO supply data.
+SELECT
+  i."ID"            AS "INV_ID",
+  i."PRODUCT_ID",
+  i."QTY"           AS "INV_QTY",
+  p."PURCHASED"     AS "PURCHASE_DATE",
+  i."LOCATION_ID"
+FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+  ON i."PURCHASE_ID" = p."ID"
+ORDER BY i."PRODUCT_ID", p."PURCHASED"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:21:51 - Thread-714 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 2 at position 2\ninvalid identifier 'I.ID'"}
+[Results for corrected sql]
+2025-05-07 07:26:09 - Thread-714 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Retrieve 20 inventory rows together with their purchase date and location
+--             (needed to confirm FIFO supply ordering).  Column names are quoted in the
+--             same lower-case spelling that appears in the data dictionary so the identifiers
+--             resolve correctly.
+SELECT
+  inv."id"           AS "inv_id",
+  inv."product_id",
+  inv."qty"          AS "inv_qty",
+  pur."purchased"    AS "purchase_date",
+  inv."location_id"
+FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"   inv
+JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"   pur
+  ON inv."purchase_id" = pur."id"
+ORDER BY inv."product_id", pur."purchased"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:26:10 - Thread-714 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 2 at position 2\ninvalid identifier \'INV."id"\''}
+[Results for corrected sql]
+2025-05-07 07:26:10 - Thread-714 (execute) - INFO - [Try to execute]
+-- 5) Build FIFO-ordered inventory lots with cumulative range for every product
+WITH inv AS (
+  SELECT
+    i."id"                    AS "inv_id",
+    i."product_id",
+    i."qty"                   AS "inv_qty",
+    TO_DATE(p."purchased")    AS "purchase_date",
+    SUM(i."qty") OVER (PARTITION BY i."product_id"
+                       ORDER BY TO_DATE(p."purchased"), i."id")               AS "inv_cum_end"
+  FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+  JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+    ON i."purchase_id" = p."id"
+)
+SELECT
+  "inv_id",
+  "product_id",
+  "inv_qty",
+  "purchase_date",
+  ("inv_cum_end" - "inv_qty") AS "inv_cum_start",
+  "inv_cum_end"
+FROM inv
+ORDER BY "product_id", "purchase_date"
+LIMIT 20;
+[Try to execute]
+2025-05-07 07:26:10 - Thread-714 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 3 at position 4\ninvalid identifier \'I."id"\''}
+[Error occurred]
+2025-05-07 07:28:20 - Thread-714 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Create FIFO-ordered inventory lots and expose each lot’s cumulative
+--              start/end range per product.  Use the actual case-sensitive column
+--              names ("ID", "PRODUCT_ID", etc.) so the query compiles.
+WITH inv AS (
+    SELECT
+        i."ID"                               AS "INV_ID",
+        i."PRODUCT_ID",
+        i."QTY"                              AS "INV_QTY",
+        TO_DATE(p."PURCHASED")               AS "PURCHASE_DATE",
+        SUM(i."QTY") OVER (
+            PARTITION BY i."PRODUCT_ID"
+            ORDER BY TO_DATE(p."PURCHASED"), i."ID"
+        )                                    AS "INV_CUM_END"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON i."PURCHASE_ID" = p."ID"
+)
+SELECT
+    "INV_ID",
+    "PRODUCT_ID",
+    "INV_QTY",
+    "PURCHASE_DATE",
+    ("INV_CUM_END" - "INV_QTY") AS "INV_CUM_START",
+    "INV_CUM_END"
+FROM inv
+ORDER BY "PRODUCT_ID", "PURCHASE_DATE"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:28:20 - Thread-714 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier 'I.ID'"}
+[Results for corrected sql]
+2025-05-07 07:31:38 - Thread-714 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build FIFO-ordered inventory lots per product with cumulative range boundaries.
+--             1) Use correct case-sensitive column names (e.g., "ID", "PRODUCT_ID") to avoid
+--                the previous invalid-identifier error.
+--             2) Window-sum each lot’s quantity to get the cumulative end position (INV_CUM_END).
+--             3) Derive the cumulative start (INV_CUM_START) and list the first 20 lots
+--                ordered by product and purchase date.
+WITH inv AS (
+    SELECT
+        i."ID"                              AS "INV_ID",
+        i."PRODUCT_ID"                      AS "PRODUCT_ID",
+        i."QTY"                             AS "INV_QTY",
+        TO_DATE(p."PURCHASED")              AS "PURCHASE_DATE",
+        SUM(i."QTY") OVER (
+            PARTITION BY i."PRODUCT_ID"
+            ORDER BY TO_DATE(p."PURCHASED"), i."ID"
+        )                                   AS "INV_CUM_END"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON i."PURCHASE_ID" = p."ID"
+)
+SELECT
+    "INV_ID",
+    "PRODUCT_ID",
+    "INV_QTY",
+    "PURCHASE_DATE",
+    ("INV_CUM_END" - "INV_QTY") AS "INV_CUM_START",
+    "INV_CUM_END"
+FROM inv
+ORDER BY "PRODUCT_ID", "PURCHASE_DATE"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:31:39 - Thread-714 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier 'I.ID'"}
+[Results for corrected sql]
+2025-05-07 07:36:08 - Thread-714 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build FIFO-ordered inventory lots with cumulative start/end positions,
+--             using properly quoted, upper-case column names so the query compiles.
+WITH inv AS (
+    SELECT
+        i."ID"                           AS "INV_ID",
+        i."PRODUCT_ID",
+        i."QTY"                          AS "INV_QTY",
+        TO_DATE(p."PURCHASED")           AS "PURCHASE_DATE",
+        SUM(i."QTY") OVER (
+            PARTITION BY i."PRODUCT_ID"
+            ORDER BY TO_DATE(p."PURCHASED"), i."ID"
+        )                               AS "INV_CUM_END"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON i."PURCHASE_ID" = p."ID"
+)
+SELECT
+    "INV_ID",
+    "PRODUCT_ID",
+    "INV_QTY",
+    "PURCHASE_DATE",
+    ("INV_CUM_END" - "INV_QTY") AS "INV_CUM_START",
+    "INV_CUM_END"
+FROM inv
+ORDER BY "PRODUCT_ID", "PURCHASE_DATE"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 07:36:09 - Thread-714 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier 'I.ID'"}
+[Results for corrected sql]
+2025-05-07 07:36:09 - Thread-714 (execute) - INFO - itercount: 0
+2025-05-07 07:36:09 - Thread-714 (execute) - INFO - [Self-refine]
+Table full name: ORACLE_SQL.ORACLE_SQL.BREWERIES
+Column name: id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[{'id': 523, 'name': 'Happy Hoppy Hippo'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CONWAY_GEN_ZERO
+Column name: x Type: TEXT
+Column name: alive Type: TEXT
+Column name: y Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CUSTOMER_REVIEWS
+Column name: customer_id Type: NUMBER
+Column name: review_list Type: TEXT
+Sample rows:
+[{'customer_id': 50042, 'review_list': '4040:A,6600:C,7950:B'}, {'customer_id': 50741, 'review_list': '4160:A'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.EMPLOYEES
+Column name: id Type: NUMBER
+Column name: title Type: TEXT
+Column name: name Type: TEXT
+Column name: supervisor_id Type: FLOAT
+Sample rows:
+[{'id': 142, 'name': 'Harold King', 'title': 'Managing Director', 'supervisor_id': nan}, {'id': 143, 'name': 'Mogens Juel', 'title': 'IT Manager', 'supervisor_id': 147.0}, {'id': 147, 'name': 'Ursula Mwbesi', 'title': 'Operations Chief', 'supervisor_id': 142.0}, {'id': 148, 'name': 'Maria Juarez', 'title': 'Purchaser', 'supervisor_id': 144.0}, {'id': 151, 'name': 'Jim Kronzki', 'title': 'Sales Manager', 'supervisor_id': 144.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ID_NAME_COLL_TYPE
+Column name: collection_id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.MONTHLY_BUDGET
+Column name: mth Type: TEXT
+Column name: product_id Type: NUMBER
+Column name: qty Type: FLOAT
+Sample rows:
+[{'product_id': 6520, 'mth': '2018-02-01', 'qty': 30.0}, {'product_id': 6520, 'mth': '2018-04-01', 'qty': 30.0}, {'product_id': 6520, 'mth': '2018-05-01', 'qty': 40.0}, {'product_id': 6520, 'mth': '2018-06-01', 'qty': 50.0}, {'product_id': 6520, 'mth': '2018-07-01', 'qty': 50.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.MONTHLY_SALES
+Column name: mth Type: TEXT
+Column name: product_id Type: NUMBER
+Column name: qty Type: NUMBER
+Sample rows:
+[{'product_id': 4040, 'mth': '2016-01-01', 'qty': 42}, {'product_id': 4040, 'mth': '2016-03-01', 'qty': 39}, {'product_id': 4040, 'mth': '2016-04-01', 'qty': 22}, {'product_id': 4040, 'mth': '2016-06-01', 'qty': 6}, {'product_id': 4040, 'mth': '2016-07-01', 'qty': 7}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ORDERLINES
+Column name: order_id Type: NUMBER
+Column name: qty Type: FLOAT
+Column name: product_id Type: NUMBER
+Column name: amount Type: FLOAT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 9233, 'order_id': 422, 'product_id': 4280, 'qty': 80.0, 'amount': 1750.0}, {'id': 9234, 'order_id': 422, 'product_id': 6520, 'qty': 80.0, 'amount': 1275.0}, {'id': 9279, 'order_id': 425, 'product_id': 5310, 'qty': 40.0, 'amount': 750.0}, {'id': 9280, 'order_id': 425, 'product_id': 5430, 'qty': 60.0, 'amount': 1150.0}, {'id': 9282, 'order_id': 425, 'product_id': 6600, 'qty': 24.0, 'amount': 480.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCTS
+Column name: id Type: NUMBER
+Column name: group_id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[{'id': 4040, 'name': 'Coalminers Sweat', 'group_id': 142}, {'id': 4160, 'name': 'Reindeer Fuel', 'group_id': 142}, {'id': 4280, 'name': 'Hoppy Crude Oil', 'group_id': 142}, {'id': 5310, 'name': 'Monks and Nuns', 'group_id': 152}, {'id': 5430, 'name': 'Hercule Trippel', 'group_id': 152}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCT_GROUPS
+Column name: id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PURCHASES
+Column name: product_id Type: NUMBER
+Column name: purchased Type: TEXT
+Column name: cost Type: FLOAT
+Column name: id Type: NUMBER
+Column name: qty Type: NUMBER
+Column name: brewery_id Type: NUMBER
+Sample rows:
+[{'id': 602, 'purchased': '2016-01-03', 'brewery_id': 536, 'product_id': 4280, 'qty': 17, 'cost': 122.0}, {'id': 605, 'purchased': '2016-01-09', 'brewery_id': 523, 'product_id': 7870, 'qty': 105, 'cost': 770.0}, {'id': 607, 'purchased': '2016-02-04', 'brewery_id': 518, 'product_id': 5310, 'qty': 87, 'cost': 654.0}, {'id': 608, 'purchased': '2016-02-05', 'brewery_id': 518, 'product_id': 5430, 'qty': 52, 'cost': 360.0}, {'id': 609, 'purchased': '2016-02-06', 'brewery_id': 518, 'product_id': 6520, 'qty': 87, 'cost': 570.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.LOCATIONS
+Column name: position Type: NUMBER
+Column name: warehouse Type: NUMBER
+Column name: aisle Type: TEXT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 1, 'warehouse': 1, 'aisle': 'A', 'position': 1}, {'id': 3, 'warehouse': 1, 'aisle': 'A', 'position': 3}, {'id': 4, 'warehouse': 1, 'aisle': 'A', 'position': 4}, {'id': 6, 'warehouse': 1, 'aisle': 'A', 'position': 6}, {'id': 7, 'warehouse': 1, 'aisle': 'A', 'position': 7}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PACKAGING_RELATIONS
+Column name: qty Type: NUMBER
+Column name: packaging_id Type: NUMBER
+Column name: contains_id Type: NUMBER
+Sample rows:
+[{'packaging_id': 521, 'contains_id': 502, 'qty': 72}, {'packaging_id': 522, 'contains_id': 501, 'qty': 36}, {'packaging_id': 533, 'contains_id': 522, 'qty': 10}, {'packaging_id': 534, 'contains_id': 523, 'qty': 20}, {'packaging_id': 534, 'contains_id': 524, 'qty': 16}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_APPS
+Column name: id Type: NUMBER
+Column name: name Type: TEXT
+Sample rows:
+[{'id': 542, 'name': 'Webshop'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_PAGES
+Column name: app_id Type: NUMBER
+Column name: page_no Type: NUMBER
+Column name: friendly_url Type: TEXT
+Sample rows:
+[{'app_id': 542, 'page_no': 1, 'friendly_url': '/Shop'}, {'app_id': 542, 'page_no': 3, 'friendly_url': '/Breweries'}, {'app_id': 542, 'page_no': 4, 'friendly_url': '/About'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CUSTOMERS
+Column name: name Type: TEXT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 51007, 'name': 'Boom Beer Bar'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CUSTOMER_FAVORITES
+Column name: customer_id Type: NUMBER
+Column name: favorite_list Type: TEXT
+Sample rows:
+[{'customer_id': 50741, 'favorite_list': '5430,7790,7870'}, {'customer_id': 51069, 'favorite_list': '6520'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ID_NAME_TYPE
+Column name: name Type: TEXT
+Column name: id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ORDERS
+Column name: delivery Type: TEXT
+Column name: id Type: NUMBER
+Column name: ordered Type: TEXT
+Column name: customer_id Type: NUMBER
+Sample rows:
+[{'id': 421, 'customer_id': 50042, 'ordered': '2019-01-15', 'delivery': ''}, {'id': 425, 'customer_id': 51069, 'ordered': '2019-02-17', 'delivery': ''}, {'id': 426, 'customer_id': 50741, 'ordered': '2019-02-26', 'delivery': ''}, {'id': 427, 'customer_id': 50042, 'ordered': '2019-03-02', 'delivery': ''}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PICKING_LOG
+Column name: log_time Type: TEXT
+Column name: pickline_no Type: FLOAT
+Column name: picklist_id Type: NUMBER
+Column name: activity Type: TEXT
+Column name: location_id Type: FLOAT
+Sample rows:
+[{'picklist_id': 841, 'log_time': '2019-01-16 14:05:44', 'activity': 'A', 'location_id': 16.0, 'pickline_no': nan}, {'picklist_id': 841, 'log_time': '2019-01-16 14:06:01', 'activity': 'D', 'location_id': 16.0, 'pickline_no': nan}, {'picklist_id': 841, 'log_time': '2019-01-16 14:06:20', 'activity': 'A', 'location_id': 29.0, 'pickline_no': nan}, {'picklist_id': 841, 'log_time': '2019-01-16 14:06:27', 'activity': 'P', 'location_id': 29.0, 'pickline_no': 2.0}, {'picklist_id': 841, 'log_time': '2019-01-16 14:07:20', 'activity': 'P', 'location_id': 77.0, 'pickline_no': 3.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCT_MINIMUMS
+Column name: qty_purchase Type: FLOAT
+Column name: qty_minimum Type: FLOAT
+Column name: product_id Type: NUMBER
+Sample rows:
+[{'product_id': 6520, 'qty_minimum': 100.0, 'qty_purchase': 400.0}, {'product_id': 6600, 'qty_minimum': 30.0, 'qty_purchase': 100.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.STOCK
+Column name: company Type: TEXT
+Column name: symbol Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.TICKER
+Column name: price Type: FLOAT
+Column name: symbol Type: TEXT
+Column name: day Type: TEXT
+Sample rows:
+[{'symbol': 'BEER', 'day': '2019-04-02', 'price': 14.2}, {'symbol': 'BEER', 'day': '2019-04-03', 'price': 14.2}, {'symbol': 'BEER', 'day': '2019-04-04', 'price': 15.7}, {'symbol': 'BEER', 'day': '2019-04-05', 'price': 15.6}, {'symbol': 'BEER', 'day': '2019-04-08', 'price': 14.8}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PICKING_LINE
+Column name: picklist_id Type: NUMBER
+Column name: qty Type: FLOAT
+Column name: product_id Type: NUMBER
+Column name: line_no Type: NUMBER
+Column name: order_id Type: NUMBER
+Column name: location_id Type: NUMBER
+Sample rows:
+[{'picklist_id': 841, 'line_no': 1, 'location_id': 16, 'order_id': 421, 'product_id': 6520, 'qty': 42.0}, {'picklist_id': 841, 'line_no': 2, 'location_id': 29, 'order_id': 421, 'product_id': 6520, 'qty': 14.0}, {'picklist_id': 841, 'line_no': 5, 'location_id': 114, 'order_id': 421, 'product_id': 4280, 'qty': 39.0}, {'picklist_id': 841, 'line_no': 6, 'location_id': 186, 'order_id': 421, 'product_id': 6520, 'qty': 24.0}, {'picklist_id': 841, 'line_no': 7, 'location_id': 165, 'order_id': 421, 'product_id': 6520, 'qty': 14.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_COUNTER_HIST
+Column name: day Type: TEXT
+Column name: app_id Type: NUMBER
+Column name: page_no Type: NUMBER
+Column name: counter Type: NUMBER
+Sample rows:
+[{'app_id': 542, 'page_no': 1, 'day': '2019-04-05', 'counter': 5311}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-07', 'counter': 5458}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-08', 'counter': 5517}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-09', 'counter': 5580}, {'app_id': 542, 'page_no': 1, 'day': '2019-04-10', 'counter': 5659}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.CHANNELS_DIM
+Column name: name Type: TEXT
+Column name: id Type: NUMBER
+Column name: shortcut Type: TEXT
+Sample rows:
+[{'id': 42, 'name': 'Twitter', 'shortcut': 'tw'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.EMP_HIRE_PERIODS
+Column name: end_ Type: TEXT
+Column name: start_ Type: TEXT
+Column name: title Type: TEXT
+Column name: emp_id Type: NUMBER
+Sample rows:
+[{'emp_id': 142, 'start_': '2010-07-01', 'end_': '2012-04-01', 'title': 'Product Director'}, {'emp_id': 144, 'start_': '2010-07-01', 'end_': '2013-07-01', 'title': 'Sales Manager'}, {'emp_id': 144, 'start_': '2012-04-01', 'end_': '', 'title': 'Product Director'}, {'emp_id': 145, 'start_': '2014-02-01', 'end_': '', 'title': 'IT Developer'}, {'emp_id': 145, 'start_': '2019-02-01', 'end_': '', 'title': 'Scrum Master'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_DEVICES
+Column name: phone Type: NUMBER
+Column name: day Type: TEXT
+Column name: tablet Type: NUMBER
+Column name: pc Type: NUMBER
+Sample rows:
+[{'day': '2019-05-01', 'pc': 1042, 'tablet': 812, 'phone': 1610}, {'day': '2019-05-02', 'pc': 967, 'tablet': 1102, 'phone': 2159}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_DEMOGRAPHICS
+Column name: f_tw_qty Type: NUMBER
+Column name: f_fb_qty Type: NUMBER
+Column name: m_tw_cnt Type: NUMBER
+Column name: m_tw_qty Type: NUMBER
+Column name: f_fb_cnt Type: NUMBER
+Column name: f_tw_cnt Type: NUMBER
+Column name: m_fb_qty Type: NUMBER
+Column name: day Type: TEXT
+Column name: m_fb_cnt Type: NUMBER
+Sample rows:
+[{'day': '2019-05-01', 'm_tw_cnt': 1232, 'm_tw_qty': 86, 'm_fb_cnt': 1017, 'm_fb_qty': 64, 'f_tw_cnt': 651, 'f_tw_qty': 76, 'f_fb_cnt': 564, 'f_fb_qty': 68}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.FAVORITE_COLL_TYPE
+Column name: id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.GENDER_DIM
+Column name: name Type: TEXT
+Column name: letter Type: TEXT
+Sample rows:
+[{'letter': 'F', 'name': 'Female'}, {'letter': 'M', 'name': 'Male'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.ID_NAME_COLL_ENTRIES
+Column name: collection_id Type: TEXT
+Column name: name Type: TEXT
+Column name: id Type: TEXT
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.INVENTORY
+Column name: location_id Type: NUMBER
+Column name: product_id Type: NUMBER
+Column name: purchase_id Type: NUMBER
+Column name: id Type: NUMBER
+Column name: qty Type: FLOAT
+Sample rows:
+[{'id': 1148, 'location_id': 244, 'product_id': 7870, 'purchase_id': 719, 'qty': 11.0}, {'id': 1151, 'location_id': 23, 'product_id': 7870, 'purchase_id': 719, 'qty': 48.0}, {'id': 1154, 'location_id': 179, 'product_id': 7950, 'purchase_id': 720, 'qty': 36.0}, {'id': 1175, 'location_id': 170, 'product_id': 7790, 'purchase_id': 724, 'qty': 48.0}, {'id': 1181, 'location_id': 185, 'product_id': 7950, 'purchase_id': 725, 'qty': 48.0}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PACKAGING
+Column name: name Type: TEXT
+Column name: id Type: NUMBER
+Sample rows:
+[{'id': 501, 'name': 'Bottle 330cl'}, {'id': 531, 'name': 'Pallet of L'}, {'id': 532, 'name': 'Pallet of M'}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PICKING_LIST
+Column name: created Type: TEXT
+Column name: id Type: NUMBER
+Column name: picker_emp_id Type: NUMBER
+Sample rows:
+[{'id': 842, 'created': '2019-01-19 15:57:42', 'picker_emp_id': 152}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.WEB_PAGE_VISITS
+Column name: client_ip Type: TEXT
+Column name: page_no Type: NUMBER
+Column name: app_id Type: NUMBER
+Column name: visit_time Type: TEXT
+Sample rows:
+[{'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:16:31', 'app_id': 542, 'page_no': 3}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:41:12', 'app_id': 542, 'page_no': 3}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:42:37', 'app_id': 542, 'page_no': 2}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 08:55:02', 'app_id': 542, 'page_no': 4}, {'client_ip': '104.130.89.12', 'visit_time': '2019-04-20 09:17:50', 'app_id': 542, 'page_no': 2}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.PRODUCT_ALCOHOL
+Column name: abv Type: FLOAT
+Column name: product_id Type: NUMBER
+Column name: sales_volume Type: FLOAT
+Sample rows:
+[{'product_id': 4040, 'sales_volume': 330.0, 'abv': 8.5}, {'product_id': 4280, 'sales_volume': 330.0, 'abv': 7.0}, {'product_id': 5310, 'sales_volume': 330.0, 'abv': 5.0}, {'product_id': 5430, 'sales_volume': 330.0, 'abv': 6.5}]
+
+--------------------------------------------------
+Table full name: ORACLE_SQL.ORACLE_SQL.SERVER_HEARTBEAT
+Column name: beat_time Type: TEXT
+Column name: server Type: TEXT
+Sample rows:
+[{'server': '10.0.0.100', 'beat_time': '2019-04-10 13:45'}, {'server': '10.0.0.100', 'beat_time': '2019-04-10 13:55'}, {'server': '10.0.0.142', 'beat_time': '2019-04-10 13:00'}, {'server': '10.0.0.142', 'beat_time': '2019-04-10 13:25'}, {'server': '10.0.0.142', 'beat_time': '2019-04-10 13:55'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'ORACLE_SQL': {'ORACLE_SQL': ['BREWERIES', 'CONWAY_GEN_ZERO', 'CUSTOMER_REVIEWS', 'EMPLOYEES', 'ID_NAME_COLL_TYPE', 'MONTHLY_BUDGET', 'MONTHLY_SALES', 'ORDERLINES', 'PRODUCTS', 'PRODUCT_GROUPS', 'PURCHASES', 'LOCATIONS', 'PACKAGING_RELATIONS', 'WEB_APPS', 'WEB_PAGES', 'CUSTOMERS', 'CUSTOMER_FAVORITES', 'ID_NAME_TYPE', 'ORDERS', 'PICKING_LOG', 'PRODUCT_MINIMUMS', 'STOCK', 'TICKER', 'PICKING_LINE', 'WEB_COUNTER_HIST', 'CHANNELS_DIM', 'EMP_HIRE_PERIODS', 'WEB_DEVICES', 'WEB_DEMOGRAPHICS', 'FAVORITE_COLL_TYPE', 'GENDER_DIM', 'ID_NAME_COLL_ENTRIES', 'INVENTORY', 'PACKAGING', 'PICKING_LIST', 'WEB_PAGE_VISITS', 'PRODUCT_ALCOHOL', 'SERVER_HEARTBEAT']}}
+
+Some few-shot examples after column exploration may be helpful:
+Query:
+-- 1) Inspect a few picking–line rows (order-requirements)
+SELECT 
+  "picklist_id",
+  "line_no",
+  "order_id",
+  "product_id",
+  "qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+LIMIT 20;
+Answer:
+picklist_id,line_no,order_id,product_id,qty
+841,1,421,6520,42.0
+841,2,421,6520,14.0
+841,3,421,6520,20.0
+841,4,421,4280,36.0
+841,5,421,4280,39.0
+841,6,421,6520,24.0
+841,7,421,6520,14.0
+841,8,421,4280,35.0
+841,9,421,6520,26.0
+842,1,423,6520,22.0
+842,2,422,6520,14.0
+842,3,422,6520,20.0
+842,4,422,4280,36.0
+842,5,422,4280,39.0
+842,6,422,6520,24.0
+842,7,422,6520,14.0
+842,8,422,4280,5.0
+842,9,423,4280,30.0
+842,10,423,4280,30.0
+842,11,422,6520,8.0
+Query:
+-- 2) See the corresponding pick-lists to get the pick-time stamp
+SELECT 
+  "id"            AS "picklist_id",
+  "created",
+  "picker_emp_id"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LIST"
+LIMIT 20;
+Answer:
+picklist_id,created,picker_emp_id
+841,2019-01-16 14:03:41,149
+842,2019-01-19 15:57:42,152
+Query:
+-- 3) Combine picking lines with their pick-times (requirement-side)
+SELECT
+  pl."picklist_id",
+  l."created"     AS "pick_time",
+  pl."line_no",
+  pl."order_id",
+  pl."product_id",
+  pl."qty"        AS "pick_qty"
+FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"  pl
+JOIN ORACLE_SQL.ORACLE_SQL."PICKING_LIST"  l
+  ON pl."picklist_id" = l."id"
+ORDER BY pl."product_id", l."created"
+LIMIT 20;
+Answer:
+picklist_id,pick_time,line_no,order_id,product_id,pick_qty
+841,2019-01-16 14:03:41,4,421,4280,36.0
+841,2019-01-16 14:03:41,8,421,4280,35.0
+841,2019-01-16 14:03:41,5,421,4280,39.0
+842,2019-01-19 15:57:42,5,422,4280,39.0
+842,2019-01-19 15:57:42,8,422,4280,5.0
+842,2019-01-19 15:57:42,9,423,4280,30.0
+842,2019-01-19 15:57:42,4,422,4280,36.0
+842,2019-01-19 15:57:42,10,423,4280,30.0
+841,2019-01-16 14:03:41,1,421,6520,42.0
+841,2019-01-16 14:03:41,2,421,6520,14.0
+841,2019-01-16 14:03:41,3,421,
+Task: Calculate the average pick percentage for each product name, using a first-in-first-out approach that selects from inventory locations based on the earliest purchase date and smallest available quantity, ensuring that the picked quantity reflects only the overlapping range between each order’s required quantity and the inventory’s available quantity, and then grouping and ordering the results by product name?
+
+Please think step by step and answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'ORACLE_SQL': {'ORACLE_SQL': ['BREWERIES', 'CONWAY_GEN_ZERO', 'CUSTOMER_REVIEWS', 'EMPLOYEES', 'ID_NAME_COLL_TYPE', 'MONTHLY_BUDGET', 'MONTHLY_SALES', 'ORDERLINES', 'PRODUCTS', 'PRODUCT_GROUPS', 'PURCHASES', 'LOCATIONS', 'PACKAGING_RELATIONS', 'WEB_APPS', 'WEB_PAGES', 'CUSTOMERS', 'CUSTOMER_FAVORITES', 'ID_NAME_TYPE', 'ORDERS', 'PICKING_LOG', 'PRODUCT_MINIMUMS', 'STOCK', 'TICKER', 'PICKING_LINE', 'WEB_COUNTER_HIST', 'CHANNELS_DIM', 'EMP_HIRE_PERIODS', 'WEB_DEVICES', 'WEB_DEMOGRAPHICS', 'FAVORITE_COLL_TYPE', 'GENDER_DIM', 'ID_NAME_COLL_ENTRIES', 'INVENTORY', 'PACKAGING', 'PICKING_LIST', 'WEB_PAGE_VISITS', 'PRODUCT_ALCOHOL', 'SERVER_HEARTBEAT']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-07 07:37:53 - Thread-714 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*--------------------------------------------------------------
+  Average pick-percentage per product
+  – FIFO = earliest purchase-date first, then smallest inventory
+  – picked quantity = overlap between order need and inventory
+  – result : ordered by product name
+----------------------------------------------------------------*/
+WITH inv AS (                               -- 1) FIFO inventory rows
+    SELECT 
+        i."id"           AS "inv_id",
+        i."product_id",
+        i."qty"          AS "inv_qty",
+        TO_DATE(p."purchased") AS "purchased"          /* earliest first */
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+          ON p."id" = i."purchase_id"
+), 
+req AS (                                   -- 2) required qty per order/product
+    SELECT 
+        "order_id",
+        "product_id",
+        SUM("qty")      AS "req_qty"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+    GROUP BY "order_id","product_id"
+), 
+alloc AS (                                 -- 3) line up inventory rows per requirement (FIFO)
+    SELECT
+        r."order_id",
+        r."product_id",
+        r."req_qty",
+        inv."inv_id",
+        inv."inv_qty",
+        inv."purchased",
+        SUM(inv."inv_qty") OVER (
+             PARTITION BY r."order_id", r."product_id"
+             ORDER BY inv."purchased", inv."inv_qty"
+             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS "prev_cum_qty"
+    FROM req r
+    JOIN inv
+      ON inv."product_id" = r."product_id"
+), 
+alloc2 AS (                                -- 4) overlap (picked) from each inventory row
+    SELECT 
+        "order_id",
+        "product_id",
+        "req_qty",
+        "inv_id",
+        "inv_qty",
+        "purchased",
+        COALESCE("prev_cum_qty",0)               AS "prev_cum_qty",
+        CASE
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) <= 0              THEN 0          -- already satisfied
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) >= "inv_qty"      THEN "inv_qty"  -- take whole location
+            ELSE  "req_qty" - COALESCE("prev_cum_qty",0)                                  -- take remainder
+        END AS "picked_qty"
+    FROM alloc
+), 
+order_pick AS (                            -- 5) pick-percentage per order/product
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        SUM("picked_qty")                                    AS "picked_total",
+        CASE WHEN "req_qty" = 0 
+             THEN 0 
+             ELSE SUM("picked_qty") / "req_qty" 
+        END                                                 AS "pick_pct"
+    FROM alloc2
+    GROUP BY "order_id","product_id","req_qty"
+), 
+prod_avg AS (                              -- 6) average percentage per product
+    SELECT 
+        pr."name"                                        AS "product_name",
+        AVG("pick_pct")                                  AS "avg_pick_pct"
+    FROM order_pick      op
+    JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS" pr
+         ON pr."id" = op."product_id"
+    GROUP BY pr."name"
+)
+SELECT 
+    "product_name",
+    ROUND("avg_pick_pct"*100,2)  AS "avg_pick_percentage"
+FROM prod_avg
+ORDER BY "product_name";
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:37:53 - Thread-714 (execute) - INFO - itercount: 1
+2025-05-07 07:37:53 - Thread-714 (execute) - INFO - [Self-refine]
+Input sql:
+/*--------------------------------------------------------------
+  Average pick-percentage per product
+  – FIFO = earliest purchase-date first, then smallest inventory
+  – picked quantity = overlap between order need and inventory
+  – result : ordered by product name
+----------------------------------------------------------------*/
+WITH inv AS (                               -- 1) FIFO inventory rows
+    SELECT 
+        i."id"           AS "inv_id",
+        i."product_id",
+        i."qty"          AS "inv_qty",
+        TO_DATE(p."purchased") AS "purchased"          /* earliest first */
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+          ON p."id" = i."purchase_id"
+), 
+req AS (                                   -- 2) required qty per order/product
+    SELECT 
+        "order_id",
+        "product_id",
+        SUM("qty")      AS "req_qty"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+    GROUP BY "order_id","product_id"
+), 
+alloc AS (                                 -- 3) line up inventory rows per requirement (FIFO)
+    SELECT
+        r."order_id",
+        r."product_id",
+        r."req_qty",
+        inv."inv_id",
+        inv."inv_qty",
+        inv."purchased",
+        SUM(inv."inv_qty") OVER (
+             PARTITION BY r."order_id", r."product_id"
+             ORDER BY inv."purchased", inv."inv_qty"
+             ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS "prev_cum_qty"
+    FROM req r
+    JOIN inv
+      ON inv."product_id" = r."product_id"
+), 
+alloc2 AS (                                -- 4) overlap (picked) from each inventory row
+    SELECT 
+        "order_id",
+        "product_id",
+        "req_qty",
+        "inv_id",
+        "inv_qty",
+        "purchased",
+        COALESCE("prev_cum_qty",0)               AS "prev_cum_qty",
+        CASE
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) <= 0              THEN 0          -- already satisfied
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) >= "inv_qty"      THEN "inv_qty"  -- take whole location
+            ELSE  "req_qty" - COALESCE("prev_cum_qty",0)                                  -- take remainder
+        END AS "picked_qty"
+    FROM alloc
+), 
+order_pick AS (                            -- 5) pick-percentage per order/product
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        SUM("picked_qty")                                    AS "picked_total",
+        CASE WHEN "req_qty" = 0 
+             THEN 0 
+             ELSE SUM("picked_qty") / "req_qty" 
+        END                                                 AS "pick_pct"
+    FROM alloc2
+    GROUP BY "order_id","product_id","req_qty"
+), 
+prod_avg AS (                              -- 6) average percentage per product
+    SELECT 
+        pr."name"                                        AS "product_name",
+        AVG("pick_pct")                                  AS "avg_pick_pct"
+    FROM order_pick      op
+    JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS" pr
+         ON pr."id" = op."product_id"
+    GROUP BY pr."name"
+)
+SELECT 
+    "product_name",
+    ROUND("avg_pick_pct"*100,2)  AS "avg_pick_percentage"
+FROM prod_avg
+ORDER BY "product_name";
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier \'I."id"\''}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:39:20 - Thread-714 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*--------------------------------------------------------------
+  Average pick-percentage per product
+----------------------------------------------------------------*/
+WITH inv AS (                  /* 1) FIFO inventory rows           */
+    SELECT 
+        i.id          AS inv_id,
+        i.product_id,
+        i.qty         AS inv_qty,
+        TO_DATE(p.purchased) AS purchased
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY  i
+    JOIN ORACLE_SQL.ORACLE_SQL.PURCHASES  p
+          ON p.id = i.purchase_id
+), 
+req AS (                       /* 2) required qty per order/product */
+    SELECT 
+        order_id,
+        product_id,
+        SUM(qty) AS req_qty
+    FROM ORACLE_SQL.ORACLE_SQL.PICKING_LINE
+    GROUP BY order_id, product_id
+), 
+alloc AS (                     /* 3) match inventory rows FIFO      */
+    SELECT
+        r.order_id,
+        r.product_id,
+        r.req_qty,
+        inv.inv_id,
+        inv.inv_qty,
+        inv.purchased,
+        SUM(inv.inv_qty) OVER (
+            PARTITION BY r.order_id, r.product_id
+            ORDER BY inv.purchased, inv.inv_qty
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS prev_cum_qty
+    FROM req r
+    JOIN inv
+      ON inv.product_id = r.product_id
+), 
+alloc2 AS (                    /* 4) picked from each inventory row */
+    SELECT 
+        order_id,
+        product_id,
+        req_qty,
+        inv_id,
+        inv_qty,
+        purchased,
+        COALESCE(prev_cum_qty,0) AS prev_cum_qty,
+        CASE
+            WHEN req_qty - COALESCE(prev_cum_qty,0) <= 0          THEN 0
+            WHEN req_qty - COALESCE(prev_cum_qty,0) >= inv_qty    THEN inv_qty
+            ELSE  req_qty - COALESCE(prev_cum_qty,0)
+        END AS picked_qty
+    FROM alloc
+), 
+order_pick AS (                /* 5) pick-percentage per order      */
+    SELECT
+        order_id,
+        product_id,
+        req_qty,
+        SUM(picked_qty)                         AS picked_total,
+        CASE WHEN req_qty = 0 
+             THEN 0 
+             ELSE SUM(picked_qty) / req_qty 
+        END                                     AS pick_pct
+    FROM alloc2
+    GROUP BY order_id, product_id, req_qty
+), 
+prod_avg AS (                  /* 6) average percentage per product */
+    SELECT 
+        pr.name                       AS product_name,
+        AVG(pick_pct)                 AS avg_pick_pct
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL.PRODUCTS pr
+         ON pr.id = op.product_id
+    GROUP BY pr.name
+)
+SELECT 
+    product_name,
+    ROUND(avg_pick_pct * 100, 2) AS avg_pick_percentage
+FROM prod_avg
+ORDER BY product_name;
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:39:20 - Thread-714 (execute) - INFO - itercount: 2
+2025-05-07 07:39:20 - Thread-714 (execute) - INFO - [Self-refine]
+Input sql:
+/*--------------------------------------------------------------
+  Average pick-percentage per product
+----------------------------------------------------------------*/
+WITH inv AS (                  /* 1) FIFO inventory rows           */
+    SELECT 
+        i.id          AS inv_id,
+        i.product_id,
+        i.qty         AS inv_qty,
+        TO_DATE(p.purchased) AS purchased
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY  i
+    JOIN ORACLE_SQL.ORACLE_SQL.PURCHASES  p
+          ON p.id = i.purchase_id
+), 
+req AS (                       /* 2) required qty per order/product */
+    SELECT 
+        order_id,
+        product_id,
+        SUM(qty) AS req_qty
+    FROM ORACLE_SQL.ORACLE_SQL.PICKING_LINE
+    GROUP BY order_id, product_id
+), 
+alloc AS (                     /* 3) match inventory rows FIFO      */
+    SELECT
+        r.order_id,
+        r.product_id,
+        r.req_qty,
+        inv.inv_id,
+        inv.inv_qty,
+        inv.purchased,
+        SUM(inv.inv_qty) OVER (
+            PARTITION BY r.order_id, r.product_id
+            ORDER BY inv.purchased, inv.inv_qty
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS prev_cum_qty
+    FROM req r
+    JOIN inv
+      ON inv.product_id = r.product_id
+), 
+alloc2 AS (                    /* 4) picked from each inventory row */
+    SELECT 
+        order_id,
+        product_id,
+        req_qty,
+        inv_id,
+        inv_qty,
+        purchased,
+        COALESCE(prev_cum_qty,0) AS prev_cum_qty,
+        CASE
+            WHEN req_qty - COALESCE(prev_cum_qty,0) <= 0          THEN 0
+            WHEN req_qty - COALESCE(prev_cum_qty,0) >= inv_qty    THEN inv_qty
+            ELSE  req_qty - COALESCE(prev_cum_qty,0)
+        END AS picked_qty
+    FROM alloc
+), 
+order_pick AS (                /* 5) pick-percentage per order      */
+    SELECT
+        order_id,
+        product_id,
+        req_qty,
+        SUM(picked_qty)                         AS picked_total,
+        CASE WHEN req_qty = 0 
+             THEN 0 
+             ELSE SUM(picked_qty) / req_qty 
+        END                                     AS pick_pct
+    FROM alloc2
+    GROUP BY order_id, product_id, req_qty
+), 
+prod_avg AS (                  /* 6) average percentage per product */
+    SELECT 
+        pr.name                       AS product_name,
+        AVG(pick_pct)                 AS avg_pick_pct
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL.PRODUCTS pr
+         ON pr.id = op.product_id
+    GROUP BY pr.name
+)
+SELECT 
+    product_name,
+    ROUND(avg_pick_pct * 100, 2) AS avg_pick_percentage
+FROM prod_avg
+ORDER BY product_name;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier 'I.ID'"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:40:31 - Thread-714 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*--------------------------------------------------------------
+  Average pick-percentage per product
+----------------------------------------------------------------*/
+WITH inv AS (  /* 1) FIFO inventory rows ----------------------------------*/
+    SELECT
+        i."id"             AS "inv_id",
+        i."product_id",
+        i."qty"            AS "inv_qty",
+        TO_DATE(p."purchased") AS "purchased"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+          ON p."id" = i."purchase_id"
+),
+req AS (      /* 2) required quantity per order / product -----------------*/
+    SELECT
+        "order_id",
+        "product_id",
+        SUM("qty") AS "req_qty"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+    GROUP BY "order_id", "product_id"
+),
+alloc AS (    /* 3) assign inventory rows to each requirement -------------*/
+    SELECT
+        r."order_id",
+        r."product_id",
+        r."req_qty",
+        inv."inv_id",
+        inv."inv_qty",
+        inv."purchased",
+        SUM(inv."inv_qty") OVER (
+            PARTITION BY r."order_id", r."product_id"
+            ORDER BY inv."purchased", inv."inv_qty"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS "prev_cum_qty"
+    FROM req r
+    JOIN inv
+      ON inv."product_id" = r."product_id"
+),
+alloc2 AS (   /* 4) overlap picked from each inventory location -----------*/
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        "inv_id",
+        "inv_qty",
+        "purchased",
+        COALESCE("prev_cum_qty", 0)                    AS "prev_cum_qty",
+        CASE
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) <= 0
+                 THEN 0
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) >= "inv_qty"
+                 THEN "inv_qty"
+            ELSE  "req_qty" - COALESCE("prev_cum_qty",0)
+        END                                            AS "picked_qty"
+    FROM alloc
+),
+order_pick AS ( /* 5) pick-percentage per order / product ----------------*/
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        SUM("picked_qty")                    AS "picked_total",
+        CASE
+            WHEN "req_qty" = 0 THEN 0
+            ELSE SUM("picked_qty") / "req_qty"
+        END                                  AS "pick_pct"
+    FROM alloc2
+    GROUP BY "order_id", "product_id", "req_qty"
+),
+prod_avg AS (  /* 6) average pick-percentage per product ------------------*/
+    SELECT
+        pr."name"                    AS "product_name",
+        AVG("pick_pct")              AS "avg_pick_pct"
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS" pr
+         ON pr."id" = op."product_id"
+    GROUP BY pr."name"
+)
+SELECT
+    "product_name",
+    ROUND("avg_pick_pct"*100, 2) AS "avg_pick_percentage"
+FROM prod_avg
+ORDER BY "product_name";
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:40:31 - Thread-714 (execute) - INFO - itercount: 3
+2025-05-07 07:40:31 - Thread-714 (execute) - INFO - [Self-refine]
+Input sql:
+/*--------------------------------------------------------------
+  Average pick-percentage per product
+----------------------------------------------------------------*/
+WITH inv AS (  /* 1) FIFO inventory rows ----------------------------------*/
+    SELECT
+        i."id"             AS "inv_id",
+        i."product_id",
+        i."qty"            AS "inv_qty",
+        TO_DATE(p."purchased") AS "purchased"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+          ON p."id" = i."purchase_id"
+),
+req AS (      /* 2) required quantity per order / product -----------------*/
+    SELECT
+        "order_id",
+        "product_id",
+        SUM("qty") AS "req_qty"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+    GROUP BY "order_id", "product_id"
+),
+alloc AS (    /* 3) assign inventory rows to each requirement -------------*/
+    SELECT
+        r."order_id",
+        r."product_id",
+        r."req_qty",
+        inv."inv_id",
+        inv."inv_qty",
+        inv."purchased",
+        SUM(inv."inv_qty") OVER (
+            PARTITION BY r."order_id", r."product_id"
+            ORDER BY inv."purchased", inv."inv_qty"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS "prev_cum_qty"
+    FROM req r
+    JOIN inv
+      ON inv."product_id" = r."product_id"
+),
+alloc2 AS (   /* 4) overlap picked from each inventory location -----------*/
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        "inv_id",
+        "inv_qty",
+        "purchased",
+        COALESCE("prev_cum_qty", 0)                    AS "prev_cum_qty",
+        CASE
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) <= 0
+                 THEN 0
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) >= "inv_qty"
+                 THEN "inv_qty"
+            ELSE  "req_qty" - COALESCE("prev_cum_qty",0)
+        END                                            AS "picked_qty"
+    FROM alloc
+),
+order_pick AS ( /* 5) pick-percentage per order / product ----------------*/
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        SUM("picked_qty")                    AS "picked_total",
+        CASE
+            WHEN "req_qty" = 0 THEN 0
+            ELSE SUM("picked_qty") / "req_qty"
+        END                                  AS "pick_pct"
+    FROM alloc2
+    GROUP BY "order_id", "product_id", "req_qty"
+),
+prod_avg AS (  /* 6) average pick-percentage per product ------------------*/
+    SELECT
+        pr."name"                    AS "product_name",
+        AVG("pick_pct")              AS "avg_pick_pct"
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS" pr
+         ON pr."id" = op."product_id"
+    GROUP BY pr."name"
+)
+SELECT
+    "product_name",
+    ROUND("avg_pick_pct"*100, 2) AS "avg_pick_percentage"
+FROM prod_avg
+ORDER BY "product_name";
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier \'I."id"\''}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:41:47 - Thread-714 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*--------------------------------------------------------------
+  Average pick-percentage per product  (FIFO logic)
+----------------------------------------------------------------*/
+WITH inv AS (                          /* 1. Inventory rows in FIFO order */
+    SELECT
+        i.id           AS inv_id,
+        i.product_id,
+        i.qty          AS inv_qty,
+        TO_DATE(p.purchased) AS purchased
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY  i
+    JOIN ORACLE_SQL.ORACLE_SQL.PURCHASES  p
+      ON p.id = i.purchase_id
+),
+req AS (                               /* 2. Required qty per order/product */
+    SELECT
+        order_id,
+        product_id,
+        SUM(qty) AS req_qty
+    FROM ORACLE_SQL.ORACLE_SQL.PICKING_LINE
+    GROUP BY order_id, product_id
+),
+alloc AS (                             /* 3. Apply FIFO inventory to needs  */
+    SELECT
+        r.order_id,
+        r.product_id,
+        r.req_qty,
+        inv.inv_id,
+        inv.inv_qty,
+        inv.purchased,
+        SUM(inv.inv_qty) OVER (
+            PARTITION BY r.order_id, r.product_id
+            ORDER BY inv.purchased, inv.inv_qty
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS prev_cum_qty
+    FROM req r
+    JOIN inv
+      ON inv.product_id = r.product_id
+),
+alloc2 AS (                            /* 4. Picked amount from each row    */
+    SELECT
+        order_id,
+        product_id,
+        req_qty,
+        inv_id,
+        inv_qty,
+        purchased,
+        COALESCE(prev_cum_qty,0) AS prev_cum_qty,
+        CASE
+            WHEN req_qty - COALESCE(prev_cum_qty,0) <= 0      THEN 0
+            WHEN req_qty - COALESCE(prev_cum_qty,0) >= inv_qty THEN inv_qty
+            ELSE  req_qty - COALESCE(prev_cum_qty,0)
+        END AS picked_qty
+    FROM alloc
+),
+order_pick AS (                        /* 5. Pick-percentage per order      */
+    SELECT
+        order_id,
+        product_id,
+        req_qty,
+        SUM(picked_qty) AS picked_total,
+        CASE
+            WHEN req_qty = 0 THEN 0
+            ELSE SUM(picked_qty) / req_qty
+        END AS pick_pct
+    FROM alloc2
+    GROUP BY order_id, product_id, req_qty
+),
+prod_avg AS (                          /* 6. Average per product            */
+    SELECT
+        pr.name        AS product_name,
+        AVG(pick_pct)  AS avg_pick_pct
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL.PRODUCTS pr
+      ON pr.id = op.product_id
+    GROUP BY pr.name
+)
+SELECT
+    product_name,
+    ROUND(avg_pick_pct * 100, 2) AS avg_pick_percentage
+FROM prod_avg
+ORDER BY product_name;
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:41:47 - Thread-714 (execute) - INFO - itercount: 4
+2025-05-07 07:41:47 - Thread-714 (execute) - INFO - [Self-refine]
+Input sql:
+/*--------------------------------------------------------------
+  Average pick-percentage per product  (FIFO logic)
+----------------------------------------------------------------*/
+WITH inv AS (                          /* 1. Inventory rows in FIFO order */
+    SELECT
+        i.id           AS inv_id,
+        i.product_id,
+        i.qty          AS inv_qty,
+        TO_DATE(p.purchased) AS purchased
+    FROM ORACLE_SQL.ORACLE_SQL.INVENTORY  i
+    JOIN ORACLE_SQL.ORACLE_SQL.PURCHASES  p
+      ON p.id = i.purchase_id
+),
+req AS (                               /* 2. Required qty per order/product */
+    SELECT
+        order_id,
+        product_id,
+        SUM(qty) AS req_qty
+    FROM ORACLE_SQL.ORACLE_SQL.PICKING_LINE
+    GROUP BY order_id, product_id
+),
+alloc AS (                             /* 3. Apply FIFO inventory to needs  */
+    SELECT
+        r.order_id,
+        r.product_id,
+        r.req_qty,
+        inv.inv_id,
+        inv.inv_qty,
+        inv.purchased,
+        SUM(inv.inv_qty) OVER (
+            PARTITION BY r.order_id, r.product_id
+            ORDER BY inv.purchased, inv.inv_qty
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        ) AS prev_cum_qty
+    FROM req r
+    JOIN inv
+      ON inv.product_id = r.product_id
+),
+alloc2 AS (                            /* 4. Picked amount from each row    */
+    SELECT
+        order_id,
+        product_id,
+        req_qty,
+        inv_id,
+        inv_qty,
+        purchased,
+        COALESCE(prev_cum_qty,0) AS prev_cum_qty,
+        CASE
+            WHEN req_qty - COALESCE(prev_cum_qty,0) <= 0      THEN 0
+            WHEN req_qty - COALESCE(prev_cum_qty,0) >= inv_qty THEN inv_qty
+            ELSE  req_qty - COALESCE(prev_cum_qty,0)
+        END AS picked_qty
+    FROM alloc
+),
+order_pick AS (                        /* 5. Pick-percentage per order      */
+    SELECT
+        order_id,
+        product_id,
+        req_qty,
+        SUM(picked_qty) AS picked_total,
+        CASE
+            WHEN req_qty = 0 THEN 0
+            ELSE SUM(picked_qty) / req_qty
+        END AS pick_pct
+    FROM alloc2
+    GROUP BY order_id, product_id, req_qty
+),
+prod_avg AS (                          /* 6. Average per product            */
+    SELECT
+        pr.name        AS product_name,
+        AVG(pick_pct)  AS avg_pick_pct
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL.PRODUCTS pr
+      ON pr.id = op.product_id
+    GROUP BY pr.name
+)
+SELECT
+    product_name,
+    ROUND(avg_pick_pct * 100, 2) AS avg_pick_percentage
+FROM prod_avg
+ORDER BY product_name;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 3 at position 8\ninvalid identifier 'I.ID'"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 07:43:02 - Thread-714 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*--------------------------------------------------------------
+  Average pick-percentage per product (FIFO allocation)
+----------------------------------------------------------------*/
+WITH inv AS (                        /* 1. Inventory rows in FIFO order */
+    SELECT
+        i."product_id",
+        i."qty"                     AS "inv_qty",
+        TO_DATE(p."purchased")      AS "purchased"
+    FROM ORACLE_SQL.ORACLE_SQL."INVENTORY"  i
+    JOIN ORACLE_SQL.ORACLE_SQL."PURCHASES"  p
+      ON p."id" = i."purchase_id"
+),
+req AS (                             /* 2. Required quantity per order   */
+    SELECT
+        "order_id",
+        "product_id",
+        SUM("qty")                   AS "req_qty"
+    FROM ORACLE_SQL.ORACLE_SQL."PICKING_LINE"
+    GROUP BY "order_id", "product_id"
+),
+alloc AS (                           /* 3. Apply FIFO inventory to needs */
+    SELECT
+        r."order_id",
+        r."product_id",
+        r."req_qty",
+        inv."inv_qty",
+        inv."purchased",
+        SUM(inv."inv_qty") OVER (
+            PARTITION BY r."order_id", r."product_id"
+            ORDER BY inv."purchased", inv."inv_qty"
+            ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+        )                            AS "prev_cum_qty"
+    FROM req r
+    JOIN inv
+      ON inv."product_id" = r."product_id"
+),
+alloc2 AS (                          /* 4. Quantity actually picked      */
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        "inv_qty",
+        "purchased",
+        COALESCE("prev_cum_qty",0)                     AS "prev_cum_qty",
+        CASE
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) <= 0 THEN 0
+            WHEN "req_qty" - COALESCE("prev_cum_qty",0) >= "inv_qty" THEN "inv_qty"
+            ELSE  "req_qty" - COALESCE("prev_cum_qty",0)
+        END                                            AS "picked_qty"
+    FROM alloc
+),
+order_pick AS (                      /* 5. Pick-percentage per order     */
+    SELECT
+        "order_id",
+        "product_id",
+        "req_qty",
+        SUM("picked_qty")                           AS "picked_total",
+        CASE WHEN "req_qty" = 0 
+             THEN 0 
+             ELSE SUM("picked_qty") / "req_qty" 
+        END                                         AS "pick_pct"
+    FROM alloc2
+    GROUP BY "order_id", "product_id", "req_qty"
+),
+prod_avg AS (                         /* 6. Average per product           */
+    SELECT
+        pr."name"                     AS "product_name",
+        AVG("pick_pct")               AS "avg_pick_pct"
+    FROM order_pick op
+    JOIN ORACLE_SQL.ORACLE_SQL."PRODUCTS" pr
+         ON pr."id" = op."product_id"
+    GROUP BY pr."name"
+)
+SELECT
+    "product_name",
+    ROUND("avg_pick_pct" * 100, 2)    AS "avg_pick_percentage"
+FROM prod_avg
+ORDER BY "product_name";
+```
+[Try to run SQL in self-refine]
+2025-05-07 07:43:03 - Thread-714 (execute) - INFO - Total iteration counts: 5
+2025-05-07 07:43:03 - Thread-714 (execute) - INFO - Max Iter, remove file

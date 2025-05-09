@@ -1,0 +1,61 @@
+/* Top-5 states (abbreviations) with the most severe-storm events
+   aggregated across 1980-1995, keeping only the 1 000 busiest states
+   in every individual year                                          */
+WITH year_tables AS (
+    SELECT 1980 AS "yr", "state"
+      FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1980"
+    UNION ALL
+    SELECT 1981, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1981"
+    UNION ALL
+    SELECT 1982, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1982"
+    UNION ALL
+    SELECT 1983, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1983"
+    UNION ALL
+    SELECT 1984, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1984"
+    UNION ALL
+    SELECT 1985, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1985"
+    UNION ALL
+    SELECT 1986, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1986"
+    UNION ALL
+    SELECT 1987, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1987"
+    UNION ALL
+    SELECT 1988, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1988"
+    UNION ALL
+    SELECT 1989, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1989"
+    UNION ALL
+    SELECT 1990, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1990"
+    UNION ALL
+    SELECT 1991, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1991"
+    UNION ALL
+    SELECT 1992, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1992"
+    UNION ALL
+    SELECT 1993, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1993"
+    UNION ALL
+    SELECT 1994, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1994"
+    UNION ALL
+    SELECT 1995, "state" FROM NOAA_DATA.NOAA_HISTORIC_SEVERE_STORMS."STORMS_1995"
+),
+ranked AS (
+    SELECT
+        "yr",
+        "state",
+        COUNT(*) AS "events",
+        DENSE_RANK() OVER (PARTITION BY "yr" ORDER BY COUNT(*) DESC) AS "state_rank"
+    FROM year_tables
+    WHERE "state" IS NOT NULL
+    GROUP BY "yr", "state"
+),
+totals AS (
+    SELECT
+        "state",
+        SUM("events") AS "total_events"
+    FROM ranked
+    WHERE "state_rank" <= 1000      -- keep only the top-1000 states each year
+    GROUP BY "state"
+)
+SELECT
+    "state",
+    "total_events"
+FROM totals
+ORDER BY "total_events" DESC
+LIMIT 5;

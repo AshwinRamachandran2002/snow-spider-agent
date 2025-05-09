@@ -1,0 +1,21 @@
+SELECT
+  CASE
+    WHEN (2016 - EXTRACT(YEAR FROM TO_DATE("birth_date", 'YYYY-MM-DD'))) BETWEEN 20 AND 29 THEN '20s'
+    WHEN (2016 - EXTRACT(YEAR FROM TO_DATE("birth_date", 'YYYY-MM-DD'))) BETWEEN 30 AND 39 THEN '30s'
+    WHEN (2016 - EXTRACT(YEAR FROM TO_DATE("birth_date", 'YYYY-MM-DD'))) BETWEEN 40 AND 49 THEN '40s'
+    WHEN (2016 - EXTRACT(YEAR FROM TO_DATE("birth_date", 'YYYY-MM-DD'))) BETWEEN 50 AND 59 THEN '50s'
+    ELSE 'Others'
+  END AS "Age_Category",
+  COUNT(DISTINCT "user_id") AS "User_Count"
+FROM LOG.LOG."MST_USERS"
+WHERE "birth_date" IS NOT NULL
+  AND TRY_TO_DATE("birth_date", 'YYYY-MM-DD') IS NOT NULL
+GROUP BY "Age_Category"
+ORDER BY
+  CASE "Age_Category"
+    WHEN '20s' THEN 1
+    WHEN '30s' THEN 2
+    WHEN '40s' THEN 3
+    WHEN '50s' THEN 4
+    ELSE 5
+  END;

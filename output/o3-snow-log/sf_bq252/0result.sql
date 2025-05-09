@@ -1,0 +1,23 @@
+WITH "SWIFT_FILES" AS (
+    SELECT DISTINCT 
+           "id",
+           "copies"
+    FROM   GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+    WHERE  "binary" = FALSE
+      AND  LOWER("sample_path") LIKE '%.swift'
+),
+"MAX_COPIES" AS (
+    SELECT MAX("copies") AS "MAX_COPY_CNT"
+    FROM   "SWIFT_FILES"
+),
+"TOP_FILE_IDS" AS (
+    SELECT "id"
+    FROM   "SWIFT_FILES", "MAX_COPIES"
+    WHERE  "copies" = "MAX_COPY_CNT"
+)
+SELECT DISTINCT
+       "sample_repo_name" AS "REPO_NAME"
+FROM   GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE  "id" IN (SELECT "id" FROM "TOP_FILE_IDS")
+ORDER BY "REPO_NAME" NULLS LAST
+LIMIT 1;

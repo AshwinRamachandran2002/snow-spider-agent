@@ -1,0 +1,2047 @@
+2025-05-01 02:26:41 - Thread-875 (execute) - INFO - [Answer format]
+```csv
+case_barcode,predicted_clinical_stage
+```
+[Answer format]
+2025-05-01 02:27:34 - Thread-875 (execute) - INFO - [Exploration]
+Relevant columns and their potential usage  
+• “disease_code”: filter to kidney renal papillary cell carcinoma cohort (value = ‘KIRP’)  
+• “clinical_stage”: provides the stage labels that will be predicted; must be non‑NULL  
+• “case_barcode”: unique patient identifier; used for joins, random split, and final output  
+• “gene_name”: used to pick the three mitochondrially encoded genes ‘MT‑CO3’, ‘MT‑CO1’, ‘MT‑CO2’  
+• “HTSeq__FPKM_UQ”: gene‑expression value subjected to averaging, distance calculation, etc.  
+• “project_short_name”: quick sanity‑check that rows indeed belong to TCGA‑KIRP (optional extra filter)  
+
+Typical conditions  
+• "disease_code" = 'KIRP'  
+• "clinical_stage" IS NOT NULL  
+• "gene_name" IN ('MT-CO1', 'MT-CO2', 'MT-CO3')  
+• Using FARM_FINGERPRINT(CAST("case_barcode" AS STRING)) % 10 < 9 ⇒ training set, else test set  
+
+Below are ten exploratory‑to‑complex Snowflake SQL snippets (each returns ≤20 rows) to understand the data and build toward the full solution.
+
+```sql
+-- 1) Description: glance at how many distinct disease codes exist in the clinical table
+SELECT DISTINCT "disease_code"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+LIMIT 20;
+```
+
+```sql
+-- 2) Description: list 20 kidney‑papillary patients that already have a clinical stage recorded
+SELECT "case_barcode", "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+-- 3) Description: show the distinct stage labels present for TCGA‑KIRP
+SELECT DISTINCT "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+-- 4) Description: preview the gene‑expression rows for the three MT‑CO genes
+SELECT "case_barcode",
+       "sample_barcode",
+       "gene_name",
+       "HTSeq__FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+LIMIT 20;
+```
+
+```sql
+-- 5) Description: join clinical & expression to make sure every KIRP case has expression for MT‑CO1
+SELECT c."case_barcode",
+       c."clinical_stage",
+       e."HTSeq__FPKM_UQ" AS "MT_CO1_FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL                         c
+JOIN TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION         e
+  ON e."case_barcode" = c."case_barcode"
+WHERE c."disease_code"  = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+  AND e."gene_name" = 'MT-CO1'
+LIMIT 20;
+```
+
+```sql
+-- 6) Description: check that each KIRP case has exactly one row per MT‑CO gene (sanity)
+SELECT e."case_barcode",
+       COUNT(DISTINCT e."gene_name") AS "num_MT_CO_genes"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+HAVING COUNT(DISTINCT e."gene_name") <> 3     -- non‑conforming samples
+LIMIT 20;
+```
+
+```sql
+-- 7) Description: create a per‑patient vector of the three MT‑CO expression values
+SELECT e."case_barcode",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+LIMIT 20;
+```
+
+```sql
+-- 8) Description: randomly split KIRP patients 90/10 via FARM_FINGERPRINT modulo trick
+SELECT c."case_barcode",
+       CASE
+         WHEN ABS(FARM_FINGERPRINT(CAST(c."case_barcode" AS STRING))) % 10 < 9 THEN 'TRAIN'
+         ELSE 'TEST'
+       END AS "split_bucket"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+WHERE c."disease_code" = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+-- 9) Description: average MT‑CO expression per clinical stage *inside the training split*
+WITH kirp_expr AS (
+  SELECT e."case_barcode",
+         e."gene_name",
+         e."HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+   WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+kirp_clin AS (
+  SELECT c."case_barcode",
+         c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+   WHERE c."disease_code" = 'KIRP'
+     AND c."clinical_stage" IS NOT NULL
+),
+train_samples AS (
+  SELECT kc."case_barcode",
+         kc."clinical_stage"
+  FROM kirp_clin kc
+  WHERE ABS(FARM_FINGERPRINT(CAST(kc."case_barcode" AS STRING))) % 10 < 9
+)
+SELECT ts."clinical_stage",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO1' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO1",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO2' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO2",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO3' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO3"
+FROM train_samples ts
+JOIN kirp_expr ke
+  ON ke."case_barcode" = ts."case_barcode"
+GROUP BY ts."clinical_stage"
+LIMIT 20;
+```
+
+```sql
+-- 10) Description: full pipeline – assign each test patient to the nearest stage centroid (Euclidean distance) and return the prediction
+WITH kirp_expr AS (
+  SELECT e."case_barcode",
+         MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+         MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+         MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+  FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+  WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+  GROUP BY e."case_barcode"
+),
+kirp_clin AS (
+  SELECT c."case_barcode",
+         c."clinical_stage"
+  FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+  WHERE c."disease_code" = 'KIRP'
+    AND c."clinical_stage" IS NOT NULL
+),
+stage_centroids AS (
+  SELECT kc."clinical_stage",
+         AVG(ke."MT_CO1") AS "cent_MT_CO1",
+         AVG(ke."MT_CO2") AS "cent_MT_CO2",
+         AVG(ke."MT_CO3") AS "cent_MT_CO3"
+  FROM kirp_clin kc
+  JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+  WHERE ABS(FARM_FINGERPRINT(CAST(kc."case_barcode" AS STRING))) % 10 < 9   -- TRAIN
+  GROUP BY kc."clinical_stage"
+),
+test_set AS (
+  SELECT kc."case_barcode",
+         ke."MT_CO1",
+         ke."MT_CO2",
+         ke."MT_CO3"
+  FROM kirp_clin kc
+  JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+  WHERE ABS(FARM_FINGERPRINT(CAST(kc."case_barcode" AS STRING))) % 10 >= 9   -- TEST
+)
+SELECT t."case_barcode",
+       FIRST_VALUE(sc."clinical_stage") OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1",2)
+                         + POWER(t."MT_CO2" - sc."cent_MT_CO2",2)
+                         + POWER(t."MT_CO3" - sc."cent_MT_CO3",2) )
+       ) AS "predicted_clinical_stage"
+FROM test_set                       t
+CROSS JOIN stage_centroids          sc
+QUALIFY ROW_NUMBER() OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1",2)
+                         + POWER(t."MT_CO2" - sc."cent_MT_CO2",2)
+                         + POWER(t."MT_CO3" - sc."cent_MT_CO3",2) )
+       ) = 1
+LIMIT 20;
+```
+
+These ten queries progress from inspecting the raw data to producing the requested case‑level clinical‑stage predictions while adhering strictly to the specified tables and columns.
+[Exploration]
+2025-05-01 02:27:34 - Thread-875 (execute) - INFO - [Try to execute]
+-- 1) Description: glance at how many distinct disease codes exist in the clinical table
+SELECT DISTINCT "disease_code"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:36 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1) Description: glance at how many distinct disease codes exist in the clinical table
+SELECT DISTINCT "disease_code"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+LIMIT 20;
+Results:
+disease_code
+OV
+GBM
+LUAD
+LUSC
+PRAD
+UCEC
+TGCT
+ESCA
+PAAD
+KIRP
+LIHC
+SARC
+BRCA
+THYM
+MESO
+COAD
+STAD
+SKCM
+HNSC
+CESC
+
+[Successfully executed]
+2025-05-01 02:27:36 - Thread-875 (execute) - INFO - [Try to execute]
+-- 2) Description: list 20 kidney‑papillary patients that already have a clinical stage recorded
+SELECT "case_barcode", "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:37 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2) Description: list 20 kidney‑papillary patients that already have a clinical stage recorded
+SELECT "case_barcode", "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+Results:
+case_barcode,clinical_stage
+TCGA-2Z-A9J1,Stage I
+TCGA-2Z-A9J2,Stage I
+TCGA-2Z-A9J3,Stage II
+TCGA-2Z-A9J5,Stage II
+TCGA-2Z-A9J6,Stage I
+TCGA-2Z-A9J7,Stage IV
+TCGA-2Z-A9J8,Stage I
+TCGA-2Z-A9J9,Stage I
+TCGA-2Z-A9JD,Stage I
+TCGA-2Z-A9JE,Stage I
+TCGA-2Z-A9JG,Stage I
+TCGA-2Z-A9JI,Stage I
+TCGA-2Z-A9JJ,Stage I
+TCGA-2Z-A9JK,Stage III
+TCGA-2Z-A9JL,Stage I
+TCGA-2Z-A9JM,Stage I
+TCGA-2Z-A9JN,Stage I
+TCGA-2Z-A9JO,Stage I
+TCGA-2Z-A9JP,Stage I
+
+[Successfully executed]
+2025-05-01 02:27:37 - Thread-875 (execute) - INFO - [Try to execute]
+-- 3) Description: show the distinct stage labels present for TCGA‑KIRP
+SELECT DISTINCT "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:37 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3) Description: show the distinct stage labels present for TCGA‑KIRP
+SELECT DISTINCT "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+Results:
+clinical_stage
+Stage I
+Stage II
+Stage IV
+Stage III
+
+[Successfully executed]
+2025-05-01 02:27:37 - Thread-875 (execute) - INFO - [Try to execute]
+-- 4) Description: preview the gene‑expression rows for the three MT‑CO genes
+SELECT "case_barcode",
+       "sample_barcode",
+       "gene_name",
+       "HTSeq__FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:39 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4) Description: preview the gene‑expression rows for the three MT‑CO genes
+SELECT "case_barcode",
+       "sample_barcode",
+       "gene_name",
+       "HTSeq__FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+LIMIT 20;
+Results:
+case_barcode,sample_barcode,gene_name,HTSeq__FPKM_UQ
+TCGA-A1-A0SO,TCGA-A1-A0SO-01A,MT-CO3,123295955.745
+TCGA-AA-3660,TCGA-AA-3660-01A,MT-CO2,239417593.449
+TCGA-CV-6003,TCGA-CV-6003-01A,MT-CO1,81692703.7962
+TCGA-DU-A6S3,TCGA-DU-A6S3-01A,MT-CO3,403618654.388
+TCGA-A7-A5ZX,TCGA-A7-A5ZX-01A,MT-CO1,81397546.1957
+TCGA-BH-A0H5,TCGA-BH-A0H5-01A,MT-CO2,57090020.4293
+TCGA-A7-A6VV,TCGA-A7-A6VV-01A,MT-CO1,70380683.4295
+TCGA-BC-A10T,TCGA-BC-A10T-11A,MT-CO3,1191576864.39
+TCGA-GM-A3NW,TCGA-GM-A3NW-01A,
+
+[Successfully executed]
+2025-05-01 02:27:39 - Thread-875 (execute) - INFO - [Try to execute]
+-- 5) Description: join clinical & expression to make sure every KIRP case has expression for MT‑CO1
+SELECT c."case_barcode",
+       c."clinical_stage",
+       e."HTSeq__FPKM_UQ" AS "MT_CO1_FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL                         c
+JOIN TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION         e
+  ON e."case_barcode" = c."case_barcode"
+WHERE c."disease_code"  = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+  AND e."gene_name" = 'MT-CO1'
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:41 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5) Description: join clinical & expression to make sure every KIRP case has expression for MT‑CO1
+SELECT c."case_barcode",
+       c."clinical_stage",
+       e."HTSeq__FPKM_UQ" AS "MT_CO1_FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL                         c
+JOIN TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION         e
+  ON e."case_barcode" = c."case_barcode"
+WHERE c."disease_code"  = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+  AND e."gene_name" = 'MT-CO1'
+LIMIT 20;
+Results:
+case_barcode,clinical_stage,MT_CO1_FPKM_UQ
+TCGA-BQ-7061,Stage I,129401033.012
+TCGA-4A-A93W,Stage I,402886181.997
+TCGA-AL-3471,Stage I,770201533.772
+TCGA-BQ-5888,Stage I,384664146.95
+TCGA-B9-4116,Stage II,22304105.8401
+TCGA-2Z-A9JT,Stage I,675501164.147
+TCGA-2Z-A9J1,Stage I,415168169.33
+
+[Successfully executed]
+2025-05-01 02:27:41 - Thread-875 (execute) - INFO - [Try to execute]
+-- 6) Description: check that each KIRP case has exactly one row per MT‑CO gene (sanity)
+SELECT e."case_barcode",
+       COUNT(DISTINCT e."gene_name") AS "num_MT_CO_genes"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+HAVING COUNT(DISTINCT e."gene_name") <> 3     -- non‑conforming samples
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:42 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6) Description: check that each KIRP case has exactly one row per MT‑CO gene (sanity)
+SELECT e."case_barcode",
+       COUNT(DISTINCT e."gene_name") AS "num_MT_CO_genes"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+HAVING COUNT(DISTINCT e."gene_name") <> 3     -- non‑conforming samples
+LIMIT 20;
+Results:
+case_barcode,num_MT_CO_genes
+TCGA-EL-A3ZT,1
+TCGA-G7-A8LB,1
+TCGA-E2-A14R,1
+TCGA-4Z-AA7Q,1
+TCGA-VV-A86M,1
+TCGA-AP-A05N,1
+TCGA-E9-A1NA,1
+TCGA-A4-7583,1
+TCGA-BH-A0DP,1
+TCGA-G7-6796,1
+TCGA-A8-A07Z,1
+TCGA-CN-4742,1
+TCGA-AN-A0FN,1
+TCGA-A7-A6VV,1
+TCGA-ZF-AA4W,1
+TCGA-55-A490,1
+TCGA-HC-7748,1
+TCGA-A2-A3Y0,1
+TCGA-RW-A68D,1
+TCGA-OL-A66I,1
+
+[Successfully executed]
+2025-05-01 02:27:42 - Thread-875 (execute) - INFO - [Try to execute]
+-- 7) Description: create a per‑patient vector of the three MT‑CO expression values
+SELECT e."case_barcode",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:43 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7) Description: create a per‑patient vector of the three MT‑CO expression values
+SELECT e."case_barcode",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+LIMIT 20;
+Results:
+case_barcode,MT_CO1,MT_CO2,MT_CO3
+TCGA-28-2510,279496650.33,,
+TCGA-E2-A15A,,,116765488.294
+TCGA-SW-A7EB,,,444757877.962
+TCGA-EL-A3ZG,216887454.358,,
+TCGA-BH-A1FU,106789696.239,,
+TCGA-P3-A5Q5,152110689.945,,
+TCGA-3U-A98H,,,184286007.717
+TCGA-XU-AAY0,,84320232.3063,
+TCGA-A2-A0EP,153433406.379,,
+TCGA-A2-A0CT,,,181649899.396
+TCGA-F7-A624,,96296481.769,
+TCGA-AR-A256,109962574.975,,
+
+[Successfully executed]
+2025-05-01 02:27:43 - Thread-875 (execute) - INFO - [Try to execute]
+-- 8) Description: randomly split KIRP patients 90/10 via FARM_FINGERPRINT modulo trick
+SELECT c."case_barcode",
+       CASE
+         WHEN ABS(FARM_FINGERPRINT(CAST(c."case_barcode" AS STRING))) % 10 < 9 THEN 'TRAIN'
+         ELSE 'TEST'
+       END AS "split_bucket"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+WHERE c."disease_code" = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+LIMIT 20;
+[Try to execute]
+2025-05-01 02:27:43 - Thread-875 (execute) - INFO - [Error occurred]
+002140 (42601): SQL compilation error:
+Unknown function FARM_FINGERPRINT
+[Error occurred]
+2025-05-01 02:29:40 - Thread-875 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: deterministic 90 / 10 train‑test split for TCGA‑KIRP patients
+--Thinking process:
+-- 1) Keep only rows with disease_code = 'KIRP' and non‑NULL clinical_stage.
+-- 2) Use CRC32(barcode) to obtain a repeatable 32‑bit integer hash for each case_barcode.
+-- 3) MOD(hash,10) maps that integer to buckets 0‑9.
+-- 4) Reserve buckets 0‑8 for TRAIN (~90 %) and bucket 9 for TEST (~10 %).
+-- 5) Return a sample of 20 rows to verify the split.
+SELECT
+    c."case_barcode",
+    CASE
+        WHEN MOD(ABS(CRC32(c."case_barcode")), 10) < 9 THEN 'TRAIN'
+        ELSE 'TEST'
+    END AS "split_bucket"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL AS c
+WHERE c."disease_code" = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 02:29:41 - Thread-875 (execute) - INFO - [Results for corrected sql]
+002140 (42601): SQL compilation error:
+Unknown function CRC32
+[Results for corrected sql]
+2025-05-01 02:31:52 - Thread-875 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: create a deterministic 90 / 10 split for TCGA‑KIRP patients who have a recorded
+--clinical stage.  HASH(<string>) yields a reproducible 64‑bit integer; ABS() makes it non‑negative
+--and MOD 10 bins it into values 0–9.  Buckets 0–8 (≈90 %) are labeled TRAIN, bucket 9 (≈10 %)
+--TEST.  Return 20 example rows to verify the logic.
+SELECT
+       c."case_barcode",
+       CASE
+           WHEN MOD(ABS(HASH(c."case_barcode")), 10) < 9 THEN 'TRAIN'
+           ELSE 'TEST'
+       END AS "split_bucket"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL AS c
+WHERE c."disease_code" = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 02:31:53 - Thread-875 (execute) - INFO - [Results for corrected sql]
+case_barcode,split_bucket
+TCGA-2Z-A9J1,TEST
+TCGA-2Z-A9J2,TRAIN
+TCGA-2Z-A9J3,TRAIN
+TCGA-2Z-A9J5,TRAIN
+TCGA-2Z-A9J6,TRAIN
+TCGA-2Z-A9J7,TRAIN
+TCGA-2Z-A9J8,TRAIN
+TCGA-2Z-A9J9,TRAIN
+TCGA-2Z-A9JD,TRAIN
+TCGA-2Z-A9JE,TRAIN
+TCGA-2Z-A9JG,TRAIN
+TCGA-2Z-A9JI,TRAIN
+TCGA-2Z-A9JJ,TRAIN
+TCGA-2Z-A9JK,TRAIN
+TCGA-2Z-A9JL,TRAIN
+TCGA-2Z-A9JM,TRAIN
+TCGA-2Z-A9JN,TRAIN
+TCGA-2Z-A9JO,TRAIN
+TCGA-2Z-A9JP,TRAIN
+TCGA-2Z-A9JQ,TRAIN
+
+[Results for corrected sql]
+2025-05-01 02:33:00 - Thread-875 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Compute the average HTSeq__FPKM_UQ of MT‑CO1, MT‑CO2, and MT‑CO3 for each
+--clinical stage inside the TRAIN split (≈90 %) of TCGA‑KIRP patients.  HASH() is used in place of
+--FARM_FINGERPRINT to create a deterministic split.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           e."gene_name",
+           e."HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+train_samples AS (
+    SELECT kc."case_barcode",
+           kc."clinical_stage"
+    FROM kirp_clin kc
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9        -- TRAIN ≈90 %
+)
+SELECT ts."clinical_stage",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO1' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO1",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO2' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO2",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO3' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO3"
+FROM train_samples ts
+JOIN kirp_expr     ke ON ke."case_barcode" = ts."case_barcode"
+GROUP BY ts."clinical_stage"
+LIMIT 20;
+```
+
+```sql
+--Description: Full pipeline—build stage centroids from TRAIN patients (deterministic HASH split),
+--then assign each TEST patient to the clinical stage whose centroid is closest in Euclidean
+--distance across MT‑CO1, MT‑CO2, and MT‑CO3 expression values.  Returns 20 predicted labels.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+    GROUP BY e."case_barcode"
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+stage_centroids AS (
+    SELECT kc."clinical_stage",
+           AVG(ke."MT_CO1") AS "cent_MT_CO1",
+           AVG(ke."MT_CO2") AS "cent_MT_CO2",
+           AVG(ke."MT_CO3") AS "cent_MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9         -- TRAIN
+    GROUP BY kc."clinical_stage"
+),
+test_set AS (
+    SELECT kc."case_barcode",
+           ke."MT_CO1",
+           ke."MT_CO2",
+           ke."MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) >= 9        -- TEST
+)
+SELECT t."case_barcode",
+       FIRST_VALUE(sc."clinical_stage") OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) AS "predicted_clinical_stage"
+FROM test_set      t
+CROSS JOIN stage_centroids sc
+QUALIFY ROW_NUMBER() OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) = 1
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 02:33:00 - Thread-875 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: create a deterministic 90 / 10 split for TCGA‑KIRP patients who have a recorded
+--clinical stage.  HASH(<string>) yields a reproducible 64‑bit integer; ABS() makes it non‑negative
+--and MOD 10 bins it into values 0–9.  Buckets 0–8 (≈90 %) are labeled TRAIN, bucket 9 (≈10 %)
+--TEST.  Return 20 example rows to verify the logic.
+SELECT
+       c."case_barcode",
+       CASE
+           WHEN MOD(ABS(HASH(c."case_barcode")), 10) < 9 THEN 'TRAIN'
+           ELSE 'TEST'
+       END AS "split_bucket"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL AS c
+WHERE c."disease_code" = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+LIMIT 20;
+Results:
+case_barcode,split_bucket
+TCGA-2Z-A9J1,TEST
+TCGA-2Z-A9J2,TRAIN
+TCGA-2Z-A9J3,TRAIN
+TCGA-2Z-A9J5,TRAIN
+TCGA-2Z-A9J6,TRAIN
+TCGA-2Z-A9J7,TRAIN
+TCGA-2Z-A9J8,TRAIN
+TCGA-2Z-A9J9,TRAIN
+TCGA-2Z-A9JD,TRAIN
+TCGA-2Z-A9JE,TRAIN
+TCGA-2Z-A9JG,TRAIN
+TCGA-2Z-A9JI,TRAIN
+TCGA-2Z-A9JJ,TRAIN
+TCGA-2Z-A9JK,TRAIN
+TCGA-2Z-A9JL,TRAIN
+TCGA-2Z-A9JM,TRAIN
+TCGA-2Z-A9JN,TRAIN
+TCGA-2Z-A9JO,TRAIN
+TCGA-2Z-A9JP,TRAIN
+TCGA-2Z-A9JQ,TRAIN
+
+[Successfully corrected]
+2025-05-01 02:33:00 - Thread-875 (execute) - INFO - [Try to execute]
+--Description: Compute the average HTSeq__FPKM_UQ of MT‑CO1, MT‑CO2, and MT‑CO3 for each
+--clinical stage inside the TRAIN split (≈90 %) of TCGA‑KIRP patients.  HASH() is used in place of
+--FARM_FINGERPRINT to create a deterministic split.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           e."gene_name",
+           e."HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+train_samples AS (
+    SELECT kc."case_barcode",
+           kc."clinical_stage"
+    FROM kirp_clin kc
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9        -- TRAIN ≈90 %
+)
+SELECT ts."clinical_stage",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO1' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO1",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO2' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO2",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO3' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO3"
+FROM train_samples ts
+JOIN kirp_expr     ke ON ke."case_barcode" = ts."case_barcode"
+GROUP BY ts."clinical_stage"
+LIMIT 20
+[Try to execute]
+2025-05-01 02:34:12 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Compute the average HTSeq__FPKM_UQ of MT‑CO1, MT‑CO2, and MT‑CO3 for each
+--clinical stage inside the TRAIN split (≈90 %) of TCGA‑KIRP patients.  HASH() is used in place of
+--FARM_FINGERPRINT to create a deterministic split.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           e."gene_name",
+           e."HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+train_samples AS (
+    SELECT kc."case_barcode",
+           kc."clinical_stage"
+    FROM kirp_clin kc
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9        -- TRAIN ≈90 %
+)
+SELECT ts."clinical_stage",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO1' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO1",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO2' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO2",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO3' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO3"
+FROM train_samples ts
+JOIN kirp_expr     ke ON ke."case_barcode" = ts."case_barcode"
+GROUP BY ts."clinical_stage"
+LIMIT 20
+Results:
+clinical_stage,avg_MT_CO1,avg_MT_CO2,avg_MT_CO3
+Stage I,472530811.97559994,472556479.50600004,459823569.3482001
+Stage IV,,19298113.0174,515561707.427
+Stage III,,417256299.04525,171280442.694
+Stage II,22304105.8401,,
+
+[Successfully executed]
+2025-05-01 02:34:12 - Thread-875 (execute) - INFO - [Try to execute]
+--Description: Full pipeline—build stage centroids from TRAIN patients (deterministic HASH split),
+--then assign each TEST patient to the clinical stage whose centroid is closest in Euclidean
+--distance across MT‑CO1, MT‑CO2, and MT‑CO3 expression values.  Returns 20 predicted labels.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+    GROUP BY e."case_barcode"
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+stage_centroids AS (
+    SELECT kc."clinical_stage",
+           AVG(ke."MT_CO1") AS "cent_MT_CO1",
+           AVG(ke."MT_CO2") AS "cent_MT_CO2",
+           AVG(ke."MT_CO3") AS "cent_MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9         -- TRAIN
+    GROUP BY kc."clinical_stage"
+),
+test_set AS (
+    SELECT kc."case_barcode",
+           ke."MT_CO1",
+           ke."MT_CO2",
+           ke."MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) >= 9        -- TEST
+)
+SELECT t."case_barcode",
+       FIRST_VALUE(sc."clinical_stage") OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) AS "predicted_clinical_stage"
+FROM test_set      t
+CROSS JOIN stage_centroids sc
+QUALIFY ROW_NUMBER() OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) = 1
+LIMIT 20
+[Try to execute]
+2025-05-01 02:35:00 - Thread-875 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Full pipeline—build stage centroids from TRAIN patients (deterministic HASH split),
+--then assign each TEST patient to the clinical stage whose centroid is closest in Euclidean
+--distance across MT‑CO1, MT‑CO2, and MT‑CO3 expression values.  Returns 20 predicted labels.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+    GROUP BY e."case_barcode"
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+stage_centroids AS (
+    SELECT kc."clinical_stage",
+           AVG(ke."MT_CO1") AS "cent_MT_CO1",
+           AVG(ke."MT_CO2") AS "cent_MT_CO2",
+           AVG(ke."MT_CO3") AS "cent_MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9         -- TRAIN
+    GROUP BY kc."clinical_stage"
+),
+test_set AS (
+    SELECT kc."case_barcode",
+           ke."MT_CO1",
+           ke."MT_CO2",
+           ke."MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) >= 9        -- TEST
+)
+SELECT t."case_barcode",
+       FIRST_VALUE(sc."clinical_stage") OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) AS "predicted_clinical_stage"
+FROM test_set      t
+CROSS JOIN stage_centroids sc
+QUALIFY ROW_NUMBER() OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) = 1
+LIMIT 20
+Results:
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-IZ-A6M8,Stage II
+
+[Successfully executed]
+2025-05-01 02:35:00 - Thread-875 (execute) - INFO - itercount: 0
+2025-05-01 02:35:00 - Thread-875 (execute) - INFO - [Self-refine]
+Table full name: TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+Column name: tumor_type Type: TEXT Description: Tumor Type; e.g. Primary, Type 1, Type 2
+Column name: vital_status Type: TEXT Description: Survival state of the participant; e.g. dead, alive
+Column name: other_malignancy_type Type: TEXT Description: Indicates whether another malignancy occurred before or at the same time; e.g. Prior Malignancy, Synchronous Malignancy
+Column name: person_neoplasm_cancer_status Type: TEXT Description: The participant's cancer status; e.g. With Tumor, Tumor Free
+Column name: pathologic_N Type: TEXT Description: The pathologic N score is a rating of the extent of cancer within nearby lymph nodes, based on surgery or biopsy; e.g. N1, N2, N3
+Column name: clinical_T Type: TEXT Description: The clinical T score is a rating of the extent of the primary tumor, based on results of tests done before surgery, such as physical exams and imaging scans; e.g. T1, T2, T3, T4
+Column name: tss_code Type: TEXT Description: Tissue Source Site Code; see https://gdc.cancer.gov/resources-TCGA-users/TCGA-code-tables/tissue-source-site-codes for explanation of codes
+Column name: pathologic_stage Type: TEXT Description: The stage of the cancer, based on surgery or biopsy; e.g. Stage I, Stage II, Stage III, Stage IV
+Column name: psa_value Type: FLOAT Description: A male participant's Prostrate-Specific Antigen (PSA) value
+Column name: other_malignancy_anatomic_site Type: TEXT Description: The site on the body where the other malignancy occurred; e.g. Bladder, Uterus, etc.
+Column name: history_of_neoadjuvant_treatment Type: TEXT Description: Describes the patient's history of neoadjuvant treatment and the kind of treament given prior to resection of the tumor; e.g. Yes, Pharmaceutical Treatment Prior to Resection, etc.
+Column name: age_at_diagnosis Type: NUMBER Description: Age, in years, at which a condition or disease was first diagnosed
+Column name: icd_10 Type: TEXT Description: Alphanumeric value used to describe the disease code from the tenth version of the International Classification of Disease (ICD-10)
+Column name: ethnicity Type: TEXT Description: The ethnic origination of a participant, independent from race; e.g. Not Hispanic or Latino, Hispanic or Latino
+Column name: days_to_birth Type: NUMBER Description: Days since birth (a negative value, relative to the date of diagnosis which is considered to be t=0)
+Column name: hpv_calls Type: TEXT Description: HPV strains; e.g. HPV18, HPV45, etc.
+Column name: number_pack_years_smoked Type: FLOAT Description: The number of packs smoked per day times the number of years smoked by the participant
+Column name: residual_tumor Type: TEXT Description: Status of the tissue margin following surgical resection; e.g. R0, R1, R2, RX
+Column name: batch_number Type: NUMBER Description: The BCR Batch Code; see https://gdc.cancer.gov/resources-TCGA-users/TCGA-code-tables/bcr-batch-codes for explanation of the codes
+Column name: program_name Type: TEXT Description: Program Name, always TCGA (The Cancer Genome Atlas) in this table.
+Column name: case_barcode Type: TEXT Description: TCGA patient/case barcode; e.g. TCGA-06-0119
+Column name: gleason_score_combined Type: NUMBER Description: The Gleason Score (ranging from 1 -5) is the grade of the aggressiveness of prostate cancer. The combined Gleason Score is the primary Gleason score  (for the largest area of the tumor) added to the secondary Gleason Score (for the next largest section of the tumor).
+Column name: menopause_status Type: TEXT Description: A female participant's menopausal status; e.g. Post, Pre, Indeterminate, Peri
+Column name: pregnancies Type: TEXT Description: The number of times (including currently if it applies) that a female participant has been pregnant, regardless of outcome.
+Column name: clinical_N Type: TEXT Description: The clinical N score is a rating of the extent of cancer within nearby lymph nodes, based on results of tests done before surgery, such as physical exams and imaging scans; e.g. N1, N2, N3
+Column name: clinical_M Type: TEXT Description: The clinical M score is a rating of metastasis, that is, how much cancer has spread to distant sites. It is based on results of tests done before surgery, such as physical exams and imaging scans; e.g. MX, M0, M1
+Column name: primary_therapy_outcome_success Type: TEXT Description: Kind of outcome achieved after the completion of the initial course of treatment; e.g. Complete Remission/Response, Progressive Disease, etc.
+Column name: other_dx Type: TEXT Description: Indicator and type of other diagnosis; e.g. No; Yes, History of Prior Malignancy; Yes, History of Synchronous/Bilateral Malignancy; Both History of Synchronous/Bilateral and Prior Malignancy
+Column name: country Type: TEXT Description: Country of the participant; e.g. Germany, United States, Canada, etc.
+Column name: days_to_submitted_specimen_dx Type: NUMBER Description: Numeric value to represent the day of the diagnosis for the submitted sample.
+Column name: histological_type Type: TEXT Description: The histological type of cancer; e.g. Adenosquamous, Astrocytoma, etc.
+Column name: race Type: TEXT Description: The race of a participant, independent from ethnicity; e.g. White, Black or African American, Asian, Native Hawaiian or other Pacific Islander, American Indian or Alaska Native
+Column name: h_pylori_infection Type: TEXT Description: Indicator of previous or current diagnosis of Helicobactor pylori infection; e.g. Yes, No, Never, Current
+Column name: new_tumor_event_after_initial_treatment Type: TEXT Description: Indicates whether a patient has had a new tumor event after initial treatment; Yes, No
+Column name: days_to_last_known_alive Type: NUMBER Description: Number of days from the date of diagnosis to the last day on which a person was known to be alive. This field is a combination of the days_to_last_followup and days_to death fields. Therefore, this field can be used whether the vital_status is 'alive' or 'dead'.
+Column name: program_dbgap_accession_number Type: TEXT Description: Program dbGaP accession number, eg phs000178
+Column name: year_of_initial_pathologic_diagnosis Type: NUMBER Description: Four digit year of the initial pathologic diagnosis
+Column name: icd_o_3_histology Type: TEXT Description: Code that represents the histology of the disease using the third edition of the International Classification of Diseases for Oncology, published in 2000, used principally in tumor and cancer registries for coding the site (topography) and the histology (morphology) of neoplasms
+Column name: gender Type: TEXT Description: Participant gender; e.g. Male, Female
+Column name: tumor_tissue_site Type: TEXT Description: The location on the body where the tumor exists; e.g. Brain, Ovary, Lung, etc.
+Column name: tobacco_smoking_history Type: NUMBER Description: Category describing current smoking status and smoking history as self-reported by a participant.; e.g. 1, 2, etc.
+Column name: number_of_lymphnodes_examined Type: NUMBER Description: The number of lymph nodes examined
+Column name: age_began_smoking_in_years Type: NUMBER Description: Age, in years, that the participant began smoking
+Column name: bcr Type: TEXT Description: Biospecimen Core Resource; e.g. Nationwide Children's Hospital, Washington University
+Column name: history_of_colon_polyps Type: TEXT Description: Indicator if the participant had a previous history of colon polyps as noted in the history/physical or previous endoscopic report(s); e.g. Yes, No
+Column name: stopped_smoking_year Type: NUMBER Description: Four-digit year that the participant stopped smoking; e.g. 2010
+Column name: other_malignancy_histological_type Type: TEXT Description: The histological type of cancer of the other malignancy; e.g. Adenosquamous, Astrocytoma, etc.
+Column name: lymphatic_invasion Type: TEXT Description: Indicator if small or thin-walled vessel invasion is present, indicating lymphatic involvement; e.g. Yes, No
+Column name: year_of_tobacco_smoking_onset Type: NUMBER Description: Four-digit year that the participant started smoking; e.g. 2010
+Column name: bmi Type: FLOAT Description: Body Mass Index of participant
+Column name: disease_code Type: TEXT Description: A code representing the type of cancer. Values can be found at https://gdc.cancer.gov/resources-TCGA-users/TCGA-code-tables/TCGA-study-abbreviations; e.g. OV, GBM, LUAD
+Column name: anatomic_neoplasm_subdivision Type: TEXT Description: The spatial location, subdivisions and/or atomic site name of a tumor; e.g. Rectum, Larynx, Tonsil, etc.
+Column name: mononucleotide_and_dinucleotide_marker_panel_analysis_status Type: TEXT Description: Status of the mononucleotide and dinucleotide marker panel analysis; microsatellite-stable (MSS), low level MSI (MSI-L) if less than 40% of markers were altered and high level MSI (MSI-H) if greater than 40% of markers were altered
+Column name: project_name Type: TEXT Description: Project Name; frequently the same as or similar to the project disease type eg   Acute Lymphoblastic Leukemia - Phase II   or   Breast Invasive Carcinoma   etc
+Column name: days_to_last_followup Type: NUMBER Description: If vital_status indicates 'alive', then this is the number of days from the date of diagnosis to the last followup (communication contact).
+Column name: neoplasm_histologic_grade Type: TEXT Description: Rating which expresses the degree of abnormality of cancer cells, a measure of differentiation and aggressiveness; e.g. G1, G2, G3, G4
+Column name: days_to_death Type: NUMBER Description: If vital_status indicates 'dead', then this is the number of days to death (a positive value) relative to the date of diagnosis.
+Column name: case_gdc_id Type: TEXT Description: GDC unique identifer for this case; e.g. 7b4ce492-ff40-4bf1-b3e8-75ff83e8746d. This identifier can be used to find more information at the GDC Data Portal ( https://portal.gdc.cancer.gov/cases/7b4ce492-ff40-4bf1-b3e8-75ff83e8746d )
+Column name: primary_neoplasm_melanoma_dx Type: TEXT Description: Indicates whether a person had a primary diagnosis of melanoma; e.g. Yes, No
+Column name: number_of_lymphnodes_positive_by_he Type: NUMBER Description: The number of lymph nodes involved with disease as determined by histological examination
+Column name: height Type: FLOAT Description: Height of participant in centimeters
+Column name: venous_invasion Type: TEXT Description: Indicator if large vessel or venous invasion was detected by surgery or presence in a tumor specimen; e.g. Yes, No
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; e.g. TCGA-OV, etc.
+Column name: days_to_initial_pathologic_diagnosis Type: NUMBER Description: The number of days to initial pathologic diagnosis
+Column name: icd_o_3_site Type: TEXT Description: Code that represents the site of the disease using the third edition of the International Classification of Diseases for Oncology, published in 2000, used principally in tumor and cancer registries for coding the site (topography) and the histology (morphology) of neoplasms
+Column name: pathologic_T Type: TEXT Description: The pathologic T score is a rating of the extent of the primary tumor, based on surgery or biopsy; e.g. T1, T2, T3, T4
+Column name: colorectal_cancer Type: TEXT Description: Indicates whether the participant has colorectal cancer; e.g. Yes, No
+Column name: weight Type: FLOAT Description: Weight of participant in kilograms
+Column name: hpv_status Type: TEXT Description: Indicates whether the participant has a record of a positive finding for human papillomavirus; e.g. Positive, Negative, Indeterminate
+Column name: pathologic_M Type: TEXT Description: The pathologic M score is a rating of metastasis, that is, how much cancer has spread to distant sites. It is based on surgery or biopsy; e.g. MX, M0, M1
+Column name: lymphnodes_examined Type: TEXT Description: Indicator whether the lymph nodes were examined; e.g. Yes, No
+Column name: lymphovascular_invasion_present Type: TEXT Description: Indicator if  invasion of a cancer to the blood vessels and/or lymphatics invasion is present; e.g. Yes, No
+Column name: clinical_stage Type: TEXT Description: The stage of the cancer, based on results of tests done before surgery, such as physical exams and imaging scans; e.g. Stage I, Stage II, Stage III, Stage IV
+Sample rows:
+[{'program_name': 'TCGA', 'case_barcode': 'TCGA-01-0630', 'case_gdc_id': 'dc9b4616-e815-43c8-9ec4-720a32868541', 'program_dbgap_accession_number': 'phs000178', 'project_short_name': 'TCGA-OV', 'project_name': 'Ovarian Serous Cystadenocarcinoma', 'disease_code': 'OV', 'gender': None, 'vital_status': None, 'race': None, 'ethnicity': None, 'age_at_diagnosis': nan, 'days_to_birth': nan, 'days_to_death': nan, 'days_to_initial_pathologic_diagnosis': nan, 'days_to_last_followup': None, 'days_to_last_known_alive': nan, 'days_to_submitted_specimen_dx': None, 'clinical_stage': None, 'clinical_T': None, 'clinical_N': None, 'clinical_M': None, 'pathologic_stage': None, 'pathologic_T': None, 'pathologic_N': None, 'pathologic_M': None, 'year_of_initial_pathologic_diagnosis': nan, 'tumor_tissue_site': None, 'primary_neoplasm_melanoma_dx': None, 'anatomic_neoplasm_subdivision': None, 'country': None, 'other_dx': None, 'other_malignancy_anatomic_site': None, 'other_malignancy_type': None, 'other_malign
+
+
+--------------------------------------------------
+Table full name: TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+Column name: sample_barcode Type: TEXT Description: TCGA sample barcode, eg TCGA-12-1089-01A. One sample may have multiple sets of CN segmentations corresponding to multiple aliquots; use GROUP BY appropriately in queries
+Column name: file_gdc_id Type: TEXT Description: Unique GDC identifier for this file (corresponds to the file_barcode)  --  this can be used to access more information from the GDC data portal like this: https://portal.gdc.cancer.gov/files/c21b332c-06c6-4403-9032-f91c8f407ba43
+Column name: aliquot_barcode Type: TEXT Description: TCGA aliquot barcode, eg TCGA-12-1089-01A-01D-0517-31
+Column name: HTSeq__FPKM_UQ Type: FLOAT Description: Fragments Per Kilobase of transcript per Million mapped reads (FPKM) is a simple expression level normalization method. The FPKM normalizes read count based on gene length and the total number of mapped reads. https://docs.gdc.cancer.gov/Encyclopedia/pages/HTSeq-FPKM/
+Column name: aliquot_gdc_id Type: TEXT Description: Unique GDC identifier for this aliquot (corresponds to the aliquot_barcode), eg 7fbfdb3e-1fd2-4206-8d2e-7f68e4a15844  --  this can be used to access more information from the GDC data portal
+Column name: case_barcode Type: TEXT Description: Original TCGA case barcode, eg TCGA-DX-A8BN
+Column name: gene_type Type: TEXT Description: The type of genetic element the reads mapped to, eg protein_coding, ribozyme
+Column name: HTSeq__FPKM Type: FLOAT Description: FPKM is implemented at the GDC on gene-level read counts that are produced by HTSeq1 and generated using custom. scripts https://docs.gdc.cancer.gov/Encyclopedia/pages/HTSeq-FPKM/
+Column name: sample_gdc_id Type: TEXT Description: Unique GDC identifier for this sample (corresponds to the sample_barcode), eg a1ec9279-c1a6-4e58-97ed-9ec1f36187c5  --  this can be used to access more information from the GDC data portal
+Column name: Ensembl_gene_id Type: TEXT Description: The Ensembl gene ID from the underlying file, but stripped of the version suffix -- eg ENSG00000185028
+Column name: Ensembl_gene_id_v Type: TEXT Description: The Ensembl gene ID from the underlying file, including the version suffix  --  eg ENSG00000235943.1
+Column name: platform Type: TEXT Description: Platform used to generate data; either IlluminaHiSeqor IlluminaGA
+Column name: project_short_name Type: TEXT Description: Project name abbreviation; the program name appended with a project name abbreviation; eg. TCGA-OV, etc.
+Column name: gene_name Type: TEXT Description: Gene name e.g. TTN, DDR1, etc.
+Column name: HTSeq__Counts Type: NUMBER Description: Number of mapped reads to each gene as calculated by the Python package HTSeq. https://docs.gdc.cancer.gov/Encyclopedia/pages/HTSeq-Counts/
+Column name: case_gdc_id Type: TEXT Description: Unique GDC identifier for this case (corresponds to the case_barcode).  Can be used to access more information from the GDC data portal like this:   https://portal.gdc.cancer.gov/files/c21b332c-06c6-4403-9032-f91c8f407ba36
+Sample rows:
+[{'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'sample_barcode': 'TCGA-04-1331-01A', 'aliquot_barcode': 'TCGA-04-1331-01A-01R-1569-13', 'gene_name': 'BMS1', 'gene_type': 'protein_coding', 'Ensembl_gene_id': 'ENSG00000165733', 'Ensembl_gene_id_v': 'ENSG00000165733.7', 'HTSeq__Counts': 3372, 'HTSeq__FPKM': 7.19867390862, 'HTSeq__FPKM_UQ': 158472.732668, 'case_gdc_id': '6d10d4ee-6331-4bba-93bc-a7b64cc0b22a', 'sample_gdc_id': 'a1ec9279-c1a6-4e58-97ed-9ec1f36187c5', 'aliquot_gdc_id': '7fbfdb3e-1fd2-4206-8d2e-7f68e4a15844', 'file_gdc_id': '776adc23-7d40-4c1a-94df-7a2ce6188db6', 'platform': None}, {'project_short_name': 'TCGA-OV', 'case_barcode': 'TCGA-04-1331', 'sample_barcode': 'TCGA-04-1331-01A', 'aliquot_barcode': 'TCGA-04-1331-01A-01R-1569-13', 'gene_name': 'RFWD2', 'gene_type': 'protein_coding', 'Ensembl_gene_id': 'ENSG00000143207', 'Ensembl_gene_id_v': 'ENSG00000143207.18', 'HTSeq__Counts': 4398, 'HTSeq__FPKM': 16.9325551545, 'HTSeq__FPKM_UQ': 372755.915943, 'case_g
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'TCGA_HG38_DATA_V0': {'QOTM': [], 'TCGA_BIOCLIN_V0': ['CLINICAL'], 'TCGA_HG38_DATA_V0': ['RNASEQ_GENE_EXPRESSION']}}
+Begin Exploring Related Columns
+Relevant columns and their potential usage  
+• “disease_code”: filter to kidney renal papillary cell carcinoma cohort (value = ‘KIRP’)  
+• “clinical_stage”: provides the stage labels that will be predicted; must be non‑NULL  
+• “case_barcode”: unique patient identifier; used for joins, random split, and final output  
+• “gene_name”: used to pick the three mitochondrially encoded genes ‘MT‑CO3’, ‘MT‑CO1’, ‘MT‑CO2’  
+• “HTSeq__FPKM_UQ”: gene‑expression value subjected to averaging, distance calculation, etc.  
+• “project_short_name”: quick sanity‑check that rows indeed belong to TCGA‑KIRP (optional extra filter)  
+
+Typical conditions  
+• "disease_code" = 'KIRP'  
+• "clinical_stage" IS NOT NULL  
+• "gene_name" IN ('MT-CO1', 'MT-CO2', 'MT-CO3')  
+• Using FARM_FINGERPRINT(CAST("case_barcode" AS STRING)) % 10 < 9 ⇒ training set, else test set  
+
+Below are ten exploratory‑to‑complex Snowflake SQL snippets (each returns ≤20 rows) to understand the data and build toward the full solution.
+
+```sql
+-- 1) Description: glance at how many distinct disease codes exist in the clinical table
+SELECT DISTINCT "disease_code"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+LIMIT 20;
+```
+
+```sql
+-- 2) Description: list 20 kidney‑papillary patients that already have a clinical stage recorded
+SELECT "case_barcode", "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+-- 3) Description: show the distinct stage labels present for TCGA‑KIRP
+SELECT DISTINCT "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+-- 4) Description: preview the gene‑expression rows for the three MT‑CO genes
+SELECT "case_barcode",
+       "sample_barcode",
+       "gene_name",
+       "HTSeq__FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+LIMIT 20;
+```
+
+```sql
+-- 5) Description: join clinical & expression to make sure every KIRP case has expression for MT‑CO1
+SELECT c."case_barcode",
+       c."clinical_stage",
+       e."HTSeq__FPKM_UQ" AS "MT_CO1_FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL                         c
+JOIN TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION         e
+  ON e."case_barcode" = c."case_barcode"
+WHERE c."disease_code"  = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+  AND e."gene_name" = 'MT-CO1'
+LIMIT 20;
+```
+
+```sql
+-- 6) Description: check that each KIRP case has exactly one row per MT‑CO gene (sanity)
+SELECT e."case_barcode",
+       COUNT(DISTINCT e."gene_name") AS "num_MT_CO_genes"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+HAVING COUNT(DISTINCT e."gene_name") <> 3     -- non‑conforming samples
+LIMIT 20;
+```
+
+```sql
+-- 7) Description: create a per‑patient vector of the three MT‑CO expression values
+SELECT e."case_barcode",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+LIMIT 20;
+```
+
+```sql
+-- 8) Description: randomly split KIRP patients 90/10 via FARM_FINGERPRINT modulo trick
+SELECT c."case_barcode",
+       CASE
+         WHEN ABS(FARM_FINGERPRINT(CAST(c."case_barcode" AS STRING))) % 10 < 9 THEN 'TRAIN'
+         ELSE 'TEST'
+       END AS "split_bucket"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+WHERE c."disease_code" = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+-- 9) Description: average MT‑CO expression per clinical stage *inside the training split*
+WITH kirp_expr AS (
+  SELECT e."case_barcode",
+         e."gene_name",
+         e."HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+   WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+kirp_clin AS (
+  SELECT c."case_barcode",
+         c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+   WHERE c."disease_code" = 'KIRP'
+     AND c."clinical_stage" IS NOT NULL
+),
+train_samples AS (
+  SELECT kc."case_barcode",
+         kc."clinical_stage"
+  FROM kirp_clin kc
+  WHERE ABS(FARM_FINGERPRINT(CAST(kc."case_barcode" AS STRING))) % 10 < 9
+)
+SELECT ts."clinical_stage",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO1' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO1",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO2' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO2",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO3' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO3"
+FROM train_samples ts
+JOIN kirp_expr ke
+  ON ke."case_barcode" = ts."case_barcode"
+GROUP BY ts."clinical_stage"
+LIMIT 20;
+```
+
+```sql
+-- 10) Description: full pipeline – assign each test patient to the nearest stage centroid (Euclidean distance) and return the prediction
+WITH kirp_expr AS (
+  SELECT e."case_barcode",
+         MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+         MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+         MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+  FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+  WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+  GROUP BY e."case_barcode"
+),
+kirp_clin AS (
+  SELECT c."case_barcode",
+         c."clinical_stage"
+  FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+  WHERE c."disease_code" = 'KIRP'
+    AND c."clinical_stage" IS NOT NULL
+),
+stage_centroids AS (
+  SELECT kc."clinical_stage",
+         AVG(ke."MT_CO1") AS "cent_MT_CO1",
+         AVG(ke."MT_CO2") AS "cent_MT_CO2",
+         AVG(ke."MT_CO3") AS "cent_MT_CO3"
+  FROM kirp_clin kc
+  JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+  WHERE ABS(FARM_FINGERPRINT(CAST(kc."case_barcode" AS STRING))) % 10 < 9   -- TRAIN
+  GROUP BY kc."clinical_stage"
+),
+test_set AS (
+  SELECT kc."case_barcode",
+         ke."MT_CO1",
+         ke."MT_CO2",
+         ke."MT_CO3"
+  FROM kirp_clin kc
+  JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+  WHERE ABS(FARM_FINGERPRINT(CAST(kc."case_barcode" AS STRING))) % 10 >= 9   -- TEST
+)
+SELECT t."case_barcode",
+       FIRST_VALUE(sc."clinical_stage") OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1",2)
+                         + POWER(t."MT_CO2" - sc."cent_MT_CO2",2)
+                         + POWER(t."MT_CO3" - sc."cent_MT_CO3",2) )
+       ) AS "predicted_clinical_stage"
+FROM test_set                       t
+CROSS JOIN stage_centroids          sc
+QUALIFY ROW_NUMBER() OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1",2)
+                         + POWER(t."MT_CO2" - sc."cent_MT_CO2",2)
+                         + POWER(t."MT_CO3" - sc."cent_MT_CO3",2) )
+       ) = 1
+LIMIT 20;
+```
+
+These ten queries progress from inspecting the raw data to producing the requested case‑level clinical‑stage predictions while adhering strictly to the specified tables and columns.
+Refined SQLs and results:
+Query:
+-- 1) Description: glance at how many distinct disease codes exist in the clinical table
+SELECT DISTINCT "disease_code"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+LIMIT 20;
+Answer:
+disease_code
+OV
+GBM
+LUAD
+LUSC
+PRAD
+UCEC
+TGCT
+ESCA
+PAAD
+KIRP
+LIHC
+SARC
+BRCA
+THYM
+MESO
+COAD
+STAD
+SKCM
+HNSC
+CESC
+Query:
+-- 2) Description: list 20 kidney‑papillary patients that already have a clinical stage recorded
+SELECT "case_barcode", "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+Answer:
+case_barcode,clinical_stage
+TCGA-2Z-A9J1,Stage I
+TCGA-2Z-A9J2,Stage I
+TCGA-2Z-A9J3,Stage II
+TCGA-2Z-A9J5,Stage II
+TCGA-2Z-A9J6,Stage I
+TCGA-2Z-A9J7,Stage IV
+TCGA-2Z-A9J8,Stage I
+TCGA-2Z-A9J9,Stage I
+TCGA-2Z-A9JD,Stage I
+TCGA-2Z-A9JE,Stage I
+TCGA-2Z-A9JG,Stage I
+TCGA-2Z-A9JI,Stage I
+TCGA-2Z-A9JJ,Stage I
+TCGA-2Z-A9JK,Stage III
+TCGA-2Z-A9JL,Stage I
+TCGA-2Z-A9JM,Stage I
+TCGA-2Z-A9JN,Stage I
+TCGA-2Z-A9JO,Stage I
+TCGA-2Z-A9JP,Stage I
+Query:
+-- 3) Description: show the distinct stage labels present for TCGA‑KIRP
+SELECT DISTINCT "clinical_stage"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+WHERE "disease_code" = 'KIRP'
+  AND "clinical_stage" IS NOT NULL
+LIMIT 20;
+Answer:
+clinical_stage
+Stage I
+Stage II
+Stage IV
+Stage III
+Query:
+-- 4) Description: preview the gene‑expression rows for the three MT‑CO genes
+SELECT "case_barcode",
+       "sample_barcode",
+       "gene_name",
+       "HTSeq__FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+LIMIT 20;
+Answer:
+case_barcode,sample_barcode,gene_name,HTSeq__FPKM_UQ
+TCGA-A1-A0SO,TCGA-A1-A0SO-01A,MT-CO3,123295955.745
+TCGA-AA-3660,TCGA-AA-3660-01A,MT-CO2,239417593.449
+TCGA-CV-6003,TCGA-CV-6003-01A,MT-CO1,81692703.7962
+TCGA-DU-A6S3,TCGA-DU-A6S3-01A,MT-CO3,403618654.388
+TCGA-A7-A5ZX,TCGA-A7-A5ZX-01A,MT-CO1,81397546.1957
+TCGA-BH-A0H5,TCGA-BH-A0H5-01A,MT-CO2,57090020.4293
+TCGA-A7-A6VV,TCGA-A7-A6VV-01A,MT-CO1,70380683.4295
+TCGA-BC-A10T,TCGA-BC-A10T-11A,MT-CO3,1191576864.39
+TCGA-GM-A3NW,TCGA-GM-A3NW-01A,
+Query:
+-- 5) Description: join clinical & expression to make sure every KIRP case has expression for MT‑CO1
+SELECT c."case_barcode",
+       c."clinical_stage",
+       e."HTSeq__FPKM_UQ" AS "MT_CO1_FPKM_UQ"
+FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL                         c
+JOIN TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION         e
+  ON e."case_barcode" = c."case_barcode"
+WHERE c."disease_code"  = 'KIRP'
+  AND c."clinical_stage" IS NOT NULL
+  AND e."gene_name" = 'MT-CO1'
+LIMIT 20;
+Answer:
+case_barcode,clinical_stage,MT_CO1_FPKM_UQ
+TCGA-BQ-7061,Stage I,129401033.012
+TCGA-4A-A93W,Stage I,402886181.997
+TCGA-AL-3471,Stage I,770201533.772
+TCGA-BQ-5888,Stage I,384664146.95
+TCGA-B9-4116,Stage II,22304105.8401
+TCGA-2Z-A9JT,Stage I,675501164.147
+TCGA-2Z-A9J1,Stage I,415168169.33
+Query:
+-- 6) Description: check that each KIRP case has exactly one row per MT‑CO gene (sanity)
+SELECT e."case_barcode",
+       COUNT(DISTINCT e."gene_name") AS "num_MT_CO_genes"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+HAVING COUNT(DISTINCT e."gene_name") <> 3     -- non‑conforming samples
+LIMIT 20;
+Answer:
+case_barcode,num_MT_CO_genes
+TCGA-EL-A3ZT,1
+TCGA-G7-A8LB,1
+TCGA-E2-A14R,1
+TCGA-4Z-AA7Q,1
+TCGA-VV-A86M,1
+TCGA-AP-A05N,1
+TCGA-E9-A1NA,1
+TCGA-A4-7583,1
+TCGA-BH-A0DP,1
+TCGA-G7-6796,1
+TCGA-A8-A07Z,1
+TCGA-CN-4742,1
+TCGA-AN-A0FN,1
+TCGA-A7-A6VV,1
+TCGA-ZF-AA4W,1
+TCGA-55-A490,1
+TCGA-HC-7748,1
+TCGA-A2-A3Y0,1
+TCGA-RW-A68D,1
+TCGA-OL-A66I,1
+Query:
+-- 7) Description: create a per‑patient vector of the three MT‑CO expression values
+SELECT e."case_barcode",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+       MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+GROUP BY e."case_barcode"
+LIMIT 20;
+Answer:
+case_barcode,MT_CO1,MT_CO2,MT_CO3
+TCGA-28-2510,279496650.33,,
+TCGA-E2-A15A,,,116765488.294
+TCGA-SW-A7EB,,,444757877.962
+TCGA-EL-A3ZG,216887454.358,,
+TCGA-BH-A1FU,106789696.239,,
+TCGA-P3-A5Q5,152110689.945,,
+TCGA-3U-A98H,,,184286007.717
+TCGA-XU-AAY0,,84320232.3063,
+TCGA-A2-A0EP,153433406.379,,
+TCGA-A2-A0CT,,,181649899.396
+TCGA-F7-A624,,96296481.769,
+TCGA-AR-A256,109962574.975,,
+Query:
+--Description: Compute the average HTSeq__FPKM_UQ of MT‑CO1, MT‑CO2, and MT‑CO3 for each
+--clinical stage inside the TRAIN split (≈90 %) of TCGA‑KIRP patients.  HASH() is used in place of
+--FARM_FINGERPRINT to create a deterministic split.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           e."gene_name",
+           e."HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+train_samples AS (
+    SELECT kc."case_barcode",
+           kc."clinical_stage"
+    FROM kirp_clin kc
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9        -- TRAIN ≈90 %
+)
+SELECT ts."clinical_stage",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO1' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO1",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO2' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO2",
+       AVG(CASE WHEN ke."gene_name" = 'MT-CO3' THEN ke."HTSeq__FPKM_UQ" END) AS "avg_MT_CO3"
+FROM train_samples ts
+JOIN kirp_expr     ke ON ke."case_barcode" = ts."case_barcode"
+GROUP BY ts."clinical_stage"
+LIMIT 20
+Answer:
+clinical_stage,avg_MT_CO1,avg_MT_CO2,avg_MT_CO3
+Stage I,472530811.97559994,472556479.50600004,459823569.3482001
+Stage IV,,19298113.0174,515561707.427
+Stage III,,417256299.04525,171280442.694
+Stage II,22304105.8401,,
+Query:
+--Description: Full pipeline—build stage centroids from TRAIN patients (deterministic HASH split),
+--then assign each TEST patient to the clinical stage whose centroid is closest in Euclidean
+--distance across MT‑CO1, MT‑CO2, and MT‑CO3 expression values.  Returns 20 predicted labels.
+WITH kirp_expr AS (
+    SELECT e."case_barcode",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO1' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO1",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO2' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO2",
+           MAX(CASE WHEN e."gene_name" = 'MT-CO3' THEN e."HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION e
+    WHERE e."gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+    GROUP BY e."case_barcode"
+),
+kirp_clin AS (
+    SELECT c."case_barcode",
+           c."clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL c
+    WHERE c."disease_code" = 'KIRP'
+      AND c."clinical_stage" IS NOT NULL
+),
+stage_centroids AS (
+    SELECT kc."clinical_stage",
+           AVG(ke."MT_CO1") AS "cent_MT_CO1",
+           AVG(ke."MT_CO2") AS "cent_MT_CO2",
+           AVG(ke."MT_CO3") AS "cent_MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) < 9         -- TRAIN
+    GROUP BY kc."clinical_stage"
+),
+test_set AS (
+    SELECT kc."case_barcode",
+           ke."MT_CO1",
+           ke."MT_CO2",
+           ke."MT_CO3"
+    FROM kirp_clin kc
+    JOIN kirp_expr ke ON ke."case_barcode" = kc."case_barcode"
+    WHERE MOD(ABS(HASH(kc."case_barcode")), 10) >= 9        -- TEST
+)
+SELECT t."case_barcode",
+       FIRST_VALUE(sc."clinical_stage") OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) AS "predicted_clinical_stage"
+FROM test_set      t
+CROSS JOIN stage_centroids sc
+QUALIFY ROW_NUMBER() OVER (
+           PARTITION BY t."case_barcode"
+           ORDER BY SQRT( POWER(t."MT_CO1" - sc."cent_MT_CO1", 2 )
+                        + POWER(t."MT_CO2" - sc."cent_MT_CO2", 2 )
+                        + POWER(t."MT_CO3" - sc."cent_MT_CO3", 2 ) )
+       ) = 1
+LIMIT 20
+Answer:
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-IZ-A6M8,Stage II
+End Exploring Related Columns
+Task: Using the TCGA-KIRP dataset, select patients from the 'TCGA_bioclin_v0.Clinical' table who have a non-null clinical_stage and a disease_code of 'KIRP.' Retrieve their gene expression data from the 'TCGA_hg38_data_v0.RNAseq_Gene_Expression' table for the genes 'MT-CO3,' 'MT-CO1,' and 'MT-CO2,' and randomly split the patients into a training set (90%) and a test set (10%) based on their case_barcode via the FARM_FINGERPRINT method. For each clinical stage in the training set, calculate the average HTSeq__FPKM_UQ expression of the three genes. For each patient in the test set, compute the Euclidean distance between the patient’s expression values and the stage-specific averages, and assign that patient to the clinical stage whose average is closest. Finally, output the case_barcode and the predicted clinical stage.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+case_barcode,predicted_clinical_stage
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'TCGA_HG38_DATA_V0': {'QOTM': [], 'TCGA_BIOCLIN_V0': ['CLINICAL'], 'TCGA_HG38_DATA_V0': ['RNASEQ_GENE_EXPRESSION']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 02:36:41 - Thread-875 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH kirp_clin AS (  -- KIRP patients with a recorded clinical stage
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (        -- expression rows for the three MT‑CO genes
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (       -- pivot gene rows into one row per patient
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (        -- combine clinical & expression, add deterministic 90/10 split key
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        ABS(FARM_FINGERPRINT(kc."case_barcode")) % 10 AS "split_key"
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (            -- ≈90 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" < 9
+),
+test AS (             -- ≈10 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" >= 9
+),
+stage_centroids AS (  -- average expression per stage inside TRAIN
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (        -- Euclidean distance from each TEST patient to each stage centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage" AS "stage_candidate",
+        SQRT(
+            POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2) +
+            POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2) +
+            POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:36:41 - Thread-875 (execute) - INFO - itercount: 1
+2025-05-01 02:36:41 - Thread-875 (execute) - INFO - [Self-refine]
+Input sql:
+WITH kirp_clin AS (  -- KIRP patients with a recorded clinical stage
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (        -- expression rows for the three MT‑CO genes
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (       -- pivot gene rows into one row per patient
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (        -- combine clinical & expression, add deterministic 90/10 split key
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        ABS(FARM_FINGERPRINT(kc."case_barcode")) % 10 AS "split_key"
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (            -- ≈90 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" < 9
+),
+test AS (             -- ≈10 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" >= 9
+),
+stage_centroids AS (  -- average expression per stage inside TRAIN
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (        -- Euclidean distance from each TEST patient to each stage centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage" AS "stage_candidate",
+        SQRT(
+            POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2) +
+            POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2) +
+            POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+The error information is:
+002140 (42601): SQL compilation error:
+Unknown function FARM_FINGERPRINT
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 02:37:12 - Thread-875 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH kirp_clin AS (  -- KIRP patients that have a recorded clinical stage
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (        -- expression rows for the three MT‑CO genes
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (       -- pivot gene rows into one row per patient
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (        -- join clinical & expression, add deterministic 90/10 split key
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        MOD(ASCII(RIGHT(kc."case_barcode", 1)), 10) AS "split_key"   -- 0‑8 train, 9 test
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (            -- ≈90 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" < 9
+),
+test AS (             -- ≈10 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" = 9
+),
+stage_centroids AS (  -- average expression per stage inside TRAIN
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (        -- Euclidean distance from each TEST patient to each stage centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage" AS "stage_candidate",
+        SQRT(
+            POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2) +
+            POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2) +
+            POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:37:14 - Thread-875 (execute) - INFO - [Executed results in self-refine]
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-2Z-A9JO,Stage II
+TCGA-AL-3471,Stage II
+TCGA-BQ-5891,Stage II
+TCGA-BQ-7061,Stage II
+TCGA-EV-5901,Stage II
+
+[Executed results in self-refine]
+2025-05-01 02:37:14 - Thread-875 (execute) - INFO - itercount: 2
+2025-05-01 02:37:14 - Thread-875 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Using the TCGA-KIRP dataset, select patients from the 'TCGA_bioclin_v0.Clinical' table who have a non-null clinical_stage and a disease_code of 'KIRP.' Retrieve their gene expression data from the 'TCGA_hg38_data_v0.RNAseq_Gene_Expression' table for the genes 'MT-CO3,' 'MT-CO1,' and 'MT-CO2,' and randomly split the patients into a training set (90%) and a test set (10%) based on their case_barcode via the FARM_FINGERPRINT method. For each clinical stage in the training set, calculate the average HTSeq__FPKM_UQ expression of the three genes. For each patient in the test set, compute the Euclidean distance between the patient’s expression values and the stage-specific averages, and assign that patient to the clinical stage whose average is closest. Finally, output the case_barcode and the predicted clinical stage., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+case_barcode,predicted_clinical_stage
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-2Z-A9JO,Stage II
+TCGA-AL-3471,Stage II
+TCGA-BQ-5891,Stage II
+TCGA-BQ-7061,Stage II
+TCGA-EV-5901,Stage II
+Current sql:
+WITH kirp_clin AS (  -- KIRP patients that have a recorded clinical stage
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (        -- expression rows for the three MT‑CO genes
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (       -- pivot gene rows into one row per patient
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (        -- join clinical & expression, add deterministic 90/10 split key
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        MOD(ASCII(RIGHT(kc."case_barcode", 1)), 10) AS "split_key"   -- 0‑8 train, 9 test
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (            -- ≈90 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" < 9
+),
+test AS (             -- ≈10 % of patients
+    SELECT *
+    FROM kirp_data
+    WHERE "split_key" = 9
+),
+stage_centroids AS (  -- average expression per stage inside TRAIN
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (        -- Euclidean distance from each TEST patient to each stage centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage" AS "stage_candidate",
+        SQRT(
+            POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2) +
+            POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2) +
+            POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+[Self-refine]
+2025-05-01 02:38:13 - Thread-875 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH kirp_clin AS (                               -- patients with stage information
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (                                    -- MT‑CO gene‑expression rows
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (                                   -- one row per patient with 3 columns
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (                                    -- combine & derive 90 / 10 split key
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        MOD(ABS(HASH(kc."case_barcode")), 10) AS "split_key"   -- 0‑8 train, 9 test
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (
+    SELECT * FROM kirp_data WHERE "split_key" < 9               -- 90 %
+),
+test  AS (
+    SELECT * FROM kirp_data WHERE "split_key"  = 9              -- 10 %
+),
+stage_centroids AS (                                -- average MT‑CO values per stage
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (                                      -- distance of each test pt to each centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage"      AS "stage_candidate",
+        SQRT(
+              POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2)
+            + POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2)
+            + POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:38:15 - Thread-875 (execute) - INFO - [Executed results in self-refine]
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-IZ-A6M8,Stage II
+
+[Executed results in self-refine]
+2025-05-01 02:38:15 - Thread-875 (execute) - INFO - itercount: 3
+2025-05-01 02:38:15 - Thread-875 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Using the TCGA-KIRP dataset, select patients from the 'TCGA_bioclin_v0.Clinical' table who have a non-null clinical_stage and a disease_code of 'KIRP.' Retrieve their gene expression data from the 'TCGA_hg38_data_v0.RNAseq_Gene_Expression' table for the genes 'MT-CO3,' 'MT-CO1,' and 'MT-CO2,' and randomly split the patients into a training set (90%) and a test set (10%) based on their case_barcode via the FARM_FINGERPRINT method. For each clinical stage in the training set, calculate the average HTSeq__FPKM_UQ expression of the three genes. For each patient in the test set, compute the Euclidean distance between the patient’s expression values and the stage-specific averages, and assign that patient to the clinical stage whose average is closest. Finally, output the case_barcode and the predicted clinical stage., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+case_barcode,predicted_clinical_stage
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-IZ-A6M8,Stage II
+Current sql:
+WITH kirp_clin AS (                               -- patients with stage information
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (                                    -- MT‑CO gene‑expression rows
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (                                   -- one row per patient with 3 columns
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (                                    -- combine & derive 90 / 10 split key
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        MOD(ABS(HASH(kc."case_barcode")), 10) AS "split_key"   -- 0‑8 train, 9 test
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (
+    SELECT * FROM kirp_data WHERE "split_key" < 9               -- 90 %
+),
+test  AS (
+    SELECT * FROM kirp_data WHERE "split_key"  = 9              -- 10 %
+),
+stage_centroids AS (                                -- average MT‑CO values per stage
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (                                      -- distance of each test pt to each centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage"      AS "stage_candidate",
+        SQRT(
+              POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2)
+            + POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2)
+            + POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+[Self-refine]
+2025-05-01 02:39:49 - Thread-875 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH kirp_clin AS (                               -- patients with KIRP and recorded stage
+    SELECT
+        "case_barcode",
+        "clinical_stage"
+    FROM TCGA_HG38_DATA_V0.TCGA_BIOCLIN_V0.CLINICAL
+    WHERE "disease_code" = 'KIRP'
+      AND "clinical_stage" IS NOT NULL
+),
+kirp_expr AS (                                    -- MT‑CO gene‑expression rows
+    SELECT
+        "case_barcode",
+        "gene_name",
+        "HTSeq__FPKM_UQ"
+    FROM TCGA_HG38_DATA_V0.TCGA_HG38_DATA_V0.RNASEQ_GENE_EXPRESSION
+    WHERE "gene_name" IN ('MT-CO1','MT-CO2','MT-CO3')
+),
+expr_pivot AS (                                   -- pivot to one row per patient
+    SELECT
+        "case_barcode",
+        MAX(CASE WHEN "gene_name" = 'MT-CO1' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO1",
+        MAX(CASE WHEN "gene_name" = 'MT-CO2' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO2",
+        MAX(CASE WHEN "gene_name" = 'MT-CO3' THEN "HTSeq__FPKM_UQ" END) AS "MT_CO3"
+    FROM kirp_expr
+    GROUP BY "case_barcode"
+),
+kirp_data AS (                                    -- join & create deterministic 90/10 split
+    SELECT
+        kc."case_barcode",
+        kc."clinical_stage",
+        ep."MT_CO1",
+        ep."MT_CO2",
+        ep."MT_CO3",
+        MOD(ABS(HASH(kc."case_barcode")), 10) AS "split_key"   -- 0‑8 train, 9 test
+    FROM kirp_clin kc
+    JOIN expr_pivot ep
+      ON ep."case_barcode" = kc."case_barcode"
+),
+train AS (                                        -- 90 % of patients
+    SELECT * FROM kirp_data WHERE "split_key" < 9
+),
+test  AS (                                        -- 10 % of patients
+    SELECT * FROM kirp_data WHERE "split_key" = 9
+),
+stage_centroids AS (                              -- average MT‑CO expression per stage
+    SELECT
+        "clinical_stage",
+        AVG("MT_CO1") AS "CEN_MT_CO1",
+        AVG("MT_CO2") AS "CEN_MT_CO2",
+        AVG("MT_CO3") AS "CEN_MT_CO3"
+    FROM train
+    GROUP BY "clinical_stage"
+),
+distances AS (                                    -- distance of each test pt to each centroid
+    SELECT
+        t."case_barcode",
+        sc."clinical_stage" AS "stage_candidate",
+        SQRT(
+              POWER(t."MT_CO1" - sc."CEN_MT_CO1", 2) +
+              POWER(t."MT_CO2" - sc."CEN_MT_CO2", 2) +
+              POWER(t."MT_CO3" - sc."CEN_MT_CO3", 2)
+        ) AS "distance"
+    FROM test t
+    CROSS JOIN stage_centroids sc
+)
+SELECT
+    "case_barcode",
+    FIRST_VALUE("stage_candidate") OVER (
+        PARTITION BY "case_barcode"
+        ORDER BY "distance"
+    ) AS "predicted_clinical_stage"
+FROM distances
+QUALIFY ROW_NUMBER() OVER (PARTITION BY "case_barcode" ORDER BY "distance") = 1
+ORDER BY "case_barcode";
+```
+[Try to run SQL in self-refine]
+2025-05-01 02:39:49 - Thread-875 (execute) - INFO - [Executed results in self-refine]
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-IZ-A6M8,Stage II
+
+[Executed results in self-refine]
+2025-05-01 02:39:49 - Thread-875 (execute) - INFO - [Consistent results]
+case_barcode,predicted_clinical_stage
+TCGA-2Z-A9J1,Stage II
+TCGA-IZ-A6M8,Stage II
+
+[Consistent results]
+2025-05-01 02:39:49 - Thread-875 (execute) - INFO - Total iteration counts: 3

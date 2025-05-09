@@ -1,0 +1,2047 @@
+2025-05-05 03:40:12 - Thread-2278 (execute) - INFO - [Exploration]
+```sql
+--Description: 1)  Inspect which anatomic sites are represented in the public CPTAC
+--   RNA-Seq table so we can find the records that correspond to kidney /
+--   clear-cell renal cell carcinoma (ccRCC).
+SELECT DISTINCT
+  `primary_site`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+LIMIT 20;
+```
+
+```sql
+--Description: 2)  List the different sample-type labels that are available for the
+--   ccRCC (“Kidney”) RNA-Seq cohort – we expect (at least) “Primary Tumor”
+--   and “Solid Tissue Normal”.
+SELECT DISTINCT
+  `sample_type_name`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+LIMIT 20;
+```
+
+```sql
+--Description: 3)  Take a quick look at RNA-Seq expression values (FPKM) for a few
+--   kidney PRIMARY TUMOR samples.  We include the gene symbol so we can later
+--   join to proteomics on the same symbol.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'primary tumor'
+LIMIT 20;
+```
+
+```sql
+--Description: 4)  Analogous view of RNA-Seq values for KIDNEY “Solid Tissue Normal”
+--   samples – these will constitute the normal group in the correlation
+--   analysis.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'solid tissue normal'
+LIMIT 20;
+```
+
+```sql
+--Description: 5)  Examine the unique aliquot-submitter identifiers that appear in
+--   the CCRCC discovery study PROTEOME table (these will eventually be mapped
+--   to sample-barcode identifiers coming from GDC RNA-Seq).
+SELECT DISTINCT
+  `aliquot_submitter_id`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+LIMIT 20;
+```
+
+```sql
+--Description: 6)  Look at a few protein log2-ratios for the mitochondrial gene
+--   COX1 in the CCRCC discovery proteome study – confirms that values we plan
+--   to correlate are present.
+SELECT
+  `aliquot_submitter_id`,
+  `gene_symbol`,
+  ROUND(`protein_abundance_log2ratio`, 4) AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+WHERE
+  `gene_symbol` = 'COX1'
+LIMIT 20;
+```
+
+```sql
+--Description: 7)  Attempt to attach a sample-type label to proteome aliquots by
+--   joining with the PDC aliquot-to-case mapping table (not every aliquot is
+--   present, but this reveals the structure of any available mapping).
+SELECT
+  p.`aliquot_submitter_id`,
+  m.`sample_type`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+LEFT JOIN
+  `isb-cgc-bq.PDC_metadata.aliquot_to_case_mapping_current` AS m
+ON
+  p.`aliquot_submitter_id` = m.`sample_submitter_id`
+LIMIT 20;
+```
+
+```sql
+--Description: 8)  Check whether any aliquot identifiers in the proteomics table
+--   ALSO appear directly as sample_barcodes in the RNA-Seq table.  If present,
+--   these rows would allow a one-to-one join without an external mapping file.
+SELECT
+  p.`aliquot_submitter_id`,
+  r.`sample_barcode`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+INNER JOIN
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`                AS r
+ON
+  p.`aliquot_submitter_id` = r.`sample_barcode`
+LIMIT 20;
+```
+
+```sql
+--Description: 9)  Build a “joined” analytical table by pairing RNA-Seq and
+--   proteome measurements that share BOTH (i) the same gene symbol and
+--   (ii) a common sample_barcode / aliquot ID (as discovered in query 8).
+--   For each entry we create log-transformed RNA expression (log2(FPKM+1)).
+SELECT
+  r.`sample_barcode`,
+  r.`sample_type_name`,
+  r.`gene_name`                                        AS gene_symbol,
+  LOG2(r.`fpkm_unstranded` + 1)                        AS log2_fpkm,
+  p.`protein_abundance_log2ratio`                      AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`           AS r
+JOIN
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+ON
+  r.`sample_barcode`      =  p.`aliquot_submitter_id`   -- overlap found in #8
+  AND r.`gene_name`       =  p.`gene_symbol`
+WHERE
+  LOWER(r.`primary_site`) = 'kidney'
+  AND r.`sample_type_name` IN ('Primary Tumor','Solid Tissue Normal')
+LIMIT 20;
+```
+
+```sql
+--Description: 10)  Using the (small) set of overlapping samples found above,
+--   calculate gene-by-gene Spearman/Pearson correlations and retain only those
+--   with |corr| > 0.5;  finally compute the average correlation for each sample
+--   type (Primary Tumor vs Normal).
+SELECT
+  joined.`sample_type_name`,
+  AVG(corr_val) AS avg_corr
+FROM (
+  SELECT
+    `sample_type_name`,
+    `gene_symbol`,
+    CORR(`log2_fpkm`, `prot_log2ratio`) AS corr_val
+  FROM (
+    -- re-use the join in query 9 without the LIMIT
+    SELECT
+      r.`sample_barcode`,
+      r.`sample_type_name`,
+      r.`gene_name`                      AS gene_symbol,
+      LOG2(r.`fpkm_unstranded` + 1)      AS log2_fpkm,
+      p.`protein_abundance_log2ratio`     AS prot_log2ratio
+    FROM
+      `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`   AS r
+    JOIN
+      `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+    ON
+      r.`sample_barcode` = p.`aliquot_submitter_id`
+      AND r.`gene_name`  = p.`gene_symbol`
+    WHERE
+      LOWER(r.`primary_site`) = 'kidney'
+      AND r.`sample_type_name` IN ('Primary Tumor','Solid Tissue Normal')
+  )
+  GROUP BY
+    `sample_type_name`, `gene_symbol`
+  HAVING
+    ABS(CORR(`log2_fpkm`,`prot_log2ratio`)) > 0.5
+) AS joined
+GROUP BY
+  joined.`sample_type_name`
+LIMIT 20;
+```
+
+These ten queries walk from simple data exploration (queries 1-6), through
+identifier / sample-type mapping checks (queries 7-8), to construction of a
+joined analytical table (query 9) and finally to the requested correlation
+calculation and summarisation (query 10).
+[Exploration]
+2025-05-05 03:40:12 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 1)  Inspect which anatomic sites are represented in the public CPTAC
+--   RNA-Seq table so we can find the records that correspond to kidney /
+--   clear-cell renal cell carcinoma (ccRCC).
+SELECT DISTINCT
+  `primary_site`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:14 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1)  Inspect which anatomic sites are represented in the public CPTAC
+--   RNA-Seq table so we can find the records that correspond to kidney /
+--   clear-cell renal cell carcinoma (ccRCC).
+SELECT DISTINCT
+  `primary_site`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+LIMIT 20;
+Results:
+primary_site
+Retroperitoneum and peritoneum
+"Uterus, NOS"
+Brain
+Other and ill-defined sites
+Pancreas
+Other and unspecified urinary organs
+Ovary
+""
+Kidney
+Colon
+Breast
+Other and unspecified female genital organs
+Rectum
+Bronchus and lung
+
+[Successfully executed]
+2025-05-05 03:40:14 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 2)  List the different sample-type labels that are available for the
+--   ccRCC (“Kidney”) RNA-Seq cohort – we expect (at least) “Primary Tumor”
+--   and “Solid Tissue Normal”.
+SELECT DISTINCT
+  `sample_type_name`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:17 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2)  List the different sample-type labels that are available for the
+--   ccRCC (“Kidney”) RNA-Seq cohort – we expect (at least) “Primary Tumor”
+--   and “Solid Tissue Normal”.
+SELECT DISTINCT
+  `sample_type_name`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+LIMIT 20;
+Results:
+sample_type_name
+Solid Tissue Normal
+Primary Tumor
+
+[Successfully executed]
+2025-05-05 03:40:17 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 3)  Take a quick look at RNA-Seq expression values (FPKM) for a few
+--   kidney PRIMARY TUMOR samples.  We include the gene symbol so we can later
+--   join to proteomics on the same symbol.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'primary tumor'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:19 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3)  Take a quick look at RNA-Seq expression values (FPKM) for a few
+--   kidney PRIMARY TUMOR samples.  We include the gene symbol so we can later
+--   join to proteomics on the same symbol.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'primary tumor'
+LIMIT 20;
+Results:
+sample_barcode,gene_name,fpkm
+C3L-00608-01,GNPDA2,4.037
+C3L-00608-01,STING1,13.746
+C3L-00608-01,AC116312.1,15.992
+C3L-00608-01,LINC02883,0.715
+C3L-00608-01,EIF4HP1,0.984
+C3L-00608-01,BDKRB2,11.338
+C3L-00608-01,ZNF286B,0.188
+
+[Successfully executed]
+2025-05-05 03:40:19 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 4)  Analogous view of RNA-Seq values for KIDNEY “Solid Tissue Normal”
+--   samples – these will constitute the normal group in the correlation
+--   analysis.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'solid tissue normal'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:21 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4)  Analogous view of RNA-Seq values for KIDNEY “Solid Tissue Normal”
+--   samples – these will constitute the normal group in the correlation
+--   analysis.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'solid tissue normal'
+LIMIT 20;
+Results:
+sample_barcode,gene_name,fpkm
+C3L-00165-06,CCT6B,0.717
+C3L-00165-06,GRHL1,1.787
+C3L-00165-06,ZNF419,2.11
+C3L-00165-06,NDC1,6.986
+C3L-00165-06,ZDHHC23,6.014
+C3L-00165-06,SCLT1,4.928
+C3L-00165-06,ENPP7P4,3.346
+C3L-00165-06,SUCNR1,7.511
+
+[Successfully executed]
+2025-05-05 03:40:21 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 5)  Examine the unique aliquot-submitter identifiers that appear in
+--   the CCRCC discovery study PROTEOME table (these will eventually be mapped
+--   to sample-barcode identifiers coming from GDC RNA-Seq).
+SELECT DISTINCT
+  `aliquot_submitter_id`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:23 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 5)  Examine the unique aliquot-submitter identifiers that appear in
+--   the CCRCC discovery study PROTEOME table (these will eventually be mapped
+--   to sample-barcode identifiers coming from GDC RNA-Seq).
+SELECT DISTINCT
+  `aliquot_submitter_id`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+LIMIT 20;
+Results:
+aliquot_submitter_id
+CPT0075130003
+CPT0065690003
+CPT0025110003
+CPT0064400001
+CPT0000640003
+CPT0077500001
+QC3
+CPT0089040001
+CPT0001270001
+CPT0092190003
+CPT0075720003
+CPT0079270003
+CPT0088760003
+
+[Successfully executed]
+2025-05-05 03:40:23 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 6)  Look at a few protein log2-ratios for the mitochondrial gene
+--   COX1 in the CCRCC discovery proteome study – confirms that values we plan
+--   to correlate are present.
+SELECT
+  `aliquot_submitter_id`,
+  `gene_symbol`,
+  ROUND(`protein_abundance_log2ratio`, 4) AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+WHERE
+  `gene_symbol` = 'COX1'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:25 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 6)  Look at a few protein log2-ratios for the mitochondrial gene
+--   COX1 in the CCRCC discovery proteome study – confirms that values we plan
+--   to correlate are present.
+SELECT
+  `aliquot_submitter_id`,
+  `gene_symbol`,
+  ROUND(`protein_abundance_log2ratio`, 4) AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+WHERE
+  `gene_symbol` = 'COX1'
+LIMIT 20;
+Results:
+aliquot_submitter_id,gene_symbol,prot_log2ratio
+CPT0025230003,COX1,-1.6373
+CPT0088570001,COX1,0.5063
+CPT0009080003,COX1,-0.7945
+CPT0023690003,COX1,-1.1156
+CPT0000640003,COX1,-1.1157
+CPT0064370003,COX1,-0.8465
+
+[Successfully executed]
+2025-05-05 03:40:25 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 7)  Attempt to attach a sample-type label to proteome aliquots by
+--   joining with the PDC aliquot-to-case mapping table (not every aliquot is
+--   present, but this reveals the structure of any available mapping).
+SELECT
+  p.`aliquot_submitter_id`,
+  m.`sample_type`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+LEFT JOIN
+  `isb-cgc-bq.PDC_metadata.aliquot_to_case_mapping_current` AS m
+ON
+  p.`aliquot_submitter_id` = m.`sample_submitter_id`
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:27 - Thread-2278 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 7)  Attempt to attach a sample-type label to proteome aliquots by
+--   joining with the PDC aliquot-to-case mapping table (not every aliquot is
+--   present, but this reveals the structure of any available mapping).
+SELECT
+  p.`aliquot_submitter_id`,
+  m.`sample_type`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+LEFT JOIN
+  `isb-cgc-bq.PDC_metadata.aliquot_to_case_mapping_current` AS m
+ON
+  p.`aliquot_submitter_id` = m.`sample_submitter_id`
+LIMIT 20;
+Results:
+aliquot_submitter_id,sample_type
+CPT0011240003,
+CPT0025880003,
+CPT0084560003,
+CPT0020120003,
+CPT0063640001,
+CPT0087050003,
+CPT0001260009,
+CPT0077140001,
+CPT0086830003,
+
+[Successfully executed]
+2025-05-05 03:40:27 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 8)  Check whether any aliquot identifiers in the proteomics table
+--   ALSO appear directly as sample_barcodes in the RNA-Seq table.  If present,
+--   these rows would allow a one-to-one join without an external mapping file.
+SELECT
+  p.`aliquot_submitter_id`,
+  r.`sample_barcode`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+INNER JOIN
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`                AS r
+ON
+  p.`aliquot_submitter_id` = r.`sample_barcode`
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:40:31 - Thread-2278 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 03:41:37 - Thread-2278 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Our earlier inner-join between proteomics aliquot IDs and RNA-Seq sample
+-- barcodes yielded zero matches.  That suggests most proteomics IDs use the
+-- “CPT…” format, while RNA-Seq barcodes use TCGA-style strings such as
+-- “C3L-00608-01”.  To confirm whether *any* proteomics aliquots are labeled
+-- with TCGA-style IDs (those typically start with “C3…”) we list every
+-- distinct proteomics aliquot_submitter_id that begins with “C3”.  If this
+-- returns an empty set we know a direct join is impossible and an external
+-- mapping is required.
+SELECT DISTINCT
+  `aliquot_submitter_id`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+WHERE
+  `aliquot_submitter_id` LIKE 'C3%'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:41:39 - Thread-2278 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-05 03:42:41 - Thread-2278 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  
+-- Count how many identifier strings are shared between the CCRCC proteomics
+-- aliquot IDs and the RNA-Seq sample barcodes.  
+-- • Step-1: collect the distinct proteomics aliquot IDs.  
+-- • Step-2: collect the distinct RNA-Seq sample barcodes.  
+-- • Step-3: use INTERSECT to keep only IDs present in both sets, then count them.  
+-- If the resulting count is 0, there is no direct overlap and we must rely on an
+-- external mapping file to relate the two datasets.
+WITH proteome_ids AS (
+  SELECT DISTINCT `aliquot_submitter_id` AS id
+  FROM `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  WHERE `aliquot_submitter_id` IS NOT NULL
+),
+rna_ids AS (
+  SELECT DISTINCT `sample_barcode` AS id
+  FROM `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE `sample_barcode` IS NOT NULL
+)
+SELECT COUNT(*) AS shared_id_count
+FROM (
+  SELECT id FROM proteome_ids
+  INTERSECT DISTINCT
+  SELECT id FROM rna_ids
+);
+```
+[Corrected SQL]
+2025-05-05 03:42:44 - Thread-2278 (execute) - INFO - [Results for corrected sql]
+shared_id_count
+0
+
+[Results for corrected sql]
+2025-05-05 03:43:14 - Thread-2278 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 9)  Build a “joined” analytical table by pairing RNA-Seq and
+--   proteome measurements that share BOTH (i) the same gene symbol and
+--   (ii) a common identifier string (sample_barcode = aliquot_submitter_id).
+--   We replace the non-existent LOG2() with LOG(x , 2) which BigQuery supports.
+SELECT
+  r.`sample_barcode`,
+  r.`sample_type_name`,
+  r.`gene_name`                                    AS gene_symbol,
+  LOG(r.`fpkm_unstranded` + 1, 2)                  AS log2_fpkm,
+  p.`protein_abundance_log2ratio`                  AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`  AS r
+JOIN
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+ON
+  r.`sample_barcode` = p.`aliquot_submitter_id`
+  AND r.`gene_name`  = p.`gene_symbol`
+WHERE
+  LOWER(r.`primary_site`) = 'kidney'
+  AND r.`sample_type_name` IN ('Primary Tumor', 'Solid Tissue Normal')
+LIMIT 20;
+```
+
+```sql
+--Description: 10)  From the joined table created above, compute gene-wise
+--   Pearson correlations between log2-FPKM (RNA) and protein log2 ratios.
+--   Keep only correlations with |corr| > 0.5 and then report the average
+--   correlation for each sample type (“Primary Tumor” vs “Solid Tissue Normal”).
+WITH joined AS (
+  SELECT
+    r.`sample_barcode`,
+    r.`sample_type_name`,
+    r.`gene_name`                   AS gene_symbol,
+    LOG(r.`fpkm_unstranded` + 1, 2) AS log2_fpkm,
+    p.`protein_abundance_log2ratio` AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`  AS r
+  JOIN
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+  ON
+    r.`sample_barcode` = p.`aliquot_submitter_id`
+    AND r.`gene_name`  = p.`gene_symbol`
+  WHERE
+    LOWER(r.`primary_site`) = 'kidney'
+    AND r.`sample_type_name` IN ('Primary Tumor', 'Solid Tissue Normal')
+)
+, gene_corr AS (
+  SELECT
+    sample_type_name,
+    gene_symbol,
+    CORR(log2_fpkm, prot_log2ratio) AS corr_val
+  FROM joined
+  GROUP BY sample_type_name, gene_symbol
+  HAVING ABS(corr_val) > 0.5
+)
+SELECT
+  sample_type_name,
+  AVG(corr_val) AS avg_correlation
+FROM gene_corr
+GROUP BY sample_type_name
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 03:43:14 - Thread-2278 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  
+-- Count how many identifier strings are shared between the CCRCC proteomics
+-- aliquot IDs and the RNA-Seq sample barcodes.  
+-- • Step-1: collect the distinct proteomics aliquot IDs.  
+-- • Step-2: collect the distinct RNA-Seq sample barcodes.  
+-- • Step-3: use INTERSECT to keep only IDs present in both sets, then count them.  
+-- If the resulting count is 0, there is no direct overlap and we must rely on an
+-- external mapping file to relate the two datasets.
+WITH proteome_ids AS (
+  SELECT DISTINCT `aliquot_submitter_id` AS id
+  FROM `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  WHERE `aliquot_submitter_id` IS NOT NULL
+),
+rna_ids AS (
+  SELECT DISTINCT `sample_barcode` AS id
+  FROM `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE `sample_barcode` IS NOT NULL
+)
+SELECT COUNT(*) AS shared_id_count
+FROM (
+  SELECT id FROM proteome_ids
+  INTERSECT DISTINCT
+  SELECT id FROM rna_ids
+);
+Results:
+shared_id_count
+0
+
+[Successfully corrected]
+2025-05-05 03:43:14 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description: 9)  Build a “joined” analytical table by pairing RNA-Seq and
+--   proteome measurements that share BOTH (i) the same gene symbol and
+--   (ii) a common identifier string (sample_barcode = aliquot_submitter_id).
+--   We replace the non-existent LOG2() with LOG(x , 2) which BigQuery supports.
+SELECT
+  r.`sample_barcode`,
+  r.`sample_type_name`,
+  r.`gene_name`                                    AS gene_symbol,
+  LOG(r.`fpkm_unstranded` + 1, 2)                  AS log2_fpkm,
+  p.`protein_abundance_log2ratio`                  AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`  AS r
+JOIN
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+ON
+  r.`sample_barcode` = p.`aliquot_submitter_id`
+  AND r.`gene_name`  = p.`gene_symbol`
+WHERE
+  LOWER(r.`primary_site`) = 'kidney'
+  AND r.`sample_type_name` IN ('Primary Tumor', 'Solid Tissue Normal')
+LIMIT 20
+[Try to execute]
+2025-05-05 03:43:17 - Thread-2278 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 03:44:29 - Thread-2278 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  
+--  We cannot join RNA-seq and proteomics at the individual-sample level (0 shared IDs).
+--  Instead, evaluate the *gene-level* association between modalities:
+--    1)  Summarise Kidney RNA-seq data:  average log2(FPKM+1) for each gene
+--        separately in “Primary Tumor” and “Solid Tissue Normal”.
+--    2)  Summarise CCRCC discovery proteomics:  average protein log2-ratio
+--        for each gene across all aliquots.
+--    3)  Join the two summaries on gene_symbol.
+--    4)  For each sample-type group compute the Pearson correlation across
+--        genes between RNA and protein averages; keep only |corr| > 0.5.
+WITH rna_summary AS (
+  SELECT
+    gene_name                         AS gene_symbol,
+    sample_type_name,
+    AVG( LOG(fpkm_unstranded + 1, 2) ) AS avg_log2_fpkm
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+    LOWER(primary_site) = 'kidney'
+    AND sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal')
+  GROUP BY
+    gene_symbol, sample_type_name
+),
+prot_summary AS (
+  SELECT
+    gene_symbol,
+    AVG(protein_abundance_log2ratio) AS avg_prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  GROUP BY
+    gene_symbol
+),
+joined AS (
+  SELECT
+    r.sample_type_name,
+    r.gene_symbol,
+    r.avg_log2_fpkm,
+    p.avg_prot_log2ratio
+  FROM
+    rna_summary AS r
+  JOIN
+    prot_summary AS p
+  USING (gene_symbol)
+)
+SELECT
+  sample_type_name,
+  CORR(avg_log2_fpkm, avg_prot_log2ratio) AS gene_corr
+FROM
+  joined
+GROUP BY
+  sample_type_name
+HAVING
+  ABS(gene_corr) > 0.5
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:44:32 - Thread-2278 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-05 03:45:32 - Thread-2278 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  
+-- Verify that there *is* measurable overlap between Kidney RNA-Seq records and
+-- CCRCC proteomics data when we join solely on gene_symbol (ignoring sample IDs).
+-- We count the total number of joined rows produced under this relaxed criterion.
+-- A non-zero result confirms that gene-level pairing is feasible for subsequent
+-- analyses such as correlation calculations.
+SELECT
+  COUNT(*) AS joined_row_count
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`      AS r
+JOIN
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+ON
+  r.gene_name = p.gene_symbol
+WHERE
+  LOWER(r.primary_site) = 'kidney'
+  AND r.sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal');
+```
+[Corrected SQL]
+2025-05-05 03:45:35 - Thread-2278 (execute) - INFO - [Results for corrected sql]
+joined_row_count
+1018614915
+
+[Results for corrected sql]
+2025-05-05 03:45:55 - Thread-2278 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  
+-- Corrected version of “SQL 10”.  Because no RNA-Seq sample_barcodes match
+-- proteomics aliquot IDs, we operate at the GENE level instead of the per-sample
+-- level:  
+--   1)  RNA-Seq (Kidney):  for each gene, compute the average log2(FPKM+1)
+--       separately in “Primary Tumor” and “Solid Tissue Normal” samples.  
+--   2)  Proteomics (CCRCC discovery): compute the average protein log2-ratio for
+--       each gene across all aliquots.  
+--   3)  Join the two summaries on gene_symbol.  
+--   4)  For each sample-type group, compute the Pearson correlation across genes
+--       between RNA and protein averages; retain only correlations whose
+--       absolute value exceeds 0.5, then report the average of those retained
+--       correlations for each sample type.
+WITH rna_summary AS (
+  SELECT
+    gene_name                         AS gene_symbol,
+    sample_type_name,
+    AVG( LOG(fpkm_unstranded + 1, 2) ) AS avg_log2_fpkm
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+    LOWER(primary_site) = 'kidney'
+    AND sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal')
+  GROUP BY
+    gene_symbol, sample_type_name
+),
+prot_summary AS (
+  SELECT
+    gene_symbol,
+    AVG(protein_abundance_log2ratio) AS avg_prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  GROUP BY
+    gene_symbol
+),
+joined AS (
+  SELECT
+    r.sample_type_name,
+    r.gene_symbol,
+    r.avg_log2_fpkm,
+    p.avg_prot_log2ratio
+  FROM
+    rna_summary AS r
+  JOIN
+    prot_summary AS p
+  USING (gene_symbol)
+),
+gene_corr AS (
+  SELECT
+    sample_type_name,
+    -- correlation across genes (one value per sample_type)
+    CORR(avg_log2_fpkm, avg_prot_log2ratio) AS corr_val
+  FROM
+    joined
+  GROUP BY
+    sample_type_name
+)
+SELECT
+  sample_type_name,
+  corr_val AS average_correlation
+FROM
+  gene_corr
+WHERE
+  ABS(corr_val) > 0.5;
+```
+[Corrected other sqls]
+2025-05-05 03:45:55 - Thread-2278 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  
+-- Verify that there *is* measurable overlap between Kidney RNA-Seq records and
+-- CCRCC proteomics data when we join solely on gene_symbol (ignoring sample IDs).
+-- We count the total number of joined rows produced under this relaxed criterion.
+-- A non-zero result confirms that gene-level pairing is feasible for subsequent
+-- analyses such as correlation calculations.
+SELECT
+  COUNT(*) AS joined_row_count
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`      AS r
+JOIN
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+ON
+  r.gene_name = p.gene_symbol
+WHERE
+  LOWER(r.primary_site) = 'kidney'
+  AND r.sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal');
+Results:
+joined_row_count
+1018614915
+
+[Successfully corrected]
+2025-05-05 03:45:55 - Thread-2278 (execute) - INFO - [Try to execute]
+--Description:  
+-- Corrected version of “SQL 10”.  Because no RNA-Seq sample_barcodes match
+-- proteomics aliquot IDs, we operate at the GENE level instead of the per-sample
+-- level:  
+--   1)  RNA-Seq (Kidney):  for each gene, compute the average log2(FPKM+1)
+--       separately in “Primary Tumor” and “Solid Tissue Normal” samples.  
+--   2)  Proteomics (CCRCC discovery): compute the average protein log2-ratio for
+--       each gene across all aliquots.  
+--   3)  Join the two summaries on gene_symbol.  
+--   4)  For each sample-type group, compute the Pearson correlation across genes
+--       between RNA and protein averages; retain only correlations whose
+--       absolute value exceeds 0.5, then report the average of those retained
+--       correlations for each sample type.
+WITH rna_summary AS (
+  SELECT
+    gene_name                         AS gene_symbol,
+    sample_type_name,
+    AVG( LOG(fpkm_unstranded + 1, 2) ) AS avg_log2_fpkm
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+    LOWER(primary_site) = 'kidney'
+    AND sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal')
+  GROUP BY
+    gene_symbol, sample_type_name
+),
+prot_summary AS (
+  SELECT
+    gene_symbol,
+    AVG(protein_abundance_log2ratio) AS avg_prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  GROUP BY
+    gene_symbol
+),
+joined AS (
+  SELECT
+    r.sample_type_name,
+    r.gene_symbol,
+    r.avg_log2_fpkm,
+    p.avg_prot_log2ratio
+  FROM
+    rna_summary AS r
+  JOIN
+    prot_summary AS p
+  USING (gene_symbol)
+),
+gene_corr AS (
+  SELECT
+    sample_type_name,
+    -- correlation across genes (one value per sample_type)
+    CORR(avg_log2_fpkm, avg_prot_log2ratio) AS corr_val
+  FROM
+    joined
+  GROUP BY
+    sample_type_name
+)
+SELECT
+  sample_type_name,
+  corr_val AS average_correlation
+FROM
+  gene_corr
+WHERE
+  ABS(corr_val) > 0.5
+[Try to execute]
+2025-05-05 03:45:58 - Thread-2278 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 03:47:01 - Thread-2278 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  
+-- Compute the transcript-versus-protein association for Clear-Cell Renal Cell
+-- Carcinoma (Kidney) without relying on matching sample identifiers (which do
+-- not overlap across the two platforms).  The analysis proceeds in three
+-- stages:
+--   1)  RNA-Seq → for each gene calculate the mean log2(FPKM+1) within
+--       “Primary Tumor” and “Solid Tissue Normal” samples.              (CTE rna)
+--   2)  Proteome → for each gene calculate the mean protein log2-ratio
+--       across all aliquots in the CCRCC discovery study.              (CTE prot)
+--   3)  Join the summaries on gene_symbol and, for each sample type, compute
+--       a single Pearson correlation coefficient across genes between the two
+--       averaged modalities.  This yields one correlation value per sample
+--       class, showing how strongly mRNA abundance tracks with protein
+--       abundance overall.
+WITH rna AS (
+  SELECT
+    gene_name                           AS gene_symbol,
+    sample_type_name,
+    AVG( LOG(fpkm_unstranded + 1, 2) )  AS avg_log2_fpkm
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+    LOWER(primary_site) = 'kidney'
+    AND sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal')
+  GROUP BY
+    gene_symbol, sample_type_name
+),
+prot AS (
+  SELECT
+    gene_symbol,
+    AVG(protein_abundance_log2ratio)    AS avg_prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  GROUP BY
+    gene_symbol
+),
+joined AS (
+  SELECT
+    r.sample_type_name,
+    r.gene_symbol,
+    r.avg_log2_fpkm,
+    p.avg_prot_log2ratio
+  FROM
+    rna  AS r
+  JOIN
+    prot AS p
+  USING (gene_symbol)
+)
+SELECT
+  sample_type_name,
+  CORR(avg_log2_fpkm, avg_prot_log2ratio) AS transcript_protein_correlation
+FROM
+  joined
+GROUP BY
+  sample_type_name;
+```
+[Corrected SQL]
+2025-05-05 03:47:04 - Thread-2278 (execute) - INFO - [Results for corrected sql]
+sample_type_name,transcript_protein_correlation
+Primary Tumor,
+Solid Tissue Normal,
+
+[Results for corrected sql]
+2025-05-05 03:47:04 - Thread-2278 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  
+-- Compute the transcript-versus-protein association for Clear-Cell Renal Cell
+-- Carcinoma (Kidney) without relying on matching sample identifiers (which do
+-- not overlap across the two platforms).  The analysis proceeds in three
+-- stages:
+--   1)  RNA-Seq → for each gene calculate the mean log2(FPKM+1) within
+--       “Primary Tumor” and “Solid Tissue Normal” samples.              (CTE rna)
+--   2)  Proteome → for each gene calculate the mean protein log2-ratio
+--       across all aliquots in the CCRCC discovery study.              (CTE prot)
+--   3)  Join the summaries on gene_symbol and, for each sample type, compute
+--       a single Pearson correlation coefficient across genes between the two
+--       averaged modalities.  This yields one correlation value per sample
+--       class, showing how strongly mRNA abundance tracks with protein
+--       abundance overall.
+WITH rna AS (
+  SELECT
+    gene_name                           AS gene_symbol,
+    sample_type_name,
+    AVG( LOG(fpkm_unstranded + 1, 2) )  AS avg_log2_fpkm
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+    LOWER(primary_site) = 'kidney'
+    AND sample_type_name IN ('Primary Tumor', 'Solid Tissue Normal')
+  GROUP BY
+    gene_symbol, sample_type_name
+),
+prot AS (
+  SELECT
+    gene_symbol,
+    AVG(protein_abundance_log2ratio)    AS avg_prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+  GROUP BY
+    gene_symbol
+),
+joined AS (
+  SELECT
+    r.sample_type_name,
+    r.gene_symbol,
+    r.avg_log2_fpkm,
+    p.avg_prot_log2ratio
+  FROM
+    rna  AS r
+  JOIN
+    prot AS p
+  USING (gene_symbol)
+)
+SELECT
+  sample_type_name,
+  CORR(avg_log2_fpkm, avg_prot_log2ratio) AS transcript_protein_correlation
+FROM
+  joined
+GROUP BY
+  sample_type_name;
+Results:
+sample_type_name,transcript_protein_correlation
+Primary Tumor,
+Solid Tissue Normal,
+
+[Successfully corrected]
+2025-05-05 03:47:04 - Thread-2278 (execute) - INFO - itercount: 0
+2025-05-05 03:47:04 - Thread-2278 (execute) - INFO - [Self-refine]
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_GBM_discovery_study_pdc_current
+Column name: sample_id Type: STRING Description: Unique PDC identifier for this sample (e.g. e8d83eb9-693a-11ea-b1fd-0aad30af8a83)
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'sample_id': '104d1c5f-2139-11ea-aee1-0e1aae319e49', 'aliquot_submitter_id': 'CPT0205570003', 'protein_abundance_log2ratio': 0.4023, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'sample_id': '104cc5fd-2139-11ea-aee1-0e1aae319e49', 'aliquot_submitter_id': 'CPT0189650004', 'protein_abundance_log2ratio': nan, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'sample_id': '104cdad1-2139-11ea-aee1-0e1aae319e49', 'aliquot_submitter_id': 'CPT0190360004', 'protein_abundance_log2ratio': nan, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'sample_id': '104d25b1-2139-11ea-aee1-0e1aae319e49', 'aliquot_submitter_id': 'CPT0206110003', 'protein_abundance_log2ratio': -0.1169, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'sample_id': '104ccf2b-2139-11ea-aee1-0e1aae319e49', 'aliquot_submitter_id': 'CPT0190240004', 'protein_abundance_log2ratio': -0.1652, 'gene_symbol': 'CRYZL2P-SEC16B'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current
+Column name: primary_site Type: STRING Description: Anatomical site of the cancer under investigation or review
+Column name: sample_barcode Type: STRING Description: sample barcode, eg. TCGA-12-1089-01A. One sample may have multiple sets of expression values corresponding to multiple aliquots; use GROUP BY appropriately in queries
+Column name: gene_name Type: STRING Description: Gene name eg. TTN, DDR1
+Column name: unstranded Type: INT64 Description: Number of mapped reads mapping to both strands of the genomic region of each gene as calculated by STAR
+Column name: fpkm_unstranded Type: FLOAT64 Description: Fragments per kilobase of transcript per million mapped reads (FPKM) calculation, intended to control for transcript length and overall sequencing quantity
+Column name: sample_type_name Type: STRING Description: The longer name of the sample type; eg. Primary Tumor, Recurrent Tumor, etc
+Sample rows:
+[{'primary_site': 'Bronchus and lung', 'sample_barcode': 'C3N-02529-03', 'gene_name': 'MIA2', 'fpkm_unstranded': 6.0617, 'sample_type_name': 'Solid Tissue Normal'}, {'primary_site': 'Bronchus and lung', 'sample_barcode': 'C3N-02529-03', 'gene_name': 'CHD1L', 'fpkm_unstranded': 0.8406, 'sample_type_name': 'Solid Tissue Normal'}, {'primary_site': 'Bronchus and lung', 'sample_barcode': 'C3N-02529-03', 'gene_name': 'FIGNL2', 'fpkm_unstranded': 0.1734, 'sample_type_name': 'Solid Tissue Normal'}, {'primary_site': 'Bronchus and lung', 'sample_barcode': 'C3N-02529-03', 'gene_name': 'GK-AS1', 'fpkm_unstranded': 3.6741, 'sample_type_name': 'Solid Tissue Normal'}, {'primary_site': 'Bronchus and lung', 'sample_barcode': 'C3N-02529-03', 'gene_name': 'RPL29P24', 'fpkm_unstranded': 1.3507, 'sample_type_name': 'Solid Tissue Normal'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_prospective_ovarian_JHU_pdc_current
+Column name: sample_id Type: STRING Description: Unique PDC identifier for this sample (e.g. e8d83eb9-693a-11ea-b1fd-0aad30af8a83)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'sample_id': '526b02b7-0881-11eb-bc0e-0aad30af8a83', 'protein_abundance_log2ratio': -2.2904, 'gene_symbol': 'COX2'}, {'sample_id': '526b0874-0881-11eb-bc0e-0aad30af8a83', 'protein_abundance_log2ratio': -1.083, 'gene_symbol': 'COX2'}, {'sample_id': '526ac797-0881-11eb-bc0e-0aad30af8a83', 'protein_abundance_log2ratio': 0.6, 'gene_symbol': 'COX2'}, {'sample_id': '526ac49a-0881-11eb-bc0e-0aad30af8a83', 'protein_abundance_log2ratio': 1.7131, 'gene_symbol': 'COX2'}, {'sample_id': '526b53e0-0881-11eb-bc0e-0aad30af8a83', 'protein_abundance_log2ratio': 1.399, 'gene_symbol': 'COX2'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_UCEC_confirmatory_study_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': 'CPT0091910003', 'protein_abundance_log2ratio': 0.4396, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0087260003', 'protein_abundance_log2ratio': -0.4726, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0133770008', 'protein_abundance_log2ratio': -0.6099, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0097440003', 'protein_abundance_log2ratio': 0.4459, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0115470003', 'protein_abundance_log2ratio': 0.7356, 'gene_symbol': 'COX1'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_PDA_discovery_study_pdc_current
+Column name: sample_id Type: STRING Description: Unique PDC identifier for this sample (e.g. e8d83eb9-693a-11ea-b1fd-0aad30af8a83)
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'sample_id': '05ce4fb2-dcb8-4046-9638-cb1c3be6ff75', 'aliquot_submitter_id': 'CPT0094030003', 'protein_abundance_log2ratio': 6.2537, 'gene_symbol': 'ATP6'}, {'sample_id': '4284e578-2b03-4f9f-86a6-b05fb12856a9', 'aliquot_submitter_id': 'CPT0162780004', 'protein_abundance_log2ratio': 0.6383, 'gene_symbol': 'ATP6'}, {'sample_id': '11794efb-6548-4a4e-b33a-f33bb30f05da', 'aliquot_submitter_id': 'CPT0221470005', 'protein_abundance_log2ratio': 0.2272, 'gene_symbol': 'ATP6'}, {'sample_id': '05653bbc-db7b-44e1-9a21-712596295bb0', 'aliquot_submitter_id': 'CPT0207980005', 'protein_abundance_log2ratio': -0.4519, 'gene_symbol': 'ATP6'}, {'sample_id': '13fb00e9-64ee-425d-8297-c8844561c886', 'aliquot_submitter_id': 'CPT0246990003', 'protein_abundance_log2ratio': -0.0403, 'gene_symbol': 'ATP6'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.per_sample_file_metadata_hg38_gdc_current
+Column name: sample_barcode Type: STRING Description: Original/submitter sample ID
+Column name: sample_type_name Type: STRING Description: The longer name of the sample type, e.g. Primary Tumor, Recurrent Tumor, etc.
+Column name: project_short_name Type: STRING Description: Project name abbreviation; the program name appended with a project name abbreviation, eg. TCGA-OV, etc.
+Column name: data_type Type: STRING Description: Experimental source of the data type, e.g. Tissue slide image, RNA-Seq
+Sample rows:
+[{'sample_barcode': 'C3L-00359-01', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'CPTAC-3', 'data_type': 'Single Cell Analysis'}, {'sample_barcode': 'C3L-00359-01', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'CPTAC-3', 'data_type': 'Differential Gene Expression'}, {'sample_barcode': 'C3L-00359-01', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'CPTAC-3', 'data_type': 'Single Cell Analysis'}, {'sample_barcode': 'C3L-00606-01', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'CPTAC-3', 'data_type': 'Single Cell Analysis'}, {'sample_barcode': 'C3L-00606-01', 'sample_type_name': 'Primary Tumor', 'project_short_name': 'CPTAC-3', 'data_type': 'Differential Gene Expression'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_PTRC_HGSOC_FFPE_discovery_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': '218201', 'protein_abundance_log2ratio': -0.223, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': '474534;474536', 'protein_abundance_log2ratio': -0.7588, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': 'S-07-0032072_A8', 'protein_abundance_log2ratio': -0.1631, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': '500869', 'protein_abundance_log2ratio': 0.3677, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': 'Frozen-bridge', 'protein_abundance_log2ratio': -0.96, 'gene_symbol': 'COX2'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.per_sample_file_metadata_CPTAC2_other_pdc_current
+Column name: sample_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter that is associated with a specific sample (e.g. Tumor Pat1)
+Column name: sample_type Type: STRING Description: Text term to describe the source of a biospecimen used for a laboratory test
+Sample rows:
+[{'sample_submitter_id': 'WHIM2', 'sample_type': 'Xenograft Tissue'}, {'sample_submitter_id': 'WHIM2', 'sample_type': 'Xenograft Tissue'}, {'sample_submitter_id': 'WHIM2', 'sample_type': 'Xenograft Tissue'}, {'sample_submitter_id': 'WHIM2', 'sample_type': 'Xenograft Tissue'}, {'sample_submitter_id': 'WHIM2', 'sample_type': 'Xenograft Tissue'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_LSCC_discovery_study_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': 'CPT0111000004', 'protein_abundance_log2ratio': -0.6605, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0241210003', 'protein_abundance_log2ratio': 0.0927, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0234930004', 'protein_abundance_log2ratio': 0.721, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0205000003', 'protein_abundance_log2ratio': 0.0343, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0186130003', 'protein_abundance_log2ratio': -0.3559, 'gene_symbol': 'ATP6'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.per_sample_file_metadata_CPTAC_2_pdc_current
+Column name: sample_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter that is associated with a specific sample (e.g. Tumor Pat1)
+Column name: sample_type Type: STRING Description: Text term to describe the source of a biospecimen used for a laboratory test
+Sample rows:
+[{'sample_submitter_id': '5557e478-3e6f-475b-8acc-1b4159', 'sample_type': 'Primary Tumor'}, {'sample_submitter_id': '5557e478-3e6f-475b-8acc-1b4159', 'sample_type': 'Primary Tumor'}, {'sample_submitter_id': '5557e478-3e6f-475b-8acc-1b4159', 'sample_type': 'Primary Tumor'}, {'sample_submitter_id': '5557e478-3e6f-475b-8acc-1b4159', 'sample_type': 'Primary Tumor'}, {'sample_submitter_id': '5557e478-3e6f-475b-8acc-1b4159', 'sample_type': 'Primary Tumor'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_prospective_breast_BI_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': '45b99ac4-0859-4a3d-8b1e-ce5590_D2.3', 'protein_abundance_log2ratio': -0.2241, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': '3799eeb5-c966-4059-a78f-ace269_D2', 'protein_abundance_log2ratio': -0.7777, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': '0a80d3c4-0758-447a-958c-ea868c', 'protein_abundance_log2ratio': nan, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'ca14c6dd-2069-4bc5-b1f2-6f2297_D2', 'protein_abundance_log2ratio': 0.2676, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': '8dd1d8be-dc7e-44f5-9f44-77ecf0_D2', 'protein_abundance_log2ratio': 0.1147, 'gene_symbol': 'COX1'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_UCEC_discovery_study_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': 'CPT0002630003', 'protein_abundance_log2ratio': -0.1879, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0027520003', 'protein_abundance_log2ratio': -0.1202, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0001140003', 'protein_abundance_log2ratio': 0.9191, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0076680003', 'protein_abundance_log2ratio': 0.2681, 'gene_symbol': 'COX1'}, {'aliquot_submitter_id': 'CPT0001460012', 'protein_abundance_log2ratio': 0.787, 'gene_symbol': 'COX1'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.per_sample_file_metadata_CPTAC3_discovery_and_confirmatory_pdc_current
+Column name: sample_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter that is associated with a specific sample (e.g. Tumor Pat1)
+Column name: sample_type Type: STRING Description: Text term to describe the source of a biospecimen used for a laboratory test
+Sample rows:
+[{'sample_submitter_id': 'P93', 'sample_type': None}, {'sample_submitter_id': 'P93', 'sample_type': None}, {'sample_submitter_id': 'P93', 'sample_type': None}, {'sample_submitter_id': 'P93', 'sample_type': None}, {'sample_submitter_id': 'P93', 'sample_type': None}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_PTRC_HGSOC_FFPE_validation_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': 'B1279', 'protein_abundance_log2ratio': 0.0572, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': 'B792', 'protein_abundance_log2ratio': -0.0577, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': 'B564', 'protein_abundance_log2ratio': 0.2563, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': 'B572', 'protein_abundance_log2ratio': -0.2389, 'gene_symbol': 'COX2'}, {'aliquot_submitter_id': 'B986', 'protein_abundance_log2ratio': 0.1307, 'gene_symbol': 'COX2'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.per_sample_file_metadata_CPTAC3_other_pdc_current
+Column name: sample_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter that is associated with a specific sample (e.g. Tumor Pat1)
+Column name: sample_type Type: STRING Description: Text term to describe the source of a biospecimen used for a laboratory test
+Sample rows:
+[{'sample_submitter_id': 'CR1', 'sample_type': None}, {'sample_submitter_id': 'CR1', 'sample_type': None}, {'sample_submitter_id': 'CR1', 'sample_type': None}, {'sample_submitter_id': 'CR1', 'sample_type': None}, {'sample_submitter_id': 'CR1', 'sample_type': None}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current
+Column name: sample_id Type: STRING Description: Unique PDC identifier for this sample (e.g. e8d83eb9-693a-11ea-b1fd-0aad30af8a83)
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'sample_id': 'a1a3a269-204c-11e9-b7f8-0a80fada099c', 'aliquot_submitter_id': 'CPT0007320003', 'protein_abundance_log2ratio': -0.216, 'gene_symbol': 'COX1'}, {'sample_id': '89b29b3b-204c-11e9-b7f8-0a80fada099c', 'aliquot_submitter_id': 'CPT0002370001', 'protein_abundance_log2ratio': 0.3005, 'gene_symbol': 'COX1'}, {'sample_id': 'e9f56258-204c-11e9-b7f8-0a80fada099c', 'aliquot_submitter_id': 'CPT0079380003', 'protein_abundance_log2ratio': -1.9029, 'gene_symbol': 'COX1'}, {'sample_id': '705881d9-204d-11e9-b7f8-0a80fada099c', 'aliquot_submitter_id': 'CPT0012550003', 'protein_abundance_log2ratio': -1.105, 'gene_symbol': 'COX1'}, {'sample_id': '86641cf5-204c-11e9-b7f8-0a80fada099c', 'aliquot_submitter_id': 'CPT0002270011', 'protein_abundance_log2ratio': 1.102, 'gene_symbol': 'COX1'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.per_sample_file_metadata_proteogenomic_translational_research_centers_pdc_current
+Column name: sample_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter that is associated with a specific sample (e.g. Tumor Pat1)
+Column name: sample_type Type: STRING Description: Text term to describe the source of a biospecimen used for a laboratory test
+Column name: project_short_name Type: STRING Description: Project name abbreviation (e.g. pediatric_brain_cancer)
+Column name: program_short_name Type: STRING Description: Program name abbreviation (e.g. CPTAC)
+Column name: data_category Type: STRING Description: Category description of the underlying data (e.g. Clinical, Raw Sequencing Data, Simple Nucleotide Variation, Transcriptome Profiling)
+Sample rows:
+[{'sample_submitter_id': '500263', 'sample_type': 'Metastatic', 'project_short_name': 'proteogenomic_translational_research_centers', 'program_short_name': 'CPTAC', 'data_category': 'Raw Mass Spectra'}, {'sample_submitter_id': '500273', 'sample_type': 'Primary Tumor', 'project_short_name': 'proteogenomic_translational_research_centers', 'program_short_name': 'CPTAC', 'data_category': 'Raw Mass Spectra'}, {'sample_submitter_id': '500273', 'sample_type': 'Primary Tumor', 'project_short_name': 'proteogenomic_translational_research_centers', 'program_short_name': 'CPTAC', 'data_category': 'Peptide Spectral Matches'}, {'sample_submitter_id': '500263', 'sample_type': 'Metastatic', 'project_short_name': 'proteogenomic_translational_research_centers', 'program_short_name': 'CPTAC', 'data_category': 'Peptide Spectral Matches'}, {'sample_submitter_id': '500273', 'sample_type': 'Primary Tumor', 'project_short_name': 'proteogenomic_translational_research_centers', 'program_short_name': 'CPTAC', 'data_category': 'Processed Mass Spectra'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_PTRC_HGSOC_frozen_validation_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': '494977', 'protein_abundance_log2ratio': nan, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'aliquot_submitter_id': '243305', 'protein_abundance_log2ratio': nan, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'aliquot_submitter_id': '297950', 'protein_abundance_log2ratio': -0.3256, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'aliquot_submitter_id': '557978', 'protein_abundance_log2ratio': -0.4082, 'gene_symbol': 'CRYZL2P-SEC16B'}, {'aliquot_submitter_id': '261437', 'protein_abundance_log2ratio': nan, 'gene_symbol': 'CRYZL2P-SEC16B'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_CPTAC_LUAD_discovery_study_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'aliquot_submitter_id': 'CPT0105330003', 'protein_abundance_log2ratio': 0.455, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0067950003', 'protein_abundance_log2ratio': 0.2003, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0111480003', 'protein_abundance_log2ratio': -0.1646, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0147900003', 'protein_abundance_log2ratio': -0.0824, 'gene_symbol': 'ATP6'}, {'aliquot_submitter_id': 'CPT0113990003', 'protein_abundance_log2ratio': 0.8196, 'gene_symbol': 'ATP6'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_phosphoproteome_CPTAC_CCRCC_discovery_study_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: study_name Type: STRING Description: Name of the study (e.g. Pediatric Brain Cancer Pilot Study - Phosphoproteome)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Sample rows:
+[{'aliquot_submitter_id': 'CPT0025350003', 'study_name': 'CPTAC CCRCC Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 0.0405}, {'aliquot_submitter_id': 'NCI7-2', 'study_name': 'CPTAC CCRCC Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 1.529}, {'aliquot_submitter_id': 'CPT0085670003', 'study_name': 'CPTAC CCRCC Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 0.2256}, {'aliquot_submitter_id': 'NCI7-1', 'study_name': 'CPTAC CCRCC Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 1.2289}, {'aliquot_submitter_id': 'CPT0011410003', 'study_name': 'CPTAC CCRCC Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': -0.4337}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.miRNAseq_isoform_hg38_gdc_current
+Column name: sample_barcode Type: STRING Description: TARGET sample barcode, eg TARGET-20-PASWAT-09A
+Column name: miRNA_id Type: STRING Description: Unique miRNA id (aka symbol), eg hsa-mir-21  --  relevant reference information can be found in the isb-cgc:genome_reference dataset in the tables miRBase_v21 and miRBase_v21_hsa_gff3
+Column name: reads_per_million_miRNA_mapped Type: FLOAT64 Description: Read count normalized by total reads mapped divided by 1 million
+Column name: sample_type_name Type: STRING Description: The longer name of the sample type; eg. Primary Tumor, Recurrent Tumor, etc
+Sample rows:
+[{'sample_barcode': '38f29517-c046-4da5-ba0d-67d614', 'miRNA_id': 'hsa-mir-214', 'reads_per_million_miRNA_mapped': 75725.406936, 'sample_type_name': 'Primary Tumor'}, {'sample_barcode': 'e3ebe010-cd31-4b5d-8fcb-b7103b', 'miRNA_id': 'hsa-mir-181b-1', 'reads_per_million_miRNA_mapped': 194999.281506, 'sample_type_name': 'Primary Tumor'}, {'sample_barcode': 'd38f40fb-dd78-43b2-8b7b-4b6977', 'miRNA_id': 'hsa-mir-30c-1', 'reads_per_million_miRNA_mapped': 2392.344498, 'sample_type_name': 'Primary Tumor'}, {'sample_barcode': 'e7b656bf-3c34-4ba1-bdf3-c7eefe', 'miRNA_id': 'hsa-mir-200a', 'reads_per_million_miRNA_mapped': 252.908447, 'sample_type_name': 'Primary Tumor'}, {'sample_barcode': '347e379b-77c0-4dd3-aa25-18c9d1', 'miRNA_id': 'hsa-mir-320b-2', 'reads_per_million_miRNA_mapped': 3110.558123, 'sample_type_name': 'Primary Tumor'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_proteome_prospective_colon_PNNL_qeplus_pdc_current
+Column name: sample_id Type: STRING Description: Unique PDC identifier for this sample (e.g. e8d83eb9-693a-11ea-b1fd-0aad30af8a83)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'sample_id': '986bfc0f-641b-11e8-bcf1-0a2705229b82', 'protein_abundance_log2ratio': -0.4967, 'gene_symbol': 'LOC105369247'}, {'sample_id': '5901cc76-641b-11e8-bcf1-0a2705229b82', 'protein_abundance_log2ratio': -0.3002, 'gene_symbol': 'LOC105369247'}, {'sample_id': 'eaa2553e-641c-11e8-bcf1-0a2705229b82', 'protein_abundance_log2ratio': -0.4576, 'gene_symbol': 'LOC105369247'}, {'sample_id': 'c9b7d7b8-641c-11e8-bcf1-0a2705229b82', 'protein_abundance_log2ratio': -0.7923, 'gene_symbol': 'LOC105369247'}, {'sample_id': 'f383ba08-6420-11e8-bcf1-0a2705229b82', 'protein_abundance_log2ratio': -0.2304, 'gene_symbol': 'LOC105369247'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.quant_phosphoproteome_CPTAC_PDA_discovery_study_pdc_current
+Column name: aliquot_submitter_id Type: STRING Description: Aliquot submitter id assigned by program (e.g. T14)
+Column name: study_name Type: STRING Description: Name of the study (e.g. Pediatric Brain Cancer Pilot Study - Phosphoproteome)
+Column name: protein_abundance_log2ratio Type: FLOAT64 Description: Average log-ratio of sample reporter-ion to common reference of peptide ions associated with the gene in acquisitions from a specific biological sample
+Sample rows:
+[{'aliquot_submitter_id': 'QC1', 'study_name': 'CPTAC PDA Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 0.3407}, {'aliquot_submitter_id': 'QC1', 'study_name': 'CPTAC PDA Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 0.7406}, {'aliquot_submitter_id': 'QC1', 'study_name': 'CPTAC PDA Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': -0.0488}, {'aliquot_submitter_id': 'QC1', 'study_name': 'CPTAC PDA Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 1.4821}, {'aliquot_submitter_id': 'QC1', 'study_name': 'CPTAC PDA Discovery Study - Phosphoproteome', 'protein_abundance_log2ratio': 0.3266}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.CPTAC.copy_number_gene_level_hg38_gdc_current
+Column name: primary_site Type: STRING Description: Anatomical site of the cancer under investigation or review
+Column name: sample_barcode Type: STRING Description: TCGA sample barcode, eg TCGA-12-1089-01A. One sample may have multiple sets of CN segmentations corresponding to multiple aliquots; use GROUP BY appropriately in queries
+Column name: gene_name Type: STRING Description: Gene name eg. TTN, DDR1
+Column name: copy_number Type: INT64 Description: The weighted median of the strand copy numbers. Gene-level copy number data is generated by intersection of copy number segment and gene ranges. It is possible for one gene to overlap with multiple segments, and in this case, copy_number, min_copy_number and max_copy_number could take different values. In particular, the copy_number value is calculated as the median, weighted on length of overlapped bases, of segment copy numbers from all overlapped segments.
+Sample rows:
+[{'primary_site': 'Kidney', 'sample_barcode': 'C3N-01651-01', 'gene_name': 'AC104454.2'}, {'primary_site': 'Kidney', 'sample_barcode': 'C3N-01651-01', 'gene_name': 'AL137792.1'}, {'primary_site': 'Kidney', 'sample_barcode': 'C3N-01651-01', 'gene_name': 'PPIEL'}, {'primary_site': 'Kidney', 'sample_barcode': 'C3N-01651-01', 'gene_name': 'HSPE1P24'}, {'primary_site': 'Kidney', 'sample_barcode': 'C3N-01651-01', 'gene_name': 'RSL24D1P4'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.PDC_metadata.refseq_mapping_current
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'gene_symbol': 'BLTP3B'}, {'gene_symbol': 'BLTP3B'}, {'gene_symbol': 'POTEB3'}, {'gene_symbol': 'POTEB3'}, {'gene_symbol': 'FAM170A'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.PDC_metadata.aliquot_to_case_mapping_current
+Column name: sample_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter that is associated with a specific sample (e.g. Tumor Pat1)
+Column name: sample_type Type: STRING Description: Text term to describe the source of a biospecimen used for a laboratory test
+Sample rows:
+[{'sample_submitter_id': 'IR', 'sample_type': None}, {'sample_submitter_id': 'CR1', 'sample_type': None}, {'sample_submitter_id': 'CR2', 'sample_type': None}, {'sample_submitter_id': 'CR3', 'sample_type': None}, {'sample_submitter_id': 'CR4', 'sample_type': None}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.PDC_metadata.studies_current
+Column name: study_name Type: STRING Description: Name of the study (e.g. Pediatric Brain Cancer Pilot Study - Phosphoproteome)
+Column name: study_submitter_id Type: STRING Description: Unique identifier deriving from the data submitter used for the study (e.g. S046-1-CompRef)
+Sample rows:
+[{'study_name': 'CPTAC GBM Discovery Study - Metabolome', 'study_submitter_id': 'CPTAC GBM Discovery Study - Metabolome'}, {'study_name': 'CPTAC CCRCC Confirmatory Study - Validation - Metabolome', 'study_submitter_id': 'CPTAC CCRCC Confirmatory Study - Validation - Metabolome'}, {'study_name': 'CPTAC CCRCC Confirmatory Study - Training - Metabolome', 'study_submitter_id': 'CPTAC CCRCC Confirmatory Study - Training - Metabolome'}, {'study_name': 'CPTAC non-ccRCC Study - Metabolome', 'study_submitter_id': 'CPTAC non-ccRCC Study - Metabolome'}, {'study_name': 'CPTAC GBM Confirmatory Study - Metabolome', 'study_submitter_id': 'CPTAC GBM Confirmatory Study - Metabolome'}]
+
+--------------------------------------------------
+Table full name: isb-cgc-bq.PDC_metadata.gene_info_current
+Column name: gene_symbol Type: STRING Description: Gene symbol, sourced by PDC from NCBI
+Sample rows:
+[{'gene_symbol': 'TUT4'}, {'gene_symbol': 'Itprid2'}, {'gene_symbol': 'MIA2'}, {'gene_symbol': 'LIPC'}, {'gene_symbol': 'TUT7'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'isb-cgc-bq': {'CPTAC': ['quant_proteome_CPTAC_GBM_discovery_study_pdc_current', 'RNAseq_hg38_gdc_current', 'quant_proteome_prospective_ovarian_JHU_pdc_current', 'quant_proteome_CPTAC_UCEC_confirmatory_study_pdc_current', 'quant_proteome_CPTAC_PDA_discovery_study_pdc_current', 'per_sample_file_metadata_hg38_gdc_current', 'quant_proteome_PTRC_HGSOC_FFPE_discovery_pdc_current', 'per_sample_file_metadata_CPTAC2_other_pdc_current', 'quant_proteome_CPTAC_LSCC_discovery_study_pdc_current', 'per_sample_file_metadata_CPTAC_2_pdc_current', 'quant_proteome_prospective_breast_BI_pdc_current', 'quant_proteome_CPTAC_UCEC_discovery_study_pdc_current', 'per_sample_file_metadata_CPTAC3_discovery_and_confirmatory_pdc_current', 'quant_proteome_PTRC_HGSOC_FFPE_validation_pdc_current', 'per_sample_file_metadata_CPTAC3_other_pdc_current', 'quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current', 'per_sample_file_metadata_proteogenomic_translational_research_centers_pdc_current', 'quant_proteome_PTRC_HGSOC_frozen_validation_pdc_current', 'quant_proteome_CPTAC_LUAD_discovery_study_pdc_current', 'quant_phosphoproteome_CPTAC_CCRCC_discovery_study_pdc_current', 'miRNAseq_isoform_hg38_gdc_current', 'quant_proteome_prospective_colon_PNNL_qeplus_pdc_current', 'quant_phosphoproteome_CPTAC_PDA_discovery_study_pdc_current', 'copy_number_gene_level_hg38_gdc_current'], 'PDC_metadata': ['refseq_mapping_current', 'aliquot_to_case_mapping_current', 'studies_current', 'gene_info_current']}}
+Some few-shot examples may be useful:
+Query:
+--Description: 1)  Inspect which anatomic sites are represented in the public CPTAC
+--   RNA-Seq table so we can find the records that correspond to kidney /
+--   clear-cell renal cell carcinoma (ccRCC).
+SELECT DISTINCT
+  `primary_site`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+LIMIT 20;
+Answer:
+primary_site
+Retroperitoneum and peritoneum
+"Uterus, NOS"
+Brain
+Other and ill-defined sites
+Pancreas
+Other and unspecified urinary organs
+Ovary
+""
+Kidney
+Colon
+Breast
+Other and unspecified female genital organs
+Rectum
+Bronchus and lung
+Query:
+--Description: 2)  List the different sample-type labels that are available for the
+--   ccRCC (“Kidney”) RNA-Seq cohort – we expect (at least) “Primary Tumor”
+--   and “Solid Tissue Normal”.
+SELECT DISTINCT
+  `sample_type_name`
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+LIMIT 20;
+Answer:
+sample_type_name
+Solid Tissue Normal
+Primary Tumor
+Query:
+--Description: 3)  Take a quick look at RNA-Seq expression values (FPKM) for a few
+--   kidney PRIMARY TUMOR samples.  We include the gene symbol so we can later
+--   join to proteomics on the same symbol.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'primary tumor'
+LIMIT 20;
+Answer:
+sample_barcode,gene_name,fpkm
+C3L-00608-01,GNPDA2,4.037
+C3L-00608-01,STING1,13.746
+C3L-00608-01,AC116312.1,15.992
+C3L-00608-01,LINC02883,0.715
+C3L-00608-01,EIF4HP1,0.984
+C3L-00608-01,BDKRB2,11.338
+C3L-00608-01,ZNF286B,0.188
+Query:
+--Description: 4)  Analogous view of RNA-Seq values for KIDNEY “Solid Tissue Normal”
+--   samples – these will constitute the normal group in the correlation
+--   analysis.
+SELECT
+  `sample_barcode`,
+  `gene_name`,
+  ROUND(`fpkm_unstranded`, 3) AS fpkm
+FROM
+  `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+WHERE
+  LOWER(`primary_site`) = 'kidney'
+  AND LOWER(`sample_type_name`) = 'solid tissue normal'
+LIMIT 20;
+Answer:
+sample_barcode,gene_name,fpkm
+C3L-00165-06,CCT6B,0.717
+C3L-00165-06,GRHL1,1.787
+C3L-00165-06,ZNF419,2.11
+C3L-00165-06,NDC1,6.986
+C3L-00165-06,ZDHHC23,6.014
+C3L-00165-06,SCLT1,4.928
+C3L-00165-06,ENPP7P4,3.346
+C3L-00165-06,SUCNR1,7.511
+Query:
+--Description: 5)  Examine the unique aliquot-submitter identifiers that appear in
+--   the CCRCC discovery study PROTEOME table (these will eventually be mapped
+--   to sample-barcode identifiers coming from GDC RNA-Seq).
+SELECT DISTINCT
+  `aliquot_submitter_id`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+LIMIT 20;
+Answer:
+aliquot_submitter_id
+CPT0075130003
+CPT0065690003
+CPT0025110003
+CPT0064400001
+CPT0000640003
+CPT0077500001
+QC3
+CPT0089040001
+CPT0001270001
+CPT0092190003
+CPT0075720003
+CPT0079270003
+CPT0088760003
+Query:
+--Description: 6)  Look at a few protein log2-ratios for the mitochondrial gene
+--   COX1 in the CCRCC discovery proteome study – confirms that values we plan
+--   to correlate are present.
+SELECT
+  `aliquot_submitter_id`,
+  `gene_symbol`,
+  ROUND(`protein_abundance_log2ratio`, 4) AS prot_log2ratio
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current`
+WHERE
+  `gene_symbol` = 'COX1'
+LIMIT 20;
+Answer:
+aliquot_submitter_id,gene_symbol,prot_log2ratio
+CPT0025230003,COX1,-1.6373
+CPT0088570001,COX1,0.5063
+CPT0009080003,COX1,-0.7945
+CPT0023690003,COX1,-1.1156
+CPT0000640003,COX1,-1.1157
+CPT0064370003,COX1,-0.8465
+Query:
+--Description: 7)  Attempt to attach a sample-type label to proteome aliquots by
+--   joining with the PDC aliquot-to-case mapping table (not every aliquot is
+--   present, but this reveals the structure of any available mapping).
+SELECT
+  p.`aliquot_submitter_id`,
+  m.`sample_type`
+FROM
+  `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` AS p
+LEFT JOIN
+  `isb-cgc-bq.PDC_metadata.aliquot_to_case_mapping_current` AS m
+ON
+  p.`aliquot_submitter_id` = m.`sample_submitter_id`
+LIMIT 20;
+Answer:
+aliquot_submitter_id,sample_type
+CPT0011240003,
+CPT0025880003,
+CPT0084560003,
+CPT0020120003,
+CPT0063640001,
+CPT0087050003,
+CPT0001260009,
+CPT0077140001,
+CPT0086830003,
+Task: Use CPTAC proteomics and RNAseq data for Clear Cell Renal Cell Carcinoma to select 'Primary Tumor' and 'Solid Tissue Normal' samples. Join the datasets on sample submitter IDs and gene symbols. Calculate the correlation between protein abundance (log2 ratio) and gene expression levels (log-transformed+1 FPKM) for each gene and sample type. Filter out correlations with an absolute value greater than 0.5, and compute the average correlation for each sample type.
+
+Please answer only one complete SQL in bigquery dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT `column_name` FROM `database.schema.table` WHERE ... ``` (Replace `database`, `schema`, and `table` with actual names. Enclose column names and table identifiers with backticks.)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables with similar prefix, you can use a wildcard table to simplify your query. e.g., SELECT col1, col2 FROM `project_id.dataset_id.table_prefix*` WHERE _TABLE_SUFFIX IN ('table1_suffix', 'table2_suffix');. Avoid manually listing tables unless absolutely necessary.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 03:48:13 - Thread-2278 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* Correlate gene–level protein abundance (log2-ratio) with log2(FPKM+1) RNA-Seq
+   for Clear-Cell Renal Cell Carcinoma (ccRCC) “Primary Tumor” vs “Solid Tissue Normal”.
+   -------------------------------------------------------------------------------
+   1)  Map proteome aliquots to GDC sample barcodes through the PDC↔GDC
+       biospecimen bridge table.
+   2)  Keep only Kidney samples that are either Primary Tumor or Solid Tissue Normal.
+   3)  Join on (sample_barcode, gene_symbol) to obtain matched proteome/RNA pairs.
+   4)  For every (sample_type, gene) compute Pearson correlation across samples,
+       require |r| > 0.5, then average the remaining correlations per sample_type.
+*/
+WITH gdc_pdc_map AS (          -- 1)  Aliquot→sample barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_barcode
+  FROM
+    `isb-cgc-bq.PDC_metadata.gdc_to_pdc_biospecimen_mapping_current`
+  WHERE sample_barcode IS NOT NULL
+),
+
+kidney_rna AS (                -- 2a)  Kidney RNA-Seq (tumour & normal)
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)          AS sample_type,      -- “primary tumor”, “solid tissue normal”
+    gene_name                        AS gene_symbol,
+    LOG(fpkm_unstranded + 1) / LOG(2) AS log2_fpkm        -- log2(FPKM+1)
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)   = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+),
+
+ccrcc_proteome AS (            -- 2b)  Kidney proteome values with mapped barcodes
+  SELECT
+    m.sample_barcode,
+    LOWER(r.sample_type_name)  AS sample_type,            -- inherit sample-type from RNA table
+    p.gene_symbol,
+    p.protein_abundance_log2ratio  AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map               m ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  JOIN (
+        SELECT DISTINCT sample_barcode, sample_type_name
+        FROM   `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+        WHERE  LOWER(primary_site)   = 'kidney'
+           AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  )                            r ON r.sample_barcode     = m.sample_barcode
+),
+
+joined_pairs AS (              -- 3)  Matched RNA / Proteome values
+  SELECT
+    p.sample_type,
+    p.gene_symbol,
+    p.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    ccrcc_proteome p
+  JOIN
+    kidney_rna    r USING (sample_barcode, gene_symbol, sample_type)
+  WHERE
+        p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm       IS NOT NULL
+),
+
+corr_per_gene AS (             -- 4)  Correlation for each gene within each sample-type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5       -- keep only strong correlations
+)
+
+SELECT
+  INITCAP(sample_type)                    AS sample_type_name,
+  AVG(gene_corr)                          AS avg_correlation
+FROM corr_per_gene
+WHERE gene_corr IS NOT NULL               -- safeguard
+GROUP BY sample_type
+ORDER BY sample_type_name;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:48:15 - Thread-2278 (execute) - INFO - itercount: 1
+2025-05-05 03:48:15 - Thread-2278 (execute) - INFO - [Self-refine]
+Input sql:
+/* Correlate gene–level protein abundance (log2-ratio) with log2(FPKM+1) RNA-Seq
+   for Clear-Cell Renal Cell Carcinoma (ccRCC) “Primary Tumor” vs “Solid Tissue Normal”.
+   -------------------------------------------------------------------------------
+   1)  Map proteome aliquots to GDC sample barcodes through the PDC↔GDC
+       biospecimen bridge table.
+   2)  Keep only Kidney samples that are either Primary Tumor or Solid Tissue Normal.
+   3)  Join on (sample_barcode, gene_symbol) to obtain matched proteome/RNA pairs.
+   4)  For every (sample_type, gene) compute Pearson correlation across samples,
+       require |r| > 0.5, then average the remaining correlations per sample_type.
+*/
+WITH gdc_pdc_map AS (          -- 1)  Aliquot→sample barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_barcode
+  FROM
+    `isb-cgc-bq.PDC_metadata.gdc_to_pdc_biospecimen_mapping_current`
+  WHERE sample_barcode IS NOT NULL
+),
+
+kidney_rna AS (                -- 2a)  Kidney RNA-Seq (tumour & normal)
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)          AS sample_type,      -- “primary tumor”, “solid tissue normal”
+    gene_name                        AS gene_symbol,
+    LOG(fpkm_unstranded + 1) / LOG(2) AS log2_fpkm        -- log2(FPKM+1)
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)   = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+),
+
+ccrcc_proteome AS (            -- 2b)  Kidney proteome values with mapped barcodes
+  SELECT
+    m.sample_barcode,
+    LOWER(r.sample_type_name)  AS sample_type,            -- inherit sample-type from RNA table
+    p.gene_symbol,
+    p.protein_abundance_log2ratio  AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map               m ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  JOIN (
+        SELECT DISTINCT sample_barcode, sample_type_name
+        FROM   `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+        WHERE  LOWER(primary_site)   = 'kidney'
+           AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  )                            r ON r.sample_barcode     = m.sample_barcode
+),
+
+joined_pairs AS (              -- 3)  Matched RNA / Proteome values
+  SELECT
+    p.sample_type,
+    p.gene_symbol,
+    p.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    ccrcc_proteome p
+  JOIN
+    kidney_rna    r USING (sample_barcode, gene_symbol, sample_type)
+  WHERE
+        p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm       IS NOT NULL
+),
+
+corr_per_gene AS (             -- 4)  Correlation for each gene within each sample-type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5       -- keep only strong correlations
+)
+
+SELECT
+  INITCAP(sample_type)                    AS sample_type_name,
+  AVG(gene_corr)                          AS avg_correlation
+FROM corr_per_gene
+WHERE gene_corr IS NOT NULL               -- safeguard
+GROUP BY sample_type
+ORDER BY sample_type_name;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##404 Not found: Table isb-cgc-bq:PDC_metadata.gdc_to_pdc_biospecimen_mapping_current was not found in location US; reason: notFound, message: Not found: Table isb-cgc-bq:PDC_metadata.gdc_to_pdc_biospecimen_mapping_current was not found in location US\n\nLocation: US\nJob ID: b451f7a1-7ee4-4241-b68a-89e563fd8cd1\n'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 03:49:41 - Thread-2278 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Correlate gene-level protein abundance with log2-transformed RNA-Seq
+    for ccRCC “Primary Tumor” vs “Solid Tissue Normal”.
+    (Uses the correct GDC↔PDC bridge table name.)                                */
+WITH gdc_pdc_map AS (          -- 1)  Aliquot → GDC sample-barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_barcode
+  FROM
+    `isb-cgc-bq.PDC_metadata.gdc_to_pdc_biospecimen_current`
+  WHERE sample_barcode IS NOT NULL
+),
+
+kidney_rna AS (                -- 2a)  Kidney RNA-Seq (tumour & normal)
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)            AS sample_type,      -- “primary tumor”, “solid tissue normal”
+    gene_name                          AS gene_symbol,
+    LOG(fpkm_unstranded + 1)/LOG(2)    AS log2_fpkm         -- log2(FPKM+1)
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)   = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+),
+
+ccrcc_proteome AS (            -- 2b)  Proteome values mapped to GDC barcodes
+  SELECT
+    m.sample_barcode,
+    LOWER(r.sample_type_name)  AS sample_type,              -- inherit sample-type from RNA table
+    p.gene_symbol,
+    p.protein_abundance_log2ratio      AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map               m ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  JOIN (
+        SELECT DISTINCT sample_barcode, sample_type_name
+        FROM   `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+        WHERE  LOWER(primary_site)   = 'kidney'
+           AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  )                            r ON r.sample_barcode     = m.sample_barcode
+),
+
+joined_pairs AS (              -- 3)  Matched RNA / Proteome values
+  SELECT
+    p.sample_type,
+    p.gene_symbol,
+    p.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    ccrcc_proteome p
+  JOIN
+    kidney_rna    r USING (sample_barcode, gene_symbol, sample_type)
+  WHERE
+        p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm       IS NOT NULL
+),
+
+corr_per_gene AS (             -- 4)  Pearson correlation per gene & sample-type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5          -- retain strong correlations
+)
+
+SELECT
+  INITCAP(sample_type)         AS sample_type_name,
+  AVG(gene_corr)               AS avg_correlation
+FROM corr_per_gene
+GROUP BY sample_type
+ORDER BY sample_type_name;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:49:42 - Thread-2278 (execute) - INFO - itercount: 2
+2025-05-05 03:49:42 - Thread-2278 (execute) - INFO - [Self-refine]
+Input sql:
+/*  Correlate gene-level protein abundance with log2-transformed RNA-Seq
+    for ccRCC “Primary Tumor” vs “Solid Tissue Normal”.
+    (Uses the correct GDC↔PDC bridge table name.)                                */
+WITH gdc_pdc_map AS (          -- 1)  Aliquot → GDC sample-barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_barcode
+  FROM
+    `isb-cgc-bq.PDC_metadata.gdc_to_pdc_biospecimen_current`
+  WHERE sample_barcode IS NOT NULL
+),
+
+kidney_rna AS (                -- 2a)  Kidney RNA-Seq (tumour & normal)
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)            AS sample_type,      -- “primary tumor”, “solid tissue normal”
+    gene_name                          AS gene_symbol,
+    LOG(fpkm_unstranded + 1)/LOG(2)    AS log2_fpkm         -- log2(FPKM+1)
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)   = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+),
+
+ccrcc_proteome AS (            -- 2b)  Proteome values mapped to GDC barcodes
+  SELECT
+    m.sample_barcode,
+    LOWER(r.sample_type_name)  AS sample_type,              -- inherit sample-type from RNA table
+    p.gene_symbol,
+    p.protein_abundance_log2ratio      AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map               m ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  JOIN (
+        SELECT DISTINCT sample_barcode, sample_type_name
+        FROM   `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+        WHERE  LOWER(primary_site)   = 'kidney'
+           AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  )                            r ON r.sample_barcode     = m.sample_barcode
+),
+
+joined_pairs AS (              -- 3)  Matched RNA / Proteome values
+  SELECT
+    p.sample_type,
+    p.gene_symbol,
+    p.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    ccrcc_proteome p
+  JOIN
+    kidney_rna    r USING (sample_barcode, gene_symbol, sample_type)
+  WHERE
+        p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm       IS NOT NULL
+),
+
+corr_per_gene AS (             -- 4)  Pearson correlation per gene & sample-type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5          -- retain strong correlations
+)
+
+SELECT
+  INITCAP(sample_type)         AS sample_type_name,
+  AVG(gene_corr)               AS avg_correlation
+FROM corr_per_gene
+GROUP BY sample_type
+ORDER BY sample_type_name;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##404 Not found: Table isb-cgc-bq:PDC_metadata.gdc_to_pdc_biospecimen_current was not found in location US; reason: notFound, message: Not found: Table isb-cgc-bq:PDC_metadata.gdc_to_pdc_biospecimen_current was not found in location US\n\nLocation: US\nJob ID: 65980345-8e82-41bf-a724-662be846363a\n'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 03:50:47 - Thread-2278 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Correlate gene–level protein abundance with log2-transformed RNA-Seq
+    for ccRCC “Primary Tumor” vs “Solid Tissue Normal”.
+    -------------------------------------------------------------------
+    1)  Pull the GDC ⇄ PDC biospecimen bridge table (wild-carded because the
+        exact suffix may vary across snapshots).
+    2)  Collect Kidney RNA-Seq values (log2(FPKM+1)) and average any replicate
+        rows per (sample, gene).
+    3)  Map CCRCC proteome aliquots to GDC sample barcodes, then average any
+        replicate rows per (sample, gene).
+    4)  Join RNA and proteome on (sample_barcode, gene_symbol).
+    5)  For every (sample_type, gene) compute Pearson correlation across
+        samples, keep |r| > 0.5, then report the mean correlation per
+        sample-type.
+*/
+WITH gdc_pdc_map AS (          -- 1)  Aliquot → sample_barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_barcode
+  FROM
+    `isb-cgc-bq.PDC_metadata.gdc_to_pdc_biospecimen*`      -- wildcard picks the live table
+  WHERE sample_barcode IS NOT NULL
+),
+
+kidney_rna AS (                -- 2)  Kidney RNA-Seq, averaged per sample+gene
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)                    AS sample_type,   -- primary tumor / solid tissue normal
+    gene_name                                  AS gene_symbol,
+    AVG( LOG(fpkm_unstranded + 1) / LOG(2) )   AS log2_fpkm      -- average across any aliquots
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)      = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  GROUP BY sample_barcode, sample_type, gene_symbol
+),
+
+ccrcc_proteome AS (            -- 3)  Proteome values mapped & averaged
+  SELECT
+    m.sample_barcode,
+    p.gene_symbol,
+    AVG(p.protein_abundance_log2ratio) AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map m
+      ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  WHERE
+    p.protein_abundance_log2ratio IS NOT NULL
+  GROUP BY m.sample_barcode, p.gene_symbol
+),
+
+joined_pairs AS (              -- 4)  Matched RNA / Proteome pairs
+  SELECT
+    r.sample_type,
+    r.gene_symbol,
+    r.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    kidney_rna      r
+  JOIN
+    ccrcc_proteome  p
+  USING (sample_barcode, gene_symbol)
+  WHERE
+    p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm  IS NOT NULL
+),
+
+corr_per_gene AS (             -- 5a)  Pearson r for each gene & sample-type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5           -- keep strong correlations
+)
+
+-- 5b)  Average the retained correlations for each sample-type
+SELECT
+  INITCAP(sample_type)  AS sample_type_name,
+  AVG(gene_corr)        AS avg_correlation
+FROM corr_per_gene
+GROUP BY sample_type
+ORDER BY sample_type_name;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:50:48 - Thread-2278 (execute) - INFO - itercount: 3
+2025-05-05 03:50:48 - Thread-2278 (execute) - INFO - [Self-refine]
+Input sql:
+/*  Correlate gene–level protein abundance with log2-transformed RNA-Seq
+    for ccRCC “Primary Tumor” vs “Solid Tissue Normal”.
+    -------------------------------------------------------------------
+    1)  Pull the GDC ⇄ PDC biospecimen bridge table (wild-carded because the
+        exact suffix may vary across snapshots).
+    2)  Collect Kidney RNA-Seq values (log2(FPKM+1)) and average any replicate
+        rows per (sample, gene).
+    3)  Map CCRCC proteome aliquots to GDC sample barcodes, then average any
+        replicate rows per (sample, gene).
+    4)  Join RNA and proteome on (sample_barcode, gene_symbol).
+    5)  For every (sample_type, gene) compute Pearson correlation across
+        samples, keep |r| > 0.5, then report the mean correlation per
+        sample-type.
+*/
+WITH gdc_pdc_map AS (          -- 1)  Aliquot → sample_barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_barcode
+  FROM
+    `isb-cgc-bq.PDC_metadata.gdc_to_pdc_biospecimen*`      -- wildcard picks the live table
+  WHERE sample_barcode IS NOT NULL
+),
+
+kidney_rna AS (                -- 2)  Kidney RNA-Seq, averaged per sample+gene
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)                    AS sample_type,   -- primary tumor / solid tissue normal
+    gene_name                                  AS gene_symbol,
+    AVG( LOG(fpkm_unstranded + 1) / LOG(2) )   AS log2_fpkm      -- average across any aliquots
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)      = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  GROUP BY sample_barcode, sample_type, gene_symbol
+),
+
+ccrcc_proteome AS (            -- 3)  Proteome values mapped & averaged
+  SELECT
+    m.sample_barcode,
+    p.gene_symbol,
+    AVG(p.protein_abundance_log2ratio) AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map m
+      ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  WHERE
+    p.protein_abundance_log2ratio IS NOT NULL
+  GROUP BY m.sample_barcode, p.gene_symbol
+),
+
+joined_pairs AS (              -- 4)  Matched RNA / Proteome pairs
+  SELECT
+    r.sample_type,
+    r.gene_symbol,
+    r.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    kidney_rna      r
+  JOIN
+    ccrcc_proteome  p
+  USING (sample_barcode, gene_symbol)
+  WHERE
+    p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm  IS NOT NULL
+),
+
+corr_per_gene AS (             -- 5a)  Pearson r for each gene & sample-type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5           -- keep strong correlations
+)
+
+-- 5b)  Average the retained correlations for each sample-type
+SELECT
+  INITCAP(sample_type)  AS sample_type_name,
+  AVG(gene_corr)        AS avg_correlation
+FROM corr_per_gene
+GROUP BY sample_type
+ORDER BY sample_type_name;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##400 isb-cgc-bq:PDC_metadata.gdc_to_pdc_biospecimen* does not match any table.; reason: invalid, message: isb-cgc-bq:PDC_metadata.gdc_to_pdc_biospecimen* does not match any table.\n\nLocation: US\nJob ID: 99ba49ef-bf14-47d5-b071-8cf3edff79ee\n'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 03:52:26 - Thread-2278 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Correlate gene-level protein abundance with log2-transformed RNA-Seq
+    for CPTAC clear-cell RCC (“Primary Tumor” vs “Solid Tissue Normal”).
+
+    Steps
+    -----
+    1)  Use the PDC aliquot-to-case mapping table to convert proteome
+        aliquot IDs to the GDC/CPTAC sample submitter IDs (barcodes).
+    2)  Collect Kidney RNA-Seq values, compute log2(FPKM + 1), and – if
+        multiple aliquots exist – average to one value per (sample, gene).
+    3)  Collect CCRCC proteome log2 ratios, map them to the same sample
+        IDs, and (again) average any replicates.
+    4)  Join RNA and proteome on (sample_id, gene), producing paired values.
+    5)  For each (sample_type, gene) compute Pearson r; retain only |r|>0.5.
+    6)  Report the mean of the retained correlations for each sample type.   */
+
+WITH gdc_pdc_map AS (          -- 1)  Aliquot → sample barcode bridge
+  SELECT DISTINCT
+    aliquot_submitter_id,
+    sample_submitter_id AS sample_barcode            -- matches GDC/CPTAC sample ID
+  FROM
+    `isb-cgc-bq.PDC_metadata.aliquot_to_case_mapping_current`
+  WHERE
+    aliquot_submitter_id IS NOT NULL
+    AND sample_submitter_id IS NOT NULL
+),
+
+kidney_rna AS (                -- 2)  Kidney RNA-Seq, averaged per sample+gene
+  SELECT
+    sample_barcode,
+    LOWER(sample_type_name)                    AS sample_type,      -- primary tumor / solid tissue normal
+    gene_name                                  AS gene_symbol,
+    AVG( LOG(fpkm_unstranded + 1) / LOG(2) )   AS log2_fpkm         -- average across any aliquots
+  FROM
+    `isb-cgc-bq.CPTAC.RNAseq_hg38_gdc_current`
+  WHERE
+        LOWER(primary_site)      = 'kidney'
+    AND LOWER(sample_type_name) IN ('primary tumor','solid tissue normal')
+  GROUP BY sample_barcode, sample_type, gene_symbol
+),
+
+ccrcc_proteome AS (            -- 3)  Proteome values mapped & averaged
+  SELECT
+    m.sample_barcode,
+    p.gene_symbol,
+    AVG(p.protein_abundance_log2ratio) AS prot_log2ratio
+  FROM
+    `isb-cgc-bq.CPTAC.quant_proteome_CPTAC_CCRCC_discovery_study_pdc_current` p
+  JOIN
+    gdc_pdc_map m
+      ON m.aliquot_submitter_id = p.aliquot_submitter_id
+  WHERE
+    p.protein_abundance_log2ratio IS NOT NULL
+  GROUP BY m.sample_barcode, p.gene_symbol
+),
+
+joined_pairs AS (              -- 4)  Matched RNA / Proteome pairs
+  SELECT
+    r.sample_type,
+    r.gene_symbol,
+    r.sample_barcode,
+    p.prot_log2ratio,
+    r.log2_fpkm
+  FROM
+    kidney_rna     r
+  JOIN
+    ccrcc_proteome p
+    ON  p.sample_barcode = r.sample_barcode
+    AND p.gene_symbol    = r.gene_symbol
+  WHERE
+        p.prot_log2ratio IS NOT NULL
+    AND r.log2_fpkm      IS NOT NULL
+),
+
+corr_per_gene AS (             -- 5)  Pearson r by gene & sample type
+  SELECT
+    sample_type,
+    gene_symbol,
+    CORR(prot_log2ratio, log2_fpkm) AS gene_corr
+  FROM joined_pairs
+  GROUP BY sample_type, gene_symbol
+  HAVING ABS(gene_corr) > 0.5                -- keep strong correlations
+)
+
+-- 6)  Mean correlation for each sample class
+SELECT
+  INITCAP(sample_type)  AS sample_type_name,
+  AVG(gene_corr)        AS avg_correlation
+FROM corr_per_gene
+GROUP BY sample_type
+ORDER BY sample_type_name;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:52:33 - Thread-2278 (execute) - INFO - Total iteration counts: 3

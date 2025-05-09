@@ -1,0 +1,48 @@
+-- Consolidate Visium spatial-transcriptomics (RNA-seq) Levels 1-4 plus auxiliary
+-- metadata for run “HT264P1-S1H2Fc2U1Z1Bs1-H2Bs2-Test”
+SELECT DISTINCT
+       "Filename",
+       "HTAN_Parent_Biospecimen_ID",
+       "Component",
+       "File_Format",
+       "entityId" AS "Entity_ID",
+       "Run_ID"
+FROM   (
+           SELECT "Filename", "HTAN_Parent_Biospecimen_ID", "Component",
+                  "File_Format", "entityId", "Run_ID"
+           FROM   "HTAN_2"."HTAN"."_10XVISIUM_SPATIALTRANSCRIPTOMICS_SCRNASEQ_LEVEL1_METADATA_CURRENT"
+           
+           UNION ALL
+           
+           SELECT "Filename", "HTAN_Parent_Biospecimen_ID", "Component",
+                  "File_Format", "entityId", "Run_ID"
+           FROM   "HTAN_2"."HTAN"."_10XVISIUM_SPATIALTRANSCRIPTOMICS_SCRNASEQ_LEVEL2_METADATA_CURRENT"
+           
+           UNION ALL
+           
+           SELECT "Filename", "HTAN_Parent_Biospecimen_ID", "Component",
+                  "File_Format", "entityId", "Run_ID"
+           FROM   "HTAN_2"."HTAN"."_10XVISIUM_SPATIALTRANSCRIPTOMICS_SCRNASEQ_LEVEL3_METADATA_CURRENT"
+           
+           UNION ALL
+           
+           SELECT "Filename", "HTAN_Parent_Biospecimen_ID", "Component",
+                  "File_Format", "entityId", "Run_ID"
+           FROM   "HTAN_2"."HTAN"."_10XVISIUM_SPATIALTRANSCRIPTOMICS_SCRNASEQ_LEVEL4_METADATA_CURRENT"
+           
+           UNION ALL
+           
+           SELECT "Filename", "HTAN_Parent_Biospecimen_ID", "Component",
+                  "File_Format", "entityId", "Run_ID"
+           FROM   "HTAN_2"."HTAN"."_10XVISIUM_SPATIALTRANSCRIPTOMICS_AUXILIARYFILES_METADATA_CURRENT"
+       ) AS combined
+WHERE  "Run_ID" ILIKE '%HT264P1-S1H2Fc2U1Z1Bs1-H2Bs2-Test%'
+ORDER BY
+       CASE
+           WHEN "Component" ILIKE '%Level1%' THEN 1
+           WHEN "Component" ILIKE '%Level2%' THEN 2
+           WHEN "Component" ILIKE '%Level3%' THEN 3
+           WHEN "Component" ILIKE '%Level4%' THEN 4
+           ELSE 5
+       END,
+       "Filename";

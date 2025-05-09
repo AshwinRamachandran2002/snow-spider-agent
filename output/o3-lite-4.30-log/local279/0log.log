@@ -1,0 +1,2511 @@
+2025-05-01 03:32:12 - Thread-1516 (execute) - INFO - [Answer format]
+```csv
+product_id,month,abs_difference
+```
+[Answer format]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Exploration]
+Relevant tables / columns and why they matter  
+
+• product_minimums.qty_minimum : minimum level that must be kept in stock for each product.  
+• product_minimums.qty_purchase : quantity we re‑order (restock) each time the minimum is violated.  
+• inventory.product_id / inventory.qty : on‑hand quantity as of the latest snapshot (we will treat the snapshot that belongs to December‑2018 as the starting level).  
+• monthly_sales.product_id / monthly_sales.mth / monthly_sales.qty : aggregate monthly demand that will be subtracted from inventory.  
+• purchases.product_id / purchases.purchased / purchases.qty : can be used to double‑check how re‑stocking is normally logged (not strictly required for the modelling exercise but good to inspect).  
+
+Typical filters you may use  
+
+• monthly_sales.mth BETWEEN '2018-12-01' AND '2019-12-01'  
+• strftime('%Y', monthly_sales.mth) = '2019'  
+• purchases.purchased >= '2019-01-01'  
+• inventory.qty IS NOT NULL  
+
+Ten exploration queries, from simple to gradually more analytical, all capped at 20 rows.
+
+```sql
+-- 1. Description:  List every product that has a defined minimum inventory level.
+SELECT DISTINCT
+       "product_id",
+       "qty_minimum",
+       "qty_purchase"
+FROM   "product_minimums"
+LIMIT  20;
+```
+
+```sql
+-- 2. Description:  View a few rows from the raw inventory snapshot to see current on‑hand quantities.
+SELECT DISTINCT
+       "product_id",
+       "qty"
+FROM   "inventory"
+LIMIT  20;
+```
+
+```sql
+-- 3. Description:  See which inventory rows belong to December 2018 (assuming purchase_id can locate time).
+SELECT DISTINCT
+       i."product_id",
+       i."qty",
+       p."purchased"          -- date of the purchase that created the stock line
+FROM   "inventory"  AS i
+JOIN   "purchases"  AS p  ON p."id" = i."purchase_id"
+WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+LIMIT  20;
+```
+
+```sql
+-- 4. Description:  Grab monthly sales figures from December 2018 that will be our starting offset.
+SELECT DISTINCT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "mth" = '2018-12-01'
+LIMIT  20;
+```
+
+```sql
+-- 5. Description:  Inspect all monthly sales for 2019 for products that have minimum levels.
+SELECT DISTINCT
+       ms."product_id",
+       ms."mth",
+       ms."qty"
+FROM   "monthly_sales"  AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+WHERE  strftime('%Y', ms."mth") = '2019'
+LIMIT  20;
+```
+
+```sql
+-- 6. Description:  Look at how purchases (potential re‑stock events) are recorded for 2019.
+SELECT DISTINCT
+       "product_id",
+       "purchased",
+       "qty"
+FROM   "purchases"
+WHERE  "purchased" >= '2019-01-01'
+LIMIT  20;
+```
+
+```sql
+-- 7. Description:  Get a feel for the size of 2019 monthly sales vs the minimum level (first 20 rows).
+SELECT DISTINCT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."qty"          AS "mth_sales"
+FROM   "monthly_sales"   AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+WHERE  strftime('%Y', ms."mth") = '2019'
+LIMIT  20;
+```
+
+```sql
+-- 8. Description:  Compute provisional ending inventory for January 2019
+--     (Dec‑2018 stock minus Jan‑2019 sales) for products where we know both figures.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"   AS "dec_end_qty",
+       jan19."sales_qty",
+       dec18."start_qty" - jan19."sales_qty"  AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20;
+```
+
+```sql
+-- 9. Description:  Identify products whose January 2019 ending inventory falls below minimum.
+SELECT
+       t."product_id",
+       t."jan19_end_qty",
+       pm."qty_minimum"
+FROM (
+      /* query 8 re‑used here as CTE or sub‑query */
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - jan19."sales_qty" AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+) AS t
+JOIN "product_minimums" AS pm  ON pm."product_id" = t."product_id"
+WHERE t."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20;
+```
+
+```sql
+-- 10. Description:  (Toward the final answer) For every product/month in 2019
+--      compute |ending_qty − minimum| and keep the month where that absolute
+--      difference is smallest.  (Still LIMIT 20 for sampling.)
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales_19 AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running AS (
+     -- recursively subtract month by month and restock when needed
+     SELECT
+            s."product_id",
+            '2019-01-01' AS "mth",
+            CAST(s."start_qty" AS REAL) AS "opening",
+            CAST(s."start_qty" - COALESCE(j."sales_qty",0) AS REAL) AS "ending"
+     FROM   start_stock  AS s
+     LEFT   JOIN sales_19 AS j  ON j."product_id" = s."product_id" AND j."mth" = '2019-01-01'
+     UNION ALL
+     SELECT
+            r."product_id",
+            date(r."mth", '+1 month') AS "mth",
+            CASE
+                 WHEN r."ending" < pm."qty_minimum"
+                 THEN r."ending" + pm."qty_purchase"
+                 ELSE r."ending"
+            END AS "opening",
+            CASE
+                 WHEN r."ending" < pm."qty_minimum"
+                 THEN r."ending" + pm."qty_purchase" - COALESCE(j2."sales_qty",0)
+                 ELSE r."ending" - COALESCE(j2."sales_qty",0)
+            END AS "ending"
+     FROM   running            AS r
+     JOIN   product_minimums   AS pm ON pm."product_id" = r."product_id"
+     LEFT   JOIN sales_19      AS j2 ON j2."product_id" = r."product_id"
+                                      AND j2."mth" = date(r."mth", '+1 month')
+     WHERE  r."mth" < '2019-12-01'
+),
+abs_diff AS (
+     SELECT
+            r."product_id",
+            r."mth",
+            ABS(r."ending" - pm."qty_minimum") AS "abs_diff"
+     FROM   running           AS r
+     JOIN   product_minimums  AS pm USING ("product_id")
+)
+SELECT
+       ad."product_id",
+       ad."mth"          AS "closest_month",
+       ad."abs_diff"
+FROM (
+     SELECT
+            product_id,
+            mth,
+            abs_diff,
+            ROW_NUMBER() OVER (PARTITION BY product_id
+                               ORDER BY abs_diff ASC) AS rn
+     FROM   abs_diff
+) ad
+WHERE  ad.rn = 1
+LIMIT 20;
+```
+
+Each query progressively reveals the data needed and culminates in a working prototype of the recursive monthly inventory adjustment required to answer the task.
+[Exploration]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Try to execute]
+-- 1. Description:  List every product that has a defined minimum inventory level.
+SELECT DISTINCT
+       "product_id",
+       "qty_minimum",
+       "qty_purchase"
+FROM   "product_minimums"
+LIMIT  20;
+[Try to execute]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Description:  List every product that has a defined minimum inventory level.
+SELECT DISTINCT
+       "product_id",
+       "qty_minimum",
+       "qty_purchase"
+FROM   "product_minimums"
+LIMIT  20;
+Results:
+product_id,qty_minimum,qty_purchase
+6520,100.0,400.0
+6600,30.0,100.0
+
+[Successfully executed]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Try to execute]
+-- 2. Description:  View a few rows from the raw inventory snapshot to see current on‑hand quantities.
+SELECT DISTINCT
+       "product_id",
+       "qty"
+FROM   "inventory"
+LIMIT  20;
+[Try to execute]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Description:  View a few rows from the raw inventory snapshot to see current on‑hand quantities.
+SELECT DISTINCT
+       "product_id",
+       "qty"
+FROM   "inventory"
+LIMIT  20;
+Results:
+product_id,qty
+4040,6.0
+4040,48.0
+4040,8.0
+4040,5.0
+4040,3.0
+4040,7.0
+4040,31.0
+4160,29.0
+4160,48.0
+4160,31.0
+4160,27.0
+4160,26.0
+4160,30.0
+4280,36.0
+4280,39.0
+4280,35.0
+4280,34.0
+4280,37.0
+4280,19.0
+5310,41.0
+
+[Successfully executed]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Try to execute]
+-- 3. Description:  See which inventory rows belong to December 2018 (assuming purchase_id can locate time).
+SELECT DISTINCT
+       i."product_id",
+       i."qty",
+       p."purchased"          -- date of the purchase that created the stock line
+FROM   "inventory"  AS i
+JOIN   "purchases"  AS p  ON p."id" = i."purchase_id"
+WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+LIMIT  20;
+[Try to execute]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. Description:  See which inventory rows belong to December 2018 (assuming purchase_id can locate time).
+SELECT DISTINCT
+       i."product_id",
+       i."qty",
+       p."purchased"          -- date of the purchase that created the stock line
+FROM   "inventory"  AS i
+JOIN   "purchases"  AS p  ON p."id" = i."purchase_id"
+WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+LIMIT  20;
+Results:
+product_id,qty,purchased
+4160,30.0,2018-12-22
+4160,48.0,2018-12-22
+4280,19.0,2018-12-23
+5430,6.0,2018-12-25
+5430,48.0,2018-12-25
+6520,43.0,2018-12-26
+7870,6.0,2018-12-29
+7870,48.0,2018-12-29
+
+[Successfully executed]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Try to execute]
+-- 4. Description:  Grab monthly sales figures from December 2018 that will be our starting offset.
+SELECT DISTINCT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "mth" = '2018-12-01'
+LIMIT  20;
+[Try to execute]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4. Description:  Grab monthly sales figures from December 2018 that will be our starting offset.
+SELECT DISTINCT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "mth" = '2018-12-01'
+LIMIT  20;
+Results:
+product_id,mth,qty
+4040,2018-12-01,27
+4160,2018-12-01,160
+4280,2018-12-01,21
+5310,2018-12-01,33
+5430,2018-12-01,39
+6520,2018-12-01,14
+6600,2018-12-01,1
+7790,2018-12-01,5
+7870,2018-12-01,13
+7950,2018-12-01,50
+
+[Successfully executed]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Try to execute]
+-- 5. Description:  Inspect all monthly sales for 2019 for products that have minimum levels.
+SELECT DISTINCT
+       ms."product_id",
+       ms."mth",
+       ms."qty"
+FROM   "monthly_sales"  AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+WHERE  strftime('%Y', ms."mth") = '2019'
+LIMIT  20;
+[Try to execute]
+2025-05-01 03:33:56 - Thread-1516 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 03:34:56 - Thread-1516 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  The previous join returned nothing; perhaps the products that have a minimum
+--level (those in product_minimums) simply lack any 2019 sales.  To check this hypothesis,
+--list the first 20 monthly_sales rows for those products (6520 and 6600) across all years.
+SELECT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "product_id" IN (SELECT "product_id" FROM "product_minimums")
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 03:34:56 - Thread-1516 (execute) - INFO - [Results for corrected sql]
+product_id,mth,qty
+6520,2016-01-01,13
+6520,2016-02-01,16
+6520,2016-03-01,9
+6520,2016-04-01,8
+6520,2016-05-01,41
+6520,2016-06-01,61
+6520,2016-07-01,66
+6520,2016-08-01,57
+6520,2016-09-01,53
+6520,2016-10-01,48
+6520,2016-11-01,22
+6520,2016-12-01,21
+6520,2017-01-01,19
+6520,2017-02-01,18
+6520,2017-03-01,21
+6520,2017-04-01,24
+6520,2017-05-01,38
+6520,2017-06-01,52
+6520,2017-07-01,71
+6520,2017-08-01,69
+
+[Results for corrected sql]
+2025-05-01 03:36:00 - Thread-1516 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  Show 2019 purchase events for the products that have defined minimum
+--levels (6520 and 6600).  This lets us see whether any restocking for these
+--products is already recorded in the purchases table.
+SELECT
+       "product_id",
+       "purchased",
+       "qty"
+FROM   "purchases"
+WHERE  "product_id" IN (SELECT "product_id" FROM "product_minimums")
+  AND  "purchased" BETWEEN '2019-01-01' AND '2019-12-31'
+LIMIT 20;
+```
+
+```sql
+--Description:  Compare monthly sales volumes with the minimum thresholds for the
+--same products, but across ALL years (the strict 2019 filter produced no rows).
+SELECT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."mth",
+       ms."qty"   AS "mth_sales"
+FROM   "monthly_sales"    AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+LIMIT 20;
+```
+
+```sql
+--Description:  Compute provisional ending inventory for January 2019 by taking the
+--December‑2018 stock (summed) and subtracting January‑2019 sales.  Use LEFT JOIN
+--so that products with no January sales default to 0 sales.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"                       AS "dec_end_qty",
+       COALESCE(jan19."sales_qty", 0)          AS "jan19_sales",
+       dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+LEFT JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20;
+```
+
+```sql
+--Description:  Using the January 2019 ending inventory just calculated, list the
+--products where that ending quantity falls below the required minimum.  Again
+--COALESCE ensures missing sales count as zero.
+WITH jan_calc AS (
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      LEFT JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+)
+SELECT
+       jc."product_id",
+       jc."jan19_end_qty",
+       pm."qty_minimum"
+FROM   jan_calc        AS jc
+JOIN   product_minimums AS pm ON pm."product_id" = jc."product_id"
+WHERE  jc."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20;
+```
+
+```sql
+--Description:  Recursive model for the whole of 2019:
+-- 1) Start with Dec‑2018 inventory totals.
+-- 2) Subtract monthly sales (0 if none).
+-- 3) If ending inventory < minimum, restock by qty_purchase before next month.
+-- 4) For every product, keep the 2019 month with the smallest |ending − minimum|.
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running(month_idx, product_id, mth, opening, ending) AS (
+     -- month_idx tracks recursion depth (1..12)
+     SELECT
+            1,
+            s."product_id",
+            '2019-01-01',
+            s."start_qty"                  AS opening,
+            s."start_qty" - COALESCE(sa."sales_qty",0) AS ending
+     FROM   start_stock AS s
+     LEFT   JOIN sales AS sa
+            ON sa."product_id" = s."product_id" AND sa."mth" = '2019-01-01'
+     UNION ALL
+     SELECT
+            r.month_idx + 1,
+            r.product_id,
+            date(r.mth , '+1 month'),
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase
+                 ELSE r.ending
+            END                                                          AS opening,
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase - COALESCE(sa2.sales_qty,0)
+                 ELSE r.ending                - COALESCE(sa2.sales_qty,0)
+            END                                                          AS ending
+     FROM   running          AS r
+     JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+     LEFT   JOIN sales       AS sa2 ON sa2.product_id = r.product_id
+                                   AND sa2.mth = date(r.mth , '+1 month')
+     WHERE  r.month_idx < 12           -- recurse until December
+),
+abs_gap AS (
+     SELECT
+            r.product_id,
+            r.mth,
+            ABS(r.ending - pm.qty_minimum) AS gap
+     FROM   running          AS r
+     JOIN   product_minimums AS pm USING (product_id)
+)
+SELECT
+       ag.product_id,
+       ag.mth      AS closest_month,
+       ag.gap      AS abs_difference
+FROM (
+     SELECT
+            product_id,
+            mth,
+            gap,
+            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY gap) AS rn
+     FROM   abs_gap
+) ag
+WHERE  ag.rn = 1
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 03:36:00 - Thread-1516 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  The previous join returned nothing; perhaps the products that have a minimum
+--level (those in product_minimums) simply lack any 2019 sales.  To check this hypothesis,
+--list the first 20 monthly_sales rows for those products (6520 and 6600) across all years.
+SELECT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "product_id" IN (SELECT "product_id" FROM "product_minimums")
+LIMIT 20;
+Results:
+product_id,mth,qty
+6520,2016-01-01,13
+6520,2016-02-01,16
+6520,2016-03-01,9
+6520,2016-04-01,8
+6520,2016-05-01,41
+6520,2016-06-01,61
+6520,2016-07-01,66
+6520,2016-08-01,57
+6520,2016-09-01,53
+6520,2016-10-01,48
+6520,2016-11-01,22
+6520,2016-12-01,21
+6520,2017-01-01,19
+6520,2017-02-01,18
+6520,2017-03-01,21
+6520,2017-04-01,24
+6520,2017-05-01,38
+6520,2017-06-01,52
+6520,2017-07-01,71
+6520,2017-08-01,69
+
+[Successfully corrected]
+2025-05-01 03:36:00 - Thread-1516 (execute) - INFO - [Try to execute]
+--Description:  Show 2019 purchase events for the products that have defined minimum
+--levels (6520 and 6600).  This lets us see whether any restocking for these
+--products is already recorded in the purchases table.
+SELECT
+       "product_id",
+       "purchased",
+       "qty"
+FROM   "purchases"
+WHERE  "product_id" IN (SELECT "product_id" FROM "product_minimums")
+  AND  "purchased" BETWEEN '2019-01-01' AND '2019-12-31'
+LIMIT 20
+[Try to execute]
+2025-05-01 03:36:00 - Thread-1516 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 03:36:33 - Thread-1516 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Because filtering on 2019 produced no rows, drop the year condition
+--to see whether products that have minimum‑stock rules (6520 and 6600) have ever
+--been recorded in the purchases table at any time.  Return the first 20 rows.
+SELECT
+       "product_id",
+       "purchased",
+       "qty"
+FROM   "purchases"
+WHERE  "product_id" IN (SELECT "product_id" FROM "product_minimums")
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 03:36:33 - Thread-1516 (execute) - INFO - [Results for corrected sql]
+product_id,purchased,qty
+6520,2016-02-06,87
+6520,2016-04-06,90
+6520,2016-06-06,86
+6520,2016-08-06,85
+6520,2016-10-06,88
+6520,2016-12-06,64
+6520,2017-01-16,88
+6520,2017-03-16,91
+6520,2017-05-16,87
+6520,2017-07-16,86
+6520,2017-09-16,89
+6520,2017-11-16,59
+6520,2018-02-26,72
+6520,2018-04-26,74
+6520,2018-06-26,70
+6520,2018-08-26,69
+6520,2018-10-26,72
+6520,2018-12-26,43
+6600,2016-01-07,34
+6600,2016-03-07,37
+
+[Results for corrected sql]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  Compare monthly sales volumes with the minimum thresholds for the
+--same products across ALL years (dropped the 2019‑only filter that produced no rows).
+SELECT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."mth",
+       ms."qty"   AS "mth_sales"
+FROM   "monthly_sales"    AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+LIMIT 20;
+```
+
+```sql
+--Description:  Compute provisional ending inventory for January 2019 by taking the
+--December‑2018 stock (summed) and subtracting January‑2019 sales.  A LEFT JOIN
+--makes sales default to 0 when no January‑2019 row exists.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"                       AS "dec_end_qty",
+       COALESCE(jan19."sales_qty", 0)          AS "jan19_sales",
+       dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+LEFT JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20;
+```
+
+```sql
+--Description:  Using the January 2019 ending inventory just calculated, list the
+--products whose ending quantity falls below the required minimum.  Missing sales
+--are treated as zero via COALESCE.
+WITH jan_calc AS (
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      LEFT JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+)
+SELECT
+       jc."product_id",
+       jc."jan19_end_qty",
+       pm."qty_minimum"
+FROM   jan_calc         AS jc
+JOIN   product_minimums AS pm ON pm."product_id" = jc."product_id"
+WHERE  jc."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20;
+```
+
+```sql
+--Description:  Recursive model for the whole of 2019:
+-- 1) Start with Dec‑2018 inventory totals.
+-- 2) Subtract monthly sales (0 if none).
+-- 3) If ending inventory < minimum, restock by qty_purchase before next month.
+-- 4) For every product, keep the 2019 month with the smallest |ending − minimum|.
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running(month_idx, product_id, mth, opening, ending) AS (
+     -- initialise with January 2019
+     SELECT
+            1,
+            s."product_id",
+            '2019-01-01',
+            s."start_qty"                  AS opening,
+            s."start_qty" - COALESCE(sa."sales_qty",0) AS ending
+     FROM   start_stock AS s
+     LEFT   JOIN sales AS sa
+            ON sa."product_id" = s."product_id" AND sa."mth" = '2019-01-01'
+     UNION ALL
+     -- advance one month at a time, restocking if needed
+     SELECT
+            r.month_idx + 1,
+            r.product_id,
+            date(r.mth , '+1 month'),
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase
+                 ELSE r.ending
+            END                                                          AS opening,
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase - COALESCE(sa2.sales_qty,0)
+                 ELSE r.ending                - COALESCE(sa2.sales_qty,0)
+            END                                                          AS ending
+     FROM   running          AS r
+     JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+     LEFT   JOIN sales       AS sa2 ON sa2.product_id = r.product_id
+                                   AND sa2.mth = date(r.mth , '+1 month')
+     WHERE  r.month_idx < 12           -- recurse until December
+),
+abs_gap AS (
+     SELECT
+            r.product_id,
+            r.mth,
+            ABS(r.ending - pm.qty_minimum) AS gap
+     FROM   running          AS r
+     JOIN   product_minimums AS pm USING (product_id)
+)
+SELECT
+       ag.product_id,
+       ag.mth      AS closest_month,
+       ag.gap      AS abs_difference
+FROM (
+     SELECT
+            product_id,
+            mth,
+            gap,
+            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY gap) AS rn
+     FROM   abs_gap
+) ag
+WHERE  ag.rn = 1
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Because filtering on 2019 produced no rows, drop the year condition
+--to see whether products that have minimum‑stock rules (6520 and 6600) have ever
+--been recorded in the purchases table at any time.  Return the first 20 rows.
+SELECT
+       "product_id",
+       "purchased",
+       "qty"
+FROM   "purchases"
+WHERE  "product_id" IN (SELECT "product_id" FROM "product_minimums")
+LIMIT 20;
+Results:
+product_id,purchased,qty
+6520,2016-02-06,87
+6520,2016-04-06,90
+6520,2016-06-06,86
+6520,2016-08-06,85
+6520,2016-10-06,88
+6520,2016-12-06,64
+6520,2017-01-16,88
+6520,2017-03-16,91
+6520,2017-05-16,87
+6520,2017-07-16,86
+6520,2017-09-16,89
+6520,2017-11-16,59
+6520,2018-02-26,72
+6520,2018-04-26,74
+6520,2018-06-26,70
+6520,2018-08-26,69
+6520,2018-10-26,72
+6520,2018-12-26,43
+6600,2016-01-07,34
+6600,2016-03-07,37
+
+[Successfully corrected]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Try to execute]
+--Description:  Compare monthly sales volumes with the minimum thresholds for the
+--same products across ALL years (dropped the 2019‑only filter that produced no rows).
+SELECT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."mth",
+       ms."qty"   AS "mth_sales"
+FROM   "monthly_sales"    AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+LIMIT 20
+[Try to execute]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  Compare monthly sales volumes with the minimum thresholds for the
+--same products across ALL years (dropped the 2019‑only filter that produced no rows).
+SELECT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."mth",
+       ms."qty"   AS "mth_sales"
+FROM   "monthly_sales"    AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+LIMIT 20
+Results:
+product_id,qty_minimum,mth,mth_sales
+6520,100.0,2016-01-01,13
+6520,100.0,2016-02-01,16
+6520,100.0,2016-03-01,9
+6520,100.0,2016-04-01,8
+6520,100.0,2016-05-01,41
+6520,100.0,2016-06-01,61
+6520,100.0,2016-07-01,66
+6520,100.0,2016-08-01,57
+6520,100.0,2016-09-01,53
+6520,100.0,2016-10-01,48
+6520,100.0,2016-11-01,22
+6520,100.0,2016-12-01,21
+6520,100.0,2017-01-01,19
+6520,100.0,2017-02-01,18
+6520,100.0,2017-03-01,21
+6520,100.0,2017-04-01,24
+6520,100.0,2017-05-01,38
+
+[Successfully executed]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Try to execute]
+--Description:  Compute provisional ending inventory for January 2019 by taking the
+--December‑2018 stock (summed) and subtracting January‑2019 sales.  A LEFT JOIN
+--makes sales default to 0 when no January‑2019 row exists.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"                       AS "dec_end_qty",
+       COALESCE(jan19."sales_qty", 0)          AS "jan19_sales",
+       dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+LEFT JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20
+[Try to execute]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  Compute provisional ending inventory for January 2019 by taking the
+--December‑2018 stock (summed) and subtracting January‑2019 sales.  A LEFT JOIN
+--makes sales default to 0 when no January‑2019 row exists.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"                       AS "dec_end_qty",
+       COALESCE(jan19."sales_qty", 0)          AS "jan19_sales",
+       dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+LEFT JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20
+Results:
+product_id,dec_end_qty,jan19_sales,jan19_end_qty
+4160,78.0,0,78.0
+4280,19.0,0,19.0
+5430,54.0,0,54.0
+6520,43.0,0,43.0
+7870,54.0,0,54.0
+
+[Successfully executed]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Try to execute]
+--Description:  Using the January 2019 ending inventory just calculated, list the
+--products whose ending quantity falls below the required minimum.  Missing sales
+--are treated as zero via COALESCE.
+WITH jan_calc AS (
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      LEFT JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+)
+SELECT
+       jc."product_id",
+       jc."jan19_end_qty",
+       pm."qty_minimum"
+FROM   jan_calc         AS jc
+JOIN   product_minimums AS pm ON pm."product_id" = jc."product_id"
+WHERE  jc."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20
+[Try to execute]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  Using the January 2019 ending inventory just calculated, list the
+--products whose ending quantity falls below the required minimum.  Missing sales
+--are treated as zero via COALESCE.
+WITH jan_calc AS (
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      LEFT JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+)
+SELECT
+       jc."product_id",
+       jc."jan19_end_qty",
+       pm."qty_minimum"
+FROM   jan_calc         AS jc
+JOIN   product_minimums AS pm ON pm."product_id" = jc."product_id"
+WHERE  jc."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20
+Results:
+product_id,jan19_end_qty,qty_minimum
+6520,43.0,100.0
+
+[Successfully executed]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Try to execute]
+--Description:  Recursive model for the whole of 2019:
+-- 1) Start with Dec‑2018 inventory totals.
+-- 2) Subtract monthly sales (0 if none).
+-- 3) If ending inventory < minimum, restock by qty_purchase before next month.
+-- 4) For every product, keep the 2019 month with the smallest |ending − minimum|.
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running(month_idx, product_id, mth, opening, ending) AS (
+     -- initialise with January 2019
+     SELECT
+            1,
+            s."product_id",
+            '2019-01-01',
+            s."start_qty"                  AS opening,
+            s."start_qty" - COALESCE(sa."sales_qty",0) AS ending
+     FROM   start_stock AS s
+     LEFT   JOIN sales AS sa
+            ON sa."product_id" = s."product_id" AND sa."mth" = '2019-01-01'
+     UNION ALL
+     -- advance one month at a time, restocking if needed
+     SELECT
+            r.month_idx + 1,
+            r.product_id,
+            date(r.mth , '+1 month'),
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase
+                 ELSE r.ending
+            END                                                          AS opening,
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase - COALESCE(sa2.sales_qty,0)
+                 ELSE r.ending                - COALESCE(sa2.sales_qty,0)
+            END                                                          AS ending
+     FROM   running          AS r
+     JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+     LEFT   JOIN sales       AS sa2 ON sa2.product_id = r.product_id
+                                   AND sa2.mth = date(r.mth , '+1 month')
+     WHERE  r.month_idx < 12           -- recurse until December
+),
+abs_gap AS (
+     SELECT
+            r.product_id,
+            r.mth,
+            ABS(r.ending - pm.qty_minimum) AS gap
+     FROM   running          AS r
+     JOIN   product_minimums AS pm USING (product_id)
+)
+SELECT
+       ag.product_id,
+       ag.mth      AS closest_month,
+       ag.gap      AS abs_difference
+FROM (
+     SELECT
+            product_id,
+            mth,
+            gap,
+            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY gap) AS rn
+     FROM   abs_gap
+) ag
+WHERE  ag.rn = 1
+LIMIT 20
+[Try to execute]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  Recursive model for the whole of 2019:
+-- 1) Start with Dec‑2018 inventory totals.
+-- 2) Subtract monthly sales (0 if none).
+-- 3) If ending inventory < minimum, restock by qty_purchase before next month.
+-- 4) For every product, keep the 2019 month with the smallest |ending − minimum|.
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running(month_idx, product_id, mth, opening, ending) AS (
+     -- initialise with January 2019
+     SELECT
+            1,
+            s."product_id",
+            '2019-01-01',
+            s."start_qty"                  AS opening,
+            s."start_qty" - COALESCE(sa."sales_qty",0) AS ending
+     FROM   start_stock AS s
+     LEFT   JOIN sales AS sa
+            ON sa."product_id" = s."product_id" AND sa."mth" = '2019-01-01'
+     UNION ALL
+     -- advance one month at a time, restocking if needed
+     SELECT
+            r.month_idx + 1,
+            r.product_id,
+            date(r.mth , '+1 month'),
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase
+                 ELSE r.ending
+            END                                                          AS opening,
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase - COALESCE(sa2.sales_qty,0)
+                 ELSE r.ending                - COALESCE(sa2.sales_qty,0)
+            END                                                          AS ending
+     FROM   running          AS r
+     JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+     LEFT   JOIN sales       AS sa2 ON sa2.product_id = r.product_id
+                                   AND sa2.mth = date(r.mth , '+1 month')
+     WHERE  r.month_idx < 12           -- recurse until December
+),
+abs_gap AS (
+     SELECT
+            r.product_id,
+            r.mth,
+            ABS(r.ending - pm.qty_minimum) AS gap
+     FROM   running          AS r
+     JOIN   product_minimums AS pm USING (product_id)
+)
+SELECT
+       ag.product_id,
+       ag.mth      AS closest_month,
+       ag.gap      AS abs_difference
+FROM (
+     SELECT
+            product_id,
+            mth,
+            gap,
+            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY gap) AS rn
+     FROM   abs_gap
+) ag
+WHERE  ag.rn = 1
+LIMIT 20
+Results:
+product_id,closest_month,abs_difference
+6520,2019-01-01,57.0
+
+[Successfully executed]
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - itercount: 0
+2025-05-01 03:37:55 - Thread-1516 (execute) - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: customers
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[(50042, 'The White Hart'), (50741, 'Hygge og Humle'), (51007, 'Boom Beer Bar')]
+
+--------------------------------------------------
+Table full name: conway_gen_zero
+Column name: x Type: INTEGER Description: 
+Column name: y Type: INTEGER Description: 
+Column name: alive Type: INTEGER Description: 
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: web_devices
+Column name: day Type:  Description: 
+Column name: pc Type: INTEGER Description: 
+Column name: tablet Type: INTEGER Description: 
+Column name: phone Type: INTEGER Description: 
+Sample rows:
+[('2019-05-01', 1042, 812, 1610), ('2019-05-02', 967, 1102, 2159)]
+
+--------------------------------------------------
+Table full name: web_demographics
+Column name: day Type:  Description: 
+Column name: m_tw_cnt Type: INTEGER Description: 
+Column name: m_tw_qty Type: INTEGER Description: 
+Column name: m_fb_cnt Type: INTEGER Description: 
+Column name: m_fb_qty Type: INTEGER Description: 
+Column name: f_tw_cnt Type: INTEGER Description: 
+Column name: f_tw_qty Type: INTEGER Description: 
+Column name: f_fb_cnt Type: INTEGER Description: 
+Column name: f_fb_qty Type: INTEGER Description: 
+Sample rows:
+[('2019-05-01', 1232, 86, 1017, 64, 651, 76, 564, 68), ('2019-05-02', 1438, 142, 1198, 70, 840, 92, 752, 78)]
+
+--------------------------------------------------
+Table full name: channels_dim
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Column name: shortcut Type: TEXT Description: 
+Sample rows:
+[(42, 'Twitter', 'tw'), (44, 'Facebook', 'fb')]
+
+--------------------------------------------------
+Table full name: gender_dim
+Column name: letter Type: TEXT Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[('F', 'Female'), ('M', 'Male')]
+
+--------------------------------------------------
+Table full name: packaging
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[(501, 'Bottle 330cl'), (502, 'Bottle 500cl'), (511, 'Gift Carton')]
+
+--------------------------------------------------
+Table full name: packaging_relations
+Column name: packaging_id Type: INTEGER Description: 
+Column name: contains_id Type: INTEGER Description: 
+Column name: qty Type: INTEGER Description: 
+Sample rows:
+[(511, 501, 3), (511, 502, 2), (521, 502, 72)]
+
+--------------------------------------------------
+Table full name: product_groups
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[(142, 'Stout'), (152, 'Belgian'), (202, 'Wheat')]
+
+--------------------------------------------------
+Table full name: products
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Column name: group_id Type: INTEGER Description: 
+Sample rows:
+[(4040, 'Coalminers Sweat', 142), (4160, 'Reindeer Fuel', 142), (4280, 'Hoppy Crude Oil', 142)]
+
+--------------------------------------------------
+Table full name: monthly_sales
+Column name: product_id Type: INTEGER Description: 
+Column name: mth Type: TEXT Description: 
+Column name: qty Type: INTEGER Description: 
+Sample rows:
+[(4040, '2016-01-01', 42), (4040, '2016-02-01', 37), (4040, '2016-03-01', 39)]
+
+--------------------------------------------------
+Table full name: breweries
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[(518, 'Balthazar Brauerei'), (523, 'Happy Hoppy Hippo'), (536, 'Brewing Barbarian')]
+
+--------------------------------------------------
+Table full name: purchases
+Column name: id Type: INTEGER Description: 
+Column name: purchased Type: TEXT Description: 
+Column name: brewery_id Type: INTEGER Description: 
+Column name: product_id Type: INTEGER Description: 
+Column name: qty Type: INTEGER Description: 
+Column name: cost Type: REAL Description: 
+Sample rows:
+[(601, '2016-01-01', 536, 4040, 52, 388.0), (602, '2016-01-03', 536, 4280, 17, 122.0), (603, '2016-01-07', 523, 6600, 34, 163.0)]
+
+--------------------------------------------------
+Table full name: product_alcohol
+Column name: product_id Type: INTEGER Description: 
+Column name: sales_volume Type: REAL Description: 
+Column name: abv Type: REAL Description: 
+Sample rows:
+[(4040, 330.0, 8.5), (4160, 500.0, 6.0), (4280, 330.0, 7.0)]
+
+--------------------------------------------------
+Table full name: customer_favorites
+Column name: customer_id Type: INTEGER Description: 
+Column name: favorite_list Type: TEXT Description: 
+Sample rows:
+[(50042, '4040,5310'), (50741, '5430,7790,7870'), (51007, None)]
+
+--------------------------------------------------
+Table full name: customer_reviews
+Column name: customer_id Type: INTEGER Description: 
+Column name: review_list Type: TEXT Description: 
+Sample rows:
+[(50042, '4040:A,6600:C,7950:B'), (50741, '4160:A'), (51007, None)]
+
+--------------------------------------------------
+Table full name: locations
+Column name: id Type: INTEGER Description: 
+Column name: warehouse Type: INTEGER Description: 
+Column name: aisle Type: TEXT Description: 
+Column name: position Type: INTEGER Description: 
+Sample rows:
+[(1, 1, 'A', 1), (2, 1, 'A', 2), (3, 1, 'A', 3)]
+
+--------------------------------------------------
+Table full name: inventory
+Column name: id Type: INTEGER Description: 
+Column name: location_id Type: INTEGER Description: 
+Column name: product_id Type: INTEGER Description: 
+Column name: purchase_id Type: INTEGER Description: 
+Column name: qty Type: REAL Description: 
+Sample rows:
+[(1148, 244, 7870, 719, 11.0), (1151, 23, 7870, 719, 48.0), (1154, 179, 7950, 720, 36.0)]
+
+--------------------------------------------------
+Table full name: orders
+Column name: id Type: INTEGER Description: 
+Column name: customer_id Type: INTEGER Description: 
+Column name: ordered Type: TEXT Description: 
+Column name: delivery Type: TEXT Description: 
+Sample rows:
+[(421, 50042, '2019-01-15', None), (422, 51069, '2019-01-17', None), (423, 50741, '2019-01-18', None)]
+
+--------------------------------------------------
+Table full name: orderlines
+Column name: id Type: INTEGER Description: 
+Column name: order_id Type: INTEGER Description: 
+Column name: product_id Type: INTEGER Description: 
+Column name: qty Type: REAL Description: 
+Column name: amount Type: REAL Description: 
+Sample rows:
+[(9120, 421, 4280, 110.0, 2400.0), (9122, 421, 6520, 140.0, 2250.0), (9233, 422, 4280, 80.0, 1750.0)]
+
+--------------------------------------------------
+Table full name: monthly_budget
+Column name: product_id Type: INTEGER Description: 
+Column name: mth Type: TEXT Description: 
+Column name: qty Type: REAL Description: 
+Sample rows:
+[(6520, '2018-01-01', 30.0), (6520, '2018-02-01', 30.0), (6520, '2018-03-01', 30.0)]
+
+--------------------------------------------------
+Table full name: product_minimums
+Column name: product_id Type: INTEGER Description: 
+Column name: qty_minimum Type: REAL Description: 
+Column name: qty_purchase Type: REAL Description: 
+Sample rows:
+[(6520, 100.0, 400.0), (6600, 30.0, 100.0)]
+
+--------------------------------------------------
+Table full name: stock
+Column name: symbol Type: TEXT Description: 
+Column name: company Type: TEXT Description: 
+Sample rows:
+[('BEER', 'Good Beer Trading Co')]
+
+--------------------------------------------------
+Table full name: ticker
+Column name: symbol Type: TEXT Description: 
+Column name: day Type: TEXT Description: 
+Column name: price Type: REAL Description: 
+Sample rows:
+[('BEER', '2019-04-01', 14.9), ('BEER', '2019-04-02', 14.2), ('BEER', '2019-04-03', 14.2)]
+
+--------------------------------------------------
+Table full name: web_apps
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[(542, 'Webshop')]
+
+--------------------------------------------------
+Table full name: web_pages
+Column name: app_id Type: INTEGER Description: 
+Column name: page_no Type: INTEGER Description: 
+Column name: friendly_url Type: TEXT Description: 
+Sample rows:
+[(542, 1, '/Shop'), (542, 2, '/Categories'), (542, 3, '/Breweries')]
+
+--------------------------------------------------
+Table full name: web_counter_hist
+Column name: app_id Type: INTEGER Description: 
+Column name: page_no Type: INTEGER Description: 
+Column name: day Type: TEXT Description: 
+Column name: counter Type: INTEGER Description: 
+Sample rows:
+[(542, 1, '2019-04-01', 5010), (542, 1, '2019-04-02', 5088), (542, 1, '2019-04-03', 5160)]
+
+--------------------------------------------------
+Table full name: server_heartbeat
+Column name: server Type: TEXT Description: 
+Column name: beat_time Type: TEXT Description: 
+Sample rows:
+[('10.0.0.100', '2019-04-10 13:00'), ('10.0.0.100', '2019-04-10 13:05'), ('10.0.0.100', '2019-04-10 13:10')]
+
+--------------------------------------------------
+Table full name: web_page_visits
+Column name: client_ip Type: TEXT Description: 
+Column name: visit_time Type: TEXT Description: 
+Column name: app_id Type: INTEGER Description: 
+Column name: page_no Type: INTEGER Description: 
+Sample rows:
+[('104.130.89.12', '2019-04-20 08:15:42', 542, 1), ('104.130.89.12', '2019-04-20 08:16:31', 542, 3), ('104.130.89.12', '2019-04-20 08:28:55', 542, 4)]
+
+--------------------------------------------------
+Table full name: employees
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Column name: title Type: TEXT Description: 
+Column name: supervisor_id Type: INTEGER Description: 
+Sample rows:
+[(142, 'Harold King', 'Managing Director', None), (143, 'Mogens Juel', 'IT Manager', 147), (144, 'Axel de Proef', 'Product Director', 142)]
+
+--------------------------------------------------
+Table full name: emp_hire_periods
+Column name: emp_id Type: INTEGER Description: 
+Column name: start_ Type: TEXT Description: 
+Column name: end_ Type: TEXT Description: 
+Column name: title Type: TEXT Description: 
+Sample rows:
+[(142, '2010-07-01', '2012-04-01', 'Product Director'), (142, '2012-04-01', None, 'Managing Director'), (143, '2010-07-01', '2014-01-01', 'IT Technician')]
+
+--------------------------------------------------
+Table full name: picking_list
+Column name: id Type: INTEGER Description: 
+Column name: created Type: TEXT Description: 
+Column name: picker_emp_id Type: INTEGER Description: 
+Sample rows:
+[(841, '2019-01-16 14:03:41', 149), (842, '2019-01-19 15:57:42', 152)]
+
+--------------------------------------------------
+Table full name: picking_line
+Column name: picklist_id Type: INTEGER Description: 
+Column name: line_no Type: INTEGER Description: 
+Column name: location_id Type: INTEGER Description: 
+Column name: order_id Type: INTEGER Description: 
+Column name: product_id Type: INTEGER Description: 
+Column name: qty Type: REAL Description: 
+Sample rows:
+[(841, 1, 16, 421, 6520, 42.0), (841, 2, 29, 421, 6520, 14.0), (841, 3, 77, 421, 6520, 20.0)]
+
+--------------------------------------------------
+Table full name: picking_log
+Column name: picklist_id Type: INTEGER Description: 
+Column name: log_time Type: TEXT Description: 
+Column name: activity Type: TEXT Description: 
+Column name: location_id Type: INTEGER Description: 
+Column name: pickline_no Type: INTEGER Description: 
+Sample rows:
+[(841, '2019-01-16 14:05:11', 'D', None, None), (841, '2019-01-16 14:05:44', 'A', 16, None), (841, '2019-01-16 14:05:52', 'P', 16, 1)]
+
+--------------------------------------------------
+Table full name: id_name_type
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: id_name_coll_type
+Column name: collection_id Type: INTEGER Description: 
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: id_name_coll_entries
+Column name: collection_id Type: INTEGER Description: 
+Column name: id Type: INTEGER Description: 
+Column name: name Type: TEXT Description: 
+Sample rows:
+[]
+
+--------------------------------------------------
+Table full name: favorite_coll_type
+Column name: id Type: INTEGER Description: 
+Sample rows:
+[]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['customers', 'conway_gen_zero', 'web_devices', 'web_demographics', 'channels_dim', 'gender_dim', 'packaging', 'packaging_relations', 'product_groups', 'products', 'monthly_sales', 'breweries', 'purchases', 'product_alcohol', 'customer_favorites', 'customer_reviews', 'locations', 'inventory', 'orders', 'orderlines', 'monthly_budget', 'product_minimums', 'stock', 'ticker', 'web_apps', 'web_pages', 'web_counter_hist', 'server_heartbeat', 'web_page_visits', 'employees', 'emp_hire_periods', 'picking_list', 'picking_line', 'picking_log', 'id_name_type', 'id_name_coll_type', 'id_name_coll_entries', 'favorite_coll_type']
+Begin Exploring Related Columns
+Relevant tables / columns and why they matter  
+
+• product_minimums.qty_minimum : minimum level that must be kept in stock for each product.  
+• product_minimums.qty_purchase : quantity we re‑order (restock) each time the minimum is violated.  
+• inventory.product_id / inventory.qty : on‑hand quantity as of the latest snapshot (we will treat the snapshot that belongs to December‑2018 as the starting level).  
+• monthly_sales.product_id / monthly_sales.mth / monthly_sales.qty : aggregate monthly demand that will be subtracted from inventory.  
+• purchases.product_id / purchases.purchased / purchases.qty : can be used to double‑check how re‑stocking is normally logged (not strictly required for the modelling exercise but good to inspect).  
+
+Typical filters you may use  
+
+• monthly_sales.mth BETWEEN '2018-12-01' AND '2019-12-01'  
+• strftime('%Y', monthly_sales.mth) = '2019'  
+• purchases.purchased >= '2019-01-01'  
+• inventory.qty IS NOT NULL  
+
+Ten exploration queries, from simple to gradually more analytical, all capped at 20 rows.
+
+```sql
+-- 1. Description:  List every product that has a defined minimum inventory level.
+SELECT DISTINCT
+       "product_id",
+       "qty_minimum",
+       "qty_purchase"
+FROM   "product_minimums"
+LIMIT  20;
+```
+
+```sql
+-- 2. Description:  View a few rows from the raw inventory snapshot to see current on‑hand quantities.
+SELECT DISTINCT
+       "product_id",
+       "qty"
+FROM   "inventory"
+LIMIT  20;
+```
+
+```sql
+-- 3. Description:  See which inventory rows belong to December 2018 (assuming purchase_id can locate time).
+SELECT DISTINCT
+       i."product_id",
+       i."qty",
+       p."purchased"          -- date of the purchase that created the stock line
+FROM   "inventory"  AS i
+JOIN   "purchases"  AS p  ON p."id" = i."purchase_id"
+WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+LIMIT  20;
+```
+
+```sql
+-- 4. Description:  Grab monthly sales figures from December 2018 that will be our starting offset.
+SELECT DISTINCT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "mth" = '2018-12-01'
+LIMIT  20;
+```
+
+```sql
+-- 5. Description:  Inspect all monthly sales for 2019 for products that have minimum levels.
+SELECT DISTINCT
+       ms."product_id",
+       ms."mth",
+       ms."qty"
+FROM   "monthly_sales"  AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+WHERE  strftime('%Y', ms."mth") = '2019'
+LIMIT  20;
+```
+
+```sql
+-- 6. Description:  Look at how purchases (potential re‑stock events) are recorded for 2019.
+SELECT DISTINCT
+       "product_id",
+       "purchased",
+       "qty"
+FROM   "purchases"
+WHERE  "purchased" >= '2019-01-01'
+LIMIT  20;
+```
+
+```sql
+-- 7. Description:  Get a feel for the size of 2019 monthly sales vs the minimum level (first 20 rows).
+SELECT DISTINCT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."qty"          AS "mth_sales"
+FROM   "monthly_sales"   AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+WHERE  strftime('%Y', ms."mth") = '2019'
+LIMIT  20;
+```
+
+```sql
+-- 8. Description:  Compute provisional ending inventory for January 2019
+--     (Dec‑2018 stock minus Jan‑2019 sales) for products where we know both figures.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"   AS "dec_end_qty",
+       jan19."sales_qty",
+       dec18."start_qty" - jan19."sales_qty"  AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20;
+```
+
+```sql
+-- 9. Description:  Identify products whose January 2019 ending inventory falls below minimum.
+SELECT
+       t."product_id",
+       t."jan19_end_qty",
+       pm."qty_minimum"
+FROM (
+      /* query 8 re‑used here as CTE or sub‑query */
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - jan19."sales_qty" AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+) AS t
+JOIN "product_minimums" AS pm  ON pm."product_id" = t."product_id"
+WHERE t."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20;
+```
+
+```sql
+-- 10. Description:  (Toward the final answer) For every product/month in 2019
+--      compute |ending_qty − minimum| and keep the month where that absolute
+--      difference is smallest.  (Still LIMIT 20 for sampling.)
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales_19 AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running AS (
+     -- recursively subtract month by month and restock when needed
+     SELECT
+            s."product_id",
+            '2019-01-01' AS "mth",
+            CAST(s."start_qty" AS REAL) AS "opening",
+            CAST(s."start_qty" - COALESCE(j."sales_qty",0) AS REAL) AS "ending"
+     FROM   start_stock  AS s
+     LEFT   JOIN sales_19 AS j  ON j."product_id" = s."product_id" AND j."mth" = '2019-01-01'
+     UNION ALL
+     SELECT
+            r."product_id",
+            date(r."mth", '+1 month') AS "mth",
+            CASE
+                 WHEN r."ending" < pm."qty_minimum"
+                 THEN r."ending" + pm."qty_purchase"
+                 ELSE r."ending"
+            END AS "opening",
+            CASE
+                 WHEN r."ending" < pm."qty_minimum"
+                 THEN r."ending" + pm."qty_purchase" - COALESCE(j2."sales_qty",0)
+                 ELSE r."ending" - COALESCE(j2."sales_qty",0)
+            END AS "ending"
+     FROM   running            AS r
+     JOIN   product_minimums   AS pm ON pm."product_id" = r."product_id"
+     LEFT   JOIN sales_19      AS j2 ON j2."product_id" = r."product_id"
+                                      AND j2."mth" = date(r."mth", '+1 month')
+     WHERE  r."mth" < '2019-12-01'
+),
+abs_diff AS (
+     SELECT
+            r."product_id",
+            r."mth",
+            ABS(r."ending" - pm."qty_minimum") AS "abs_diff"
+     FROM   running           AS r
+     JOIN   product_minimums  AS pm USING ("product_id")
+)
+SELECT
+       ad."product_id",
+       ad."mth"          AS "closest_month",
+       ad."abs_diff"
+FROM (
+     SELECT
+            product_id,
+            mth,
+            abs_diff,
+            ROW_NUMBER() OVER (PARTITION BY product_id
+                               ORDER BY abs_diff ASC) AS rn
+     FROM   abs_diff
+) ad
+WHERE  ad.rn = 1
+LIMIT 20;
+```
+
+Each query progressively reveals the data needed and culminates in a working prototype of the recursive monthly inventory adjustment required to answer the task.
+Refined SQLs and results:
+Query:
+-- 1. Description:  List every product that has a defined minimum inventory level.
+SELECT DISTINCT
+       "product_id",
+       "qty_minimum",
+       "qty_purchase"
+FROM   "product_minimums"
+LIMIT  20;
+Answer:
+product_id,qty_minimum,qty_purchase
+6520,100.0,400.0
+6600,30.0,100.0
+Query:
+-- 2. Description:  View a few rows from the raw inventory snapshot to see current on‑hand quantities.
+SELECT DISTINCT
+       "product_id",
+       "qty"
+FROM   "inventory"
+LIMIT  20;
+Answer:
+product_id,qty
+4040,6.0
+4040,48.0
+4040,8.0
+4040,5.0
+4040,3.0
+4040,7.0
+4040,31.0
+4160,29.0
+4160,48.0
+4160,31.0
+4160,27.0
+4160,26.0
+4160,30.0
+4280,36.0
+4280,39.0
+4280,35.0
+4280,34.0
+4280,37.0
+4280,19.0
+5310,41.0
+Query:
+-- 3. Description:  See which inventory rows belong to December 2018 (assuming purchase_id can locate time).
+SELECT DISTINCT
+       i."product_id",
+       i."qty",
+       p."purchased"          -- date of the purchase that created the stock line
+FROM   "inventory"  AS i
+JOIN   "purchases"  AS p  ON p."id" = i."purchase_id"
+WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+LIMIT  20;
+Answer:
+product_id,qty,purchased
+4160,30.0,2018-12-22
+4160,48.0,2018-12-22
+4280,19.0,2018-12-23
+5430,6.0,2018-12-25
+5430,48.0,2018-12-25
+6520,43.0,2018-12-26
+7870,6.0,2018-12-29
+7870,48.0,2018-12-29
+Query:
+-- 4. Description:  Grab monthly sales figures from December 2018 that will be our starting offset.
+SELECT DISTINCT
+       "product_id",
+       "mth",
+       "qty"
+FROM   "monthly_sales"
+WHERE  "mth" = '2018-12-01'
+LIMIT  20;
+Answer:
+product_id,mth,qty
+4040,2018-12-01,27
+4160,2018-12-01,160
+4280,2018-12-01,21
+5310,2018-12-01,33
+5430,2018-12-01,39
+6520,2018-12-01,14
+6600,2018-12-01,1
+7790,2018-12-01,5
+7870,2018-12-01,13
+7950,2018-12-01,50
+Query:
+--Description:  Compare monthly sales volumes with the minimum thresholds for the
+--same products across ALL years (dropped the 2019‑only filter that produced no rows).
+SELECT
+       ms."product_id",
+       pm."qty_minimum",
+       ms."mth",
+       ms."qty"   AS "mth_sales"
+FROM   "monthly_sales"    AS ms
+JOIN   "product_minimums" AS pm USING ("product_id")
+LIMIT 20
+Answer:
+product_id,qty_minimum,mth,mth_sales
+6520,100.0,2016-01-01,13
+6520,100.0,2016-02-01,16
+6520,100.0,2016-03-01,9
+6520,100.0,2016-04-01,8
+6520,100.0,2016-05-01,41
+6520,100.0,2016-06-01,61
+6520,100.0,2016-07-01,66
+6520,100.0,2016-08-01,57
+6520,100.0,2016-09-01,53
+6520,100.0,2016-10-01,48
+6520,100.0,2016-11-01,22
+6520,100.0,2016-12-01,21
+6520,100.0,2017-01-01,19
+6520,100.0,2017-02-01,18
+6520,100.0,2017-03-01,21
+6520,100.0,2017-04-01,24
+6520,100.0,2017-05-01,38
+Query:
+--Description:  Compute provisional ending inventory for January 2019 by taking the
+--December‑2018 stock (summed) and subtracting January‑2019 sales.  A LEFT JOIN
+--makes sales default to 0 when no January‑2019 row exists.
+SELECT
+       dec18."product_id",
+       dec18."start_qty"                       AS "dec_end_qty",
+       COALESCE(jan19."sales_qty", 0)          AS "jan19_sales",
+       dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+FROM (
+      SELECT i."product_id", SUM(i."qty") AS "start_qty"
+      FROM   "inventory" AS i
+      JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+      WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+      GROUP  BY i."product_id"
+) dec18
+LEFT JOIN (
+      SELECT "product_id", SUM("qty") AS "sales_qty"
+      FROM   "monthly_sales"
+      WHERE  "mth" = '2019-01-01'
+      GROUP  BY "product_id"
+) jan19 USING ("product_id")
+LIMIT 20
+Answer:
+product_id,dec_end_qty,jan19_sales,jan19_end_qty
+4160,78.0,0,78.0
+4280,19.0,0,19.0
+5430,54.0,0,54.0
+6520,43.0,0,43.0
+7870,54.0,0,54.0
+Query:
+--Description:  Using the January 2019 ending inventory just calculated, list the
+--products whose ending quantity falls below the required minimum.  Missing sales
+--are treated as zero via COALESCE.
+WITH jan_calc AS (
+      SELECT
+             dec18."product_id",
+             dec18."start_qty" - COALESCE(jan19."sales_qty", 0) AS "jan19_end_qty"
+      FROM (
+            SELECT i."product_id", SUM(i."qty") AS "start_qty"
+            FROM   "inventory" AS i
+            JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+            WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+            GROUP  BY i."product_id"
+      ) dec18
+      LEFT JOIN (
+            SELECT "product_id", SUM("qty") AS "sales_qty"
+            FROM   "monthly_sales"
+            WHERE  "mth" = '2019-01-01'
+            GROUP  BY "product_id"
+      ) jan19 USING ("product_id")
+)
+SELECT
+       jc."product_id",
+       jc."jan19_end_qty",
+       pm."qty_minimum"
+FROM   jan_calc         AS jc
+JOIN   product_minimums AS pm ON pm."product_id" = jc."product_id"
+WHERE  jc."jan19_end_qty" < pm."qty_minimum"
+LIMIT 20
+Answer:
+product_id,jan19_end_qty,qty_minimum
+6520,43.0,100.0
+Query:
+--Description:  Recursive model for the whole of 2019:
+-- 1) Start with Dec‑2018 inventory totals.
+-- 2) Subtract monthly sales (0 if none).
+-- 3) If ending inventory < minimum, restock by qty_purchase before next month.
+-- 4) For every product, keep the 2019 month with the smallest |ending − minimum|.
+WITH start_stock AS (
+     SELECT i."product_id",
+            SUM(i."qty") AS "start_qty"
+     FROM   "inventory" AS i
+     JOIN   "purchases" AS p ON p."id" = i."purchase_id"
+     WHERE  p."purchased" BETWEEN '2018-12-01' AND '2018-12-31'
+     GROUP  BY i."product_id"
+),
+sales AS (
+     SELECT "product_id",
+            "mth",
+            SUM("qty") AS "sales_qty"
+     FROM   "monthly_sales"
+     WHERE  "mth" BETWEEN '2019-01-01' AND '2019-12-01'
+     GROUP  BY "product_id", "mth"
+),
+running(month_idx, product_id, mth, opening, ending) AS (
+     -- initialise with January 2019
+     SELECT
+            1,
+            s."product_id",
+            '2019-01-01',
+            s."start_qty"                  AS opening,
+            s."start_qty" - COALESCE(sa."sales_qty",0) AS ending
+     FROM   start_stock AS s
+     LEFT   JOIN sales AS sa
+            ON sa."product_id" = s."product_id" AND sa."mth" = '2019-01-01'
+     UNION ALL
+     -- advance one month at a time, restocking if needed
+     SELECT
+            r.month_idx + 1,
+            r.product_id,
+            date(r.mth , '+1 month'),
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase
+                 ELSE r.ending
+            END                                                          AS opening,
+            CASE
+                 WHEN r.ending < pm.qty_minimum
+                 THEN r.ending + pm.qty_purchase - COALESCE(sa2.sales_qty,0)
+                 ELSE r.ending                - COALESCE(sa2.sales_qty,0)
+            END                                                          AS ending
+     FROM   running          AS r
+     JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+     LEFT   JOIN sales       AS sa2 ON sa2.product_id = r.product_id
+                                   AND sa2.mth = date(r.mth , '+1 month')
+     WHERE  r.month_idx < 12           -- recurse until December
+),
+abs_gap AS (
+     SELECT
+            r.product_id,
+            r.mth,
+            ABS(r.ending - pm.qty_minimum) AS gap
+     FROM   running          AS r
+     JOIN   product_minimums AS pm USING (product_id)
+)
+SELECT
+       ag.product_id,
+       ag.mth      AS closest_month,
+       ag.gap      AS abs_difference
+FROM (
+     SELECT
+            product_id,
+            mth,
+            gap,
+            ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY gap) AS rn
+     FROM   abs_gap
+) ag
+WHERE  ag.rn = 1
+LIMIT 20
+Answer:
+product_id,closest_month,abs_difference
+6520,2019-01-01,57.0
+End Exploring Related Columns
+Task: Using a recursive monthly inventory adjustment model starting from December 2018 inventory levels, where we restock a product if its ending inventory drops below the minimum required level, determine for each product the month in 2019 where the absolute difference between its ending inventory and the minimum required level is the smallest, and return the product_id, that month, and the absolute difference.
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+Usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Follow the answer format like: ```csv
+product_id,month,abs_difference
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is (table names): 
+['customers', 'conway_gen_zero', 'web_devices', 'web_demographics', 'channels_dim', 'gender_dim', 'packaging', 'packaging_relations', 'product_groups', 'products', 'monthly_sales', 'breweries', 'purchases', 'product_alcohol', 'customer_favorites', 'customer_reviews', 'locations', 'inventory', 'orders', 'orderlines', 'monthly_budget', 'product_minimums', 'stock', 'ticker', 'web_apps', 'web_pages', 'web_counter_hist', 'server_heartbeat', 'web_page_visits', 'employees', 'emp_hire_periods', 'picking_list', 'picking_line', 'picking_log', 'id_name_type', 'id_name_coll_type', 'id_name_coll_entries', 'favorite_coll_type']
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 03:38:31 - Thread-1516 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH RECURSIVE
+-- 1. December‑2018 closing stock (starting level for 2019)
+start_stock AS (
+  SELECT
+         i.product_id,
+         SUM(i.qty) AS start_qty
+  FROM   inventory  AS i
+  JOIN   purchases  AS p
+         ON p.id = i.purchase_id
+  WHERE  p.purchased BETWEEN '2018-12-01' AND '2018-12-31'
+  GROUP  BY i.product_id
+),
+
+-- 2. 2019 monthly sales (0 later when no row exists)
+sales_2019 AS (
+  SELECT
+         product_id,
+         mth,
+         SUM(qty) AS sales_qty
+  FROM   monthly_sales
+  WHERE  mth BETWEEN '2019-01-01' AND '2019-12-01'
+  GROUP  BY product_id , mth
+),
+
+-- 3. Month‑by‑month inventory evolution with automatic restock
+running AS (
+  /* Seed row : January‑2019 */
+  SELECT
+         ss.product_id,
+         '2019-01-01'          AS mth,
+         ss.start_qty          AS opening,
+         ss.start_qty - COALESCE(s.sales_qty,0)  AS ending,
+         1                     AS month_idx
+  FROM   start_stock  AS ss
+  LEFT   JOIN sales_2019 AS s
+         ON s.product_id = ss.product_id
+        AND s.mth        = '2019-01-01'
+
+  UNION ALL
+
+  /* Carry forward month by month up to December */
+  SELECT
+         r.product_id,
+         date(r.mth,'+1 month')                                     AS mth,
+         CASE
+              WHEN r.ending < pm.qty_minimum
+              THEN r.ending + pm.qty_purchase
+              ELSE r.ending
+         END                                                       AS opening,
+         CASE
+              WHEN r.ending < pm.qty_minimum
+              THEN r.ending + pm.qty_purchase - COALESCE(s2.sales_qty,0)
+              ELSE r.ending                 - COALESCE(s2.sales_qty,0)
+         END                                                       AS ending,
+         r.month_idx + 1
+  FROM   running            AS r
+  JOIN   product_minimums   AS pm  ON pm.product_id = r.product_id
+  LEFT   JOIN sales_2019    AS s2  ON s2.product_id = r.product_id
+                                  AND s2.mth = date(r.mth,'+1 month')
+  WHERE  r.month_idx < 12               -- stop at December‑2019
+),
+
+-- 4. Absolute gap to the minimum after each month
+abs_gap AS (
+  SELECT
+         r.product_id,
+         r.mth,
+         ABS(r.ending - pm.qty_minimum) AS gap
+  FROM   running          AS r
+  JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+),
+
+-- 5. Pick the month with the smallest gap per product
+best_month AS (
+  SELECT
+         product_id,
+         mth,
+         gap,
+         ROW_NUMBER() OVER (PARTITION BY product_id
+                            ORDER BY gap, mth) AS rn
+  FROM   abs_gap
+)
+
+SELECT
+       product_id,
+       mth       AS month,
+       gap       AS abs_difference
+FROM   best_month
+WHERE  rn = 1
+ORDER  BY product_id;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:38:31 - Thread-1516 (execute) - INFO - [Executed results in self-refine]
+product_id,month,abs_difference
+6520,2019-01-01,57.0
+
+[Executed results in self-refine]
+2025-05-01 03:38:31 - Thread-1516 (execute) - INFO - itercount: 1
+2025-05-01 03:38:31 - Thread-1516 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Using a recursive monthly inventory adjustment model starting from December 2018 inventory levels, where we restock a product if its ending inventory drops below the minimum required level, determine for each product the month in 2019 where the absolute difference between its ending inventory and the minimum required level is the smallest, and return the product_id, that month, and the absolute difference., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+product_id,month,abs_difference
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+product_id,month,abs_difference
+6520,2019-01-01,57.0
+Current sql:
+WITH RECURSIVE
+-- 1. December‑2018 closing stock (starting level for 2019)
+start_stock AS (
+  SELECT
+         i.product_id,
+         SUM(i.qty) AS start_qty
+  FROM   inventory  AS i
+  JOIN   purchases  AS p
+         ON p.id = i.purchase_id
+  WHERE  p.purchased BETWEEN '2018-12-01' AND '2018-12-31'
+  GROUP  BY i.product_id
+),
+
+-- 2. 2019 monthly sales (0 later when no row exists)
+sales_2019 AS (
+  SELECT
+         product_id,
+         mth,
+         SUM(qty) AS sales_qty
+  FROM   monthly_sales
+  WHERE  mth BETWEEN '2019-01-01' AND '2019-12-01'
+  GROUP  BY product_id , mth
+),
+
+-- 3. Month‑by‑month inventory evolution with automatic restock
+running AS (
+  /* Seed row : January‑2019 */
+  SELECT
+         ss.product_id,
+         '2019-01-01'          AS mth,
+         ss.start_qty          AS opening,
+         ss.start_qty - COALESCE(s.sales_qty,0)  AS ending,
+         1                     AS month_idx
+  FROM   start_stock  AS ss
+  LEFT   JOIN sales_2019 AS s
+         ON s.product_id = ss.product_id
+        AND s.mth        = '2019-01-01'
+
+  UNION ALL
+
+  /* Carry forward month by month up to December */
+  SELECT
+         r.product_id,
+         date(r.mth,'+1 month')                                     AS mth,
+         CASE
+              WHEN r.ending < pm.qty_minimum
+              THEN r.ending + pm.qty_purchase
+              ELSE r.ending
+         END                                                       AS opening,
+         CASE
+              WHEN r.ending < pm.qty_minimum
+              THEN r.ending + pm.qty_purchase - COALESCE(s2.sales_qty,0)
+              ELSE r.ending                 - COALESCE(s2.sales_qty,0)
+         END                                                       AS ending,
+         r.month_idx + 1
+  FROM   running            AS r
+  JOIN   product_minimums   AS pm  ON pm.product_id = r.product_id
+  LEFT   JOIN sales_2019    AS s2  ON s2.product_id = r.product_id
+                                  AND s2.mth = date(r.mth,'+1 month')
+  WHERE  r.month_idx < 12               -- stop at December‑2019
+),
+
+-- 4. Absolute gap to the minimum after each month
+abs_gap AS (
+  SELECT
+         r.product_id,
+         r.mth,
+         ABS(r.ending - pm.qty_minimum) AS gap
+  FROM   running          AS r
+  JOIN   product_minimums AS pm  ON pm.product_id = r.product_id
+),
+
+-- 5. Pick the month with the smallest gap per product
+best_month AS (
+  SELECT
+         product_id,
+         mth,
+         gap,
+         ROW_NUMBER() OVER (PARTITION BY product_id
+                            ORDER BY gap, mth) AS rn
+  FROM   abs_gap
+)
+
+SELECT
+       product_id,
+       mth       AS month,
+       gap       AS abs_difference
+FROM   best_month
+WHERE  rn = 1
+ORDER  BY product_id;
+[Self-refine]
+2025-05-01 03:39:06 - Thread-1516 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH RECURSIVE
+/* December‑2018 stock per product (may be NULL) */
+dec_stock AS (
+    SELECT i.product_id,
+           SUM(i.qty) AS qty
+    FROM   inventory  AS i
+    JOIN   purchases  AS p
+           ON p.id = i.purchase_id
+    WHERE  p.purchased BETWEEN '2018-12-01' AND '2018-12-31'
+    GROUP  BY i.product_id
+),
+
+/* All products that have minimum / purchase rules and their starting stock */
+start_stock AS (
+    SELECT pm.product_id,
+           COALESCE(ds.qty, 0.0) AS start_qty
+    FROM   product_minimums pm
+    LEFT   JOIN dec_stock ds USING (product_id)
+),
+
+/* 2019 monthly sales totals */
+sales_2019 AS (
+    SELECT product_id,
+           mth,
+           SUM(qty) AS sales_qty
+    FROM   monthly_sales
+    WHERE  mth BETWEEN '2019-01-01' AND '2019-12-01'
+    GROUP  BY product_id, mth
+),
+
+/* Month‑by‑month inventory development with automatic restocking */
+running AS (
+    /* Seed month: January‑2019 */
+    SELECT
+        ss.product_id,
+        '2019-01-01'                              AS mth,
+        ss.start_qty                              AS opening,
+        ss.start_qty - COALESCE(s.sales_qty, 0)   AS ending,
+        1                                         AS idx
+    FROM   start_stock ss
+    LEFT   JOIN sales_2019 s
+           ON s.product_id = ss.product_id
+          AND s.mth        = '2019-01-01'
+
+    UNION ALL
+
+    /* Subsequent months up to December‑2019 */
+    SELECT
+        r.product_id,
+        DATE(r.mth, '+1 month')                                                       AS mth,
+        CASE WHEN r.ending < pm.qty_minimum
+             THEN r.ending + pm.qty_purchase
+             ELSE r.ending
+        END                                                                            AS opening,
+        CASE WHEN r.ending < pm.qty_minimum
+             THEN r.ending + pm.qty_purchase - COALESCE(s2.sales_qty, 0)
+             ELSE r.ending                 - COALESCE(s2.sales_qty, 0)
+        END                                                                            AS ending,
+        r.idx + 1                                                                     AS idx
+    FROM   running r
+    JOIN   product_minimums pm  ON pm.product_id = r.product_id
+    LEFT   JOIN sales_2019   s2 ON s2.product_id = r.product_id
+                               AND s2.mth        = DATE(r.mth, '+1 month')
+    WHERE  r.idx < 12   -- continue until December (idx = 12)
+),
+
+/* Absolute gap between ending stock and minimum each month */
+gaps AS (
+    SELECT
+        r.product_id,
+        r.mth,
+        ABS(r.ending - pm.qty_minimum) AS gap
+    FROM   running r
+    JOIN   product_minimums pm ON pm.product_id = r.product_id
+),
+
+/* Select the month with the smallest gap for each product */
+best_month AS (
+    SELECT
+        product_id,
+        mth,
+        gap,
+        ROW_NUMBER() OVER (PARTITION BY product_id
+                           ORDER BY gap, mth) AS rn
+    FROM   gaps
+)
+
+SELECT
+    product_id,
+    mth   AS month,
+    ROUND(gap, 4) AS abs_difference
+FROM   best_month
+WHERE  rn = 1
+ORDER  BY product_id;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:39:06 - Thread-1516 (execute) - INFO - [Executed results in self-refine]
+product_id,month,abs_difference
+6520,2019-01-01,57.0
+6600,2019-01-01,30.0
+
+[Executed results in self-refine]
+2025-05-01 03:39:06 - Thread-1516 (execute) - INFO - itercount: 2
+2025-05-01 03:39:06 - Thread-1516 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Using a recursive monthly inventory adjustment model starting from December 2018 inventory levels, where we restock a product if its ending inventory drops below the minimum required level, determine for each product the month in 2019 where the absolute difference between its ending inventory and the minimum required level is the smallest, and return the product_id, that month, and the absolute difference., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+product_id,month,abs_difference
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+product_id,month,abs_difference
+6520,2019-01-01,57.0
+6600,2019-01-01,30.0
+Current sql:
+WITH RECURSIVE
+/* December‑2018 stock per product (may be NULL) */
+dec_stock AS (
+    SELECT i.product_id,
+           SUM(i.qty) AS qty
+    FROM   inventory  AS i
+    JOIN   purchases  AS p
+           ON p.id = i.purchase_id
+    WHERE  p.purchased BETWEEN '2018-12-01' AND '2018-12-31'
+    GROUP  BY i.product_id
+),
+
+/* All products that have minimum / purchase rules and their starting stock */
+start_stock AS (
+    SELECT pm.product_id,
+           COALESCE(ds.qty, 0.0) AS start_qty
+    FROM   product_minimums pm
+    LEFT   JOIN dec_stock ds USING (product_id)
+),
+
+/* 2019 monthly sales totals */
+sales_2019 AS (
+    SELECT product_id,
+           mth,
+           SUM(qty) AS sales_qty
+    FROM   monthly_sales
+    WHERE  mth BETWEEN '2019-01-01' AND '2019-12-01'
+    GROUP  BY product_id, mth
+),
+
+/* Month‑by‑month inventory development with automatic restocking */
+running AS (
+    /* Seed month: January‑2019 */
+    SELECT
+        ss.product_id,
+        '2019-01-01'                              AS mth,
+        ss.start_qty                              AS opening,
+        ss.start_qty - COALESCE(s.sales_qty, 0)   AS ending,
+        1                                         AS idx
+    FROM   start_stock ss
+    LEFT   JOIN sales_2019 s
+           ON s.product_id = ss.product_id
+          AND s.mth        = '2019-01-01'
+
+    UNION ALL
+
+    /* Subsequent months up to December‑2019 */
+    SELECT
+        r.product_id,
+        DATE(r.mth, '+1 month')                                                       AS mth,
+        CASE WHEN r.ending < pm.qty_minimum
+             THEN r.ending + pm.qty_purchase
+             ELSE r.ending
+        END                                                                            AS opening,
+        CASE WHEN r.ending < pm.qty_minimum
+             THEN r.ending + pm.qty_purchase - COALESCE(s2.sales_qty, 0)
+             ELSE r.ending                 - COALESCE(s2.sales_qty, 0)
+        END                                                                            AS ending,
+        r.idx + 1                                                                     AS idx
+    FROM   running r
+    JOIN   product_minimums pm  ON pm.product_id = r.product_id
+    LEFT   JOIN sales_2019   s2 ON s2.product_id = r.product_id
+                               AND s2.mth        = DATE(r.mth, '+1 month')
+    WHERE  r.idx < 12   -- continue until December (idx = 12)
+),
+
+/* Absolute gap between ending stock and minimum each month */
+gaps AS (
+    SELECT
+        r.product_id,
+        r.mth,
+        ABS(r.ending - pm.qty_minimum) AS gap
+    FROM   running r
+    JOIN   product_minimums pm ON pm.product_id = r.product_id
+),
+
+/* Select the month with the smallest gap for each product */
+best_month AS (
+    SELECT
+        product_id,
+        mth,
+        gap,
+        ROW_NUMBER() OVER (PARTITION BY product_id
+                           ORDER BY gap, mth) AS rn
+    FROM   gaps
+)
+
+SELECT
+    product_id,
+    mth   AS month,
+    ROUND(gap, 4) AS abs_difference
+FROM   best_month
+WHERE  rn = 1
+ORDER  BY product_id;
+[Self-refine]
+2025-05-01 03:39:37 - Thread-1516 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH RECURSIVE
+dec_stock AS (
+    SELECT i.product_id,
+           SUM(i.qty) AS qty
+    FROM   inventory  AS i
+    JOIN   purchases  AS p
+      ON  p.id = i.purchase_id
+    WHERE  p.purchased BETWEEN '2018-12-01' AND '2018-12-31'
+    GROUP  BY i.product_id
+),
+start_stock AS (
+    SELECT pm.product_id,
+           COALESCE(ds.qty, 0.0) AS start_qty
+    FROM   product_minimums pm
+    LEFT   JOIN dec_stock ds USING (product_id)
+),
+sales_2019 AS (
+    SELECT product_id,
+           mth,
+           SUM(qty) AS sales_qty
+    FROM   monthly_sales
+    WHERE  mth BETWEEN '2019-01-01' AND '2019-12-01'
+    GROUP  BY product_id, mth
+),
+running AS (
+    SELECT
+        ss.product_id,
+        '2019-01-01'                            AS mth,
+        ss.start_qty                            AS opening,
+        ss.start_qty - COALESCE(s.sales_qty,0) AS ending,
+        1                                       AS idx
+    FROM   start_stock ss
+    LEFT   JOIN sales_2019 s
+           ON s.product_id = ss.product_id
+          AND s.mth        = '2019-01-01'
+    UNION ALL
+    SELECT
+        r.product_id,
+        DATE(r.mth,'+1 month')                                                      AS mth,
+        CASE WHEN r.ending < pm.qty_minimum
+             THEN r.ending + pm.qty_purchase
+             ELSE r.ending
+        END                                                                         AS opening,
+        CASE WHEN r.ending < pm.qty_minimum
+             THEN r.ending + pm.qty_purchase - COALESCE(s2.sales_qty,0)
+             ELSE r.ending                 - COALESCE(s2.sales_qty,0)
+        END                                                                         AS ending,
+        r.idx + 1                                                                   AS idx
+    FROM   running r
+    JOIN   product_minimums pm  ON pm.product_id = r.product_id
+    LEFT   JOIN sales_2019   s2 ON s2.product_id = r.product_id
+                               AND s2.mth        = DATE(r.mth,'+1 month')
+    WHERE  r.idx < 12      -- stop after December‑2019
+),
+gaps AS (
+    SELECT
+        r.product_id,
+        r.mth,
+        ABS(r.ending - pm.qty_minimum) AS gap
+    FROM   running r
+    JOIN   product_minimums pm USING (product_id)
+),
+best_month AS (
+    SELECT
+        product_id,
+        mth,
+        gap,
+        ROW_NUMBER() OVER (PARTITION BY product_id
+                           ORDER BY gap, mth) AS rn
+    FROM   gaps
+)
+SELECT
+    product_id,
+    mth AS month,
+    ROUND(gap,4) AS abs_difference
+FROM   best_month
+WHERE  rn = 1
+ORDER  BY product_id;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:39:37 - Thread-1516 (execute) - INFO - [Executed results in self-refine]
+product_id,month,abs_difference
+6520,2019-01-01,57.0
+6600,2019-01-01,30.0
+
+[Executed results in self-refine]
+2025-05-01 03:39:37 - Thread-1516 (execute) - INFO - [Consistent results]
+product_id,month,abs_difference
+6520,2019-01-01,57.0
+6600,2019-01-01,30.0
+
+[Consistent results]
+2025-05-01 03:39:37 - Thread-1516 (execute) - INFO - Total iteration counts: 2

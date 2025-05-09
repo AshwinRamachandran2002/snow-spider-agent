@@ -1,0 +1,10 @@
+SELECT "dma_name", SUM("score") AS "total_search_score"
+FROM "GOOGLE_TRENDS"."GOOGLE_TRENDS"."TOP_TERMS"
+WHERE "term" IN (
+    SELECT DISTINCT "term"
+    FROM "GOOGLE_TRENDS"."GOOGLE_TRENDS"."TOP_RISING_TERMS"
+    WHERE "week" BETWEEN '2022-10-01' AND '2022-10-31'
+)
+GROUP BY "dma_name"
+ORDER BY "total_search_score" DESC NULLS LAST
+LIMIT 1;

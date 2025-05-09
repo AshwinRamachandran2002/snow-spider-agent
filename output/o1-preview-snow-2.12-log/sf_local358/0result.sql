@@ -1,0 +1,12 @@
+SELECT
+  CASE
+    WHEN DATEDIFF('year', CAST("birth_date" AS DATE), CURRENT_DATE) BETWEEN 20 AND 29 THEN '20s'
+    WHEN DATEDIFF('year', CAST("birth_date" AS DATE), CURRENT_DATE) BETWEEN 30 AND 39 THEN '30s'
+    WHEN DATEDIFF('year', CAST("birth_date" AS DATE), CURRENT_DATE) BETWEEN 40 AND 49 THEN '40s'
+    WHEN DATEDIFF('year', CAST("birth_date" AS DATE), CURRENT_DATE) BETWEEN 50 AND 59 THEN '50s'
+    ELSE 'Others'
+  END AS "Age_Category",
+  COUNT(*) AS "User_Count"
+FROM LOG.LOG.MST_USERS
+GROUP BY "Age_Category"
+ORDER BY "Age_Category";

@@ -1,0 +1,2212 @@
+2025-05-01 00:56:22 - Thread-140 (execute) - INFO - [Answer format]
+```csv
+language,module,occurrences
+```
+[Answer format]
+2025-05-01 00:57:31 - Thread-140 (execute) - INFO - [Exploration]
+Relevant columns and potential usages
+• "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  
+  – "repo_name": repository key to join with contents  
+  – "path": to keep only files that end in “.py” or “.r”  
+  – "id": blob/object id to join with contents  
+
+• "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  
+  – "sample_repo_name": repository key to join with SAMPLE_FILES."repo_name"  
+  – "sample_path": file path to join with SAMPLE_FILES."path" (if desired)  
+  – "id": alternative join key (same blob/object id)  
+  – "content": holds full source; scan for  
+        · Python:  lines starting with “import ” or “from … import …”  
+        · R:       lines containing “library(…)” or “require(…)”  
+
+Conditions that will usually be applied in later queries  
+• "path" ILIKE '%.py'  OR "path" ILIKE '%.r'  
+• optional join on "SAMPLE_FILES"."id" = "SAMPLE_CONTENTS"."id"  
+• REGEXP to pull module/library names  
+
+Below are ten exploratory Snowflake SQL queries (each limited to 20 rows) growing from very simple to the complete aggregation.  
+All identifiers are double‑quoted, and comments precede each statement.
+
+```sql
+-- 1. List a few file paths that look like Python or R source files
+SELECT "repo_name",
+       "path"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE  "path" ILIKE '%.py' OR "path" ILIKE '%.r'
+LIMIT  20;
+```
+
+```sql
+-- 2. Inspect corresponding blobs from SAMPLE_CONTENTS for those paths
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+       ON f."id" = c."id"
+WHERE   f."path" ILIKE '%.py' OR f."path" ILIKE '%.r'
+LIMIT   20;
+```
+
+```sql
+-- 3. Pull just the first 200 characters of content for a visual sanity check
+SELECT  c."sample_repo_name",
+        c."sample_path",
+        LEFT(c."content", 200) AS "snippet"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+WHERE   c."sample_path" ILIKE '%.py' OR c."sample_path" ILIKE '%.r'
+LIMIT   20;
+```
+
+```sql
+-- 4. Extract Python “import xxx” single‑word modules
+SELECT  REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)', 1, 1, 'e', 1) AS "python_module"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.py'
+          LIMIT  20
+        )
+WHERE   "python_module" IS NOT NULL
+LIMIT   20;
+```
+
+```sql
+-- 5. Extract Python “from aaa import …” root package names
+SELECT  REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)', 1, 1, 'e', 1)  AS "python_module"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.py'
+          LIMIT  20
+        )
+WHERE   "python_module" IS NOT NULL
+LIMIT   20;
+```
+
+```sql
+-- 6. Extract R “library(…)” or “require(…)” calls
+SELECT  REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)', 1, 1, 'e', 2) AS "r_library"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.r'
+          LIMIT  20
+        )
+WHERE   "r_library" IS NOT NULL
+LIMIT   20;
+```
+
+```sql
+-- 7. Count occurrences of every Python import (both syntaxes combined)
+SELECT  LOWER(mod_name)                           AS "python_module",
+        COUNT(*)                                  AS "occurrences"
+FROM   (
+        /* harvest “import aaa” */
+        SELECT REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)',1,1,'e',1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        /* harvest “from aaa import …” */
+        SELECT REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)',1,1,'e',1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+      ) t
+WHERE  mod_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+-- 8. Count occurrences of every R library / require call
+SELECT  LOWER(lib_name)           AS "r_library",
+        COUNT(*)                  AS "occurrences"
+FROM   (
+        SELECT REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',1,1,'e',2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.r'
+      ) t
+WHERE  lib_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. Union Python & R counts and tag each row with language flag
+SELECT 'python' AS "language",
+       LOWER(mod_name) AS "package",
+       COUNT(*)        AS "occurrences"
+FROM  (
+        SELECT REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)',1,1,'e',1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        SELECT REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)',1,1,'e',1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+     ) p(mod_name)
+WHERE mod_name IS NOT NULL
+GROUP BY 1,2
+UNION ALL
+SELECT 'r' AS "language",
+       LOWER(lib_name) AS "package",
+       COUNT(*)        AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',1,1,'e',2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.r'
+     ) r(lib_name)
+WHERE lib_name IS NOT NULL
+GROUP BY 1,2
+LIMIT 20;
+```
+
+```sql
+-- 10. Final aggregated result sorted by language then descending occurrence
+SELECT  *
+FROM    (
+          /* wrap the union query from #9 into a single derived table */
+          SELECT 'python' AS "language",
+                 LOWER(mod_name) AS "package",
+                 COUNT(*)        AS "occurrences"
+          FROM  (
+                  SELECT REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)',1,1,'e',1) AS mod_name
+                  FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+                  WHERE  "sample_path" ILIKE '%.py'
+                  UNION ALL
+                  SELECT REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)',1,1,'e',1)
+                  FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+                  WHERE  "sample_path" ILIKE '%.py'
+               ) p(mod_name)
+          WHERE  mod_name IS NOT NULL
+          GROUP BY 1,2
+
+          UNION ALL
+
+          SELECT 'r' AS "language",
+                 LOWER(lib_name) AS "package",
+                 COUNT(*)        AS "occurrences"
+          FROM   (
+                  SELECT REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',1,1,'e',2) AS lib_name
+                  FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+                  WHERE  "sample_path" ILIKE '%.r'
+               ) r(lib_name)
+          WHERE  lib_name IS NOT NULL
+          GROUP BY 1,2
+        ) all_pkgs
+ORDER BY "language", "occurrences" DESC
+LIMIT 20;
+```
+
+These ten statements incrementally explore relevant columns, join sources, extract import/library calls, and finally aggregate counts by language. Each query is limited to 20 rows for safety.
+[Exploration]
+2025-05-01 00:57:31 - Thread-140 (execute) - INFO - [Try to execute]
+-- 1. List a few file paths that look like Python or R source files
+SELECT "repo_name",
+       "path"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE  "path" ILIKE '%.py' OR "path" ILIKE '%.r'
+LIMIT  20;
+[Try to execute]
+2025-05-01 00:57:32 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. List a few file paths that look like Python or R source files
+SELECT "repo_name",
+       "path"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE  "path" ILIKE '%.py' OR "path" ILIKE '%.r'
+LIMIT  20;
+Results:
+repo_name,path
+jleclanche/django-push-notifications,push_notifications/migrations/0002_auto_20160106_0850.py
+kennyledet/Algorithm-Implementations,Maximum_Subarray/Python/shivam5992/kadane.py
+kennyledet/Algorithm-Implementations,Caesar_Cipher/Python/kennyledet/caesar_cipher.py
+mercicle/Deep-Learning-with-h2o-in-R,data-prep/split-train-test.r
+orcasgit/django-pgcrypto-expressions,setup.py
+orcasgit/django-pgcrypto-expressions,pgcrypto_expressions/test/settings.py
+percolate/ec2-security-groups
+
+[Successfully executed]
+2025-05-01 00:57:32 - Thread-140 (execute) - INFO - [Try to execute]
+-- 2. Inspect corresponding blobs from SAMPLE_CONTENTS for those paths
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+       ON f."id" = c."id"
+WHERE   f."path" ILIKE '%.py' OR f."path" ILIKE '%.r'
+LIMIT   20;
+[Try to execute]
+2025-05-01 00:58:25 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Inspect corresponding blobs from SAMPLE_CONTENTS for those paths
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+       ON f."id" = c."id"
+WHERE   f."path" ILIKE '%.py' OR f."path" ILIKE '%.r'
+LIMIT   20;
+Results:
+repo_name,path,size,binary
+google/rekall,rekall-core/rekall/plugins/linux/iomem.py,2331,False
+dieseldev/diesel,examples/zeromq_receiver.py,619,False
+dimagi/commcare-hq,corehq/sql_proxy_accessors/migrations/0006_get_case_by_external_id.py,564,False
+MAECProject/python-maec,maec/utils/merge.py,12077,False
+
+[Successfully executed]
+2025-05-01 00:58:25 - Thread-140 (execute) - INFO - [Try to execute]
+-- 3. Pull just the first 200 characters of content for a visual sanity check
+SELECT  c."sample_repo_name",
+        c."sample_path",
+        LEFT(c."content", 200) AS "snippet"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+WHERE   c."sample_path" ILIKE '%.py' OR c."sample_path" ILIKE '%.r'
+LIMIT   20;
+[Try to execute]
+2025-05-01 00:58:26 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. Pull just the first 200 characters of content for a visual sanity check
+SELECT  c."sample_repo_name",
+        c."sample_path",
+        LEFT(c."content", 200) AS "snippet"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+WHERE   c."sample_path" ILIKE '%.py' OR c."sample_path" ILIKE '%.r'
+LIMIT   20;
+Results:
+sample_repo_name,sample_path,snippet
+pyudev/pyudev,src/pyudev/_ctypeslib/__init__.py,"# -*- coding: utf-8 -*-
+# Copyright (C) 2015 mulhern <amulhern@redhat.com>
+
+# This library is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public"
+CiscoSystems/networking-cisco,networking_cisco/neutronclient/policyprofile.py,"# Copyright 2015 Cisco Systems, Inc.
+# All rights reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the ""License"")
+
+[Successfully executed]
+2025-05-01 00:58:26 - Thread-140 (execute) - INFO - [Try to execute]
+-- 4. Extract Python “import xxx” single‑word modules
+SELECT  REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)', 1, 1, 'e', 1) AS "python_module"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.py'
+          LIMIT  20
+        )
+WHERE   "python_module" IS NOT NULL
+LIMIT   20;
+[Try to execute]
+2025-05-01 00:58:26 - Thread-140 (execute) - INFO - [Error occurred]
+002140 (42601): SQL compilation error:
+Unknown function SPLIT_TO_TABLE
+[Error occurred]
+2025-05-01 01:00:13 - Thread-140 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+-- Goal: inspect a handful of Python files, break each file into lines, and pull out the module
+--       names from simple “import <module>” statements.
+-- Steps:
+--   1. Fetch rows from SAMPLE_CONTENTS where sample_path ends in “.py”.
+--   2. Limit to 20 blobs just to keep the demo light.
+--   3. Use the table‑function SPLIT_TO_TABLE to explode each file’s "content" string into
+--      separate rows (one per line).  Because it returns a table, wrap it with TABLE(…)
+--      and attach via LATERAL so the function can reference the current row.
+--   4. For each line, apply REGEXP_SUBSTR.  The pattern:
+--        ^\s*import\s+([A-Za-z0-9_]+)
+--      captures the module token immediately after the keyword “import”.
+--   5. Keep only rows where the regex matched (i.e., the result is not NULL).
+--   6. Finally, limit the output to 20 rows to preview the extracted module names.
+SELECT
+       REGEXP_SUBSTR(line.value,                 -- each source line
+                     '^\\s*import\\s+([A-Za-z0-9_]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM  (
+        SELECT "content"
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+        WHERE  "sample_path" ILIKE '%.py'
+        LIMIT  20   -- sample a few files
+      ) src,
+      LATERAL TABLE(SPLIT_TO_TABLE(src."content", '\n')) AS line
+WHERE REGEXP_SUBSTR(line.value,
+                    '^\\s*import\\s+([A-Za-z0-9_]+)',
+                    1, 1, 'e', 1) IS NOT NULL
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:00:14 - Thread-140 (execute) - INFO - [Results for corrected sql]
+001003 (42000): SQL compilation error:
+syntax error line 11 at position 14 unexpected 'TABLE'.
+syntax error line 11 at position 54 unexpected ')'.
+[Results for corrected sql]
+2025-05-01 01:02:19 - Thread-140 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: sample 20 Python files, split each file’s text into individual lines with
+--             TABLE(SPLIT_TO_TABLE)), then pull out simple “import <module>” statements and
+--             return the captured module names (max 20 rows for preview).
+SELECT
+       REGEXP_SUBSTR(vals.value,
+                     '^\\s*import\\s+([A-Za-z0-9_]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM (
+        SELECT "content"
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
+        WHERE  "sample_path" ILIKE '%.py'
+        LIMIT  20
+     ) AS src,
+     LATERAL TABLE(SPLIT_TO_TABLE(src."content", '\n')) AS vals
+WHERE REGEXP_SUBSTR(vals.value,
+                    '^\\s*import\\s+([A-Za-z0-9_]+)',
+                    1, 1, 'e', 1) IS NOT NULL
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:02:19 - Thread-140 (execute) - INFO - [Results for corrected sql]
+001003 (42000): SQL compilation error:
+syntax error line 11 at position 13 unexpected 'TABLE'.
+syntax error line 11 at position 53 unexpected ')'.
+[Results for corrected sql]
+2025-05-01 01:03:01 - Thread-140 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+-- We want to list Python modules referenced by simple lines of the form “import <module>”.
+-- 1) Work on SAMPLE_CONTENTS restricted to files whose path ends in .py.
+-- 2) Snowflake’s SPLIT_TO_TABLE text‑splitting function turns one file’s content
+--    into multiple rows (one per line); we join it LATERALLY so it can see each row’s content.
+-- 3) For every resulting line we apply REGEXP_SUBSTR with the pattern:
+--       ^\s*import\s+([A-Za-z0-9_]+)
+--    This captures the module name as the first capture group.
+-- 4) Keep only matches (non‑NULL).
+-- 5) Return up to 20 module names for quick verification.
+SELECT
+       REGEXP_SUBSTR(lines.value,
+                     '^\\s*import\\s+([A-Za-z0-9_]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" AS sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n')      AS lines
+WHERE  sc."sample_path" ILIKE '%.py'
+  AND  REGEXP_SUBSTR(lines.value,
+                     '^\\s*import\\s+([A-Za-z0-9_]+)',
+                     1, 1, 'e', 1) IS NOT NULL
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:03:42 - Thread-140 (execute) - INFO - [Results for corrected sql]
+python_module
+os
+skytools
+plpy
+skytools
+doctest
+ctypes
+numpy
+ctypes
+numpy
+doctest
+cStringIO
+gstudio
+gstudio
+os
+xbmc
+re
+urllib2
+json
+time
+socket
+
+[Results for corrected sql]
+2025-05-01 01:04:38 - Thread-140 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: #5  Extract Python “from … import …” statements (root package names) from 20
+--             random .py files; split file text into lines with SPLIT_TO_TABLE and capture the
+--             package appearing right after the keyword “from”.
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.py'
+  AND  REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+--Description: #6  Extract R library / require calls from 20 randomly selected .r files; split
+--             content into lines, capture the package name inside library(…) or require(…).
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) AS "r_library"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.r'
+  AND  REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+--Description: #7  Count occurrences of every Python module imported via either “import …”
+--             or “from … import …” across all .py files; explode each file into lines,
+--             harvest module names, group, and order by frequency.
+SELECT  LOWER(mod_name)            AS "python_module",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        /* pattern: import aaa */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        /* pattern: from aaa import … */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+      ) t
+WHERE  mod_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+--Description: #8  Count occurrences of every R package referenced by library()/require() in
+--             all .r files; explode content into lines, capture package names, aggregate.
+SELECT  LOWER(lib_name)            AS "r_library",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+      ) t
+WHERE  lib_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+--Description: #9  Combine Python and R package counts, tagging each row with language;
+--             for Python combine both import syntaxes, for R use library()/require();
+--             present up to 20 rows of the union.
+SELECT 'python'                    AS "language",
+       LOWER(mod_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+     ) p(mod_name)
+WHERE mod_name IS NOT NULL
+GROUP BY 1,2
+UNION ALL
+SELECT 'r'                         AS "language",
+       LOWER(lib_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+     ) r(lib_name)
+WHERE lib_name IS NOT NULL
+GROUP BY 1,2
+LIMIT 20;
+```
+
+```sql
+--Description: #10  Final aggregation: produce full list of packages across Python & R,
+--             grouped by language, ordered by occurrence count (descending within language),
+--             limited to 20 rows for display.
+SELECT *
+FROM (
+      /* Python packages */
+      SELECT 'python' AS "language",
+             LOWER(mod_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*import\\s+([A-Za-z0-9_]+)',
+                                   1, 1, 'e', 1) AS mod_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+              UNION ALL
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                                   1, 1, 'e', 1)
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+           ) p(mod_name)
+      WHERE mod_name IS NOT NULL
+      GROUP BY 1,2
+
+      UNION ALL
+
+      /* R packages */
+      SELECT 'r' AS "language",
+             LOWER(lib_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                                   1, 1, 'e', 2) AS lib_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.r'
+           ) r(lib_name)
+      WHERE lib_name IS NOT NULL
+      GROUP BY 1,2
+     ) all_pkgs
+ORDER BY "language", "occurrences" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 01:04:38 - Thread-140 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description / Thinking process:
+-- We want to list Python modules referenced by simple lines of the form “import <module>”.
+-- 1) Work on SAMPLE_CONTENTS restricted to files whose path ends in .py.
+-- 2) Snowflake’s SPLIT_TO_TABLE text‑splitting function turns one file’s content
+--    into multiple rows (one per line); we join it LATERALLY so it can see each row’s content.
+-- 3) For every resulting line we apply REGEXP_SUBSTR with the pattern:
+--       ^\s*import\s+([A-Za-z0-9_]+)
+--    This captures the module name as the first capture group.
+-- 4) Keep only matches (non‑NULL).
+-- 5) Return up to 20 module names for quick verification.
+SELECT
+       REGEXP_SUBSTR(lines.value,
+                     '^\\s*import\\s+([A-Za-z0-9_]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" AS sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n')      AS lines
+WHERE  sc."sample_path" ILIKE '%.py'
+  AND  REGEXP_SUBSTR(lines.value,
+                     '^\\s*import\\s+([A-Za-z0-9_]+)',
+                     1, 1, 'e', 1) IS NOT NULL
+LIMIT 20;
+Results:
+python_module
+os
+skytools
+plpy
+skytools
+doctest
+ctypes
+numpy
+ctypes
+numpy
+doctest
+cStringIO
+gstudio
+gstudio
+os
+xbmc
+re
+urllib2
+json
+time
+socket
+
+[Successfully corrected]
+2025-05-01 01:04:38 - Thread-140 (execute) - INFO - [Try to execute]
+--Description: #5  Extract Python “from … import …” statements (root package names) from 20
+--             random .py files; split file text into lines with SPLIT_TO_TABLE and capture the
+--             package appearing right after the keyword “from”.
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.py'
+  AND  REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) IS NOT NULL
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:38 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: #5  Extract Python “from … import …” statements (root package names) from 20
+--             random .py files; split file text into lines with SPLIT_TO_TABLE and capture the
+--             package appearing right after the keyword “from”.
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.py'
+  AND  REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) IS NOT NULL
+LIMIT 20
+Results:
+python_module
+cStringIO
+lantz
+lantz.errors
+lantz.foreign
+andor
+matplotlib
+greedy
+cur
+datetime
+urlparse
+urllib2
+xmlrpclib
+django.test
+django.contrib
+django.contrib.auth.models
+django.contrib.sites.models
+django.contrib.contenttypes.models
+BeautifulSoup
+gstudio.models
+gstudio.models
+
+[Successfully executed]
+2025-05-01 01:04:38 - Thread-140 (execute) - INFO - [Try to execute]
+--Description: #6  Extract R library / require calls from 20 randomly selected .r files; split
+--             content into lines, capture the package name inside library(…) or require(…).
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) AS "r_library"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.r'
+  AND  REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) IS NOT NULL
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:39 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: #6  Extract R library / require calls from 20 randomly selected .r files; split
+--             content into lines, capture the package name inside library(…) or require(…).
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) AS "r_library"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.r'
+  AND  REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) IS NOT NULL
+LIMIT 20
+Results:
+r_library
+sptrans
+PLSR
+RUnit
+DEMOdz
+TCGAgbm
+testthat
+raster
+data.table
+microbenchmark
+SpaDES
+edgeR
+getopt
+shogun
+ShortRead
+hamcrest
+
+[Successfully executed]
+2025-05-01 01:04:39 - Thread-140 (execute) - INFO - [Try to execute]
+--Description: #7  Count occurrences of every Python module imported via either “import …”
+--             or “from … import …” across all .py files; explode each file into lines,
+--             harvest module names, group, and order by frequency.
+SELECT  LOWER(mod_name)            AS "python_module",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        /* pattern: import aaa */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        /* pattern: from aaa import … */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+      ) t
+WHERE  mod_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:39 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: #7  Count occurrences of every Python module imported via either “import …”
+--             or “from … import …” across all .py files; explode each file into lines,
+--             harvest module names, group, and order by frequency.
+SELECT  LOWER(mod_name)            AS "python_module",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        /* pattern: import aaa */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        /* pattern: from aaa import … */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+      ) t
+WHERE  mod_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+Results:
+python_module,occurrences
+os,162
+sys,134
+__future__,122
+numpy,67
+logging,62
+datetime,61
+time,58
+traceback,56
+re,52
+unittest,45
+django.db,42
+json,37
+.,31
+collections,27
+random,26
+django.conf,23
+socket,22
+occ,20
+threading,20
+itertools,17
+
+[Successfully executed]
+2025-05-01 01:04:39 - Thread-140 (execute) - INFO - [Try to execute]
+--Description: #8  Count occurrences of every R package referenced by library()/require() in
+--             all .r files; explode content into lines, capture package names, aggregate.
+SELECT  LOWER(lib_name)            AS "r_library",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+      ) t
+WHERE  lib_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:40 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: #8  Count occurrences of every R package referenced by library()/require() in
+--             all .r files; explode content into lines, capture package names, aggregate.
+SELECT  LOWER(lib_name)            AS "r_library",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+      ) t
+WHERE  lib_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+Results:
+r_library,occurrences
+data.table,1
+shortread,1
+demodz,1
+hamcrest,1
+tcgagbm,1
+plsr,1
+raster,1
+edger,1
+testthat,1
+getopt,1
+sptrans,1
+microbenchmark,1
+spades,1
+shogun,1
+runit,1
+
+[Successfully executed]
+2025-05-01 01:04:40 - Thread-140 (execute) - INFO - [Try to execute]
+--Description: #9  Combine Python and R package counts, tagging each row with language;
+--             for Python combine both import syntaxes, for R use library()/require();
+--             present up to 20 rows of the union.
+SELECT 'python'                    AS "language",
+       LOWER(mod_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+     ) p(mod_name)
+WHERE mod_name IS NOT NULL
+GROUP BY 1,2
+UNION ALL
+SELECT 'r'                         AS "language",
+       LOWER(lib_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+     ) r(lib_name)
+WHERE lib_name IS NOT NULL
+GROUP BY 1,2
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:40 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: #9  Combine Python and R package counts, tagging each row with language;
+--             for Python combine both import syntaxes, for R use library()/require();
+--             present up to 20 rows of the union.
+SELECT 'python'                    AS "language",
+       LOWER(mod_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+     ) p(mod_name)
+WHERE mod_name IS NOT NULL
+GROUP BY 1,2
+UNION ALL
+SELECT 'r'                         AS "language",
+       LOWER(lib_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+     ) r(lib_name)
+WHERE lib_name IS NOT NULL
+GROUP BY 1,2
+LIMIT 20
+Results:
+language,package,occurrences
+python,configparser,7
+python,ast,1
+python,django.template,3
+python,pkg_resources,5
+python,grpc._adapter,1
+python,golismero.api.audit,1
+python,ftplib,1
+python,tasks,1
+python,openerp.tools.safe_eval,1
+python,numpy.distutils.core,1
+python,xmodule.modulestore.tests.django_utils,1
+python,pip.index,1
+python,mobject,1
+python,cogs.utils.dataio,1
+python,tethys_config.models,1
+python,.style,1
+python,testtools,1
+
+[Successfully executed]
+2025-05-01 01:04:40 - Thread-140 (execute) - INFO - [Try to execute]
+--Description: #10  Final aggregation: produce full list of packages across Python & R,
+--             grouped by language, ordered by occurrence count (descending within language),
+--             limited to 20 rows for display.
+SELECT *
+FROM (
+      /* Python packages */
+      SELECT 'python' AS "language",
+             LOWER(mod_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*import\\s+([A-Za-z0-9_]+)',
+                                   1, 1, 'e', 1) AS mod_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+              UNION ALL
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                                   1, 1, 'e', 1)
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+           ) p(mod_name)
+      WHERE mod_name IS NOT NULL
+      GROUP BY 1,2
+
+      UNION ALL
+
+      /* R packages */
+      SELECT 'r' AS "language",
+             LOWER(lib_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                                   1, 1, 'e', 2) AS lib_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.r'
+           ) r(lib_name)
+      WHERE lib_name IS NOT NULL
+      GROUP BY 1,2
+     ) all_pkgs
+ORDER BY "language", "occurrences" DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:41 - Thread-140 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: #10  Final aggregation: produce full list of packages across Python & R,
+--             grouped by language, ordered by occurrence count (descending within language),
+--             limited to 20 rows for display.
+SELECT *
+FROM (
+      /* Python packages */
+      SELECT 'python' AS "language",
+             LOWER(mod_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*import\\s+([A-Za-z0-9_]+)',
+                                   1, 1, 'e', 1) AS mod_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+              UNION ALL
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                                   1, 1, 'e', 1)
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+           ) p(mod_name)
+      WHERE mod_name IS NOT NULL
+      GROUP BY 1,2
+
+      UNION ALL
+
+      /* R packages */
+      SELECT 'r' AS "language",
+             LOWER(lib_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                                   1, 1, 'e', 2) AS lib_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.r'
+           ) r(lib_name)
+      WHERE lib_name IS NOT NULL
+      GROUP BY 1,2
+     ) all_pkgs
+ORDER BY "language", "occurrences" DESC
+LIMIT 20
+Results:
+language,package,occurrences
+python,os,162
+python,sys,134
+python,__future__,122
+python,numpy,67
+python,logging,62
+python,datetime,61
+python,time,58
+python,traceback,56
+python,re,52
+python,unittest,45
+python,django.db,42
+python,json,37
+python,.,31
+python,collections,27
+python,random,26
+python,django.conf,23
+python,socket,22
+python,occ,20
+python,threading,20
+python,itertools,17
+
+[Successfully executed]
+2025-05-01 01:04:41 - Thread-140 (execute) - INFO - itercount: 0
+2025-05-01 01:04:41 - Thread-140 (execute) - INFO - [Self-refine]
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_FILES
+Column name: symlink_target Type: TEXT Description: None
+Column name: id Type: TEXT Description: None
+Column name: mode Type: NUMBER Description: None
+Column name: path Type: TEXT Description: None
+Column name: repo_name Type: TEXT Description: None
+Column name: ref Type: TEXT Description: None
+Sample rows:
+[{'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'drivers/isdn/hisax/elsa.c', 'mode': 33188, 'id': '64ba26a4afe649818a23565fc4ae6631eaf9d9b1', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'arch/arm/mach-pxa/include/mach/smemc.h', 'mode': 33188, 'id': 'b802f285fe00e6dd3b39af77e3b351d3a4343316', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'drivers/i2c/busses/i2c-eg20t.c', 'mode': 33188, 'id': 'c811289b61e21628f28d79b71f27651c39e3e024', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'arch/arm/mm/proc-arm920.S', 'mode': 33188, 'id': 'b06224a692b9bc255c860f959b7fe5913e957852', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'drivers/video/msm/lcdc_external.c', 'mode': 33188, 'id
+
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.LANGUAGES
+Column name: repo_name Type: TEXT Description: None
+Column name: language Type: VARIANT Description: None
+Sample rows:
+[{'repo_name': 'debjyoti385/awesome-data-mining-datasets', 'language': '[]'}, {'repo_name': 'graidl/test', 'language': '[]'}, {'repo_name': 'iBeacons/grape', 'language': '[]'}, {'repo_name': 'swapnil-pimpale/geep-kernel-training', 'language': '[]'}, {'repo_name': 'TheEvilDev/atom-yeoman', 'language': '[]'}]
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.LICENSES
+Column name: repo_name Type: TEXT Description: None
+Column name: license Type: TEXT Description: None
+Sample rows:
+[{'repo_name': 'npm/npmconf', 'license': 'isc'}, {'repo_name': 'live627/shiny-bear', 'license': 'isc'}, {'repo_name': 'k7hoven/spexcript', 'license': 'isc'}, {'repo_name': 'photofroggy/Reflex', 'license': 'isc'}, {'repo_name': 'sr-cafe/topisto', 'license': 'isc'}]
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_COMMITS
+Column name: parent Type: VARIANT Description: None
+Column name: committer Type: VARIANT Description: None
+Column name: difference Type: VARIANT Description: None
+Column name: message Type: TEXT Description: None
+Column name: author Type: VARIANT Description: None
+Column name: difference_truncated Type: BOOLEAN Description: None
+Column name: subject Type: TEXT Description: None
+Column name: trailer Type: VARIANT Description: None
+Column name: encoding Type: TEXT Description: None
+Column name: commit Type: TEXT Description: None
+Column name: repo_name Type: TEXT Description: None
+Column name: tree Type: TEXT Description: None
+Sample rows:
+[{'commit': '76cdd58e558669366adfaded436fda01b30cce3e', 'tree': 'deaccb499752c928919693edea65f9ea4c1fe756', 'parent': '[\n  "1c12c4cf9411eb130b245fa8d0fbbaf989477c7b"\n]', 'author': '{\n  "date": 1210806352000000,\n  "email": "8dcf0f69152f32f23184f83357a3731522e56b9c@de.ibm.com",\n  "name": "Heiko Carstens",\n  "time_sec": 1210806352,\n  "tz_offset": -420\n}', 'committer': '{\n  "date": 1210817475000000,\n  "email": "69652caca27c8b940640ad396ab71f93cacec34f@linux-foundation.org",\n  "name": "Linus Torvalds",\n  "time_sec": 1210817475,\n  "tz_offset": -420\n}', 'subject': 'memory_hotplug: always initialize pageblock bitmap', 'message': 'memory_hotplug: always initialize pageblock bitmap\n\nTrying to online a new memory section that was added via memory hotplug\nsometimes results in crashes when the new pages are added via __free_page.\n Reason for that is that the pageblock bitmap isn\'t initialized and hence\ncontains random stuff.  That means that get_pageblock_migratetype()\nreturns 
+
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+Column name: size Type: NUMBER Description: None
+Column name: binary Type: BOOLEAN Description: None
+Column name: sample_symlink_target Type: TEXT Description: None
+Column name: copies Type: NUMBER Description: None
+Column name: sample_mode Type: NUMBER Description: None
+Column name: sample_path Type: TEXT Description: None
+Column name: content Type: TEXT Description: None
+Column name: sample_ref Type: TEXT Description: None
+Column name: id Type: TEXT Description: None
+Column name: sample_repo_name Type: TEXT Description: None
+Sample rows:
+[{'id': '2dd586a19b594a73e9c6f7485d1e5da9203a4467', 'size': 21447, 'content': '/*\n * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips\n *\n * Copyright (C) 2008 David Brownell\n *\n * This program is free software; you can redistribute it and/or modify\n * it under the terms of the GNU General Public License version 2 as\n * published by the Free Software Foundation.\n *\n */\n#include <linux/kernel.h>\n#include <linux/init.h>\n#include <linux/bcd.h>\n#include <linux/slab.h>\n#include <linux/rtc.h>\n#include <linux/workqueue.h>\n\n#include <linux/spi/spi.h>\n#include <linux/spi/ds1305.h>\n#include <linux/module.h>\n\n\n/*\n * Registers ... mask DS1305_WRITE into register address to write,\n * otherwise you\'re reading it.  All non-bitmask values are BCD.\n */\n#define DS1305_WRITE\t\t0x80\n\n\n/* RTC date/time ... the main special cases are that we:\n *  - Need fancy "hours" encoding in 12hour mode\n *  - Don\'t rely on the "day-of-week" field (or tm_wday)\n *  - Are a 21st-
+
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_REPOS
+Column name: watch_count Type: NUMBER Description: None
+Column name: repo_name Type: TEXT Description: None
+Sample rows:
+[{'repo_name': 'kbandla/APTnotes', 'watch_count': 256}, {'repo_name': 'bigcompany/hook.io', 'watch_count': 256}, {'repo_name': 'krisk/Fuse', 'watch_count': 256}, {'repo_name': 'brigade/react-waypoint', 'watch_count': 256}, {'repo_name': 'Quartz/mapquery', 'watch_count': 256}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['SAMPLE_FILES', 'LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_REPOS']}}
+Begin Exploring Related Columns
+Relevant columns and potential usages
+• "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  
+  – "repo_name": repository key to join with contents  
+  – "path": to keep only files that end in “.py” or “.r”  
+  – "id": blob/object id to join with contents  
+
+• "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  
+  – "sample_repo_name": repository key to join with SAMPLE_FILES."repo_name"  
+  – "sample_path": file path to join with SAMPLE_FILES."path" (if desired)  
+  – "id": alternative join key (same blob/object id)  
+  – "content": holds full source; scan for  
+        · Python:  lines starting with “import ” or “from … import …”  
+        · R:       lines containing “library(…)” or “require(…)”  
+
+Conditions that will usually be applied in later queries  
+• "path" ILIKE '%.py'  OR "path" ILIKE '%.r'  
+• optional join on "SAMPLE_FILES"."id" = "SAMPLE_CONTENTS"."id"  
+• REGEXP to pull module/library names  
+
+Below are ten exploratory Snowflake SQL queries (each limited to 20 rows) growing from very simple to the complete aggregation.  
+All identifiers are double‑quoted, and comments precede each statement.
+
+```sql
+-- 1. List a few file paths that look like Python or R source files
+SELECT "repo_name",
+       "path"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE  "path" ILIKE '%.py' OR "path" ILIKE '%.r'
+LIMIT  20;
+```
+
+```sql
+-- 2. Inspect corresponding blobs from SAMPLE_CONTENTS for those paths
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+       ON f."id" = c."id"
+WHERE   f."path" ILIKE '%.py' OR f."path" ILIKE '%.r'
+LIMIT   20;
+```
+
+```sql
+-- 3. Pull just the first 200 characters of content for a visual sanity check
+SELECT  c."sample_repo_name",
+        c."sample_path",
+        LEFT(c."content", 200) AS "snippet"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+WHERE   c."sample_path" ILIKE '%.py' OR c."sample_path" ILIKE '%.r'
+LIMIT   20;
+```
+
+```sql
+-- 4. Extract Python “import xxx” single‑word modules
+SELECT  REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)', 1, 1, 'e', 1) AS "python_module"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.py'
+          LIMIT  20
+        )
+WHERE   "python_module" IS NOT NULL
+LIMIT   20;
+```
+
+```sql
+-- 5. Extract Python “from aaa import …” root package names
+SELECT  REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)', 1, 1, 'e', 1)  AS "python_module"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.py'
+          LIMIT  20
+        )
+WHERE   "python_module" IS NOT NULL
+LIMIT   20;
+```
+
+```sql
+-- 6. Extract R “library(…)” or “require(…)” calls
+SELECT  REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)', 1, 1, 'e', 2) AS "r_library"
+FROM    (
+          SELECT SPLIT_TO_TABLE(c."content", '\n') AS line
+          FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          WHERE  c."sample_path" ILIKE '%.r'
+          LIMIT  20
+        )
+WHERE   "r_library" IS NOT NULL
+LIMIT   20;
+```
+
+```sql
+-- 7. Count occurrences of every Python import (both syntaxes combined)
+SELECT  LOWER(mod_name)                           AS "python_module",
+        COUNT(*)                                  AS "occurrences"
+FROM   (
+        /* harvest “import aaa” */
+        SELECT REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)',1,1,'e',1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        /* harvest “from aaa import …” */
+        SELECT REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)',1,1,'e',1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+      ) t
+WHERE  mod_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+-- 8. Count occurrences of every R library / require call
+SELECT  LOWER(lib_name)           AS "r_library",
+        COUNT(*)                  AS "occurrences"
+FROM   (
+        SELECT REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',1,1,'e',2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.r'
+      ) t
+WHERE  lib_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20;
+```
+
+```sql
+-- 9. Union Python & R counts and tag each row with language flag
+SELECT 'python' AS "language",
+       LOWER(mod_name) AS "package",
+       COUNT(*)        AS "occurrences"
+FROM  (
+        SELECT REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)',1,1,'e',1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        SELECT REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)',1,1,'e',1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.py'
+     ) p(mod_name)
+WHERE mod_name IS NOT NULL
+GROUP BY 1,2
+UNION ALL
+SELECT 'r' AS "language",
+       LOWER(lib_name) AS "package",
+       COUNT(*)        AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',1,1,'e',2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+        WHERE  "sample_path" ILIKE '%.r'
+     ) r(lib_name)
+WHERE lib_name IS NOT NULL
+GROUP BY 1,2
+LIMIT 20;
+```
+
+```sql
+-- 10. Final aggregated result sorted by language then descending occurrence
+SELECT  *
+FROM    (
+          /* wrap the union query from #9 into a single derived table */
+          SELECT 'python' AS "language",
+                 LOWER(mod_name) AS "package",
+                 COUNT(*)        AS "occurrences"
+          FROM  (
+                  SELECT REGEXP_SUBSTR(line, '^\\s*import\\s+([A-Za-z0-9_]+)',1,1,'e',1) AS mod_name
+                  FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+                  WHERE  "sample_path" ILIKE '%.py'
+                  UNION ALL
+                  SELECT REGEXP_SUBSTR(line, '^\\s*from\\s+([A-Za-z0-9_\\.]+)',1,1,'e',1)
+                  FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+                  WHERE  "sample_path" ILIKE '%.py'
+               ) p(mod_name)
+          WHERE  mod_name IS NOT NULL
+          GROUP BY 1,2
+
+          UNION ALL
+
+          SELECT 'r' AS "language",
+                 LOWER(lib_name) AS "package",
+                 COUNT(*)        AS "occurrences"
+          FROM   (
+                  SELECT REGEXP_SUBSTR(line, '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',1,1,'e',2) AS lib_name
+                  FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", LATERAL SPLIT_TO_TABLE("content", '\n') AS line
+                  WHERE  "sample_path" ILIKE '%.r'
+               ) r(lib_name)
+          WHERE  lib_name IS NOT NULL
+          GROUP BY 1,2
+        ) all_pkgs
+ORDER BY "language", "occurrences" DESC
+LIMIT 20;
+```
+
+These ten statements incrementally explore relevant columns, join sources, extract import/library calls, and finally aggregate counts by language. Each query is limited to 20 rows for safety.
+Refined SQLs and results:
+Query:
+-- 1. List a few file paths that look like Python or R source files
+SELECT "repo_name",
+       "path"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE  "path" ILIKE '%.py' OR "path" ILIKE '%.r'
+LIMIT  20;
+Answer:
+repo_name,path
+jleclanche/django-push-notifications,push_notifications/migrations/0002_auto_20160106_0850.py
+kennyledet/Algorithm-Implementations,Maximum_Subarray/Python/shivam5992/kadane.py
+kennyledet/Algorithm-Implementations,Caesar_Cipher/Python/kennyledet/caesar_cipher.py
+mercicle/Deep-Learning-with-h2o-in-R,data-prep/split-train-test.r
+orcasgit/django-pgcrypto-expressions,setup.py
+orcasgit/django-pgcrypto-expressions,pgcrypto_expressions/test/settings.py
+percolate/ec2-security-groups
+Query:
+-- 2. Inspect corresponding blobs from SAMPLE_CONTENTS for those paths
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+       ON f."id" = c."id"
+WHERE   f."path" ILIKE '%.py' OR f."path" ILIKE '%.r'
+LIMIT   20;
+Answer:
+repo_name,path,size,binary
+google/rekall,rekall-core/rekall/plugins/linux/iomem.py,2331,False
+dieseldev/diesel,examples/zeromq_receiver.py,619,False
+dimagi/commcare-hq,corehq/sql_proxy_accessors/migrations/0006_get_case_by_external_id.py,564,False
+MAECProject/python-maec,maec/utils/merge.py,12077,False
+Query:
+-- 3. Pull just the first 200 characters of content for a visual sanity check
+SELECT  c."sample_repo_name",
+        c."sample_path",
+        LEFT(c."content", 200) AS "snippet"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+WHERE   c."sample_path" ILIKE '%.py' OR c."sample_path" ILIKE '%.r'
+LIMIT   20;
+Answer:
+sample_repo_name,sample_path,snippet
+pyudev/pyudev,src/pyudev/_ctypeslib/__init__.py,"# -*- coding: utf-8 -*-
+# Copyright (C) 2015 mulhern <amulhern@redhat.com>
+
+# This library is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public"
+CiscoSystems/networking-cisco,networking_cisco/neutronclient/policyprofile.py,"# Copyright 2015 Cisco Systems, Inc.
+# All rights reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the ""License"")
+Query:
+--Description: #5  Extract Python “from … import …” statements (root package names) from 20
+--             random .py files; split file text into lines with SPLIT_TO_TABLE and capture the
+--             package appearing right after the keyword “from”.
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) AS "python_module"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.py'
+  AND  REGEXP_SUBSTR(l.value,
+                     '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                     1, 1, 'e', 1) IS NOT NULL
+LIMIT 20
+Answer:
+python_module
+cStringIO
+lantz
+lantz.errors
+lantz.foreign
+andor
+matplotlib
+greedy
+cur
+datetime
+urlparse
+urllib2
+xmlrpclib
+django.test
+django.contrib
+django.contrib.auth.models
+django.contrib.sites.models
+django.contrib.contenttypes.models
+BeautifulSoup
+gstudio.models
+gstudio.models
+Query:
+--Description: #6  Extract R library / require calls from 20 randomly selected .r files; split
+--             content into lines, capture the package name inside library(…) or require(…).
+SELECT
+       REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) AS "r_library"
+FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  sc
+     , LATERAL SPLIT_TO_TABLE(sc."content", '\n') AS l
+WHERE  sc."sample_path" ILIKE '%.r'
+  AND  REGEXP_SUBSTR(l.value,
+                     '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                     1, 1, 'e', 2) IS NOT NULL
+LIMIT 20
+Answer:
+r_library
+sptrans
+PLSR
+RUnit
+DEMOdz
+TCGAgbm
+testthat
+raster
+data.table
+microbenchmark
+SpaDES
+edgeR
+getopt
+shogun
+ShortRead
+hamcrest
+Query:
+--Description: #7  Count occurrences of every Python module imported via either “import …”
+--             or “from … import …” across all .py files; explode each file into lines,
+--             harvest module names, group, and order by frequency.
+SELECT  LOWER(mod_name)            AS "python_module",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        /* pattern: import aaa */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        /* pattern: from aaa import … */
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+      ) t
+WHERE  mod_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+Answer:
+python_module,occurrences
+os,162
+sys,134
+__future__,122
+numpy,67
+logging,62
+datetime,61
+time,58
+traceback,56
+re,52
+unittest,45
+django.db,42
+json,37
+.,31
+collections,27
+random,26
+django.conf,23
+socket,22
+occ,20
+threading,20
+itertools,17
+Query:
+--Description: #8  Count occurrences of every R package referenced by library()/require() in
+--             all .r files; explode content into lines, capture package names, aggregate.
+SELECT  LOWER(lib_name)            AS "r_library",
+        COUNT(*)                   AS "occurrences"
+FROM  (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS", 
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+      ) t
+WHERE  lib_name IS NOT NULL
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 20
+Answer:
+r_library,occurrences
+data.table,1
+shortread,1
+demodz,1
+hamcrest,1
+tcgagbm,1
+plsr,1
+raster,1
+edger,1
+testthat,1
+getopt,1
+sptrans,1
+microbenchmark,1
+spades,1
+shogun,1
+runit,1
+Query:
+--Description: #9  Combine Python and R package counts, tagging each row with language;
+--             for Python combine both import syntaxes, for R use library()/require();
+--             present up to 20 rows of the union.
+SELECT 'python'                    AS "language",
+       LOWER(mod_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*import\\s+([A-Za-z0-9_]+)',
+                             1, 1, 'e', 1) AS mod_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+        UNION ALL
+        SELECT REGEXP_SUBSTR(l.value,
+                             '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                             1, 1, 'e', 1)
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.py'
+     ) p(mod_name)
+WHERE mod_name IS NOT NULL
+GROUP BY 1,2
+UNION ALL
+SELECT 'r'                         AS "language",
+       LOWER(lib_name)             AS "package",
+       COUNT(*)                    AS "occurrences"
+FROM (
+        SELECT REGEXP_SUBSTR(l.value,
+                             '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                             1, 1, 'e', 2) AS lib_name
+        FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+               LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+        WHERE  "sample_path" ILIKE '%.r'
+     ) r(lib_name)
+WHERE lib_name IS NOT NULL
+GROUP BY 1,2
+LIMIT 20
+Answer:
+language,package,occurrences
+python,configparser,7
+python,ast,1
+python,django.template,3
+python,pkg_resources,5
+python,grpc._adapter,1
+python,golismero.api.audit,1
+python,ftplib,1
+python,tasks,1
+python,openerp.tools.safe_eval,1
+python,numpy.distutils.core,1
+python,xmodule.modulestore.tests.django_utils,1
+python,pip.index,1
+python,mobject,1
+python,cogs.utils.dataio,1
+python,tethys_config.models,1
+python,.style,1
+python,testtools,1
+Query:
+--Description: #10  Final aggregation: produce full list of packages across Python & R,
+--             grouped by language, ordered by occurrence count (descending within language),
+--             limited to 20 rows for display.
+SELECT *
+FROM (
+      /* Python packages */
+      SELECT 'python' AS "language",
+             LOWER(mod_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*import\\s+([A-Za-z0-9_]+)',
+                                   1, 1, 'e', 1) AS mod_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+              UNION ALL
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                                   1, 1, 'e', 1)
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.py'
+           ) p(mod_name)
+      WHERE mod_name IS NOT NULL
+      GROUP BY 1,2
+
+      UNION ALL
+
+      /* R packages */
+      SELECT 'r' AS "language",
+             LOWER(lib_name) AS "package",
+             COUNT(*)       AS "occurrences"
+      FROM (
+              SELECT REGEXP_SUBSTR(l.value,
+                                   '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                                   1, 1, 'e', 2) AS lib_name
+              FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+                     LATERAL SPLIT_TO_TABLE("content", '\n') AS l
+              WHERE  "sample_path" ILIKE '%.r'
+           ) r(lib_name)
+      WHERE lib_name IS NOT NULL
+      GROUP BY 1,2
+     ) all_pkgs
+ORDER BY "language", "occurrences" DESC
+LIMIT 20
+Answer:
+language,package,occurrences
+python,os,162
+python,sys,134
+python,__future__,122
+python,numpy,67
+python,logging,62
+python,datetime,61
+python,time,58
+python,traceback,56
+python,re,52
+python,unittest,45
+python,django.db,42
+python,json,37
+python,.,31
+python,collections,27
+python,random,26
+python,django.conf,23
+python,socket,22
+python,occ,20
+python,threading,20
+python,itertools,17
+End Exploring Related Columns
+Task: Can you analyze the joined data from github repos files and github_repos contents, focusing only on files ending with '.py' or '.r', then extract Python modules from 'import' or 'from ... import' lines and R libraries from 'library(...)' lines, count their occurrences, and finally list the results sorted by language and by the number of occurrences in descending order?
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+language,module,occurrences
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['SAMPLE_FILES', 'LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_REPOS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 01:05:53 - Thread-140 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH lines AS (
+    SELECT
+        c."sample_path"  AS "path",
+        SPLIT_TO_TABLE(c."content", '\n') AS "line"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+),
+
+/* ----------- Python: collect modules from ‘import …’ and ‘from … import …’ ----------- */
+python_modules AS (
+    /* pattern: import <module> */
+    SELECT LOWER(REGEXP_SUBSTR(l.value,
+                               '^\\s*import\\s+([A-Za-z0-9_]+)',
+                               1, 1, 'e', 1)) AS "module"
+    FROM lines l
+    WHERE l."path" ILIKE '%.py'
+      AND REGEXP_SUBSTR(l.value,
+                        '^\\s*import\\s+([A-Za-z0-9_]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+
+    UNION ALL
+
+    /* pattern: from <module> import … */
+    SELECT LOWER(REGEXP_SUBSTR(l.value,
+                               '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                               1, 1, 'e', 1)) AS "module"
+    FROM lines l
+    WHERE l."path" ILIKE '%.py'
+      AND REGEXP_SUBSTR(l.value,
+                        '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+),
+
+/* --------------------------- R: collect library calls --------------------------- */
+r_modules AS (
+    SELECT LOWER(REGEXP_SUBSTR(l.value,
+                               '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                               1, 1, 'e', 2)) AS "module"
+    FROM lines l
+    WHERE l."path" ILIKE '%.r'
+      AND REGEXP_SUBSTR(l.value,
+                        '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                        1, 1, 'e', 2) IS NOT NULL
+),
+
+/* ---------------------------- Aggregate counts by language ---------------------------- */
+aggregated AS (
+    SELECT 'python' AS "language", "module", COUNT(*) AS "occurrences"
+    FROM python_modules
+    GROUP BY "module"
+
+    UNION ALL
+
+    SELECT 'r'      AS "language", "module", COUNT(*) AS "occurrences"
+    FROM r_modules
+    GROUP BY "module"
+)
+
+/* ----------------------------- Final ordered result ----------------------------- */
+SELECT
+    "language",
+    "module",
+    "occurrences"
+FROM aggregated
+ORDER BY
+    "language",
+    "occurrences" DESC NULLS LAST,
+    "module";
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:05:53 - Thread-140 (execute) - INFO - itercount: 1
+2025-05-01 01:05:53 - Thread-140 (execute) - INFO - [Self-refine]
+Input sql:
+WITH lines AS (
+    SELECT
+        c."sample_path"  AS "path",
+        SPLIT_TO_TABLE(c."content", '\n') AS "line"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+),
+
+/* ----------- Python: collect modules from ‘import …’ and ‘from … import …’ ----------- */
+python_modules AS (
+    /* pattern: import <module> */
+    SELECT LOWER(REGEXP_SUBSTR(l.value,
+                               '^\\s*import\\s+([A-Za-z0-9_]+)',
+                               1, 1, 'e', 1)) AS "module"
+    FROM lines l
+    WHERE l."path" ILIKE '%.py'
+      AND REGEXP_SUBSTR(l.value,
+                        '^\\s*import\\s+([A-Za-z0-9_]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+
+    UNION ALL
+
+    /* pattern: from <module> import … */
+    SELECT LOWER(REGEXP_SUBSTR(l.value,
+                               '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                               1, 1, 'e', 1)) AS "module"
+    FROM lines l
+    WHERE l."path" ILIKE '%.py'
+      AND REGEXP_SUBSTR(l.value,
+                        '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+),
+
+/* --------------------------- R: collect library calls --------------------------- */
+r_modules AS (
+    SELECT LOWER(REGEXP_SUBSTR(l.value,
+                               '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                               1, 1, 'e', 2)) AS "module"
+    FROM lines l
+    WHERE l."path" ILIKE '%.r'
+      AND REGEXP_SUBSTR(l.value,
+                        '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                        1, 1, 'e', 2) IS NOT NULL
+),
+
+/* ---------------------------- Aggregate counts by language ---------------------------- */
+aggregated AS (
+    SELECT 'python' AS "language", "module", COUNT(*) AS "occurrences"
+    FROM python_modules
+    GROUP BY "module"
+
+    UNION ALL
+
+    SELECT 'r'      AS "language", "module", COUNT(*) AS "occurrences"
+    FROM r_modules
+    GROUP BY "module"
+)
+
+/* ----------------------------- Final ordered result ----------------------------- */
+SELECT
+    "language",
+    "module",
+    "occurrences"
+FROM aggregated
+ORDER BY
+    "language",
+    "occurrences" DESC NULLS LAST,
+    "module";
+The error information is:
+002140 (42601): SQL compilation error:
+Unknown function SPLIT_TO_TABLE
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 01:07:01 - Thread-140 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH lines AS (
+    SELECT
+        c."sample_path"                            AS "path",
+        f.value::string                            AS "line"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c,
+         LATERAL FLATTEN(input => SPLIT(c."content", '\n')) f
+),
+
+/* ------------------------ Python: imports & from‑imports ------------------------ */
+python_modules AS (
+    /* pattern: import <module> */
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '^\\s*import\\s+([A-Za-z0-9_]+)',
+                               1, 1, 'e', 1))           AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.py'
+      AND REGEXP_SUBSTR("line",
+                        '^\\s*import\\s+([A-Za-z0-9_]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+
+    UNION ALL
+
+    /* pattern: from <module> import … */
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                               1, 1, 'e', 1))           AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.py'
+      AND REGEXP_SUBSTR("line",
+                        '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+),
+
+/* ------------------------------ R: library / require ----------------------------- */
+r_modules AS (
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                               1, 1, 'e', 2))           AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.r'
+      AND REGEXP_SUBSTR("line",
+                        '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                        1, 1, 'e', 2) IS NOT NULL
+),
+
+/* ----------------------------- aggregate by language ----------------------------- */
+aggregated AS (
+    SELECT 'python' AS "language", "module", COUNT(*) AS "occurrences"
+    FROM python_modules
+    GROUP BY "module"
+
+    UNION ALL
+
+    SELECT 'r'      AS "language", "module", COUNT(*) AS "occurrences"
+    FROM r_modules
+    GROUP BY "module"
+)
+
+/* ---------------------------------- final output ---------------------------------- */
+SELECT
+    "language",
+    "module",
+    "occurrences"
+FROM aggregated
+ORDER BY
+    "language",
+    "occurrences" DESC NULLS LAST,
+    "module";
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:07:03 - Thread-140 (execute) - INFO - [Executed results in self-refine]
+language,module,occurrences
+python,os,162
+python,sys,134
+python,__future__,122
+python,numpy,67
+python,logging,62
+python,datetime,61
+python,time,58
+python,traceback,56
+python,re,52
+python,unittest,45
+python,django.db,42
+python,json,37
+python,.,31
+python,collections,27
+python,random,26
+python,django.conf,23
+python,socket,22
+python,occ,20
+python,threading,20
+python,argparse,17
+python,itertools,17
+python,gi.repository,16
+python,lib.core.common,16
+python,mock,16
+python,shutil,16
+python,django.test,15
+
+[Executed results in self-refine]
+2025-05-01 01:07:03 - Thread-140 (execute) - INFO - itercount: 2
+2025-05-01 01:07:03 - Thread-140 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Can you analyze the joined data from github repos files and github_repos contents, focusing only on files ending with '.py' or '.r', then extract Python modules from 'import' or 'from ... import' lines and R libraries from 'library(...)' lines, count their occurrences, and finally list the results sorted by language and by the number of occurrences in descending order?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+language,module,occurrences
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+language,module,occurrences
+python,os,162
+python,sys,134
+python,__future__,122
+python,numpy,67
+python,logging,62
+python,datetime,61
+python,time,58
+python,traceback,56
+python,re,52
+python,unittest,45
+python,django.db,42
+python,json,37
+python,.,31
+python,collections,27
+python,random,26
+python,django.conf,23
+python,socket,22
+python,occ,20
+python,threading,20
+python,argparse,17
+python,itertools,17
+python,gi.repository,16
+python,lib.core.common,16
+python,mock,16
+python,shutil,16
+python,django.test,15
+Current sql:
+WITH lines AS (
+    SELECT
+        c."sample_path"                            AS "path",
+        f.value::string                            AS "line"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c,
+         LATERAL FLATTEN(input => SPLIT(c."content", '\n')) f
+),
+
+/* ------------------------ Python: imports & from‑imports ------------------------ */
+python_modules AS (
+    /* pattern: import <module> */
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '^\\s*import\\s+([A-Za-z0-9_]+)',
+                               1, 1, 'e', 1))           AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.py'
+      AND REGEXP_SUBSTR("line",
+                        '^\\s*import\\s+([A-Za-z0-9_]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+
+    UNION ALL
+
+    /* pattern: from <module> import … */
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                               1, 1, 'e', 1))           AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.py'
+      AND REGEXP_SUBSTR("line",
+                        '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+),
+
+/* ------------------------------ R: library / require ----------------------------- */
+r_modules AS (
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                               1, 1, 'e', 2))           AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.r'
+      AND REGEXP_SUBSTR("line",
+                        '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                        1, 1, 'e', 2) IS NOT NULL
+),
+
+/* ----------------------------- aggregate by language ----------------------------- */
+aggregated AS (
+    SELECT 'python' AS "language", "module", COUNT(*) AS "occurrences"
+    FROM python_modules
+    GROUP BY "module"
+
+    UNION ALL
+
+    SELECT 'r'      AS "language", "module", COUNT(*) AS "occurrences"
+    FROM r_modules
+    GROUP BY "module"
+)
+
+/* ---------------------------------- final output ---------------------------------- */
+SELECT
+    "language",
+    "module",
+    "occurrences"
+FROM aggregated
+ORDER BY
+    "language",
+    "occurrences" DESC NULLS LAST,
+    "module";
+[Self-refine]
+2025-05-01 01:07:43 - Thread-140 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH lines AS (
+    SELECT
+        c."sample_path"                 AS "path",
+        f.value::string                 AS "line"
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c,
+         LATERAL FLATTEN(input => SPLIT(c."content", '\n')) f
+),
+
+/* ------------------------ Python: imports & from‑imports ------------------------ */
+python_modules AS (
+    /* pattern: import <module> */
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '^\\s*import\\s+([A-Za-z0-9_]+)',
+                               1, 1, 'e', 1)) AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.py'
+      AND REGEXP_SUBSTR("line",
+                        '^\\s*import\\s+([A-Za-z0-9_]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+
+    UNION ALL
+
+    /* pattern: from <module> import … */
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                               1, 1, 'e', 1)) AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.py'
+      AND REGEXP_SUBSTR("line",
+                        '^\\s*from\\s+([A-Za-z0-9_\\.]+)',
+                        1, 1, 'e', 1) IS NOT NULL
+),
+
+/* ------------------------------ R: library / require ----------------------------- */
+r_modules AS (
+    SELECT LOWER(REGEXP_SUBSTR("line",
+                               '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                               1, 1, 'e', 2)) AS "module"
+    FROM lines
+    WHERE "path" ILIKE '%.r'
+      AND REGEXP_SUBSTR("line",
+                        '\\b(library|require)\\s*\\(\\s*([A-Za-z0-9\\.]+)',
+                        1, 1, 'e', 2) IS NOT NULL
+),
+
+/* ----------------------------- aggregate by language ----------------------------- */
+aggregated AS (
+    SELECT 'python' AS "language", "module", COUNT(*) AS "occurrences"
+    FROM python_modules
+    GROUP BY "module"
+
+    UNION ALL
+
+    SELECT 'r'      AS "language", "module", COUNT(*) AS "occurrences"
+    FROM r_modules
+    GROUP BY "module"
+)
+
+/* ---------------------------------- final output ---------------------------------- */
+SELECT
+    "language",
+    "module",
+    "occurrences"
+FROM aggregated
+ORDER BY
+    "language",
+    "occurrences" DESC NULLS LAST,
+    "module";
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:07:43 - Thread-140 (execute) - INFO - [Executed results in self-refine]
+language,module,occurrences
+python,os,162
+python,sys,134
+python,__future__,122
+python,numpy,67
+python,logging,62
+python,datetime,61
+python,time,58
+python,traceback,56
+python,re,52
+python,unittest,45
+python,django.db,42
+python,json,37
+python,.,31
+python,collections,27
+python,random,26
+python,django.conf,23
+python,socket,22
+python,occ,20
+python,threading,20
+python,argparse,17
+python,itertools,17
+python,gi.repository,16
+python,lib.core.common,16
+python,mock,16
+python,shutil,16
+python,django.test,15
+
+[Executed results in self-refine]
+2025-05-01 01:07:43 - Thread-140 (execute) - INFO - [Consistent results]
+language,module,occurrences
+python,os,162
+python,sys,134
+python,__future__,122
+python,numpy,67
+python,logging,62
+python,datetime,61
+python,time,58
+python,traceback,56
+python,re,52
+python,unittest,45
+python,django.db,42
+python,json,37
+python,.,31
+python,collections,27
+python,random,26
+python,django.conf,23
+python,socket,22
+python,occ,20
+python,threading,20
+python,argparse,17
+python,itertools,17
+python,gi.repository,16
+python,lib.core.common,16
+python,mock,16
+python,shutil,16
+python,django.test,15
+
+[Consistent results]
+2025-05-01 01:07:43 - Thread-140 (execute) - INFO - Total iteration counts: 2

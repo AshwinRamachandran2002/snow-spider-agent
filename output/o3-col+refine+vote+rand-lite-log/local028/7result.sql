@@ -1,0 +1,11 @@
+SELECT
+    substr("order_delivered_customer_date", 6, 2) AS month,
+    SUM(CASE WHEN substr("order_delivered_customer_date", 1, 4) = '2016' THEN 1 ELSE 0 END) AS delivered_2016,
+    SUM(CASE WHEN substr("order_delivered_customer_date", 1, 4) = '2017' THEN 1 ELSE 0 END) AS delivered_2017,
+    SUM(CASE WHEN substr("order_delivered_customer_date", 1, 4) = '2018' THEN 1 ELSE 0 END) AS delivered_2018
+FROM   "olist_orders"
+WHERE  "order_status" = 'delivered'
+  AND  "order_delivered_customer_date" IS NOT NULL
+  AND  substr("order_delivered_customer_date", 1, 4) IN ('2016', '2017', '2018')
+GROUP BY month
+ORDER BY month;

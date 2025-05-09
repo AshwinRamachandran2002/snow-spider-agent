@@ -1,0 +1,12 @@
+SELECT s."stprba" AS State, ROUND(SUM(n."VALUE") / 1000000000, 4) AS Highest_Annual_Revenue_Billions
+FROM "SEC_QUARTERLY_FINANCIALS"."SEC_QUARTERLY_FINANCIALS"."NUMBERS" n
+JOIN "SEC_QUARTERLY_FINANCIALS"."SEC_QUARTERLY_FINANCIALS"."SUBMISSION" s
+  ON n."SUBMISSION_NUMBER" = s."submission_number"
+WHERE n."MEASURE_TAG" = 'Revenues'
+  AND n."NUMBER_OF_QUARTERS" = 4
+  AND s."countryba" = 'US'
+  AND s."fiscal_year" = 2016
+  AND n."UNITS" = 'USD'
+GROUP BY s."stprba"
+ORDER BY Highest_Annual_Revenue_Billions DESC NULLS LAST
+LIMIT 1;

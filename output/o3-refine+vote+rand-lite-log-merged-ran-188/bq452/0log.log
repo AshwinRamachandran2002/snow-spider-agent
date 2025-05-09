@@ -1,0 +1,417 @@
+2025-05-05 03:56:51 - Thread-2489 (execute) - INFO - [Exploration]
+```sql
+--Description: 1) Peek at the super–population distribution in the sample table
+SELECT `Super_Population`, COUNT(*) AS n_samples
+FROM   `spider2-public-data.1000_genomes.sample_info`
+GROUP  BY Super_Population
+ORDER  BY n_samples DESC
+LIMIT  20;
+```
+
+```sql
+--Description: 2) Pull all EAS (‘East Asian’) sample IDs that will be our “cases”
+SELECT `Sample`
+FROM   `spider2-public-data.1000_genomes.sample_info`
+WHERE  `Super_Population` = 'EAS'
+LIMIT  20;
+```
+
+```sql
+--Description: 3) Take a quick look at one chromosome-12 variant to understand the nested `call` field
+SELECT  reference_name, start, end, alternate_bases, call[OFFSET(0)] AS first_call
+FROM    `spider2-public-data.1000_genomes.variants`
+WHERE   reference_name = '12'
+LIMIT   20;
+```
+
+```sql
+--Description: 4) Unnest calls for a few chr-12 variants and join to sample_info to see allele counts sample-by-sample
+SELECT  v.start,
+        c.call_set_name                                        AS sample_id,
+        si.Super_Population,
+        (SELECT SUM(g) FROM UNNEST(c.genotype) AS g)           AS alt_alleles,
+        2 - (SELECT SUM(g) FROM UNNEST(c.genotype) AS g)       AS ref_alleles
+FROM    `spider2-public-data.1000_genomes.variants`  AS v,
+        UNNEST(v.call)                                         AS c
+JOIN    `spider2-public-data.1000_genomes.sample_info` AS si
+        ON si.Sample = c.call_set_name
+WHERE   v.reference_name = '12'
+LIMIT   20;
+```
+
+```sql
+--Description: 5) Aggregate reference & alternate allele counts per variant **and** per EAS / non-EAS group
+SELECT  v.start, v.end,
+        CASE WHEN si.Super_Population = 'EAS' THEN 'EAS' ELSE 'OTH' END AS grp,
+        SUM( (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )            AS alt_cnt,
+        SUM( 2 - (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )        AS ref_cnt
+FROM    `spider2-public-data.1000_genomes.variants`  AS v,
+        UNNEST(v.call)                                                 AS c
+JOIN    `spider2-public-data.1000_genomes.sample_info` AS si
+        ON si.Sample = c.call_set_name
+WHERE   v.reference_name = '12'
+GROUP BY v.start, v.end, grp
+LIMIT   20;
+```
+
+```sql
+--Description: 6) Pivot the previous result so that each variant has the four observed counts needed for a 2×2 table
+WITH allele_by_grp AS (
+  SELECT  v.start, v.end,
+          CASE WHEN si.Super_Population = 'EAS' THEN 'EAS' ELSE 'OTH' END AS grp,
+          SUM( (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )            AS alt_cnt,
+          SUM( 2 - (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )        AS ref_cnt
+  FROM    `spider2-public-data.1000_genomes.variants`  AS v,
+          UNNEST(v.call)                                                 AS c
+  JOIN    `spider2-public-data.1000_genomes.sample_info` AS si
+          ON si.Sample = c.call_set_name
+  WHERE   v.reference_name = '12'
+  GROUP BY v.start, v.end, grp
+)
+SELECT  start, end,
+        MAX(IF(grp='EAS', alt_cnt, NULL)) AS A,     --alt in cases
+        MAX(IF(grp='EAS', ref_cnt, NULL)) AS B,     --ref in cases
+        MAX(IF(grp='OTH', alt_cnt, NULL)) AS C,     --alt in controls
+        MAX(IF(grp='OTH', ref_cnt, NULL)) AS D      --ref in controls
+FROM    allele_by_grp
+GROUP BY start, end
+LIMIT   20;
+```
+
+```sql
+--Description: 7) Compute expected counts & Yates-corrected χ², but keep *all* variants for now
+WITH cont AS (
+  /* same pivot as step-6 */
+  SELECT  start, end,
+          MAX(IF(grp='EAS', alt_cnt, NULL)) AS A,
+          MAX(IF(grp='EAS', ref_cnt, NULL)) AS B,
+          MAX(IF(grp='OTH', alt_cnt, NULL)) AS C,
+          MAX(IF(grp='OTH', ref_cnt, NULL)) AS D
+  FROM (
+      SELECT  v.start, v.end,
+              CASE WHEN si.Super_Population = 'EAS' THEN 'EAS' ELSE 'OTH' END AS grp,
+              SUM( (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )            AS alt_cnt,
+              SUM( 2 - (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )        AS ref_cnt
+      FROM    `spider2-public-data.1000_genomes.variants`  AS v,
+              UNNEST(v.call)                                                 AS c
+      JOIN    `spider2-public-data.1000_genomes.sample_info` AS si
+              ON si.Sample = c.call_set_name
+      WHERE   v.reference_name = '12'
+      GROUP BY v.start, v.end, grp
+  )
+  GROUP BY start, end
+)
+SELECT  *,
+        /* totals */
+        (A+C) AS alt_total, (B+D) AS ref_total, (A+B) AS case_total, (C+D) AS ctrl_total,
+        /* expected counts */
+        (A+B)*(A+C)/(A+B+C+D) AS exp_A,
+        (A+B)*(B+D)/(A+B+C+D) AS exp_B,
+        (C+D)*(A+C)/(A+B+C+D) AS exp_C,
+        (C+D)*(B+D)/(A+B+C+D) AS exp_D,
+        /* Yates corrected χ² */
+        (
+          POW(ABS(A - ((A+B)*(A+C)/(A+B+C+D))) - 0.5, 2)/((A+B)*(A+C)/(A+B+C+D)) +
+          POW(ABS(B - ((A+B)*(B+D)/(A+B+C+D))) - 0.5, 2)/((A+B)*(B+D)/(A+B+C+D)) +
+          POW(ABS(C - ((C+D)*(A+C)/(A+B+C+D))) - 0.5, 2)/((C+D)*(A+C)/(A+B+C+D)) +
+          POW(ABS(D - ((C+D)*(B+D)/(A+B+C+D))) - 0.5, 2)/((C+D)*(B+D)/(A+B+C+D))
+        ) AS chi2_yates
+FROM    cont
+LIMIT   20;
+```
+
+```sql
+--Description: 8) Keep only variants whose every expected cell ≥ 5 (standard χ² assumption)
+WITH cont AS ( /* same CTE as step-7 */ ... )
+SELECT  start, end, chi2_yates
+FROM    (
+  SELECT  *,
+          /* same χ² calculation as above */  -- omitted here for brevity
+  FROM    cont
+)
+WHERE   exp_A >= 5 AND exp_B >= 5 AND exp_C >= 5 AND exp_D >= 5
+LIMIT   20;
+```
+
+```sql
+--Description: 9) Retrieve variants whose Yates-corrected χ² ≥ 29.71679 and sort descending
+WITH cont AS ( /* same CTE as step-7 */ ... )
+SELECT  start, end, chi2_yates
+FROM    (
+  SELECT  *,
+          /* χ² calculation here too */  -- omitted for brevity
+  FROM    cont
+)
+WHERE   exp_A >= 5 AND exp_B >= 5 AND exp_C >= 5 AND exp_D >= 5
+  AND   chi2_yates >= 29.71679
+ORDER BY chi2_yates DESC
+LIMIT   20;
+```
+
+```sql
+--Description: 10) Final answer: top chr-12 variants meeting the threshold (returning only asked columns)
+WITH allele_by_grp AS (
+  SELECT  v.start, v.end,
+          CASE WHEN si.Super_Population = 'EAS' THEN 'EAS' ELSE 'OTH' END AS grp,
+          SUM( (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )            AS alt_cnt,
+          SUM( 2 - (SELECT SUM(g) FROM UNNEST(c.genotype) AS g) )        AS ref_cnt
+  FROM    `spider2-public-data.1000_genomes.variants`  AS v,
+          UNNEST(v.call)                                                 AS c
+  JOIN    `spider2-public-data.1000_genomes.sample_info` AS si
+          ON si.Sample = c.call_set_name
+  WHERE   v.reference_name = '12'
+  GROUP BY v.start, v.end, grp
+),
+cont AS (
+  SELECT  start, end,
+          MAX(IF(grp='EAS', alt_cnt, NULL)) AS A,
+          MAX(IF(grp='EAS', ref_cnt, NULL)) AS B,
+          MAX(IF(grp='OTH', alt_cnt, NULL)) AS C,
+          MAX(IF(grp='OTH', ref_cnt, NULL)) AS D
+  FROM    allele_by_grp
+  GROUP BY start, end
+),
+chi AS (
+  SELECT  start, end, A, B, C, D,
+          (A+B)*(A+C)/(A+B+C+D) AS exp_A,
+          (A+B)*(B+D)/(A+B+C+D) AS exp_B,
+          (C+D)*(A+C)/(A+B+C+D) AS exp_C,
+          (C+D)*(B+D)/(A+B+C+D) AS exp_D,
+          (
+            POW(ABS(A - ((A+B)*(A+C)/(A+B+C+D))) - 0.5, 2)/((A+B)*(A+C)/(A+B+C+D)) +
+            POW(ABS(B - ((A+B)*(B+D)/(A+B+C+D))) - 0.5, 2)/((A+B)*(B+D)/(A+B+C+D)) +
+            POW(ABS(C - ((C+D)*(A+C)/(A+B+C+D))) - 0.5, 2)/((C+D)*(A+C)/(A+B+C+D)) +
+            POW(ABS(D - ((C+D)*(B+D)/(A+B+C+D))) - 0.5, 2)/((C+D)*(B+D)/(A+B+C+D))
+          ) AS chi2_yates
+  FROM    cont
+  WHERE   A IS NOT NULL AND B IS NOT NULL AND C IS NOT NULL AND D IS NOT NULL
+          /* ensure expected >=5 */
+          AND ( (A+B)*(A+C)/(A+B+C+D) ) >= 5
+          AND ( (A+B)*(B+D)/(A+B+C+D) ) >= 5
+          AND ( (C+D)*(A+C)/(A+B+C+D) ) >= 5
+          AND ( (C+D)*(B+D)/(A+B+C+D) ) >= 5
+)
+SELECT  start, end, chi2_yates
+FROM    chi
+WHERE   chi2_yates >= 29.71679
+ORDER BY chi2_yates DESC;
+```
+[Exploration]
+2025-05-05 03:56:51 - Thread-2489 (execute) - INFO - [Try to execute]
+--Description: 1) Peek at the super–population distribution in the sample table
+SELECT `Super_Population`, COUNT(*) AS n_samples
+FROM   `spider2-public-data.1000_genomes.sample_info`
+GROUP  BY Super_Population
+ORDER  BY n_samples DESC
+LIMIT  20;
+[Try to execute]
+2025-05-05 03:56:52 - Thread-2489 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: 2194cc58-ec80-4087-b71d-2bea6bf59bf5\n'}
+[Error occurred]
+2025-05-05 03:58:25 - Thread-2489 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Check which tables inside the dataset `spider2-public-data.1000_genomes` are actually accessible (they will be listed here if readable).
+SELECT
+  table_id   AS table_name,
+  row_count
+FROM
+  `spider2-public-data.1000_genomes.__TABLES_SUMMARY__`
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:58:26 - Thread-2489 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.__TABLES_SUMMARY__: User does not have permission to query table spider2-public-data:1000_genomes.__TABLES_SUMMARY__, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.__TABLES_SUMMARY__: User does not have permission to query table spider2-public-data:1000_genomes.__TABLES_SUMMARY__, or perhaps it does not exist.\n\nLocation: US\nJob ID: c6909e76-859e-4d2a-b657-7a39f169d643\n'}
+[Results for corrected sql]
+2025-05-05 03:59:10 - Thread-2489 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Confirm that the public `variants` table is readable by counting how many rows belong to chromosome 12.
+SELECT COUNT(*) AS chr12_variant_count
+FROM   `spider2-public-data.1000_genomes.variants`
+WHERE  reference_name = '12';
+```
+[Corrected SQL]
+2025-05-05 03:59:11 - Thread-2489 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.\n\nLocation: US\nJob ID: 5c0d432b-43f5-481d-8613-5d4b26560c01\n'}
+[Results for corrected sql]
+2025-05-05 03:59:39 - Thread-2489 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: The custom spider2-public-data dataset is inaccessible, so first verify access to the standard public 1000 Genomes dataset by counting how many variant rows lie on chromosome 12.  
+SELECT COUNT(*) AS chr12_variant_count
+FROM   `bigquery-public-data.1000_genomes.variants`
+WHERE  reference_name = '12';
+```
+[Corrected SQL]
+2025-05-05 03:59:40 - Thread-2489 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table bigquery-public-data:1000_genomes.variants: User does not have permission to query table bigquery-public-data:1000_genomes.variants, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table bigquery-public-data:1000_genomes.variants: User does not have permission to query table bigquery-public-data:1000_genomes.variants, or perhaps it does not exist.\n\nLocation: US\nJob ID: 6103d2cc-00a7-4276-8c23-85c01d7e229d\n'}
+[Results for corrected sql]
+2025-05-05 03:59:40 - Thread-2489 (execute) - INFO - [Try to execute]
+--Description: 2) Pull all EAS (‘East Asian’) sample IDs that will be our “cases”
+SELECT `Sample`
+FROM   `spider2-public-data.1000_genomes.sample_info`
+WHERE  `Super_Population` = 'EAS'
+LIMIT  20;
+[Try to execute]
+2025-05-05 03:59:41 - Thread-2489 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: e6b92cd3-7307-4187-8429-a01aae9435b6\n'}
+[Error occurred]
+2025-05-05 04:00:45 - Thread-2489 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build 2×2 contingency tables for every chromosome-12 variant using East-Asian (EAS) samples as “cases” and all other samples as “controls”, apply Yates’s-corrected χ², keep variants whose four expected counts ≥ 5 and χ² ≥ 29.71679, and return their genomic positions with the statistic.
+WITH allele_by_grp AS (
+  -- Count ref and alt alleles for each variant grouped by EAS vs others
+  SELECT
+    v.start,
+    v.end,
+    CASE WHEN si.Super_Population = 'EAS' THEN 'EAS' ELSE 'OTH' END AS grp,
+    SUM(CASE WHEN g = 0 THEN 1 ELSE 0 END) AS ref_cnt,
+    SUM(CASE WHEN g  > 0 THEN 1 ELSE 0 END) AS alt_cnt
+  FROM
+    `bigquery-public-data.1000_genomes.variants` AS v
+    CROSS JOIN UNNEST(v.call)                  AS c
+    JOIN `bigquery-public-data.1000_genomes.sample_info` AS si
+      ON si.Sample = c.call_set_name
+    CROSS JOIN UNNEST(c.genotype) AS g
+  WHERE
+    v.reference_name = '12'
+  GROUP BY
+    v.start, v.end, grp
+),
+cont AS (
+  -- Pivot to obtain 2×2 observed counts per variant
+  SELECT
+    start,
+    end,
+    MAX(IF(grp='EAS', alt_cnt, 0)) AS A,   -- alt in cases
+    MAX(IF(grp='EAS', ref_cnt, 0)) AS B,   -- ref in cases
+    MAX(IF(grp='OTH', alt_cnt, 0)) AS C,   -- alt in controls
+    MAX(IF(grp='OTH', ref_cnt, 0)) AS D    -- ref in controls
+  FROM allele_by_grp
+  GROUP BY start, end
+),
+chi2 AS (
+  -- Compute expected counts and Yates-corrected χ²
+  SELECT
+    start,
+    end,
+    A, B, C, D,
+    (A+B)*(A+C)/(A+B+C+D) AS exp_A,
+    (A+B)*(B+D)/(A+B+C+D) AS exp_B,
+    (C+D)*(A+C)/(A+B+C+D) AS exp_C,
+    (C+D)*(B+D)/(A+B+C+D) AS exp_D,
+    (
+      POW(ABS(A - ( (A+B)*(A+C)/(A+B+C+D) )) - 0.5, 2) / ( (A+B)*(A+C)/(A+B+C+D) ) +
+      POW(ABS(B - ( (A+B)*(B+D)/(A+B+C+D) )) - 0.5, 2) / ( (A+B)*(B+D)/(A+B+C+D) ) +
+      POW(ABS(C - ( (C+D)*(A+C)/(A+B+C+D) )) - 0.5, 2) / ( (C+D)*(A+C)/(A+B+C+D) ) +
+      POW(ABS(D - ( (C+D)*(B+D)/(A+B+C+D) )) - 0.5, 2) / ( (C+D)*(B+D)/(A+B+C+D) )
+    ) AS chi2_yates
+  FROM cont
+)
+SELECT
+  start,
+  end,
+  chi2_yates
+FROM chi2
+WHERE
+  exp_A >= 5 AND exp_B >= 5 AND exp_C >= 5 AND exp_D >= 5
+  AND chi2_yates >= 29.71679
+ORDER BY
+  chi2_yates DESC;
+```
+[Corrected SQL]
+2025-05-05 04:00:46 - Thread-2489 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##400 Syntax error: Expected ")" but got keyword END at [25:5]; reason: invalidQuery, location: query, message: Syntax error: Expected ")" but got keyword END at [25:5]\n\nLocation: US\nJob ID: d44b5e8c-9ec7-494b-9baf-78ef68babf9b\n'}
+[Results for corrected sql]
+2025-05-05 04:02:49 - Thread-2489 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build 2×2 contingency tables for every chromosome-12 variant using EAS samples as “cases” and all other super-populations as “controls”; compute Yates-corrected χ², retain variants whose four expected counts ≥ 5 and whose statistic ≥ 29.71679, and return their genomic coordinates with the χ² value.
+WITH per_call AS (        -- allele counts for each variant-sample call
+  SELECT
+    v.start,
+    v.end,
+    CASE WHEN si.Super_Population = 'EAS' THEN 'EAS' ELSE 'OTH' END AS grp,
+    /* number of alternate alleles in this call */
+    (SELECT COUNTIF(g > 0) FROM UNNEST(c.genotype) AS g WHERE g IS NOT NULL) AS alt_cnt,
+    /* number of reference alleles in this call */
+    (SELECT COUNTIF(g = 0) FROM UNNEST(c.genotype) AS g WHERE g IS NOT NULL) AS ref_cnt
+  FROM
+    `bigquery-public-data.1000_genomes.variants`      AS v
+  CROSS JOIN UNNEST(v.call)                           AS c
+  JOIN `bigquery-public-data.1000_genomes.sample_info` AS si
+    ON si.Sample = c.call_set_name
+  WHERE v.reference_name = '12'              -- chromosome 12 only
+),
+allele_by_grp AS (     -- aggregate alleles per variant & group
+  SELECT
+    start,
+    end,
+    grp,
+    SUM(alt_cnt) AS alt_cnt,
+    SUM(ref_cnt) AS ref_cnt
+  FROM per_call
+  GROUP BY start, end, grp
+),
+pivot AS (             -- observed 2×2 table
+  SELECT
+    start,
+    end,
+    COALESCE(MAX(IF(grp = 'EAS', alt_cnt, NULL)), 0) AS A,  -- alt in cases
+    COALESCE(MAX(IF(grp = 'EAS', ref_cnt, NULL)), 0) AS B,  -- ref in cases
+    COALESCE(MAX(IF(grp = 'OTH', alt_cnt, NULL)), 0) AS C,  -- alt in controls
+    COALESCE(MAX(IF(grp = 'OTH', ref_cnt, NULL)), 0) AS D   -- ref in controls
+  FROM allele_by_grp
+  GROUP BY start, end
+),
+expected AS (          -- expected counts and χ² with Yates correction
+  SELECT
+    start,
+    end,
+    A, B, C, D,
+    (A+B+C+D)                                   AS N,
+    -- expected counts
+    (A+B)*(A+C)/CAST(A+B+C+D AS FLOAT64) AS exp_A,
+    (A+B)*(B+D)/CAST(A+B+C+D AS FLOAT64) AS exp_B,
+    (C+D)*(A+C)/CAST(A+B+C+D AS FLOAT64) AS exp_C,
+    (C+D)*(B+D)/CAST(A+B+C+D AS FLOAT64) AS exp_D
+  FROM pivot
+),
+final AS (
+  SELECT
+    start,
+    end,
+    /* Yates-corrected χ² */
+    (
+      POW(ABS(CAST(A AS FLOAT64) - exp_A) - 0.5, 2)/exp_A +
+      POW(ABS(CAST(B AS FLOAT64) - exp_B) - 0.5, 2)/exp_B +
+      POW(ABS(CAST(C AS FLOAT64) - exp_C) - 0.5, 2)/exp_C +
+      POW(ABS(CAST(D AS FLOAT64) - exp_D) - 0.5, 2)/exp_D
+    ) AS chi2_yates
+  FROM expected
+  WHERE exp_A >= 5 AND exp_B >= 5 AND exp_C >= 5 AND exp_D >= 5   -- validity requirement
+)
+SELECT
+  start,
+  end,
+  chi2_yates
+FROM final
+WHERE chi2_yates >= 29.71679
+ORDER BY chi2_yates DESC;
+```
+[Corrected SQL]
+2025-05-05 04:02:50 - Thread-2489 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##400 Syntax error: Expected ")" but got keyword END at [21:5]; reason: invalidQuery, location: query, message: Syntax error: Expected ")" but got keyword END at [21:5]\n\nLocation: US\nJob ID: f19294e3-13e1-4cc1-8288-ba05fc21ab89\n'}
+[Results for corrected sql]
+2025-05-05 04:05:06 - Thread-2489 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Pull a quick list of East-Asian (EAS) sample IDs from the public 1000 Genomes `sample_info` table to define the “case” cohort.
+SELECT
+  Sample
+FROM
+  `bigquery-public-data.1000_genomes.sample_info`
+WHERE
+  Super_Population = 'EAS'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:05:08 - Thread-2489 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table bigquery-public-data:1000_genomes.sample_info: User does not have permission to query table bigquery-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table bigquery-public-data:1000_genomes.sample_info: User does not have permission to query table bigquery-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: dc23987d-2f21-4dc8-8e6b-31d19d71e79f\n'}
+[Results for corrected sql]

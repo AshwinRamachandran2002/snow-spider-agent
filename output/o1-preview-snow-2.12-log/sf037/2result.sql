@@ -1,0 +1,51 @@
+WITH home_depot_stores AS (
+  SELECT
+    HD."POI_ID" AS "home_depot_poi_id",
+    HD_ADDR."LATITUDE" AS "hd_latitude",
+    HD_ADDR."LONGITUDE" AS "hd_longitude"
+  FROM
+    "US_REAL_ESTATE"."CYBERSYN"."POINT_OF_INTEREST_INDEX" AS HD
+    JOIN "US_REAL_ESTATE"."CYBERSYN"."POINT_OF_INTEREST_ADDRESSES_RELATIONSHIPS" AS HD_REL
+      ON HD."POI_ID" = HD_REL."POI_ID"
+    JOIN "US_REAL_ESTATE"."CYBERSYN"."US_ADDRESSES" AS HD_ADDR
+      ON HD_REL."ADDRESS_ID" = HD_ADDR."ADDRESS_ID"
+  WHERE
+    HD."POI_NAME" = 'The Home Depot'
+    AND (HD_REL."RELATIONSHIP_END_DATE" IS NULL OR HD_REL."RELATIONSHIP_END_DATE" > CURRENT_DATE())
+    AND HD_ADDR."LATITUDE" IS NOT NULL
+    AND HD_ADDR."LONGITUDE" IS NOT NULL
+),
+lowes_stores AS (
+  SELECT
+    LS."POI_ID" AS "lowes_poi_id",
+    LS_ADDR."LATITUDE" AS "ls_latitude",
+    LS_ADDR."LONGITUDE" AS "ls_longitude"
+  FROM
+    "US_REAL_ESTATE"."CYBERSYN"."POINT_OF_INTEREST_INDEX" AS LS
+    JOIN "US_REAL_ESTATE"."CYBERSYN"."POINT_OF_INTEREST_ADDRESSES_RELATIONSHIPS" AS LS_REL
+      ON LS."POI_ID" = LS_REL."POI_ID"
+    JOIN "US_REAL_ESTATE"."CYBERSYN"."US_ADDRESSES" AS LS_ADDR
+      ON LS_REL."ADDRESS_ID" = LS_ADDR."ADDRESS_ID"
+  WHERE
+    LS."POI_NAME" = 'Lowe''s Home Improvement'
+    AND (LS_REL."RELATIONSHIP_END_DATE" IS NULL OR LS_REL."RELATIONSHIP_END_DATE" > CURRENT_DATE())
+    AND LS_ADDR."LATITUDE" IS NOT NULL
+    AND LS_ADDR."LONGITUDE" IS NOT NULL
+)
+SELECT
+  HD."home_depot_poi_id",
+  ROUND(
+    MIN(
+      ST_DISTANCE(
+        TO_GEOGRAPHY(CONCAT('POINT (', HD."hd_longitude", ' ', HD."hd_latitude", ')')),
+        TO_GEOGRAPHY(CONCAT('POINT (', LS."ls_longitude", ' ', LS."ls_latitude", ')'))
+      )
+    ) * 0.000621371, 4
+  ) AS "distance_miles"
+FROM
+  home_depot_stores AS HD
+  CROSS JOIN lowes_stores AS LS
+GROUP BY
+  HD."home_depot_poi_id"
+ORDER BY
+  HD."home_depot_poi_id";

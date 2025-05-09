@@ -1,0 +1,1733 @@
+2025-05-05 03:31:10 - Thread-2133 (execute) - INFO - [Exploration]
+```sql
+-- 1. Description: Preview a handful of Nature-dataset records so we know the main article–level columns we will work with.
+SELECT 
+  "id",
+  "date",
+  "title",
+  "category"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: Look at the particular article we will treat as the query-article (ID = ‘8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373’).
+SELECT 
+  "id",
+  "date",
+  "title",
+  "abstract",
+  "body"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+WHERE "id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: Tokenise the body of that same article (stop-words removed) so we can inspect the remaining word list.
+SELECT
+  token.value::STRING  AS "token"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+     LATERAL FLATTEN(
+       input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+     ) token
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: Join those tokens to WORD_FREQUENCIES to see each token’s global frequency.
+SELECT
+  tok.value::STRING                           AS "word",
+  wf."frequency"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE      AS n,
+     LATERAL FLATTEN(
+       input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+     )                                           AS tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES  AS wf
+       ON wf."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: Attach GloVe vectors to those same words so we can check that the vectors really exist.
+SELECT
+  tok.value::STRING                           AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE      AS n,
+     LATERAL FLATTEN(
+       input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+     )                                           AS tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS      AS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+
+```sql
+-- 6. Description: For that one article, compute the weighted vector for every token
+--                (vector / frequency^0.4) and sum them into one aggregate VECTOR column.
+WITH tokens AS (
+  SELECT
+    tok.value::STRING                               AS word,
+    gv."vector"                                     AS vec,
+    wf."frequency"                                  AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+       LATERAL FLATTEN(
+         input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+       )                                            tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+)
+SELECT
+  ARRAY_AGG( (value::FLOAT) / POWER(freq, 0.4) )   WITHIN GROUP (ORDER BY seq4()) AS "weighted_component_vector"
+FROM tokens,
+     LATERAL FLATTEN(input => tokens.vec);
+```
+
+```sql
+-- 7. Description: Produce an aggregate (still un-normalised) vector for EVERY article; one row per article.
+WITH per_token AS (
+  SELECT
+    n."id"                                          AS art_id,
+    gv."vector"                                     AS vec,
+    wf."frequency"                                  AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+       LATERAL FLATTEN(
+         input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+       )                                            tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+)
+SELECT
+  art_id,
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) ) 
+     WITHIN GROUP (ORDER BY seq4())                AS agg_vec
+FROM per_token,
+     LATERAL FLATTEN(input => per_token.vec) val
+GROUP BY art_id
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: Take those aggregate vectors and also store their magnitudes
+--                (so we can normalise and later compute cosine similarities fast).
+WITH agg AS (
+  /* re-use the aggregation in query #7 */
+  SELECT
+    art_id,
+    ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) ) 
+      WITHIN GROUP (ORDER BY seq4())               AS agg_vec
+  FROM (
+    SELECT
+      n."id"                                         AS art_id,
+      gv."vector"                                    AS vec,
+      wf."frequency"                                 AS freq
+    FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+         LATERAL FLATTEN(
+           input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+         )                                           tok
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+           ON gv."word" = tok.value::STRING
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+           ON wf."word" = tok.value::STRING
+  ) inner_tbl,
+  LATERAL FLATTEN(input => inner_tbl.vec) val
+  GROUP BY art_id
+)
+SELECT
+  art_id,
+  agg_vec,
+  SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, x -> (x * x)) )) AS mag
+FROM agg
+LIMIT 20;
+```
+
+```sql
+-- 9. Description: Pre-normalise those vectors to unit length so cosine similarity reduces to simple dot product.
+WITH agg AS (
+  /* same aggregation block as above, shortened for clarity */
+  SELECT
+    art_id,
+    ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) ) 
+      WITHIN GROUP (ORDER BY seq4())               AS agg_vec
+  FROM (
+    SELECT
+      n."id"                                         AS art_id,
+      gv."vector"                                    AS vec,
+      wf."frequency"                                 AS freq
+    FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+         LATERAL FLATTEN(
+           input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+         )                                           tok
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+           ON gv."word" = tok.value::STRING
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+           ON wf."word" = tok.value::STRING
+  ) inner_tbl,
+  LATERAL FLATTEN(input => inner_tbl.vec) val
+  GROUP BY art_id
+)
+SELECT
+  art_id,
+  ARRAY_TRANSFORM(
+      agg_vec,
+      x -> x / SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, y -> (y*y)) ))
+  )                                                 AS unit_vec
+FROM agg
+LIMIT 20;
+```
+
+```sql
+-- 10. Description: Final query – produce the 10 articles whose unit-vectors have the highest cosine similarity 
+--                 (dot product) with the query article’s unit-vector.  
+WITH unit_vectors AS (
+  /* create one unit-length vector per article (same logic as #9) */
+  SELECT
+    art_id,
+    ARRAY_TRANSFORM(
+      agg_vec,
+      x -> x / SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, y -> (y*y)) ))
+    )                                               AS unit_vec
+  FROM (
+    /* aggregate weighted vectors per article */
+    SELECT
+      art_id,
+      ARRAY_AGG(weighted.value::FLOAT) 
+           WITHIN GROUP (ORDER BY seq4())           AS agg_vec
+    FROM (
+      SELECT
+        n."id"                                      AS art_id,
+        gv."vector"                                 AS vec,
+        wf."frequency"                              AS freq
+      FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+           LATERAL FLATTEN(
+             input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+           ) tok
+      LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+             ON gv."word" = tok.value::STRING
+      LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+             ON wf."word" = tok.value::STRING
+    ) per_token,
+    LATERAL FLATTEN(input => per_token.vec) raw,
+    LATERAL (
+      SELECT raw.value::FLOAT / POWER(per_token.freq, 0.4) AS value
+    ) weighted
+    GROUP BY art_id
+  )
+),
+query_vec AS (
+  SELECT unit_vec
+  FROM unit_vectors
+  WHERE art_id = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+)
+SELECT
+  n."id",
+  n."date",
+  n."title",
+  ARRAY_SUM(
+    ARRAY_ZIP_WITH(
+      uv.unit_vec,
+      (SELECT unit_vec FROM query_vec),
+      (u,q) -> (u*q)
+    )
+  )                                                AS cosine_similarity
+FROM unit_vectors uv
+JOIN WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+     ON n."id" = uv.art_id
+WHERE uv.art_id <> '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+ORDER BY cosine_similarity DESC
+LIMIT 10;
+```
+[Exploration]
+2025-05-05 03:31:10 - Thread-2133 (execute) - INFO - [Try to execute]
+-- 1. Description: Preview a handful of Nature-dataset records so we know the main article–level columns we will work with.
+SELECT 
+  "id",
+  "date",
+  "title",
+  "category"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:31:11 - Thread-2133 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Description: Preview a handful of Nature-dataset records so we know the main article–level columns we will work with.
+SELECT 
+  "id",
+  "date",
+  "title",
+  "category"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+LIMIT 20;
+Results:
+id,date,title,category
+b8f29c08-2530-4ff1-bd49-da1f483b73ed,2018-12-31,Structural basis of Notch recognition by human γ-secretase,Cryoelectron microscopy; Proteases
+ba1d19c8-e235-4bf6-95ff-f2022a69e510,2018-09-27,"You are what you eat: diet, health and the gut microbiota",Microbiome; Microbiota; Nutrition
+83ee533c-7dd3-4e7f-9f30-53cddb6fa2a6,2018-10-31,The SWI/SNF complex is a mechanoregulated inhibitor of YAP and TAZ,Cancer; Cell biology; Cell signalling
+
+[Successfully executed]
+2025-05-05 03:31:11 - Thread-2133 (execute) - INFO - [Try to execute]
+-- 2. Description: Look at the particular article we will treat as the query-article (ID = ‘8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373’).
+SELECT 
+  "id",
+  "date",
+  "title",
+  "abstract",
+  "body"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+WHERE "id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:31:13 - Thread-2133 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Description: Look at the particular article we will treat as the query-article (ID = ‘8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373’).
+SELECT 
+  "id",
+  "date",
+  "title",
+  "abstract",
+  "body"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+WHERE "id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+Results:
+id,date,title,abstract,body
+8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373,2018-10-08,Blood-based biomarkers for Alzheimer disease: mapping the road to the clinic,"Biomarker discovery and development for clinical research, diagnostics and therapy monitoring in clinical trials have advanced rapidly in key areas of medicine — most notably, oncology and cardiovascular diseases — allowing rapid early detection and supporting the evolution of biomarker-guided, precision-medicine-based targeted therapies. In A
+
+[Successfully executed]
+2025-05-05 03:31:13 - Thread-2133 (execute) - INFO - [Try to execute]
+-- 3. Description: Tokenise the body of that same article (stop-words removed) so we can inspect the remaining word list.
+SELECT
+  token.value::STRING  AS "token"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n,
+     LATERAL FLATTEN(
+       input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+     ) token
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:31:13 - Thread-2133 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 5 at position 16\ninvalid identifier 'SPIDER2'"}
+[Error occurred]
+2025-05-05 03:31:55 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+-- Goal: For the same article, examine each stop-word-filtered token together with its
+--       global corpus frequency.  This helps verify that our JOIN to the frequency
+--       table works before we move on to vector weighting.
+-- Steps
+--   1. Tokenise the “body” column via the local UDF WORD_VECTORS_US.WORD_VECTORS_US.tokenise_no_stop().
+--   2. FLATTEN the resulting array so each token is a row.
+--   3. LEFT JOIN those tokens to WORD_FREQUENCIES on the token text.
+--   4. Return the token and its frequency (NULL if the token is missing from the frequency table).
+--   5. LIMIT 20 to keep output readable.
+SELECT
+  tok.value::STRING                       AS "word",
+  wf."frequency"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+     ,LATERAL FLATTEN(
+        INPUT => WORD_VECTORS_US.WORD_VECTORS_US.tokenise_no_stop(n."body")
+      ) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+       ON wf."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:31:55 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##001072 (42601): SQL compilation error:\nLateral View cannot be on the left side of join'}
+[Results for corrected sql]
+2025-05-05 03:32:43 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Retrieve the list of non-stopword tokens from the “body” of the
+--              Alzheimer-biomarker article.  
+--              • WORD_VECTORS_US.WORD_VECTORS_US.tokenise_no_stop() returns an ARRAY 
+--                of tokens after stop-word removal.  
+--              • CROSS JOIN LATERAL FLATTEN() explodes that array into one row per token, 
+--                which avoids the previous join-ordering error.  
+--              • LIMIT 20 shows only the first 20 tokens for quick inspection.
+SELECT
+  tok.value::STRING AS "token"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => WORD_VECTORS_US.WORD_VECTORS_US.tokenise_no_stop(n."body")
+) tok
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:32:43 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##002141 (42601): SQL compilation error:\nUnknown user-defined function WORD_VECTORS_US.WORD_VECTORS_US.TOKENISE_NO_STOP'}
+[Results for corrected sql]
+2025-05-05 03:33:32 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Show the first 20 tokens (stop-words already removed) from the “body”
+--              of the Nature article with ID = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'.
+--              1) Call the UDF "SPIDER2-PUBLIC-DATA".WORD_VECTORS_US.TOKENISE_NO_STOP(…)
+--                 which returns an ARRAY of tokens.
+--              2) CROSS JOIN LATERAL FLATTEN to explode that ARRAY into one row per token.
+--              3) Filter by the desired article ID and LIMIT the preview to 20 rows.
+SELECT
+  tok.value::STRING AS "token"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => "SPIDER2-PUBLIC-DATA".WORD_VECTORS_US.TOKENISE_NO_STOP(n."body")
+) tok
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:33:32 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##002141 (42601): SQL compilation error:\nUnknown user-defined function "SPIDER2-PUBLIC-DATA".WORD_VECTORS_US.TOKENISE_NO_STOP'}
+[Results for corrected sql]
+2025-05-05 03:33:32 - Thread-2133 (execute) - INFO - [Try to execute]
+-- 4. Description: Join those tokens to WORD_FREQUENCIES to see each token’s global frequency.
+SELECT
+  tok.value::STRING                           AS "word",
+  wf."frequency"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE      AS n,
+     LATERAL FLATTEN(
+       input => spider2-public-data.word_vectors_us.tokenise_no_stop(n."body")
+     )                                           AS tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES  AS wf
+       ON wf."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:33:33 - Thread-2133 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##001072 (42601): SQL compilation error:\nLateral View cannot be on the left side of join'}
+[Error occurred]
+2025-05-05 03:34:23 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Tokenise (stop-words removed) the body text of the target article,
+--             explode the resulting ARRAY into individual tokens via
+--             CROSS JOIN LATERAL FLATTEN, then attach each token’s corpus
+--             frequency from WORD_FREQUENCIES.  This avoids the previous
+--             LATERAL-join ordering error and uses the fully-qualified,
+--             quoted UDF path that contains a hyphen.
+SELECT
+  tok.value::STRING AS "word",
+  wf."frequency"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => "SPIDER2-PUBLIC-DATA"."WORD_VECTORS_US".TOKENISE_NO_STOP(n."body")
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+       ON wf."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:34:23 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##002141 (42601): SQL compilation error:\nUnknown user-defined function "SPIDER2-PUBLIC-DATA".WORD_VECTORS_US.TOKENISE_NO_STOP'}
+[Results for corrected sql]
+2025-05-05 03:35:07 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Extend the previous step by attaching the GloVe vector for each token so we
+--              can verify that vectors exist before we later weight and aggregate them.
+--              1.  Inline-tokenise n."body":  LOWER → strip non-alphanumerics → SPLIT on spaces.
+--              2.  CROSS JOIN LATERAL FLATTEN to explode the resulting ARRAY of tokens.
+--              3.  Filter out NULL / empty tokens.
+--              4.  LEFT JOIN to GLOVE_VECTORS on the token text to pull the 100-D vector
+--                 (stored as a VARIANT array).  
+--              5.  LIMIT 20 rows for quick inspection.
+SELECT
+  tok.value::STRING AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => SPLIT(
+             REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+             ' '
+           )
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+  AND tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:36:00 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+word,vector
+supplementary,"[
+  -3.028999865055084e-01,
+  -4.576799869537354e-01,
+  -1.685800030827522e-03,
+  5.024700164794922e-01,
+  -1.090200021862984e-01,
+  3.252499997615814e-01,
+  7.072900235652924e-02,
+  -1.376899927854538e-01,
+  -4.922499954700470e-01,
+  5.720499753952026e-01,
+  -6.045899987220764e-01,
+  4.136599898338318e-01,
+  1.762199997901917e-01,
+  -1.637600064277649e-01,
+  -1.148399990051985e-02,
+  2.140700072050095e-01,
+  1.768700033426285e-01,
+  1.436300039291382e+00,
+  7.8574001
+
+[Results for corrected sql]
+2025-05-05 03:36:57 - Thread-2133 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  #5 ‒ Attach GloVe vectors to each token (inline-tokenised) for the
+--              Alzheimer-biomarker article so we can verify that vectors exist.
+SELECT
+  tok.value::STRING  AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE  n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => SPLIT(
+             REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+             ' '
+           )
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+  AND tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+```
+
+```sql
+--Description:  #6 ‒ For the same article, compute one aggregate weighted vector:
+--              (each component = token-vector ÷ frequency^0.4) and show the 100-D
+--              weighted-component array.
+WITH tokens AS (
+  SELECT
+    tok.value::STRING                              AS word,
+    gv."vector"                                    AS vec,
+    wf."frequency"                                 AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+    AND tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+      WITHIN GROUP (ORDER BY seq4())               AS "weighted_component_vector"
+FROM tokens,
+     LATERAL FLATTEN(input => tokens.vec) val;
+```
+
+```sql
+--Description:  #7 ‒ Build an un-normalised aggregate weighted vector for EVERY
+--              article in the Nature table (one row per article).
+WITH per_token AS (
+  SELECT
+    n."id"                                         AS art_id,
+    gv."vector"                                    AS vec,
+    wf."frequency"                                 AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  art_id,
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+      WITHIN GROUP (ORDER BY seq4())              AS agg_vec
+FROM per_token,
+     LATERAL FLATTEN(input => per_token.vec) val
+GROUP BY art_id
+LIMIT 20;
+```
+
+```sql
+--Description:  #8 ‒ Re-use the weighted aggregation from #7, then compute each
+--              article’s vector magnitude (Euclidean norm) so we can normalise later.
+WITH agg AS (
+  SELECT
+    art_id,
+    ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+        WITHIN GROUP (ORDER BY seq4())            AS agg_vec
+  FROM (
+    SELECT
+      n."id"                                      AS art_id,
+      gv."vector"                                 AS vec,
+      wf."frequency"                              AS freq
+    FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+    CROSS JOIN LATERAL FLATTEN(
+      INPUT => SPLIT(
+                 REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+                 ' '
+               )
+    ) tok
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+           ON gv."word" = tok.value::STRING
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+           ON wf."word" = tok.value::STRING
+    WHERE tok.value IS NOT NULL
+      AND tok.value <> ''
+  ) src,
+  LATERAL FLATTEN(input => src.vec) val
+  GROUP BY art_id
+)
+SELECT
+  art_id,
+  agg_vec,
+  SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, x -> x * x) ))  AS mag
+FROM agg
+LIMIT 20;
+```
+
+```sql
+--Description:  #9 ‒ Produce a UNIT-length vector for every article by dividing each
+--              component of agg_vec by its magnitude (norm).
+WITH agg AS (
+  SELECT
+    art_id,
+    ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+        WITHIN GROUP (ORDER BY seq4())            AS agg_vec
+  FROM (
+    SELECT
+      n."id"                                      AS art_id,
+      gv."vector"                                 AS vec,
+      wf."frequency"                              AS freq
+    FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+    CROSS JOIN LATERAL FLATTEN(
+      INPUT => SPLIT(
+                 REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+                 ' '
+               )
+    ) tok
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+           ON gv."word" = tok.value::STRING
+    LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+           ON wf."word" = tok.value::STRING
+    WHERE tok.value IS NOT NULL
+      AND tok.value <> ''
+  ) src,
+  LATERAL FLATTEN(input => src.vec) val
+  GROUP BY art_id
+)
+SELECT
+  art_id,
+  ARRAY_TRANSFORM(
+     agg_vec,
+     x -> x / SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, y -> y*y ) ))
+  )                                               AS unit_vec
+FROM agg
+LIMIT 20;
+```
+
+```sql
+--Description:  #10 ‒ Compute cosine similarity (dot product, since vectors are unit
+--              length) between every article and the query article, returning the
+--              10 most similar articles (ID, date, title, similarity score).
+WITH unit_vectors AS (
+  /* build unit vectors for every article (same logic as #9) */
+  SELECT
+    art_id,
+    ARRAY_TRANSFORM(
+       agg_vec,
+       x -> x / SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, y -> y*y ) ))
+    )                                             AS unit_vec
+  FROM (
+    /* aggregate weighted components for each article */
+    SELECT
+      art_id,
+      ARRAY_AGG(weighted.value::FLOAT)
+          WITHIN GROUP (ORDER BY seq4())          AS agg_vec
+    FROM (
+      SELECT
+        n."id"                                    AS art_id,
+        gv."vector"                               AS vec,
+        wf."frequency"                            AS freq
+      FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+      CROSS JOIN LATERAL FLATTEN(
+        INPUT => SPLIT(
+                   REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+                   ' '
+                 )
+      ) tok
+      LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+             ON gv."word" = tok.value::STRING
+      LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+             ON wf."word" = tok.value::STRING
+      WHERE tok.value IS NOT NULL
+        AND tok.value <> ''
+    ) per_token,
+    LATERAL FLATTEN(input => per_token.vec) raw,
+    LATERAL ( SELECT raw.value::FLOAT / POWER(per_token.freq, 0.4) AS value ) weighted
+    GROUP BY art_id
+  )
+),
+query_vec AS (
+  SELECT unit_vec
+  FROM unit_vectors
+  WHERE art_id = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+)
+SELECT
+  n."id",
+  n."date",
+  n."title",
+  ARRAY_SUM(
+    ARRAY_ZIP_WITH(
+      uv.unit_vec,
+      (SELECT unit_vec FROM query_vec),
+      (u,q) -> u*q
+    )
+  )                                               AS cosine_similarity
+FROM unit_vectors uv
+JOIN WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+     ON n."id" = uv.art_id
+WHERE uv.art_id <> '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+ORDER BY cosine_similarity DESC
+LIMIT 10;
+```
+[Corrected other sqls]
+2025-05-05 03:36:57 - Thread-2133 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Extend the previous step by attaching the GloVe vector for each token so we
+--              can verify that vectors exist before we later weight and aggregate them.
+--              1.  Inline-tokenise n."body":  LOWER → strip non-alphanumerics → SPLIT on spaces.
+--              2.  CROSS JOIN LATERAL FLATTEN to explode the resulting ARRAY of tokens.
+--              3.  Filter out NULL / empty tokens.
+--              4.  LEFT JOIN to GLOVE_VECTORS on the token text to pull the 100-D vector
+--                 (stored as a VARIANT array).  
+--              5.  LIMIT 20 rows for quick inspection.
+SELECT
+  tok.value::STRING AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => SPLIT(
+             REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+             ' '
+           )
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+  AND tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+Results:
+word,vector
+supplementary,"[
+  -3.028999865055084e-01,
+  -4.576799869537354e-01,
+  -1.685800030827522e-03,
+  5.024700164794922e-01,
+  -1.090200021862984e-01,
+  3.252499997615814e-01,
+  7.072900235652924e-02,
+  -1.376899927854538e-01,
+  -4.922499954700470e-01,
+  5.720499753952026e-01,
+  -6.045899987220764e-01,
+  4.136599898338318e-01,
+  1.762199997901917e-01,
+  -1.637600064277649e-01,
+  -1.148399990051985e-02,
+  2.140700072050095e-01,
+  1.768700033426285e-01,
+  1.436300039291382e+00,
+  7.8574001
+
+[Successfully corrected]
+2025-05-05 03:36:57 - Thread-2133 (execute) - INFO - [Try to execute]
+--Description:  #5 ‒ Attach GloVe vectors to each token (inline-tokenised) for the
+--              Alzheimer-biomarker article so we can verify that vectors exist.
+SELECT
+  tok.value::STRING  AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE  n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => SPLIT(
+             REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+             ' '
+           )
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+  AND tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20
+[Try to execute]
+2025-05-05 03:36:59 - Thread-2133 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  #5 ‒ Attach GloVe vectors to each token (inline-tokenised) for the
+--              Alzheimer-biomarker article so we can verify that vectors exist.
+SELECT
+  tok.value::STRING  AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE  n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => SPLIT(
+             REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+             ' '
+           )
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+  AND tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20
+Results:
+word,vector
+table,"[
+  -1.496800035238266e-01,
+  -4.217900037765503e-01,
+  -1.416299939155579e-01,
+  5.112800002098083e-02,
+  3.363400101661682e-01,
+  2.619799971580505e-01,
+  1.278900057077408e-01,
+  1.062000021338463e-01,
+  1.772200018167496e-01,
+  1.304499983787537e+00,
+  -2.480800002813339e-01,
+  6.674100160598755e-01,
+  -9.197399765253067e-02,
+  -1.862699985504150e-01,
+  4.095000028610229e-02,
+  5.717299878597260e-02,
+  -2.292200028896332e-01,
+  2.277100086212158e+00,
+  1.125399991869926e-
+
+[Successfully executed]
+2025-05-05 03:36:59 - Thread-2133 (execute) - INFO - [Try to execute]
+--Description:  #6 ‒ For the same article, compute one aggregate weighted vector:
+--              (each component = token-vector ÷ frequency^0.4) and show the 100-D
+--              weighted-component array.
+WITH tokens AS (
+  SELECT
+    tok.value::STRING                              AS word,
+    gv."vector"                                    AS vec,
+    wf."frequency"                                 AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+    AND tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+      WITHIN GROUP (ORDER BY seq4())               AS "weighted_component_vector"
+FROM tokens,
+     LATERAL FLATTEN(input => tokens.vec) val
+[Try to execute]
+2025-05-05 03:37:03 - Thread-2133 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description:  #6 ‒ For the same article, compute one aggregate weighted vector:
+--              (each component = token-vector ÷ frequency^0.4) and show the 100-D
+--              weighted-component array.
+WITH tokens AS (
+  SELECT
+    tok.value::STRING                              AS word,
+    gv."vector"                                    AS vec,
+    wf."frequency"                                 AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+    AND tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+      WITHIN GROUP (ORDER BY seq4())               AS "weighted_component_vector"
+FROM tokens,
+     LATERAL FLATTEN(input => tokens.vec) val
+Results:
+weighted_component_vector
+"[
+  -4.116489795554936e-03,
+  6.001475348025648e-03,
+  -9.864312487493438e-03,
+  5.183215721565521e-03,
+  3.691923652560469e-03,
+  1.221560456333413e-02,
+  -4.839166549285899e-03,
+  -6.138551649296937e-03,
+  -2.957391922702521e-03,
+  5.655203167602902e-02,
+  -1.855816455753218e-02,
+  1.025528839668526e-02,
+  -1.876143315103968e-03,
+  -9.299211613453680e-03,
+  -2.374236882250230e-03,
+  -7.738023342747103e-03,
+  -2.024605715250771e-03,
+  4.890786327924840e-02,
+  -1.1785
+
+[Successfully executed]
+2025-05-05 03:37:03 - Thread-2133 (execute) - INFO - [Try to execute]
+--Description:  #7 ‒ Build an un-normalised aggregate weighted vector for EVERY
+--              article in the Nature table (one row per article).
+WITH per_token AS (
+  SELECT
+    n."id"                                         AS art_id,
+    gv."vector"                                    AS vec,
+    wf."frequency"                                 AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  art_id,
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+      WITHIN GROUP (ORDER BY seq4())              AS agg_vec
+FROM per_token,
+     LATERAL FLATTEN(input => per_token.vec) val
+GROUP BY art_id
+LIMIT 20
+[Try to execute]
+2025-05-05 03:40:24 - Thread-2133 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000630 (57014): Statement reached its statement or warehouse timeout of 200 second(s) and was canceled.'}
+[Error occurred]
+2025-05-05 03:41:22 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Produce unit-length (normalised) aggregate vectors for the most-recent
+--              50 Nature articles, keeping the workload small enough to avoid timeout.
+--              Steps inside the CTE cascade:
+--                1. recent_articles  – grab 50 newest rows with non-NULL body text.
+--                2. per_token        – inline-tokenise each body, join to GloVe + frequency
+--                                       so we have (vector, freq) for every token.
+--                3. agg              – build an un-normalised aggregate vector
+--                                       Σ( token_vector / freq^0.4 ) for each article.
+--                4. final SELECT     – divide each component of agg_vec by its Euclidean
+--                                       norm to obtain a unit vector (ready for cosine
+--                                       similarity work) and show the first 20 rows.
+WITH recent_articles AS (               -- 1. limit to newest 50 articles
+  SELECT "id", "body"
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+  WHERE "body" IS NOT NULL
+  ORDER BY "date" DESC
+  LIMIT 50
+), per_token AS (                       -- 2. token → vector + frequency
+  SELECT
+    a."id"                              AS art_id,
+    gv."vector"                         AS vec,
+    wf."frequency"                      AS freq
+  FROM recent_articles a
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(a."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+), agg AS (                             -- 3. aggregate weighted vector per article
+  SELECT
+    art_id,
+    ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+        WITHIN GROUP (ORDER BY seq4())  AS agg_vec
+  FROM per_token,
+       LATERAL FLATTEN(input => per_token.vec) val
+  GROUP BY art_id
+)
+SELECT
+  art_id,
+  ARRAY_TRANSFORM(                      -- 4. normalise to unit length
+     agg_vec,
+     x -> x / SQRT(ARRAY_SUM( ARRAY_TRANSFORM(agg_vec, y -> y*y) ))
+  ) AS unit_vec
+FROM agg
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:41:22 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 38 at position 46\ninvalid identifier 'AGG_VEC'"}
+[Results for corrected sql]
+2025-05-05 03:42:37 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Build an un-normalised aggregate weighted vector for each of the
+--              100 most-recent Nature articles (keeps run-time below the warehouse
+--              limit).  Process:
+--                1. recent_articles  – grab latest 100 rows with non-NULL body text.
+--                2. per_token        – inline-tokenise the body; attach each token’s
+--                   GloVe vector and global frequency.
+--                3. Final SELECT     – explode every 100-D token vector, divide each
+--                   component by freq^0.4, then ARRAY_AGG the 100 weighted components
+--                   into agg_vec for every article.  Return 20 rows for inspection.
+WITH recent_articles AS (                       -- 1. limit workload
+  SELECT "id", "body"
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+  WHERE "body" IS NOT NULL
+  ORDER BY "date" DESC
+  LIMIT 100
+), per_token AS (                               -- 2. token → (vector , freq)
+  SELECT
+    a."id"                                    AS art_id,
+    gv."vector"                               AS vec,
+    wf."frequency"                            AS freq
+  FROM recent_articles a
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(a."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  art_id,
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) ) AS agg_vec
+FROM per_token
+     ,LATERAL FLATTEN(input => per_token.vec) val
+GROUP BY art_id
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:44:59 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##100082 (22000): The data length in result column AGG_VEC is not supported by this version of the client. Actual length 17325593 exceeds supported length of 16777216.'}
+[Results for corrected sql]
+2025-05-05 03:46:16 - Thread-2133 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Construct a 100-component, un-normalised aggregate weighted vector
+--              for every article while staying under Snowflake’s 16 MB cell limit.
+--              1.  per_token  – inline-tokenise each “body”, join each token to its
+--                  100-D GloVe vector + global frequency.  
+--              2.  flat_val   – FLATTEN the 100-D vector so every component is a row,
+--                  divide by freq^0.4 ⇒ weighted_comp.  
+--              3.  summed     – SUM weighted_comp for each (article, component index).  
+--              4.  Final SELECT reassembles the 100 component-sums (ORDER BY index)
+--                  into a compact ARRAY (agg_vec) per article.  Display 20 rows.
+WITH per_token AS (
+  SELECT
+    n."id"                                AS art_id,
+    gv."vector"                           AS vec,
+    wf."frequency"                        AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+), flat_val AS (
+  SELECT
+    art_id,
+    v.index                           AS idx,                 -- component 0-99
+    v.value::FLOAT / POWER(freq, 0.4) AS weighted_comp
+  FROM per_token,
+       LATERAL FLATTEN(input => vec) v
+), summed AS (
+  SELECT
+    art_id,
+    idx,
+    SUM(weighted_comp)               AS comp_sum
+  FROM flat_val
+  GROUP BY art_id, idx
+)
+SELECT
+  art_id,
+  ARRAY_AGG(comp_sum ORDER BY idx)   AS agg_vec               -- 100-element vector
+FROM summed
+GROUP BY art_id
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:46:16 - Thread-2133 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##001003 (42000): SQL compilation error:\nsyntax error line 36 at position 21 unexpected 'ORDER'.\nsyntax error line 36 at position 33 unexpected ')'."}
+[Results for corrected sql]
+2025-05-05 03:46:16 - Thread-2133 (execute) - INFO - itercount: 0
+2025-05-05 03:46:16 - Thread-2133 (execute) - INFO - [Self-refine]
+Table full name: WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+Column name: acquisition_date Type: DATE
+Column name: title Type: TEXT
+Column name: abstract Type: TEXT
+Column name: citations Type: TEXT
+Column name: body Type: TEXT
+Column name: pdf_link Type: TEXT
+Column name: date Type: DATE
+Column name: doi Type: TEXT
+Column name: category Type: TEXT
+Column name: link Type: TEXT
+Column name: organization_affiliated Type: TEXT
+Column name: keywords Type: TEXT
+Column name: id Type: TEXT
+Column name: authors Type: TEXT
+Column name: nature_source Type: TEXT
+Sample rows:
+[{'abstract': 'Serum is a common supplement for cell culture due to it containing the essential active components for the growth and maintenance of cells. However, the knowledges of the active components in serum are incomplete. Apart from the direct influence of serum components on cultured cells, the reaction of serum components with tested drugs cannot be ignored, which usually results in the false conclusion on the activity of the tested drugs. Here we report the toxicity effect of polyamines (spermidine and spermine) on cultured cells, especially on drug-resistant cancer cell lines, which resulted from the oxidative degradation of polyamines by amine oxidases in serum supplement. Upon adding spermidine or spermine, high concentration of H2O2, an enzyme oxidation product of polyamines, was generated in culture media containing ruminant serum, such as fetal bovine serum (FBS), calf serum, bovine serum, goat serum or horse serum, but not in the media containing human serum. Drug-resistant cancer cell lines showed much higher sensitivity to the oxidation products of polyamines (H2O2 and acrolein) than their wild cell lines, which was due to their low antioxidative capacity.', 'acquisition_date': '2020-06-06', 'authors': 'Linlin Wang; Ying Liu; Cui Qi; Luyao Shen; Junyan Wang; Xiangjun Liu; Nan Zhang; Tao Bing; Dihua Shangguan', 'category': 'Cell culture; Chemical biology', 'citations': '7', 'date': '2018-07-10', 'doi': '10.1038/s41598-018-28648-8', 'body': 'Introduction\nCell culture is a widely used tool to study physiological, biological and pharmacological activities in vitro, as well as to produce biological components, such as proteins, hormones and vaccines. This method is fast, cheap, reproducible, and greatly reduces the use of experimental animals. Serum from animals or human is a common supplement for the culture of eukaryotic cells due to it containing a large number of active components, like growth factors, enzymes, hormones, etc., which are essential for the growth and maintenance of cells1,2,3. Fetal bovine serum (FBS) is the most commonly used serum in cell culture, because it is rich in fetal growth factors and hormones that stimulate cellular proliferation and maintenance. Although FBS has been used for more than 50 years, the knowledge is incomplete regarding the serum components and their influence on cultured cells4,5. Apart from the unknown influence of serum components on the cultured cells directly, the effects of enzymes in serum on the tested drugs should be paid much more attention, otherwise it may result in the false positive or negative results, consequently lead to misleading conclusions. In previous work, we have shown that the cytotoxicity activity of guanine-rich oligonucleotides is attributed to the cytotoxicity of guanine derivatives derived from degradation of oligonucleotides by nuclease in FBS, but not attributed to the direct action of oligonucleotides on cells as reported elsewhere6.\nAs ubiquitous endogenous metabolites, polyamines are essential organic compounds for cell growth and proliferation. Putrescine, spermidine and spermine, existing normally in millimolar concentration range in nucleus7, are the mainly naturally occurring polyamines in mammalian cells8. Polyamines are involved in a wide variety of cellular processes: participating in the regulation of gene expression and enzyme activity, activating DNA synthesis, facilitating the interaction of DNA and protein, as well as protecting DNA molecules from putative damaging agents7,9. Among these polyamines, spermine is reported to possess the highest biological activity10. Under physiologic ionic and pH conditions, polyamines are multivalent cations with aliphatic hydrocarbon chains separating the charges11, and hence negatively charged nucleic acids, including DNA and RNA, are their prime targets of interaction, and consequently regulate the structures of DNA, condense DNA molecules to a liquid crystalline phase12, and enhance the activity of G-quadruplex/hemin DNAzymes in vitro13. Many evidences suggest that polyamines play important roles as modulators of nucleic acid structure14.\nThe intracellular polyamines are maintained at a correct level through the subtle coordination and regulation of biosynthesis, transport, and catabolism. In mammalian cells, polyamine catabolism occurs through two distinct pathways with the help of three kinds of enzymes: spermidine/spermine N1-acetyltransferase, N1-acetylpolyamine oxidase and spermine oxidase15 (Fig. S1). Polyamine catabolism can generate cytotoxic metabolites such as hydrogen peroxide (H2O2) and aldehydes in situ, thereafter inducing apoptosis, necrosis, inhibition of cell proliferation, and inhibition of DNA and protein synthesis7,16,17. Polyamines are also the substrates of various kinds of amine oxidases, such as monoamine oxidases, diamine oxidases, polyamine oxidases and copper containing amine oxidases. These enzymes catalyze the oxidative deamination of polyamines to generate the reaction products H2O2 and aldehyde(s) that are able to induce cell death in several cultured human tumor cell lines18,19,20,21,22,23. Therefore, polyamines and amine oxidases are also considered to have potential in therapeutic applications15,17.\nHere, we describe the cytotoxicity of polyamines and their degradation products on different cell lines. The generation of H2O2 (one of the degradation product of polyamines) in culture media containing different serums was measured after addition of spermidine and spermine. The degradation products of spermidine and spermine resulted from the amine oxidases in serum were found to be the main reason of the cytotoxicity of spermidine and spermine.; Cell culture is a widely used tool to study physiological, biological and pharmacological activities in vitro, as well as to produce biological components, such as proteins, hormones and vaccines. This method is fast, cheap, reproducible, and greatly reduces the use of experimental animals. Serum from animals or human is a common supplement for the culture of eukaryotic cells due to it containing a large number of active components, like growth factors, enzymes, hormones, etc., which are essential for the growth and maintenance of cells1,2,3. Fetal bovine serum (FBS) is the most commonly used serum in cell culture, because it is rich in fetal growth factors and hormones that stimulate cellular proliferation and maintenance. Although FBS has been used for more than 50 years, the knowledge is incomplete regarding the serum components and their influence on cultured cells4,5. Apart from the unknown influence of serum components on the cultured cells directly, the effects of enzymes in serum on the tested drugs should be paid much more attention, otherwise it may result in the false positive or negative results, consequently lead to misleading conclusions. In previous work, we have shown that the cytotoxicity activity of guanine-rich oligonucleotides is attributed to the cytotoxicity of guanine derivatives derived from degradation of oligonucleotides by nuclease in FBS, but not attributed to the direct action of oligonucleotides on cells as reported elsewhere6.\nAs ubiquitous endogenous metabolites, polyamines are essential organic compounds for cell growth and proliferation. Putrescine, spermidine and spermine, existing normally in millimolar concentration range in nucleus7, are the mainly naturally occurring polyamines in mammalian cells8. Polyamines are involved in a wide variety of cellular processes: participating in the regulation of gene expression and enzyme activity, activating DNA synthesis, facilitating the interaction of DNA and protein, as well as protecting DNA molecules from putative damaging agents7,9. Among these polyamines, spermine is reported to possess the highest biological activity10. Under physiologic ionic and pH conditions, polyamines are multivalent cations with aliphatic hydrocarbon chains separating the charges11, and hence negatively charged nucleic acids, including DNA and RNA, are their prime targets of interaction, and consequently regulate the structures of DNA, condense DNA molecules to a liquid crystalline phase12, and enhance the activity of G-quadruplex/hemin DNAzymes in vitro13. Many evidences suggest that polyamines play important roles as modulators of nucleic acid structure14.\nThe intracellular polyamines are maintained at a correct level through the subtle coordination and regulation of biosynthesis, transport, and catabolism. In mammalian cells, polyamine catabolism occurs through two distinct pathways with the help of three kinds of enzymes: spermidine/spermine N1-acetyltransferase, N1-acetylpolyamine oxidase and spermine oxidase15 (Fig. S1). Polyamine catabolism can generate cytotoxic metabolites such as hydrogen peroxide (H2O2) and aldehydes in situ, thereafter inducing apoptosis, necrosis, inhibition of cell proliferation, and inhibition of DNA and protein synthesis7,16,17. Polyamines are also the substrates of various kinds of amine oxidases, such as monoamine oxidases, diamine oxidases, polyamine oxidases and copper containing amine oxidases. These enzymes catalyze the oxidative deamination of polyamines to generate the reaction products H2O2 and aldehyde(s) that are able to induce cell death in several cultured human tumor cell lines18,19,20,21,22,23. Therefore, polyamines and amine oxidases are also considered to have potential in therapeutic applications15,17.\nHere, we describe the cytotoxicity of polyamines and their degradation products on different cell lines. The generation of H2O2 (one of the degradation product of polyamines) in culture media containing different serums was measured after addition of spermidine and spermine. The degradation products of spermidine and spermine resulted from the amine oxidases in serum were found to be the main reason of the cytotoxicity of spermidine and spermine.; Results and Discussion\nThe toxicity ef
+--------------------------------------------------
+Table full name: WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES
+Column name: word Type: TEXT
+Column name: frequency Type: NUMBER
+Sample rows:
+[{'word': 'separating', 'frequency': 256}, {'word': 'C8', 'frequency': 256}, {'word': 'Benjamini', 'frequency': 256}, {'word': 'RCA', 'frequency': 256}, {'word': 'antennal', 'frequency': 256}]
+--------------------------------------------------
+Table full name: WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS
+Column name: word Type: TEXT
+Column name: vector Type: VARIANT
+Sample rows:
+[{'word': '01:44', 'vector': '[\n  -4.383600130677223e-02,\n  1.611000001430511e-01,\n  5.632200241088867e-01,\n  -4.001300036907196e-01,\n  -8.750299811363220e-01,\n  -1.227600034326315e-02,\n  1.805099993944168e-01,\n  -7.279099822044373e-01,\n  -5.645599961280823e-01,\n  -3.744199872016907e-01,\n  7.448599934577942e-01,\n  5.657200142741203e-02,\n  -8.297900110483170e-02,\n  4.517899826169014e-02,\n  -4.257000088691711e-01,\n  1.779299974441528e-01,\n  4.165700078010559e-01,\n  -1.948699951171875e-01,\n  -1.243200004100800e-01,\n  2.108699977397919e-01,\n  -5.181099846959114e-02,\n  2.477400004863739e-02,\n  1.425700038671494e-01,\n  3.997600078582764e-01,\n  1.423600018024445e-01,\n  3.769400119781494e-01,\n  1.243000030517578e-01,\n  2.296599996043369e-04,\n  4.714300036430359e-01,\n  2.521100044250488e-01,\n  -1.187900006771088e-01,\n  4.612599909305573e-01,\n  -1.869899928569794e-01,\n  3.239299952983856e-01,\n  -4.410299879964441e-04,\n  -9.339399635791779e-02,\n  2.12029993534
+--------------------------------------------------
+External knowledge that might be helpful: 
+# BigQuery Tokenize Definitions
+
+## `tokenise_no_stop`
+
+### Description
+Removes common stopwords from a text string and tokenizes the remaining content into an array of words. This function is essential for natural language processing tasks where common words (like "and", "the", etc.) that offer little value in understanding the text's meaning are filtered out to focus on more significant words.
+
+### SQL Definition
+```sql
+CREATE FUNCTION `spider2-public-data`.word_vectors_us.tokenise_no_stop(text STRING)
+AS (
+(
+    SELECT ARRAY_AGG(word) FROM UNNEST(REGEXP_EXTRACT_ALL(
+                                REGEXP_REPLACE(text, r'’|\'s(\W)', r'\1'),
+                                r'((?:\d+(?:,\d+)*(?:\.\d+)?)+|(?:[\w])+)')) AS word
+    WHERE LOWER(word) not in UNNEST(['a', 'about', 'above', 'after', 'again', 'against', 'ain', 'all', 'am', 'an', 'and', 'any', 'are', 'aren', 'arent', 'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', 'can', 'couldn', 'couldnt', 'd', 'did', 'didn', 'didnt', 'do', 'does', 'doesn', 'doesnt', 'doing', 'don', 'dont', 'down', 'during', 'each', 'few', 'for', 'from', 'further', 'had', 'hadn', 'hadnt', 'has', 'hasn', 'hasnt', 'have', 'haven', 'havent', 'having', 'he', 'her', 'here', 'hers', 'herself', 'him', 'himself', 'his', 'how', 'i', 'if', 'in', 'into', 'is', 'isn', 'isnt', 'it', 'its', 'itself', 'just', 'll', 'm', 'ma', 'me', 'mightn', 'mightnt', 'more', 'most', 'mustn', 'mustnt', 'my', 'myself', 'needn', 'neednt', 'no', 'nor', 'not', 'now', 'o', 'of', 'off', 'on', 'once', 'only', 'or', 'other', 'our', 'ours', 'ourselves', 'out', 'over', 'own', 're', 's', 'same', 'shan', 'shant', 'she', 'shes', 'should', 'shouldn', 'shouldnt', 'shouldve', 'so', 'some', 'such', 't', 'than', 'that', 'thatll', 'the', 'their', 'theirs', 'them', 'themselves', 'then', 'there', 'these', 'they', 'this', 'those', 'through', 'to', 'too', 'under', 'until', 'up', 've', 'very', 'was', 'wasn', 'wasnt', 'we', 'were', 'weren', 'werent', 'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'why', 'will', 'with', 'won', 'wont', 'wouldn', 'wouldnt', 'y', 'you', 'youd', 'youll', 'your', 'youre', 'yours', 'yourself', 'yourselves', 'youve'])
+    )
+);
+```
+
+### Example Usage
+Remove stopwords and tokenize the text from a dataset of book descriptions:
+```sql
+SELECT 
+  book_title,
+  `spider2-public-data.word_vectors_us.tokenise_no_stop`(description) AS tokenised_description
+FROM 
+  book_catalog;
+```
+
+## `tokenise_text`
+
+### Description
+Tokenizes text by extracting words and numerical values, including handling compound numbers and ignoring punctuation and possessive apostrophes. This function is suitable for preliminary text analysis where basic tokenization is needed without the removal of stopwords.
+
+### SQL Definition
+```sql
+CREATE FUNCTION `spider2-public-data`.word_vectors_us.tokenise_text(text STRING)
+AS (
+(
+    SELECT REGEXP_EXTRACT_ALL(
+              REGEXP_REPLACE(text, r'’|\'s(\W)', r'\1'),
+                             r'((?:\d+(?:,\d+)*(?:\.\d+)?)+|(?:[\w])+)')
+    )
+);
+```
+
+### Example Usage
+Tokenize user comments to analyze the frequency of words in customer feedback:
+```sql
+SELECT 
+  comment_id,
+  `spider2-public-data.word_vectors_us.tokenise_text`(user_comment) AS tokenised_comment
+FROM 
+  user_feedback;
+```
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'WORD_VECTORS_US': {'WORD_VECTORS_US': ['NATURE', 'WORD_FREQUENCIES', 'GLOVE_VECTORS']}}
+Some few-shot examples may be useful:
+Query:
+-- 1. Description: Preview a handful of Nature-dataset records so we know the main article–level columns we will work with.
+SELECT 
+  "id",
+  "date",
+  "title",
+  "category"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+LIMIT 20;
+Answer:
+id,date,title,category
+b8f29c08-2530-4ff1-bd49-da1f483b73ed,2018-12-31,Structural basis of Notch recognition by human γ-secretase,Cryoelectron microscopy; Proteases
+ba1d19c8-e235-4bf6-95ff-f2022a69e510,2018-09-27,"You are what you eat: diet, health and the gut microbiota",Microbiome; Microbiota; Nutrition
+83ee533c-7dd3-4e7f-9f30-53cddb6fa2a6,2018-10-31,The SWI/SNF complex is a mechanoregulated inhibitor of YAP and TAZ,Cancer; Cell biology; Cell signalling
+Query:
+-- 2. Description: Look at the particular article we will treat as the query-article (ID = ‘8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373’).
+SELECT 
+  "id",
+  "date",
+  "title",
+  "abstract",
+  "body"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+WHERE "id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+LIMIT 20;
+Answer:
+id,date,title,abstract,body
+8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373,2018-10-08,Blood-based biomarkers for Alzheimer disease: mapping the road to the clinic,"Biomarker discovery and development for clinical research, diagnostics and therapy monitoring in clinical trials have advanced rapidly in key areas of medicine — most notably, oncology and cardiovascular diseases — allowing rapid early detection and supporting the evolution of biomarker-guided, precision-medicine-based targeted therapies. In A
+Query:
+--Description:  #5 ‒ Attach GloVe vectors to each token (inline-tokenised) for the
+--              Alzheimer-biomarker article so we can verify that vectors exist.
+SELECT
+  tok.value::STRING  AS "word",
+  gv."vector"
+FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE  n
+CROSS JOIN LATERAL FLATTEN(
+  INPUT => SPLIT(
+             REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+             ' '
+           )
+) tok
+LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS gv
+       ON gv."word" = tok.value::STRING
+WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+  AND tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20
+Answer:
+word,vector
+table,"[
+  -1.496800035238266e-01,
+  -4.217900037765503e-01,
+  -1.416299939155579e-01,
+  5.112800002098083e-02,
+  3.363400101661682e-01,
+  2.619799971580505e-01,
+  1.278900057077408e-01,
+  1.062000021338463e-01,
+  1.772200018167496e-01,
+  1.304499983787537e+00,
+  -2.480800002813339e-01,
+  6.674100160598755e-01,
+  -9.197399765253067e-02,
+  -1.862699985504150e-01,
+  4.095000028610229e-02,
+  5.717299878597260e-02,
+  -2.292200028896332e-01,
+  2.277100086212158e+00,
+  1.125399991869926e-
+Query:
+--Description:  #6 ‒ For the same article, compute one aggregate weighted vector:
+--              (each component = token-vector ÷ frequency^0.4) and show the 100-D
+--              weighted-component array.
+WITH tokens AS (
+  SELECT
+    tok.value::STRING                              AS word,
+    gv."vector"                                    AS vec,
+    wf."frequency"                                 AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  CROSS JOIN LATERAL FLATTEN(
+    INPUT => SPLIT(
+               REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+               ' '
+             )
+  ) tok
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS   gv
+         ON gv."word" = tok.value::STRING
+  LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES wf
+         ON wf."word" = tok.value::STRING
+  WHERE n."id" = '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'
+    AND tok.value IS NOT NULL
+    AND tok.value <> ''
+)
+SELECT
+  ARRAY_AGG( (val.value::FLOAT) / POWER(freq, 0.4) )
+      WITHIN GROUP (ORDER BY seq4())               AS "weighted_component_vector"
+FROM tokens,
+     LATERAL FLATTEN(input => tokens.vec) val
+Answer:
+weighted_component_vector
+"[
+  -4.116489795554936e-03,
+  6.001475348025648e-03,
+  -9.864312487493438e-03,
+  5.183215721565521e-03,
+  3.691923652560469e-03,
+  1.221560456333413e-02,
+  -4.839166549285899e-03,
+  -6.138551649296937e-03,
+  -2.957391922702521e-03,
+  5.655203167602902e-02,
+  -1.855816455753218e-02,
+  1.025528839668526e-02,
+  -1.876143315103968e-03,
+  -9.299211613453680e-03,
+  -2.374236882250230e-03,
+  -7.738023342747103e-03,
+  -2.024605715250771e-03,
+  4.890786327924840e-02,
+  -1.1785
+Task: Please process the articles from the 'nature' dataset by first tokenizing the body text into words and removing stopwords. For each remaining word, retrieve its word vector from the glove_vectors table and its frequency from the word_frequencies table, then divide each word vector by the 0.4th power of the word's frequency to weight it. Sum the weighted vectors to obtain an aggregate vector for each article, normalize this aggregate vector to unit length, and then compute the cosine similarity scores between these normalized vectors. Finally, return the IDs, dates, titles, and cosine similarity scores of the top 10 articles most similar to the article with the ID '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373'.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'WORD_VECTORS_US': {'WORD_VECTORS_US': ['NATURE', 'WORD_FREQUENCIES', 'GLOVE_VECTORS']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 03:47:43 - Thread-2133 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH
+/* ---------------------------------------------------- */
+/* 0.  fixed helpers                                    */
+/* ---------------------------------------------------- */
+ref_id AS (      /* the article we compare everything with */
+  SELECT '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373' AS ref_id
+),
+/* (same stop-word list used in the provided BigQuery UDF) */
+stopwords(word) AS (
+  SELECT COLUMN1 FROM VALUES
+  ('a'),('about'),('above'),('after'),('again'),('against'),('ain'),('all'),('am'),('an'),('and'),
+  ('any'),('are'),('aren'),('arent'),('as'),('at'),('be'),('because'),('been'),('before'),('being'),
+  ('below'),('between'),('both'),('but'),('by'),('can'),('couldn'),('couldnt'),('d'),('did'),
+  ('didn'),('didnt'),('do'),('does'),('doesn'),('doesnt'),('doing'),('don'),('dont'),('down'),
+  ('during'),('each'),('few'),('for'),('from'),('further'),('had'),('hadn'),('hadnt'),('has'),
+  ('hasn'),('hasnt'),('have'),('haven'),('havent'),('having'),('he'),('her'),('here'),('hers'),
+  ('herself'),('him'),('himself'),('his'),('how'),('i'),('if'),('in'),('into'),('is'),('isn'),
+  ('isnt'),('it'),('its'),('itself'),('just'),('ll'),('m'),('ma'),('me'),('mightn'),('mightnt'),
+  ('more'),('most'),('mustn'),('mustnt'),('my'),('myself'),('needn'),('neednt'),('no'),('nor'),
+  ('not'),('now'),('o'),('of'),('off'),('on'),('once'),('only'),('or'),('other'),('our'),('ours'),
+  ('ourselves'),('out'),('over'),('own'),('re'),('s'),('same'),('shan'),('shant'),('she'),('shes'),
+  ('should'),('shouldn'),('shouldnt'),('shouldve'),('so'),('some'),('such'),('t'),('than'),('that'),
+  ('thatll'),('the'),('their'),('theirs'),('them'),('themselves'),('then'),('there'),('these'),
+  ('they'),('this'),('those'),('through'),('to'),('too'),('under'),('until'),('up'),('ve'),
+  ('very'),('was'),('wasn'),('wasnt'),('we'),('were'),('weren'),('werent'),('what'),('when'),
+  ('where'),('which'),('while'),('who'),('whom'),('why'),('will'),('with'),('won'),('wont'),
+  ('wouldn'),('wouldnt'),('y'),('you'),('youd'),('youll'),('your'),('youre'),('yours'),
+  ('yourself'),('yourselves'),('youve')
+),
+/* ---------------------------------------------------- */
+/* 1.  token-level rows that still have glove vectors   */
+/* ---------------------------------------------------- */
+tokens AS (
+  SELECT
+      n."id"                              AS article_id,
+      gv."vector"                         AS vec,
+      wf."frequency"                      AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE               n
+       ,LATERAL FLATTEN(
+           INPUT => SPLIT(
+                     REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+                     ' '
+                   )
+        ) tok
+       /* remove stop-words */
+       LEFT JOIN stopwords sw
+              ON LOWER(tok.value)::STRING = sw.word
+       /* attach glove vector + global frequency */
+       LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS     gv
+              ON gv."word" = tok.value::STRING
+       LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES  wf
+              ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+    AND sw.word IS NULL                 -- not a stop-word
+    AND gv."vector" IS NOT NULL         -- vector must be present
+    AND wf."frequency" IS NOT NULL      -- frequency must be present
+),
+/* ---------------------------------------------------- */
+/* 2.  component-level weighted sums per article         */
+/* ---------------------------------------------------- */
+components AS (
+  SELECT
+      article_id,
+      idx.index                                            AS position,
+      SUM( idx.value::FLOAT / POWER(freq, 0.4) )          AS comp_sum
+  FROM tokens
+       ,LATERAL FLATTEN(input => tokens.vec) idx          -- explode 100-D vector
+  GROUP BY article_id, position
+),
+/* ---------------------------------------------------- */
+/* 3.  vector norms                                      */
+/* ---------------------------------------------------- */
+norms AS (
+  SELECT
+      article_id,
+      SQRT( SUM( comp_sum * comp_sum ) ) AS norm
+  FROM components
+  GROUP BY article_id
+),
+/* keep reference article’s components + norm */
+ref_components AS (
+  SELECT position, comp_sum
+  FROM   components
+  WHERE  article_id = (SELECT ref_id FROM ref_id)
+),
+ref_norm AS (
+  SELECT norm AS ref_norm
+  FROM   norms
+  WHERE  article_id = (SELECT ref_id FROM ref_id)
+),
+/* ---------------------------------------------------- */
+/* 4.  dot-product of every article with reference       */
+/* ---------------------------------------------------- */
+dot_products AS (
+  SELECT
+      a.article_id,
+      SUM( a.comp_sum * r.comp_sum ) AS dot
+  FROM components            a
+       JOIN ref_components   r
+         ON a.position = r.position
+  GROUP BY a.article_id
+),
+/* ---------------------------------------------------- */
+/* 5.  cosine similarity                                 */
+/* ---------------------------------------------------- */
+cosines AS (
+  SELECT
+      d.article_id,
+      d.dot / ( n.norm * (SELECT ref_norm FROM ref_norm) )  AS cosine_sim
+  FROM dot_products d
+       JOIN norms   n  ON n.article_id = d.article_id
+  WHERE n.norm > 0
+)
+/* ---------------------------------------------------- */
+/* 6.  final top-10 list                                 */
+/* ---------------------------------------------------- */
+SELECT
+    art."id",
+    art."date",
+    art."title",
+    c.cosine_sim
+FROM cosines                      c
+     JOIN WORD_VECTORS_US.WORD_VECTORS_US.NATURE  art
+          ON art."id" = c.article_id
+     JOIN ref_id r
+WHERE c.article_id <> r.ref_id          -- exclude the query article itself
+ORDER BY c.cosine_sim DESC NULLS LAST
+LIMIT 10;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:47:43 - Thread-2133 (execute) - INFO - itercount: 1
+2025-05-05 03:47:43 - Thread-2133 (execute) - INFO - [Self-refine]
+Input sql:
+WITH
+/* ---------------------------------------------------- */
+/* 0.  fixed helpers                                    */
+/* ---------------------------------------------------- */
+ref_id AS (      /* the article we compare everything with */
+  SELECT '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373' AS ref_id
+),
+/* (same stop-word list used in the provided BigQuery UDF) */
+stopwords(word) AS (
+  SELECT COLUMN1 FROM VALUES
+  ('a'),('about'),('above'),('after'),('again'),('against'),('ain'),('all'),('am'),('an'),('and'),
+  ('any'),('are'),('aren'),('arent'),('as'),('at'),('be'),('because'),('been'),('before'),('being'),
+  ('below'),('between'),('both'),('but'),('by'),('can'),('couldn'),('couldnt'),('d'),('did'),
+  ('didn'),('didnt'),('do'),('does'),('doesn'),('doesnt'),('doing'),('don'),('dont'),('down'),
+  ('during'),('each'),('few'),('for'),('from'),('further'),('had'),('hadn'),('hadnt'),('has'),
+  ('hasn'),('hasnt'),('have'),('haven'),('havent'),('having'),('he'),('her'),('here'),('hers'),
+  ('herself'),('him'),('himself'),('his'),('how'),('i'),('if'),('in'),('into'),('is'),('isn'),
+  ('isnt'),('it'),('its'),('itself'),('just'),('ll'),('m'),('ma'),('me'),('mightn'),('mightnt'),
+  ('more'),('most'),('mustn'),('mustnt'),('my'),('myself'),('needn'),('neednt'),('no'),('nor'),
+  ('not'),('now'),('o'),('of'),('off'),('on'),('once'),('only'),('or'),('other'),('our'),('ours'),
+  ('ourselves'),('out'),('over'),('own'),('re'),('s'),('same'),('shan'),('shant'),('she'),('shes'),
+  ('should'),('shouldn'),('shouldnt'),('shouldve'),('so'),('some'),('such'),('t'),('than'),('that'),
+  ('thatll'),('the'),('their'),('theirs'),('them'),('themselves'),('then'),('there'),('these'),
+  ('they'),('this'),('those'),('through'),('to'),('too'),('under'),('until'),('up'),('ve'),
+  ('very'),('was'),('wasn'),('wasnt'),('we'),('were'),('weren'),('werent'),('what'),('when'),
+  ('where'),('which'),('while'),('who'),('whom'),('why'),('will'),('with'),('won'),('wont'),
+  ('wouldn'),('wouldnt'),('y'),('you'),('youd'),('youll'),('your'),('youre'),('yours'),
+  ('yourself'),('yourselves'),('youve')
+),
+/* ---------------------------------------------------- */
+/* 1.  token-level rows that still have glove vectors   */
+/* ---------------------------------------------------- */
+tokens AS (
+  SELECT
+      n."id"                              AS article_id,
+      gv."vector"                         AS vec,
+      wf."frequency"                      AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE               n
+       ,LATERAL FLATTEN(
+           INPUT => SPLIT(
+                     REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+                     ' '
+                   )
+        ) tok
+       /* remove stop-words */
+       LEFT JOIN stopwords sw
+              ON LOWER(tok.value)::STRING = sw.word
+       /* attach glove vector + global frequency */
+       LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS     gv
+              ON gv."word" = tok.value::STRING
+       LEFT JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES  wf
+              ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+    AND sw.word IS NULL                 -- not a stop-word
+    AND gv."vector" IS NOT NULL         -- vector must be present
+    AND wf."frequency" IS NOT NULL      -- frequency must be present
+),
+/* ---------------------------------------------------- */
+/* 2.  component-level weighted sums per article         */
+/* ---------------------------------------------------- */
+components AS (
+  SELECT
+      article_id,
+      idx.index                                            AS position,
+      SUM( idx.value::FLOAT / POWER(freq, 0.4) )          AS comp_sum
+  FROM tokens
+       ,LATERAL FLATTEN(input => tokens.vec) idx          -- explode 100-D vector
+  GROUP BY article_id, position
+),
+/* ---------------------------------------------------- */
+/* 3.  vector norms                                      */
+/* ---------------------------------------------------- */
+norms AS (
+  SELECT
+      article_id,
+      SQRT( SUM( comp_sum * comp_sum ) ) AS norm
+  FROM components
+  GROUP BY article_id
+),
+/* keep reference article’s components + norm */
+ref_components AS (
+  SELECT position, comp_sum
+  FROM   components
+  WHERE  article_id = (SELECT ref_id FROM ref_id)
+),
+ref_norm AS (
+  SELECT norm AS ref_norm
+  FROM   norms
+  WHERE  article_id = (SELECT ref_id FROM ref_id)
+),
+/* ---------------------------------------------------- */
+/* 4.  dot-product of every article with reference       */
+/* ---------------------------------------------------- */
+dot_products AS (
+  SELECT
+      a.article_id,
+      SUM( a.comp_sum * r.comp_sum ) AS dot
+  FROM components            a
+       JOIN ref_components   r
+         ON a.position = r.position
+  GROUP BY a.article_id
+),
+/* ---------------------------------------------------- */
+/* 5.  cosine similarity                                 */
+/* ---------------------------------------------------- */
+cosines AS (
+  SELECT
+      d.article_id,
+      d.dot / ( n.norm * (SELECT ref_norm FROM ref_norm) )  AS cosine_sim
+  FROM dot_products d
+       JOIN norms   n  ON n.article_id = d.article_id
+  WHERE n.norm > 0
+)
+/* ---------------------------------------------------- */
+/* 6.  final top-10 list                                 */
+/* ---------------------------------------------------- */
+SELECT
+    art."id",
+    art."date",
+    art."title",
+    c.cosine_sim
+FROM cosines                      c
+     JOIN WORD_VECTORS_US.WORD_VECTORS_US.NATURE  art
+          ON art."id" = c.article_id
+     JOIN ref_id r
+WHERE c.article_id <> r.ref_id          -- exclude the query article itself
+ORDER BY c.cosine_sim DESC NULLS LAST
+LIMIT 10;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##001072 (42601): SQL compilation error:\nLateral View cannot be on the left side of join'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 03:48:24 - Thread-2133 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ------------------------------------------------------------ */
+/*  Cosine-similarity of every Nature article to a reference    */
+/*  (Snowflake-SQL version that avoids the lateral-join error)  */
+/* ------------------------------------------------------------ */
+WITH
+/* 0.  reference article ID ----------------------------------- */
+ref_id AS (
+  SELECT '8a78ef2d-d5f7-4d2d-9b47-5adb25cbd373' AS ref_id
+),
+
+/* 0a. stop-word list ---------------------------------------- */
+stopwords(word) AS (
+  SELECT COLUMN1 FROM VALUES
+  ('a'),('about'),('above'),('after'),('again'),('against'),('ain'),('all'),('am'),('an'),('and'),
+  ('any'),('are'),('aren'),('arent'),('as'),('at'),('be'),('because'),('been'),('before'),('being'),
+  ('below'),('between'),('both'),('but'),('by'),('can'),('couldn'),('couldnt'),('d'),('did'),
+  ('didn'),('didnt'),('do'),('does'),('doesn'),('doesnt'),('doing'),('don'),('dont'),('down'),
+  ('during'),('each'),('few'),('for'),('from'),('further'),('had'),('hadn'),('hadnt'),('has'),
+  ('hasn'),('hasnt'),('have'),('haven'),('havent'),('having'),('he'),('her'),('here'),('hers'),
+  ('herself'),('him'),('himself'),('his'),('how'),('i'),('if'),('in'),('into'),('is'),('isn'),
+  ('isnt'),('it'),('its'),('itself'),('just'),('ll'),('m'),('ma'),('me'),('mightn'),('mightnt'),
+  ('more'),('most'),('mustn'),('mustnt'),('my'),('myself'),('needn'),('neednt'),('no'),('nor'),
+  ('not'),('now'),('o'),('of'),('off'),('on'),('once'),('only'),('or'),('other'),('our'),('ours'),
+  ('ourselves'),('out'),('over'),('own'),('re'),('s'),('same'),('shan'),('shant'),('she'),('shes'),
+  ('should'),('shouldn'),('shouldnt'),('shouldve'),('so'),('some'),('such'),('t'),('than'),('that'),
+  ('thatll'),('the'),('their'),('theirs'),('them'),('themselves'),('then'),('there'),('these'),
+  ('they'),('this'),('those'),('through'),('to'),('too'),('under'),('until'),('up'),('ve'),
+  ('very'),('was'),('wasn'),('wasnt'),('we'),('were'),('weren'),('werent'),('what'),('when'),
+  ('where'),('which'),('while'),('who'),('whom'),('why'),('will'),('with'),('won'),('wont'),
+  ('wouldn'),('wouldnt'),('y'),('you'),('youd'),('youll'),('your'),('youre'),('yours'),
+  ('yourself'),('yourselves'),('youve')
+),
+
+/* 1.  article-token rows (only words with vectors & frequency) */
+tokens AS (
+  SELECT
+      n."id"                                              AS article_id,
+      gv."vector"                                         AS vec,
+      wf."frequency"                                      AS freq
+  FROM WORD_VECTORS_US.WORD_VECTORS_US.NATURE n
+  /* explode the article body into individual words */
+  CROSS JOIN LATERAL FLATTEN(
+                INPUT => SPLIT(
+                           REGEXP_REPLACE(LOWER(n."body"), '[^0-9a-z ]', ' '),
+                           ' '
+                         )
+             ) tok
+  /* remove stop-words */
+  LEFT  JOIN stopwords sw
+         ON LOWER(tok.value)::STRING = sw.word
+  /* attach GloVe vector and global frequency */
+  LEFT  JOIN WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS      gv
+         ON gv."word" = tok.value::STRING
+  LEFT  JOIN WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES   wf
+         ON wf."word" = tok.value::STRING
+  WHERE tok.value IS NOT NULL
+    AND tok.value <> ''
+    AND sw.word IS NULL
+    AND gv."vector" IS NOT NULL
+    AND wf."frequency" IS NOT NULL
+),
+
+/* 2.  weighted-component sums per article ------------------- */
+components AS (
+  SELECT
+      article_id,
+      idx.index                                  AS position,
+      SUM( idx.value::FLOAT / POWER(freq, 0.4) ) AS comp_sum
+  FROM tokens
+  CROSS JOIN LATERAL FLATTEN(input => vec) idx           -- explode 100-D vector
+  GROUP BY article_id, position
+),
+
+/* 3.  vector norms per article ----------------------------- */
+norms AS (
+  SELECT
+      article_id,
+      SQRT( SUM(comp_sum * comp_sum) ) AS norm
+  FROM components
+  GROUP BY article_id
+),
+
+/* reference article data ----------------------------------- */
+ref_components AS (
+  SELECT position, comp_sum
+  FROM   components
+  WHERE  article_id = (SELECT ref_id FROM ref_id)
+),
+ref_norm AS (
+  SELECT norm AS ref_norm
+  FROM   norms
+  WHERE  article_id = (SELECT ref_id FROM ref_id)
+),
+
+/* 4.  dot-product of every article with the reference ------- */
+dot_products AS (
+  SELECT
+      a.article_id,
+      SUM( a.comp_sum * r.comp_sum ) AS dot
+  FROM components         a
+  JOIN ref_components     r
+    ON a.position = r.position
+  GROUP BY a.article_id
+),
+
+/* 5.  cosine similarity ------------------------------------ */
+cosines AS (
+  SELECT
+      d.article_id,
+      d.dot / ( n.norm * (SELECT ref_norm FROM ref_norm) ) AS cosine_sim
+  FROM dot_products d
+  JOIN norms       n  ON n.article_id = d.article_id
+  WHERE n.norm > 0
+)
+
+/* 6.  final top-10 most similar articles ------------------- */
+SELECT
+    art."id",
+    art."date",
+    art."title",
+    c.cosine_sim
+FROM cosines                           c
+JOIN WORD_VECTORS_US.WORD_VECTORS_US.NATURE art
+  ON art."id" = c.article_id
+JOIN ref_id r
+WHERE c.article_id <> r.ref_id               -- exclude the query article itself
+ORDER BY c.cosine_sim DESC NULLS LAST
+LIMIT 10;
+```
+[Try to run SQL in self-refine]
+2025-05-05 03:49:23 - Thread-2133 (execute) - INFO - Total iteration counts: 1

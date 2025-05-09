@@ -1,0 +1,18 @@
+SELECT
+    a.first_name || ' ' || a.last_name AS full_name
+FROM actor            AS a
+JOIN film_actor       AS fa ON a.actor_id = fa.actor_id
+JOIN film             AS f  ON fa.film_id = f.film_id
+JOIN language         AS l  ON f.language_id = l.language_id
+JOIN film_category    AS fc ON f.film_id = fc.film_id
+JOIN category         AS c  ON fc.category_id = c.category_id
+WHERE l.name = 'English'
+  AND c.name = 'Children'
+  AND f.rating IN ('G', 'PG')
+  AND f.length <= 120
+  AND CAST(f.release_year AS INTEGER) BETWEEN 2000 AND 2010
+GROUP BY a.actor_id, a.first_name, a.last_name
+ORDER BY COUNT(DISTINCT f.film_id) DESC,
+         a.last_name,
+         a.first_name
+LIMIT 1;

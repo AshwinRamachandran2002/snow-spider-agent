@@ -1,0 +1,3203 @@
+2025-01-23 12:38:40 - openai._base_client - INFO - Retrying request to /chat/completions in 0.392741 seconds
+2025-01-23 12:39:28 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-23 12:39:28 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:28 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:28 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:31 - snowflake.connector.cursor - INFO - Number of results in first chunk: 15
+2025-01-23 12:39:32 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:32 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:32 - root - INFO - SQL:
+-- 1. Select the content of all files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100
+Results:
+Too long, hard cut:
+content
+"/*
+ * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips
+ *
+ * Copyright (C) 2008 David Brownell
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/bcd.h>
+#include <linux/slab.h>
+#include <linux/rtc.h>
+#include <linux/workqueue.h>
+
+#include <linux/spi/spi.h>
+#include <linux/spi/ds1305.h>
+#include <linux/module.h>
+
+
+/*
+ * Registers ... mask DS1305_WRITE into register address to write,
+ * otherwise you're reading it.  All non-bitmask values are BCD.
+ */
+#define DS1305_WRITE		0x80
+
+
+/* RTC date/time ... the main special cases are that we:
+ *  - Need fancy ""hours"" encoding in 12hour mode
+ *  - Don't rely on the ""day-of-week"" field (or tm_wday)
+ *  - Are a 21st-century clock (2000 <= year < 2100)
+ */
+#define DS1305_RTC_LEN		7		/* bytes for RTC regs */
+
+#define DS1305_SEC		0x00		/* register addresses */
+#define DS1305_MIN		0x01
+#define DS1305_HOUR		0x02
+#	define DS1305_HR_12		0x40	/* set == 12 hr mode */
+#	define DS1305_HR_PM		0x20	/* set == PM (12hr mode) */
+#define DS1305_WDAY		0x03
+#define DS1305_MDAY		0x04
+#define DS1305_MON		0x05
+#define DS1305_YEAR		0x06
+
+
+/* The two alarms have only sec/min/hour/wday fields (ALM_LEN).
+ * DS1305_ALM_DISABLE disables a match field (some combos are bad).
+ *
+ * NOTE that since we don't use WDAY, we limit ourselves to alarms
+ * only one day into the future (vs potentially up to a week).
+ *
+ * NOTE ALSO that while we could generate once-a-second IRQs (UIE), we
+ * don't currently support them.  We'd either need to do it only when
+ * no alarm is pending (not the standard model), or to use the second
+ * alarm (implying that this is a DS1305 not DS1306, *and* that either
+ * it's wired up a second IRQ we know, or that INTCN is set)
+ */
+#define DS1305_ALM_LEN		4		/* bytes for ALM regs */
+#define DS1305_ALM_DISABLE	0x80
+
+#define DS1305_ALM0(r)		(0x07 + (r))	/* register addresses */
+#define DS1305_ALM1(r)		(0x0b + (r))
+
+
+/* three control registers */
+#define DS1305_CONTROL_LEN	3		/* bytes of control regs */
+
+#define DS1305_CONTROL		0x0f		/* register addresses */
+#	define DS1305_nEOSC		0x80	/* low enables oscillator */
+#	define DS1305_WP		0x40	/* write protect */
+#	define DS1305_INTCN		0x04	/* clear == only int0 used */
+#	define DS1306_1HZ		0x04	/* enable 1Hz output */
+#	define DS1305_AEI1		0x02	/* enable ALM1 IRQ */
+#	define DS1305_AEI0		0x01	/* enable ALM0 IRQ */
+#define DS1305_STATUS		0x10
+/* status has just AEIx bits, mirrored as IRQFx */
+#define DS1305_TRICKLE		0x11
+/* trickle bits are defined in <linux/spi/ds1305.h> */
+
+/* a bunch of NVRAM */
+#define DS1305_NVRAM_LEN	96		/* bytes of NVRAM */
+
+#define DS1305_NVRAM		0x20		/* register addresses */
+
+
+struct ds1305 {
+	struct spi_device	*spi;
+	struct rtc_device	*rtc;
+
+	struct work_struct	work;
+
+	unsigned long		flags;
+#define FLAG_EXITING	0
+
+	bool			hr12;
+	u8			ctrl[DS1305_CONTROL_LEN];
+};
+
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Utilities ...  tolerate 12-hour AM/PM notation in case of non-Linux
+ * software (like a bootloader) which may require it.
+ */
+
+static unsigned bcd2hour(u8 bcd)
+{
+	if (bcd & DS1305_HR_12) {
+		unsigned	hour = 0;
+
+		bcd &= ~DS1305_HR_12;
+		if (bcd & DS1305_HR_PM) {
+			hour = 12;
+			bcd &= ~DS1305_HR_PM;
+		}
+		hour += bcd2bin(bcd);
+		return hour - 1;
+	}
+	return bcd2bin(bcd);
+}
+
+static u8 hour2bcd(bool hr12, int hour)
+{
+	if (hr12) {
+		hour++;
+		if (hour <= 12)
+			return DS1305_HR_12 | bin2bcd(hour);
+		hour -= 12;
+		return DS1305_HR_12 | DS1305_HR_PM | bin2bcd(hour);
+	}
+	return bin2bcd(hour);
+}
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Interface to RTC framework
+ */
+
+static int ds1305_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		buf[2];
+	long		err = -EINVAL;
+
+	buf[0] = DS1305_WRITE | DS1305_CONTROL;
+	buf[1] = ds1305->ctrl[0];
+
+	if (enabled) {
+		if (ds1305->ctrl[0] & DS1305_AEI0)
+			goto done;
+		buf[1] |= DS1305_AEI0;
+	} else {
+		if (!(buf[1] & DS1305_AEI0))
+			goto done;
+		buf[1] &= ~DS1305_AEI0;
+	}
+	err = spi_write_then_read(ds1305->spi, buf, sizeof(buf), NULL, 0);
+	if (err >= 0)
+		ds1305->ctrl[0] = buf[1];
+done:
+	return err;
+
+}
+
+
+/*
+ * Get/set of date and time is pretty normal.
+ */
+
+static int ds1305_get_time(struct device *dev, struct rtc_time *time)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		addr = DS1305_SEC;
+	u8		buf[DS1305_RTC_LEN];
+	int		status;
+
+	/* Use write-then-read to get all the date/time registers
+	 * since dma from stack is nonportable
+	 */
+	status = spi_write_then_read(ds1305->spi, &addr, sizeof(addr),
+			buf, sizeof(buf));
+	if (status < 0)
+		return status;
+
+	dev_vdbg(dev, ""%s: %02x %02x %02x, %02x %02x %02x %02x\n"",
+		""read"", buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5], buf[6]);
+
+	/* Decode the registers
+
+2025-01-23 12:39:32 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:32 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:32 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:34 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-01-23 12:39:34 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:34 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:34 - root - INFO - SQL:
+-- 2. Select the file paths of all files
+SELECT "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100
+Results:
+Too long, hard cut:
+sample_path
+drivers/rtc/rtc-ds1305.c
+files/core-js/0.9.12/library.min.js
+twmap_gen/lib/adodb5/perf/perf-db2.inc.php
+drivers/devfreq/governor_simpleondemand.c
+book/_themes/pydoctheme/static/pydoctheme.css
+src/main/java/io/mycat/manager/response/ShowSQLSumUser.java
+src/main/java/com/whammich/sstow/compat/hardmode/HandlerHardMode.java
+src/main/java/flaxbeard/steamcraft/item/ItemSteamcraftNugget.java
+src/router/tests/test_uri.cc
+plugins/User/src/Notification/Message/PasswordRequestMessage.php
+plugins/BackendTheme/src/Template/Element/settings.ctp
+plg_midi_device/src/SConscript
+vendor/doctrine/common/tests/Doctrine/Tests/Common/Persistence/Mapping/_files/.DS_Store
+FAQ-USER
+ProcessHacker/pcre/pcre2_config.c
+document/static/js/es6_modules/exporter/epub.js
+platform-api-client-gwt/che-core-client-gwt-runner/src/main/java/org/eclipse/che/api/runner/gwt/client/utils/RunnerUtils.java
+framework/src/java/org/apache/tapestry/form/validator/MaxLength.java
+framework/src/documentation/content/xdocs/tapestry/ComponentReference/ActionLink.xml
+commonjs/google-map/map.js
+tapestry-core/src/test/java/org/apache/tapestry5/internal/services/RequestPathOptimizerImplTest.java
+tapestry-core/src/test/java/org/apache/tapestry5/ContentTypeTest.java
+vio/vio.c
+product_taxes_group/tests/test_product_taxes_group.py
+mozaik_portal/static/src/js/portal.js
+mozaik_email/wizard/allow_duplicate_view.xml
+rtmpdump.c
+tests/benchmarks/benchmarks.pro
+src/webengine/api/qquickwebengineprofile.cpp
+trunk/Documentation/KamanjaAPIDocs/com/ligadata/InputOutputAdapterInfo/CountersAdapter.html
+src/backend/test/main.cpp
+src/Ractive/prototype/fire.js
+build/cmd/hilo/loader/ImageLoader.js
+temp/com.tecnalia.ossmeter.model/src/com/tecnalia/ossmeter/model/eclipseproject/EclipseprojectFactory.java
+assets/variants/light/buttons/button_reverse.png
+docs/api-en/symbols/BitmapText.html
+assets/css/sass/admin/_posts.scss
+web/files/css/desktop/windows/inv_search_window.css
+Server/src/org/openas2/message/DataHistory.java
+Modules/BetterCms.Module.Root/Commands/Tag/SaveTag/SaveTagCommand.cs
+test/less/stylesheet/compress.less3.selectors.part2.test24.c.json
+README.md
+arch/arm/mach-tegra/board-cardhu-panel.c
+lib/entities/plants/peatbog.dart
+src/filesystem/ZWorkerPool.h
+userspace/libsinsp/filterchecks.h
+third-party/org.carrot2.api/javadoc/org/carrot2/text/preprocessing/CaseNormalizerDescriptor.Keys.html
+src/systeminfo/qnetworkinfo.h
+docdoku-server/docdoku-server-web/src/main/java/com/docdoku/server/rest/AdminResource.java
+icons/file_type_source@3x.png
+sample/test-elements/callbacks.html
+assets/apple-touch-icon.acorn
+tests/quicktestbrowser/ApplicationRoot.qml
+trunk/Documentation/KamanjaAPIDocs/com/ligadata/kamanja/metadata/ModelDef.html
+build/changelog/entries/2015/10/10337.enhancement
+newsfeed/migrations/0004_auto__chg_field_featuredsection_image.py
+README.md
+source/ed/ed_reader.h
+samples/bunnymark/Main.hx
+client/components/characters/charactersAdd.html
+ulauncher/search/file_browser/FileBrowserMode.py
+core/lib/dr_config.h
+core/kernel_linux/clients/umbra/memcheck.h
+src/server/game/DungeonFinding/LFGQueue.cpp
+src/main/java/net/blay09/mods/cookingforblockheads/CookingConfig.java
+symposion/static/img/stripe.png
+ME3Explorer/Resources/property_database_64x64.png
+src/administrator/components/com_kunena/controllers/plugins.php
+View/Factory/Html/Objects/HtmlStrong.php
+module/plugins/crypter/UploadableChFolder.py
+src/3rdparty/Relinq-1.15.15.0/SharedSource/Core/ReSharperAnnotations/PublicAPIAttribute.cs
+src/clustering/administration/main/directory_lock.cc
+src/maidsafe/routing/async_queue.h
+src/3rdparty/Relinq-1.15.15.0/Relinq/Core/Parsing/ExpressionTreeVisitors/TreeEvaluation/EvaluatableTreeFindingExpressionTreeVisitor.cs
+mm/ktsan/ktsan.c
+sbt/src/sbt-test/dependency-management/publish-local/changes/RetrieveTest.sbt
+build.xml
+src/main/resources/assets/titanite/textures/items/tansanitePearl.png
+src/commands/CmdInfo.cpp
+www/lib/HTML/QuickForm/date.php
+doc/fr/installation/index.rst
+doc/stdlibref/stable-partition.html
+ModelItems/InstModelItem.cpp
+Documentation/DocuBlocks/foxxQueuesPollInterval.md
+module/EcampCore/src/EcampCore/Fieldset/User/UserCreateFieldset.php
+resources/public/android-chrome-48x48.png
+Documentation/Books/Manual/Administration/Upgrading/Upgrading30.mdpp
+plugins/org.jkiss.dbeaver.ext.db2/src/org/jkiss/dbeaver/ext/db2/model/dict/DB2TablespaceType.java
+examples/react-in-blaze/packages/npm-container/.npm/package/npm-shrinkwrap.json
+src/github.com/getlantern/lantern-mobile/app/src/main/res/values-et/strings.xml
+Documentation/Examples/generalGraphModulePaths2.generated
+server/templates/emailTemplate.handlebars
+Yupi.Messages/Handlers/Groups/RemoveGroupAdminMessageEvent.cs
+server/src/main/java/com/vaadin/ui/Upload.java
+WARZONE_ASSETS/models/Weapons/DC-15A_Rifle/model.glm
+WARZONE_ASSETS/sound/tts/dimitrissad22k/A280 Clone Blaster.mp3
+WARZONE_ASSETS/sound/tts/harry22k/E-11 Blaster Rifle.mp3
+WARZONE_ASSETS/sound/tts/andreas22k/Westarm 5 Blaster.mp3
+WARZONE_ASSETS/sound/tts/willbadguy22k/hmmm. 
+
+2025-01-23 12:39:34 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:34 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:34 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:36 - snowflake.connector.cursor - INFO - Number of results in first chunk: 17
+2025-01-23 12:39:38 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:38 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:38 - root - INFO - SQL:
+-- 3. Select the content of all non-binary files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE
+LIMIT 100
+Results:
+Too long, hard cut:
+content
+"#pragma once
+/*
+ *      Copyright (C) 2005-2012 Team XBMC
+ *      http://xbmc.org
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with XBMC; see the file COPYING.  If not, see
+ *  <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include ""utils/StdString.h""
+#include <vector>
+
+#include ""pictures/PictureScalingAlgorithm.h""
+#include ""utils/GlobalsHandling.h""
+
+class TiXmlElement;
+
+class DatabaseSettings
+{
+public:
+  void Reset()
+  {
+    type.clear();
+    host.clear();
+    port.clear();
+    user.clear();
+    pass.clear();
+    name.clear();
+  };
+  CStdString type;
+  CStdString host;
+  CStdString port;
+  CStdString user;
+  CStdString pass;
+  CStdString name;
+};
+
+struct TVShowRegexp
+{
+  bool byDate;
+  CStdString regexp;
+  int defaultSeason;
+  TVShowRegexp(bool d, const CStdString& r, int s = 1)
+  {
+    byDate = d;
+    regexp = r;
+    defaultSeason = s;
+  }
+};
+
+struct RefreshOverride
+{
+  float fpsmin;
+  float fpsmax;
+
+  float refreshmin;
+  float refreshmax;
+
+  bool  fallback;
+};
+
+
+struct RefreshVideoLatency
+{
+  float refreshmin;
+  float refreshmax;
+
+  float delay;
+};
+
+typedef std::vector<TVShowRegexp> SETTINGS_TVSHOWLIST;
+
+class CAdvancedSettings
+{
+  public:
+    CAdvancedSettings();
+
+    static CAdvancedSettings* getInstance();
+
+    void Initialize();
+    bool Initialized() { return m_initialized; };
+    void AddSettingsFile(const CStdString &filename);
+    bool Load();
+    void Clear();
+
+    static void GetCustomTVRegexps(TiXmlElement *pRootElement, SETTINGS_TVSHOWLIST& settings);
+    static void GetCustomRegexps(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomRegexpReplacers(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomExtensions(TiXmlElement *pRootElement, CStdString& extensions);
+
+    bool CanLogComponent(int component) const;
+
+    int m_audioHeadRoom;
+#ifdef TARGET_OPENELEC
+    // OpenELEC workaround for minimum sample Rate
+    int m_minimumSampleRate;
+#endif
+    float m_ac3Gain;
+    int m_maxPllAdjust;
+    CStdString m_audioDefaultPlayer;
+    float m_audioPlayCountMinimumPercent;
+    bool m_dvdplayerIgnoreDTSinWAV;
+    float m_limiterHold;
+    float m_limiterRelease;
+
+    bool  m_omxHWAudioDecode;
+    bool  m_omxDecodeStartWithValidFrame;
+
+    float m_videoSubsDelayRange;
+    float m_videoAudioDelayRange;
+    int m_videoSmallStepBackSeconds;
+    int m_videoSmallStepBackTries;
+    int m_videoSmallStepBackDelay;
+    bool m_videoUseTimeSeeking;
+    int m_videoTimeSeekForward;
+    int m_videoTimeSeekBackward;
+    int m_videoTimeSeekForwardBig;
+    int m_videoTimeSeekBackwardBig;
+    int m_videoPercentSeekForward;
+    int m_videoPercentSeekBackward;
+    int m_videoPercentSeekForwardBig;
+    int m_videoPercentSeekBackwardBig;
+    CStdString m_videoPPFFmpegDeint;
+    CStdString m_videoPPFFmpegPostProc;
+    bool m_videoVDPAUtelecine;
+    bool m_videoVDPAUdeintSkipChromaHD;
+    bool m_musicUseTimeSeeking;
+    int m_musicTimeSeekForward;
+    int m_musicTimeSeekBackward;
+    int m_musicTimeSeekForwardBig;
+    int m_musicTimeSeekBackwardBig;
+    int m_musicPercentSeekForward;
+    int m_musicPercentSeekBackward;
+    int m_musicPercentSeekForwardBig;
+    int m_musicPercentSeekBackwardBig;
+    int m_videoBlackBarColour;
+    int m_videoIgnoreSecondsAtStart;
+    float m_videoIgnorePercentAtEnd;
+    float m_audioApplyDrc;
+    bool m_useFfmpegVda;
+
+    int   m_videoVDPAUScaling;
+    bool  m_videoVAAPIforced;
+    float m_videoNonLinStretchRatio;
+    bool  m_videoEnableHighQualityHwScalers;
+    float m_videoAutoScaleMaxFps;
+    std::vector<RefreshOverride> m_videoAdjustRefreshOverrides;
+    std::vector<RefreshVideoLatency> m_videoRefreshLatency;
+    float m_videoDefaultLatency;
+    bool m_videoDisableBackgroundDeinterlace;
+    int  m_videoCaptureUseOcclusionQuery;
+    bool m_DXVACheckCompatibility;
+    bool m_DXVACheckCompatibilityPresent;
+    bool m_DXVAForceProcessorRenderer;
+    bool m_DXVANoDeintProcForProgressive;
+    bool m_DXVAAllowHqScaling;
+    int  m_videoFpsDetect;
+    int  m_videoBusyDialogDelay_ms;
+
+    CStdString m_videoDefaultPlayer;
+    CStdString m_videoDefaultDVDPlayer;
+    float m_videoPlayCountMinimumPercent;
+
+    float m_slideshowBlackBarCompensation;
+    float m_slideshowZoomAmount;
+    float m_slideshowPanAmount;
+
+    bool m_lcdHeartbeat;
+    bool m_lcdDimOnScreenSave;
+    int m_lcdScrolldelay;
+    CStdString m_lcdHostName;
+
+    int m_songInfoDuration;
+    int m_logLevel;
+    int m_logLevelHint;
+    CStdString m_cd
+
+2025-01-23 12:39:38 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:38 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:38 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:39 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-01-23 12:39:39 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:40 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:40 - root - INFO - SQL:
+-- 4. Select the paths of all Java source files
+SELECT "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" LIKE '%.java'
+LIMIT 100
+Results:
+Too long, hard cut:
+sample_path
+flexmojos-testing/flexmojos-test-harness/src/test/java/net/flexmojos/oss/tests/concept/AttachAsdocTest.java
+gemfirexd/client/src/main/java/io/snappydata/thrift/internal/ClientParameterMetaData.java
+libjava/javax/naming/spi/NamingManager.java
+lionengine-network/src/main/java/com/b3dgs/lionengine/network/Networker.java
+lionengine-core/src/main/java/com/b3dgs/lionengine/drawable/Image.java
+src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/orchestration/NhinAggregator.java
+Product/Production/Services/PatientDiscoveryCore/src/main/java/gov/hhs/fha/nhinc/patientdiscovery/model/builder/impl/PatientSearchResultsModelBuilderImpl.java
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/messaging/client/CONNECTCXFClientFactory.java
+pcap4j-core/src/main/java/org/pcap4j/core/NativePacketDllMappings.java
+framework/src/java/org/apache/tapestry/coerce/BooleanArrayToIteratorConverter.java
+mapfishapp/src/main/java/org/georchestra/mapfishapp/ws/upload/FeatureGeoFileReader.java
+src/test/org/apache/sqoop/hcat/HCatalogImportTest.java
+velocity-tools-generic/src/test/java/org/apache/velocity/tools/generic/DateToolTests.java
+jca/src/main/java/org/apache/qpid/ra/tm/WLSTransactionManagerLocator.java
+src/java/org/apache/cassandra/db/commitlog/ReplayPosition.java
+uimaj-json/src/main/java/org/apache/uima/json/impl/MetaDataObjectSerializer_json.java
+core/sis-metadata/src/test/java/org/apache/sis/metadata/iso/DefaultMetadataTest.java
+uimaj-core/src/main/java/org/apache/uima/collection/CasConsumerDescription.java
+microscope-collector/src/test/java/com/lmax/disruptor/sequenced/OneToThreePipelineSequencedThroughputTest.java
+bundles/binding/org.openhab.binding.zwave/src/main/java/org/openhab/binding/zwave/internal/protocol/commandclass/ZWaveWakeUpCommandClass.java
+clients/java/src/main/java/com/senseidb/search/client/req/SenseiClientRequest.java
+src/java/net/p455w0rd/wirelesscraftingterminal/core/sync/packets/PacketSetMagnet.java
+src/test/java/de/is24/infrastructure/gridfs/http/web/controller/StatusControllerWithInactiveDatabaseIT.java
+whois-endtoend/src/test/java/net/ripe/db/whois/changedphase3/util/Scenario.java
+main/source/org/apach3/http/nio/NHttpServerEventHandler.java
+commons/ihe/xds/src/main/java/org/openehealth/ipf/commons/ihe/xds/core/ebxml/EbXMLRetrieveDocumentSetRequest.java
+xxl-job-admin/src/main/java/com/xxl/job/admin/core/jobbean/impl/DemoConcurrentJobBean.java
+src/test/java/edu/jhuapl/tinkerpop/mapreduce/InputFormatsTest.java
+src/org/javacore/nio/FileChannelTransferTo.java
+common/java/core/net/i2p/client/naming/ExecNamingService.java
+src/main/java/com/airbnb/metrics/ParserForNoTag.java
+src/net/rec/contra/cjbe/editor/detail/attributes/GenericAttributeDetailPane.java
+client/cli/src/main/java/org/apache/syncope/client/cli/commands/domain/DomainList.java
+cloudfoundry-client/src/main/java/org/cloudfoundry/client/v2/userprovidedserviceinstances/_ListUserProvidedServiceInstancesResponse.java
+cdk-morphlines/cdk-morphlines-hadoop-core/src/test/java/com/cloudera/cdk/morphline/hadoop/core/MiniDFSTest.java
+dbunit/src/main/java/org/jboss/arquillian/persistence/dbunit/filter/OracleDatabaseSequenceFilter.java
+gradle/wrapper/dists/gradle-2.2.1-all/c64ydeuardnfqctvr1gm30w53/gradle-2.2.1/src/dependency-management/org/gradle/api/internal/notations/ModuleIdentiferNotationParser.java
+app/src/main/java/in/co/praveenkumar/mdroid/helper/ImageLoader.java
+common_wiki_jdbc/src/wikokit/base/wikt/sql/quote/TQuotTranslation.java
+src/dr/app/tempest/TempestPanel.java
+core/src/com/clarkparsia/owlwg/testrun/SyntaxConstraintRun.java
+app-starters-test-support/src/main/java/org/springframework/cloud/stream/app/test/sftp/SftpSinkTestConfiguration.java
+java/com/l2jserver/gameserver/network/BlowFishKeygen.java
+src/keel/Algorithms/Preprocess/Converter/CsvToKeel.java
+src/com/vonglasow/michael/satstat/widgets/NetworkTypePreference.java
+src/main/java/com/github/fge/jsonschema/load/JsonPatchLoader.java
+src/main/java/rtg/world/biome/realistic/highlands/RealisticBiomeHLMesa.java
+src/test/java/com/alibaba/wasp/WaspCluster.java
+src/edu/fudan/ontology/graph/SparseMatrixT.java
+jtransc-asm/src/com/jtransc/org/objectweb/asm/util/CheckMethodAdapter.java
+APDE/src/main/java/com/calsignlabs/apde/FileMeta.java
+gomint-api/src/main/java/io/gomint/scheduler/Task.java
+luna/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/JavadocAllocationExpression.java
+main/recognition/test/boofcv/alg/tracker/tld/TestTldFernDescription.java
+squidlib-util/src/main/java/squidpony/tileset/Maze2Wide.java
+backend/manager/modules/common/src/test/java/org/ovirt/engine/core/common/validation/Ipv6ConstraintTest.java
+zanata-war/src/main/java/org/zanata/security/CheckPermissionDecisionVoter.java
+src/main/java/org/codinjutsu/tools/jenkins/logic/BuildStatusVisitor.java
+whois-commons/src/test/java/net/ripe/db/whois/common/domain/IpRangesTest.java
+vlo-web-app/src/main/java/eu/clarin
+
+2025-01-23 12:39:40 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:40 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:40 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:42 - snowflake.connector.cursor - INFO - Number of results in first chunk: 16
+2025-01-23 12:39:43 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:43 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:43 - root - INFO - SQL:
+-- 5. Select the content of all non-binary Java source files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+LIMIT 100
+Results:
+Too long, hard cut:
+content
+"/**
+ * Flexmojos is a set of maven goals to allow maven users to compile, optimize and test Flex SWF, Flex SWC, Air SWF and Air SWC.
+ * Copyright (C) 2008-2012  Marvin Froeder <marvin@flexmojos.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package net.flexmojos.oss.tests.concept;
+
+import java.io.File;
+
+import net.flexmojos.oss.test.FMVerifier;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+public class AttachAsdocTest
+    extends AbstractConceptTest
+{
+
+    @Test
+    public void attachAsdoc()
+        throws Exception
+    {
+        FMVerifier v = standardConceptTester( ""attach-asdoc"" );
+        File target = new File( v.getBasedir(), ""target"" );
+
+        Assert.assertTrue( target.exists() );
+
+        File doc = new File( target, ""attach-asdoc-1.0-SNAPSHOT-asdoc.zip"" );
+        Assert.assertTrue( doc.exists() );
+    }
+}
+"
+"/*
+ * Copyright (c) 2010-2015 Pivotal Software, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+
+package io.snappydata.thrift.internal;
+
+import java.sql.ParameterMetaData;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.pivotal.gemfirexd.internal.shared.common.reference.SQLState;
+import io.snappydata.thrift.ColumnDescriptor;
+import io.snappydata.thrift.common.Converters;
+import io.snappydata.thrift.common.ThriftExceptionUtil;
+import io.snappydata.thrift.snappydataConstants;
+
+/**
+ * Implementation of JDBC {@link ParameterMetaData} for the thrift JDBC driver.
+ */
+public class ClientParameterMetaData implements ParameterMetaData {
+
+  private final List<ColumnDescriptor> descriptors;
+
+  ClientParameterMetaData(List<ColumnDescriptor> metadata) {
+    this.descriptors = metadata;
+  }
+
+  /** check if 1-based index of column is valid one */
+  final void checkForValidColumn(int column) throws SQLException {
+    final int numColumns = this.descriptors.size();
+    if (column < 1 || column > numColumns) {
+      throw ThriftExceptionUtil.newSQLException(
+          SQLState.LANG_INVALID_PARAM_POSITION, null, column, numColumns);
+    }
+  }
+
+  final ColumnDescriptor getDescriptor(int column) throws SQLException {
+    checkForValidColumn(column);
+    return this.descriptors.get(column - 1);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getParameterCount() throws SQLException {
+    return this.descriptors.size();
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int isNullable(int param) throws SQLException {
+    ColumnDescriptor desc = getDescriptor(param);
+    if (desc.isSetNullable()) {
+      return desc.isNullable() ? parameterNullable : parameterNoNulls;
+    } else {
+      return parameterNullableUnknown;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public boolean isSigned(int param) throws SQLException {
+    switch (getDescriptor(param).getType()) {
+      case INTEGER:
+      case REAL:
+      case DECIMAL:
+      case SMALLINT:
+      case BIGINT:
+      case TINYINT:
+      case DOUBLE:
+      case FLOAT:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getPrecision(int param) throws SQLExcepti
+
+2025-01-23 12:39:43 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:43 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:43 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:44 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-01-23 12:39:44 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:45 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:45 - root - INFO - SQL:
+-- 6. Select distinct repository names from the contents table
+SELECT DISTINCT "sample_repo_name"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100
+Results:
+sample_repo_name
+pelya/commandergenius
+cloudera/impala-kudu
+khasang/SmartForecast
+urjaman/flashrom
+velo/flexmojos
+SnappyDataInc/snappy-store
+XyrusWorx/apophysis7x
+drdaeman/accel-ppp
+tokee/lucene
+webscalesql/webscalesql-5.6
+CONNECT-Solution/CONNECT
+DoSomething/voting-app
+apache/sqoop
+AbiWord/abiword
+meta-debian/meta-debian
+Cerberuss/GofPatterns
+cloudmatrix/esky
+Mygod/Skylark
+JHUAPL/AccumuloGraph
+vmesel/GeoMath
+mapbender/mapbender
+sfmskywalker/Orchard
+ovh/overthebox-openwrt
+Caltech-IPAC/firefly
+Kunena/Kunena-Forum
+nickkolok/chas-ege
+apache/uima-uimaj
+apache/sis
+bombmanual/bombmanual.github.io
+pplante/droidtowers
+Nexus-Mods/Nexus-Mod-Manager
+jmaih/RISE_toolbox
+headwirecom/aem-solr-search
+glmcdona/strings2
+anycmd/anycmd
+linuxdeepin/deepin-wm
+mempo/mempo-kernel
+apache/qpid-java
+ImmobilienScout24/yum-repo-server
+gorescript/gorescript
+oehf/ipf
+findsorguk/findsorguk
+garyKeorkunian/squants
+Sitecore/Habitat
+StefanoFiumara/Harry-Potter-Unity
+gr8pefish/IronBackpacks
+iridium-browser/iridium-browser-ubuntu
+sam408130/Ionic-Demos
+Glimpse/Glimpse.Prototype
+coinkite/cloudfire
+b3dgs/lionengine
+Incubaid/arakoon
+aspnetboilerplate/aspnetboilerplate
+jaquadro/StorageDrawers
+Job-Yang/YTZImageComparison
+awslabs/aws-sdk-cpp
+ghxiao/drew
+aasensio/pySIR
+epiSurg/EpiSurg
+googlei18n/language-resources
+crossbario/crossbarexamples
+ezScrum/ezScrum
+fxos-components/bridge
+LibreOffice/core
+KDE/krita
+mdaniel/virtualbox-org-svn-vbox-trunk
+hroptatyr/dateutils
+espadrine/opera
+digama0/mmj2
+nathansttt/hog2
+google/binexport
+biocaml/biocaml
+tatsuhiro-t/aria2
+albertz/openlierox
+Open-Transport/synthese
+danielnaber/openthesaurus
+scrollback/io.scrollback.neighborhoods
+project-store/theme
+sileht/check_mk
+umbraco/Umbraco-CMS
+nigelsmall/py2neo
+Esteemed-Innovation/Flaxbeards-Steam-Power
+TheTechnobear/EigenD
+sonata-project/sandbox-build
+koala-framework/koala-framework
+ligaDATA/Kamanja
+hiloteam/Hilo
+oivva/boxy
+ChildrenOfUr/coUclient
+timduru/tf300t-katkernel
+ChildrenOfUr/coUserver
+draios/sysdig
+bosonic/bosonic
+Ulauncher/Ulauncher
+DynamoRIO/drk
+google/ktsan
+apache/tomcat-native
+erasaur/binary
+jdahlstrom/vaadin.react
+pfirmstone/river-internet
+
+2025-01-23 12:39:45 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:45 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:45 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:46 - snowflake.connector.cursor - INFO - Number of results in first chunk: 100
+2025-01-23 12:39:46 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:46 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:47 - root - INFO - SQL:
+-- 7. Select sizes and paths of Java source files, ordered by size descending
+SELECT "size", "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+ORDER BY "size" DESC
+LIMIT 100
+Results:
+Too long, hard cut:
+size,sample_path
+201543,gemfirexd/tools/src/dunit/java/com/pivotal/gemfirexd/wan/GfxdSerialWanDUnit.java
+175045,src/org/apache/velocity/runtime/parser/ParserTokenManager.java
+170837,cosmic-core/server/src/main/java/com/cloud/api/query/QueryManagerImpl.java
+139740,squidlib-util/src/main/java/squidpony/tileset/Maze2Wide.java
+106992,源包/server/MapleStatEffect.java
+101004,src/com/dabomstew/pkrandom/romhandlers/Gen5RomHandler.java
+100348,Plugins/Instantiation/de.uni_hildesheim.sse.vil.rt.ui/src-gen/de/uni_hildesheim/sse/vil/rt/ui/contentassist/antlr/internal/InternalRtVilLexer.java
+98056,src/share/classes/sun/security/tools/jarsigner/Main.java
+75174,com/planet_ink/coffee_mud/Items/Basic/GenSailingShip.java
+71563,vlc-android/src/org/videolan/vlc/PlaybackService.java
+71289,components/tools/OmeroJava/test/integration/AdminServiceTest.java
+70269,src/freenet/clients/fcp/FCPPluginConnectionImpl.java
+69399,tddl-parser/src/main/java/com/alibaba/cobar/parser/visitor/MySQLOutputASTVisitor.java
+62548,src/flow/java/java8/util/concurrent/SubmissionPublisher.java
+61594,Source Library/openmaxims_workspace/ValueObjects/src/ims/RefMan/vo/CatsReferralWizardVo.java
+59692,core/src/main/java/net/time4j/PlainTimestamp.java
+58888,Source Library/openmaxims_workspace/Admin/src/ims/admin/forms/dataview/GenForm.java
+57213,CodenameOne/src/com/codename1/io/gzip/Deflate.java
+56599,examples/Math-issue-288/src/main/java/org/apache/commons/math/linear/BigMatrixImpl.java
+55887,components/org.apache.stratos.autoscaler/src/main/java/org/apache/stratos/autoscaler/monitor/component/GroupMonitor.java
+54176,jaxws/src/jdk.xml.bind/share/classes/com/sun/xml/internal/xsom/impl/parser/state/particle.java
+53901,junit/org/dyn4j/geometry/GeometryTest.java
+52533,jtransc-asm/src/com/jtransc/org/objectweb/asm/util/CheckMethodAdapter.java
+51947,jdk/src/java.base/share/classes/java/net/SocketPermission.java
+44341,core/src/main/java/edu/mines/jtk/mosaic/PlotPanel.java
+44132,mina.core/core/src/main/java/org/apache/mina/core/buffer/IoBuffer.java
+42231,app/documents/Helper.java
+42207,src/main/java/java8/util/stream/ReduceOps.java
+42186,ui/src/org/pentaho/di/ui/trans/steps/sqlfileoutput/SQLFileOutputDialog.java
+41248,app/src/production/java/se/leap/bitmaskclient/ProviderAPI.java
+38229,src/test/org/apache/sqoop/hcat/HCatalogImportTest.java
+38147,java/sage/SageTVWindow.java
+36887,tests/integration-tests/src/test/java/org/apache/activemq/artemis/tests/integration/proton/ProtonTest.java
+36652,lib/server-core/src/test/java/org/apache/olingo/server/core/uri/parser/UriTokenizerTest.java
+36383,sakai-evaluation-impl/src/java/org/sakaiproject/evaluation/logic/EvalCommonLogicImpl.java
+35768,easyrec-utils/src/main/java/gnu/trove/map/hash/TLongIntHashMap.java
+35302,sdk/src/com/constellio/app/api/search/MultilingualFreeTextSearchBrokenAcceptTest.java
+34862,src/main/java/com/elmakers/mine/bukkit/action/CastContext.java
+34847,components/camel-spring/src/main/java/org/apache/camel/spring/handler/CamelNamespaceHandler.java
+34758,src/dr/app/tempest/TempestPanel.java
+33562,presto-main/src/main/java/com/facebook/presto/operator/scalar/ReflectionParametricScalar.java
+33149,source/src/com/espertech/esper/epl/join/plan/NStreamOuterQueryPlanBuilder.java
+32398,cassandra-unit/src/test/java/org/cassandraunit/dataset/xml/ClasspathXmlDataSetTest.java
+32287,genie-web/src/test/java/com/netflix/genie/web/controllers/ClusterRestControllerIntegrationTests.java
+32262,luna/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+32132,server/src/main/java/com/vaadin/ui/Upload.java
+30710,mbhd-swing/src/test/java/FontAwesomeTools.java
+30653,core/ide/che-core-ide-app/src/main/java/org/eclipse/che/ide/part/explorer/project/ProjectExplorerPresenter.java
+28739,Source Library/openmaxims_workspace/ValueObjects/src/ims/icp/vo/domain/ICPFullVoAssembler.java
+28521,src/test/java/one/util/streamex/DoubleStreamExTest.java
+28437,hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/HybridHashJoinOperatorDescriptor.java
+28121,AIMSICD/src/main/java/com/secupwn/aimsicd/activities/MapViewerOsmDroid.java
+27844,Source Library/openmaxims_workspace-archive/Admin/src/ims/admin/domain/impl/HcpAdminImpl.java
+27048,fit/src/test/java/org/apache/olingo/fit/base/BatchTestITCase.java
+26710,Original Files/source/src/android/support/v4/app/Fragment.java
+26568,alljoyn/alljoyn_java/test/org/alljoyn/bus/AboutIconProxyTest.java
+26451,Source Library/openmaxims_workspace/Scheduling/src/ims/scheduling/forms/ocsexternalevents/GenForm.java
+26197,src/java/org/apache/cassandra/streaming/StreamSession.java
+26144,lucee-java/lucee-core/src/lucee/runtime/tag/Feed.java
+25050,src/main/java/com/persado/oss/quality/stevia/testng/Verify.java
+24624,src/main/java/com/amazonaws/services/storagegateway/model/CreateStorediSCSIVolumeRequest.java
+23979,app/src/main/java/com/yydcdut/note/view/fab/FloatingActionsMenu.java
+23511,app/src/org/runnerup/export/GarminSynchronizer.java
+23420
+
+2025-01-23 12:39:47 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:47 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:47 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:49 - snowflake.connector.cursor - INFO - Number of results in first chunk: 2
+2025-01-23 12:39:50 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:50 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:50 - root - INFO - SQL:
+-- 8. Select the content of text files containing 'import' statements
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "content" LIKE '%import%'
+LIMIT 100
+Results:
+Too long, hard cut:
+content
+"# -*- coding: utf-8 -*-
+# Copyright (C) 2015 mulhern <amulhern@redhat.com>
+
+# This library is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation; either version 2.1 of the License, or (at your
+# option) any later version.
+
+# This library is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+
+# You should have received a copy of the GNU Lesser General Public License
+# along with this library; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+
+""""""
+    pyudev._ctypeslib
+    =================
+
+    Wrappers for libraries.
+
+    .. moduleauthor::  mulhern  <amulhern@redhat.com>
+""""""
+
+from . import libc
+from . import libudev
+"
+"<?php
+/**
+ * Subclass for representing a row from the 'entry' table.
+ *
+ *
+ *
+ * @package Core
+ * @subpackage model
+ */
+class entry extends Baseentry implements ISyncableFile, IIndexable, IOwnable, IRelatedObject
+{
+	protected $new_categories = '';
+	protected $new_categories_ids = '';
+	protected $old_categories;
+	protected $is_categories_modified = false;
+	protected $is_categories_names_modified = false;
+	protected $creator_kuser_id = null;
+	
+	const MINIMUM_ID_TO_DISPLAY = 8999;
+	
+	const ROOTS_FIELD_PREFIX = 'K_Pref';
+	const ROOTS_FIELD_ENTRY_PREFIX = 'KP_Entry';
+	const ROOTS_FIELD_PARENT_ENTRY_PREFIX = 'KP_Parent';
+	const ROOTS_FIELD_BULK_UPLOAD_PREFIX = 'KP_Bulk';
+
+	// NOTE - CHANGES MUST BE MADE TO LAYOUT.PHP JS PART AS WELL
+	// different sort orders for browsing entries
+	const ENTRY_SORT_MOST_VIEWED = 0;
+	const ENTRY_SORT_MOST_RECENT = 1;
+	const ENTRY_SORT_MOST_COMMENTS = 2;
+	const ENTRY_SORT_MOST_FAVORITES = 3;
+	const ENTRY_SORT_RANK = 4;
+	const ENTRY_SORT_MEDIA_TYPE = 5;
+	const ENTRY_SORT_NAME = 6;
+	const ENTRY_SORT_KUSER_SCREEN_NAME = 7;
+
+	// NOTE - CHANGES MUST BE MADE TO LAYOUT.PHP JS PART AS WELL
+	const ENTRY_MEDIA_TYPE_AUTOMATIC = -1;
+	const ENTRY_MEDIA_TYPE_ANY = 0;
+	const ENTRY_MEDIA_TYPE_VIDEO = 1;
+	const ENTRY_MEDIA_TYPE_IMAGE = 2;
+	const ENTRY_MEDIA_TYPE_TEXT = 3;
+	const ENTRY_MEDIA_TYPE_HTML = 4;
+	const ENTRY_MEDIA_TYPE_AUDIO = 5;
+	const ENTRY_MEDIA_TYPE_SHOW = 6;
+	const ENTRY_MEDIA_TYPE_SHOW_XML = 7; // for the kplayer: the data contains the xml itself and not a url
+	const ENTRY_MEDIA_TYPE_BUBBLES = 9;
+	const ENTRY_MEDIA_TYPE_XML = 10;
+	const ENTRY_MEDIA_TYPE_DOCUMENT = 11;
+	const ENTRY_MEDIA_TYPE_SWF = 12;
+	const ENTRY_MEDIA_TYPE_PDF = 13;
+	
+	const ENTRY_MEDIA_TYPE_GENERIC_1= 101;	// these types can be used for derived classes - assume this is some kind of TXT file
+	const ENTRY_MEDIA_TYPE_GENERIC_2= 102;	// these types can be used for derived classes
+	const ENTRY_MEDIA_TYPE_GENERIC_3= 103;	// these types can be used for derived classes
+	const ENTRY_MEDIA_TYPE_GENERIC_4= 104;	// these types can be used for derived classes
+	
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_FLASH = 201;
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_WINDOWS_MEDIA = 202;
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_REAL_MEDIA = 203;
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_QUICKTIME = 204;
+	
+	// NOTE - CHANGES MUST BE MADE TO LAYOUT.PHP JS PART AS WELL
+	const ENTRY_MEDIA_SOURCE_FILE = 1;
+	const ENTRY_MEDIA_SOURCE_WEBCAM = 2;
+	const ENTRY_MEDIA_SOURCE_FLICKR = 3;
+	const ENTRY_MEDIA_SOURCE_YOUTUBE = 4;
+	const ENTRY_MEDIA_SOURCE_URL = 5;
+	const ENTRY_MEDIA_SOURCE_TEXT = 6;
+	const ENTRY_MEDIA_SOURCE_MYSPACE = 7;
+	const ENTRY_MEDIA_SOURCE_PHOTOBUCKET = 8;
+	const ENTRY_MEDIA_SOURCE_JAMENDO = 9;
+	const ENTRY_MEDIA_SOURCE_CCMIXTER = 10;
+	const ENTRY_MEDIA_SOURCE_NYPL = 11;
+	const ENTRY_MEDIA_SOURCE_CURRENT = 12;
+	const ENTRY_MEDIA_SOURCE_MEDIA_COMMONS = 13;
+	const ENTRY_MEDIA_SOURCE_KALTURA = 20;
+	const ENTRY_MEDIA_SOURCE_KALTURA_USER_CLIPS = 21;
+	const ENTRY_MEDIA_SOURCE_ARCHIVE_ORG = 22;
+	const ENTRY_MEDIA_SOURCE_KALTURA_PARTNER = 23;
+	const ENTRY_MEDIA_SOURCE_METACAFE = 24;
+	const ENTRY_MEDIA_SOURCE_KALTURA_QA = 25;
+	const ENTRY_MEDIA_SOURCE_KALTURA_KSHOW = 26;
+	const ENTRY_MEDIA_SOURCE_KALTURA_PARTNER_KSHOW = 27;
+	const ENTRY_MEDIA_SOURCE_SEARCH_PROXY = 28;
+	const ENTRY_MEDIA_SOURCE_AKAMAI_LIVE = 29;
+	const ENTRY_MEDIA_SOURCE_MANUAL_LIVE_STREAM = 30;
+	const ENTRY_MEDIA_SOURCE_AKAMAI_UNIVERSAL_LIVE = 31;
+	const ENTRY_MEDIA_SOURCE_LIVE_STREAM = 32;
+	const ENTRY_MEDIA_SOURCE_LIVE_CHANNEL = 33;
+	const ENTRY_MEDIA_SOURCE_RECORDED_LIVE = 34;
+	const ENTRY_MEDIA_SOURCE_CLIP = 35;
+	const ENTRY_MEDIA_SOURCE_PARTNER_SPECIFIC = 100;
+		
+	const ENTRY_MODERATION_STATUS_PENDING_MODERATION = 1;
+	const ENTRY_MODERATION_STATUS_APPROVED = 2;
+	const ENTRY_MODERATION_STATUS_REJECTED = 3;
+	const ENTRY_MODERATION_STATUS_FLAGGED_FOR_REVIEW = 5;
+	const ENTRY_MODERATION_STATUS_AUTO_APPROVED = 6;
+	
+	const MAX_NORMALIZED_RANK = 5;
+
+	const MAX_CATEGORIES_PER_ENTRY = 32;
+	const MAX_CATEGORIES_PER_ENTRY_DISAB
+
+2025-01-23 12:39:50 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:50 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:50 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:53 - snowflake.connector.cursor - INFO - Number of results in first chunk: 15
+2025-01-23 12:39:54 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:54 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:54 - root - INFO - SQL:
+-- 9. Select the content of Java files containing 'import java' statements
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java' AND "content" LIKE '%import java%'
+LIMIT 100
+Results:
+Too long, hard cut:
+content
+"/**
+ * Flexmojos is a set of maven goals to allow maven users to compile, optimize and test Flex SWF, Flex SWC, Air SWF and Air SWC.
+ * Copyright (C) 2008-2012  Marvin Froeder <marvin@flexmojos.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package net.flexmojos.oss.tests.concept;
+
+import java.io.File;
+
+import net.flexmojos.oss.test.FMVerifier;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+public class AttachAsdocTest
+    extends AbstractConceptTest
+{
+
+    @Test
+    public void attachAsdoc()
+        throws Exception
+    {
+        FMVerifier v = standardConceptTester( ""attach-asdoc"" );
+        File target = new File( v.getBasedir(), ""target"" );
+
+        Assert.assertTrue( target.exists() );
+
+        File doc = new File( target, ""attach-asdoc-1.0-SNAPSHOT-asdoc.zip"" );
+        Assert.assertTrue( doc.exists() );
+    }
+}
+"
+"/*
+ * Copyright (c) 2010-2015 Pivotal Software, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+
+package io.snappydata.thrift.internal;
+
+import java.sql.ParameterMetaData;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.pivotal.gemfirexd.internal.shared.common.reference.SQLState;
+import io.snappydata.thrift.ColumnDescriptor;
+import io.snappydata.thrift.common.Converters;
+import io.snappydata.thrift.common.ThriftExceptionUtil;
+import io.snappydata.thrift.snappydataConstants;
+
+/**
+ * Implementation of JDBC {@link ParameterMetaData} for the thrift JDBC driver.
+ */
+public class ClientParameterMetaData implements ParameterMetaData {
+
+  private final List<ColumnDescriptor> descriptors;
+
+  ClientParameterMetaData(List<ColumnDescriptor> metadata) {
+    this.descriptors = metadata;
+  }
+
+  /** check if 1-based index of column is valid one */
+  final void checkForValidColumn(int column) throws SQLException {
+    final int numColumns = this.descriptors.size();
+    if (column < 1 || column > numColumns) {
+      throw ThriftExceptionUtil.newSQLException(
+          SQLState.LANG_INVALID_PARAM_POSITION, null, column, numColumns);
+    }
+  }
+
+  final ColumnDescriptor getDescriptor(int column) throws SQLException {
+    checkForValidColumn(column);
+    return this.descriptors.get(column - 1);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getParameterCount() throws SQLException {
+    return this.descriptors.size();
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int isNullable(int param) throws SQLException {
+    ColumnDescriptor desc = getDescriptor(param);
+    if (desc.isSetNullable()) {
+      return desc.isNullable() ? parameterNullable : parameterNoNulls;
+    } else {
+      return parameterNullableUnknown;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public boolean isSigned(int param) throws SQLException {
+    switch (getDescriptor(param).getType()) {
+      case INTEGER:
+      case REAL:
+      case DECIMAL:
+      case SMALLINT:
+      case BIGINT:
+      case TINYINT:
+      case DOUBLE:
+      case FLOAT:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getPrecision(int param) throws SQLExcepti
+
+2025-01-23 12:39:54 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:39:54 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:39:54 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:39:56 - snowflake.connector.cursor - INFO - Number of results in first chunk: 16
+2025-01-23 12:39:57 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:39:57 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:39:58 - root - INFO - SQL:
+-- 10. Select paths and content of Java files that contain 'import' statements
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java' AND "content" LIKE '%import%'
+LIMIT 100
+Results:
+Too long, hard cut:
+sample_path,content
+flexmojos-testing/flexmojos-test-harness/src/test/java/net/flexmojos/oss/tests/concept/AttachAsdocTest.java,"/**
+ * Flexmojos is a set of maven goals to allow maven users to compile, optimize and test Flex SWF, Flex SWC, Air SWF and Air SWC.
+ * Copyright (C) 2008-2012  Marvin Froeder <marvin@flexmojos.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package net.flexmojos.oss.tests.concept;
+
+import java.io.File;
+
+import net.flexmojos.oss.test.FMVerifier;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+public class AttachAsdocTest
+    extends AbstractConceptTest
+{
+
+    @Test
+    public void attachAsdoc()
+        throws Exception
+    {
+        FMVerifier v = standardConceptTester( ""attach-asdoc"" );
+        File target = new File( v.getBasedir(), ""target"" );
+
+        Assert.assertTrue( target.exists() );
+
+        File doc = new File( target, ""attach-asdoc-1.0-SNAPSHOT-asdoc.zip"" );
+        Assert.assertTrue( doc.exists() );
+    }
+}
+"
+gemfirexd/client/src/main/java/io/snappydata/thrift/internal/ClientParameterMetaData.java,"/*
+ * Copyright (c) 2010-2015 Pivotal Software, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+
+package io.snappydata.thrift.internal;
+
+import java.sql.ParameterMetaData;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.pivotal.gemfirexd.internal.shared.common.reference.SQLState;
+import io.snappydata.thrift.ColumnDescriptor;
+import io.snappydata.thrift.common.Converters;
+import io.snappydata.thrift.common.ThriftExceptionUtil;
+import io.snappydata.thrift.snappydataConstants;
+
+/**
+ * Implementation of JDBC {@link ParameterMetaData} for the thrift JDBC driver.
+ */
+public class ClientParameterMetaData implements ParameterMetaData {
+
+  private final List<ColumnDescriptor> descriptors;
+
+  ClientParameterMetaData(List<ColumnDescriptor> metadata) {
+    this.descriptors = metadata;
+  }
+
+  /** check if 1-based index of column is valid one */
+  final void checkForValidColumn(int column) throws SQLException {
+    final int numColumns = this.descriptors.size();
+    if (column < 1 || column > numColumns) {
+      throw ThriftExceptionUtil.newSQLException(
+          SQLState.LANG_INVALID_PARAM_POSITION, null, column, numColumns);
+    }
+  }
+
+  final ColumnDescriptor getDescriptor(int column) throws SQLException {
+    checkForValidColumn(column);
+    return this.descriptors.get(column - 1);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getParameterCount() throws SQLException {
+    return this.descriptors.size();
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int isNullable(int param) throws SQLException {
+    ColumnDescriptor desc = getDescriptor(param);
+    if (desc.isSetNullable()) {
+      return desc.isNullable() ? parameterNullable : parameterNoNulls;
+    } else {
+      return parameterNullableUnknown;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public boolean isSigned(int param) throws SQLException {
+    switch (getDescriptor(param).getType()) {
+      case INTEGER:
+      case REAL:
+      case DECIMAL:
+      case SMALLINT:
+      case BIGINT:
+      case TI
+
+2025-01-23 12:39:58 - root - INFO - itercount: 0
+2025-01-23 12:39:58 - root - INFO - Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+DDL describes table information.
+,0
+table_name,SAMPLE_FILES
+description,
+DDL,"create or replace TABLE SAMPLE_FILES (
+	""repo_name"" VARCHAR(16777216),
+	""ref"" VARCHAR(16777216),
+	""path"" VARCHAR(16777216),
+	""mode"" NUMBER(38,0),
+	""id"" VARCHAR(16777216),
+	""symlink_target"" VARCHAR(16777216)
+);"
+
+,1
+table_name,LANGUAGES
+description,
+DDL,"create or replace TABLE LANGUAGES (
+	""repo_name"" VARCHAR(16777216),
+	""language"" VARIANT
+);"
+
+,2
+table_name,LICENSES
+description,
+DDL,"create or replace TABLE LICENSES (
+	""repo_name"" VARCHAR(16777216),
+	""license"" VARCHAR(16777216)
+);"
+
+,3
+table_name,SAMPLE_COMMITS
+description,
+DDL,"create or replace TABLE SAMPLE_COMMITS (
+	""commit"" VARCHAR(16777216),
+	""tree"" VARCHAR(16777216),
+	""parent"" VARIANT,
+	""author"" VARIANT,
+	""committer"" VARIANT,
+	""subject"" VARCHAR(16777216),
+	""message"" VARCHAR(16777216),
+	""trailer"" VARIANT,
+	""difference"" VARIANT,
+	""difference_truncated"" BOOLEAN,
+	""repo_name"" VARCHAR(16777216),
+	""encoding"" VARCHAR(16777216)
+);"
+
+,4
+table_name,SAMPLE_CONTENTS
+description,
+DDL,"create or replace TABLE SAMPLE_CONTENTS (
+	""id"" VARCHAR(16777216),
+	""size"" NUMBER(38,0),
+	""content"" VARCHAR(16777216),
+	""binary"" BOOLEAN,
+	""copies"" NUMBER(38,0),
+	""sample_repo_name"" VARCHAR(16777216),
+	""sample_ref"" VARCHAR(16777216),
+	""sample_path"" VARCHAR(16777216),
+	""sample_mode"" NUMBER(38,0),
+	""sample_symlink_target"" VARCHAR(16777216)
+);"
+
+,5
+table_name,SAMPLE_REPOS
+description,
+DDL,"create or replace TABLE SAMPLE_REPOS (
+	""repo_name"" VARCHAR(16777216),
+	""watch_count"" NUMBER(38,0)
+);"
+
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: {table name}}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_FILES', 'SAMPLE_REPOS']}}
+Begin Exploring Related Columns
+**Relevant Tables and Columns:**
+
+- **"SAMPLE_CONTENTS"."content"**: Contains the contents of the files. This column is crucial for extracting import statements from Java source files.
+
+- **"SAMPLE_CONTENTS"."sample_path"**: Contains the file paths. We can use this to identify Java source files by filtering where the path ends with `.java`.
+
+- **"SAMPLE_CONTENTS"."binary"**: Indicates whether the file content is binary (`TRUE`) or text (`FALSE`). We can use this to filter out binary files and focus on text files.
+
+**Possible Conditions:**
+
+- **"binary" = FALSE**: To select only text files.
+
+- **"sample_path" LIKE '%.java'**: To select files that are Java source files.
+
+- **"content" LIKE '%import%'**: To select files that contain import statements.
+
+---
+
+**SQL Queries:**
+
+```sql
+-- 1. Select the content of all files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100;
+
+-- 2. Select the file paths of all files
+SELECT "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100;
+
+-- 3. Select the content of all non-binary files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE
+LIMIT 100;
+
+-- 4. Select the paths of all Java source files
+SELECT "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" LIKE '%.java'
+LIMIT 100;
+
+-- 5. Select the content of all non-binary Java source files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+LIMIT 100;
+
+-- 6. Select distinct repository names from the contents table
+SELECT DISTINCT "sample_repo_name"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100;
+
+-- 7. Select sizes and paths of Java source files, ordered by size descending
+SELECT "size", "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+ORDER BY "size" DESC
+LIMIT 100;
+
+-- 8. Select the content of text files containing 'import' statements
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "content" LIKE '%import%'
+LIMIT 100;
+
+-- 9. Select the content of Java files containing 'import java' statements
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java' AND "content" LIKE '%import java%'
+LIMIT 100;
+
+-- 10. Select paths and content of Java files that contain 'import' statements
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java' AND "content" LIKE '%import%'
+LIMIT 100;
+```
+
+These queries help in understanding the structure and content of the data related to Java source files and their import statements, which is essential for identifying the top 10 most frequently imported packages.Query:
+-- 1. Select the content of all files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100
+Answer:
+Too long, hard cut:
+content
+"/*
+ * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips
+ *
+ * Copyright (C) 2008 David Brownell
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/bcd.h>
+#include <linux/slab.h>
+#include <linux/rtc.h>
+#include <linux/workqueue.h>
+
+#include <linux/spi/spi.h>
+#include <linux/spi/ds1305.h>
+#include <linux/module.h>
+
+
+/*
+ * Registers ... mask DS1305_WRITE into register address to write,
+ * otherwise you're reading it.  All non-bitmask values are BCD.
+ */
+#define DS1305_WRITE		0x80
+
+
+/* RTC date/time ... the main special cases are that we:
+ *  - Need fancy ""hours"" encoding in 12hour mode
+ *  - Don't rely on the ""day-of-week"" field (or tm_wday)
+ *  - Are a 21st-century clock (2000 <= year < 2100)
+ */
+#define DS1305_RTC_LEN		7		/* bytes for RTC regs */
+
+#define DS1305_SEC		0x00		/* register addresses */
+#define DS1305_MIN		0x01
+#define DS1305_HOUR		0x02
+#	define DS1305_HR_12		0x40	/* set == 12 hr mode */
+#	define DS1305_HR_PM		0x20	/* set == PM (12hr mode) */
+#define DS1305_WDAY		0x03
+#define DS1305_MDAY		0x04
+#define DS1305_MON		0x05
+#define DS1305_YEAR		0x06
+
+
+/* The two alarms have only sec/min/hour/wday fields (ALM_LEN).
+ * DS1305_ALM_DISABLE disables a match field (some combos are bad).
+ *
+ * NOTE that since we don't use WDAY, we limit ourselves to alarms
+ * only one day into the future (vs potentially up to a week).
+ *
+ * NOTE ALSO that while we could generate once-a-second IRQs (UIE), we
+ * don't currently support them.  We'd either need to do it only when
+ * no alarm is pending (not the standard model), or to use the second
+ * alarm (implying that this is a DS1305 not DS1306, *and* that either
+ * it's wired up a second IRQ we know, or that INTCN is set)
+ */
+#define DS1305_ALM_LEN		4		/* bytes for ALM regs */
+#define DS1305_ALM_DISABLE	0x80
+
+#define DS1305_ALM0(r)		(0x07 + (r))	/* register addresses */
+#define DS1305_ALM1(r)		(0x0b + (r))
+
+
+/* three control registers */
+#define DS1305_CONTROL_LEN	3		/* bytes of control regs */
+
+#define DS1305_CONTROL		0x0f		/* register addresses */
+#	define DS1305_nEOSC		0x80	/* low enables oscillator */
+#	define DS1305_WP		0x40	/* write protect */
+#	define DS1305_INTCN		0x04	/* clear == only int0 used */
+#	define DS1306_1HZ		0x04	/* enable 1Hz output */
+#	define DS1305_AEI1		0x02	/* enable ALM1 IRQ */
+#	define DS1305_AEI0		0x01	/* enable ALM0 IRQ */
+#define DS1305_STATUS		0x10
+/* status has just AEIx bits, mirrored as IRQFx */
+#define DS1305_TRICKLE		0x11
+/* trickle bits are defined in <linux/spi/ds1305.h> */
+
+/* a bunch of NVRAM */
+#define DS1305_NVRAM_LEN	96		/* bytes of NVRAM */
+
+#define DS1305_NVRAM		0x20		/* register addresses */
+
+
+struct ds1305 {
+	struct spi_device	*spi;
+	struct rtc_device	*rtc;
+
+	struct work_struct	work;
+
+	unsigned long		flags;
+#define FLAG_EXITING	0
+
+	bool			hr12;
+	u8			ctrl[DS1305_CONTROL_LEN];
+};
+
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Utilities ...  tolerate 12-hour AM/PM notation in case of non-Linux
+ * software (like a bootloader) which may require it.
+ */
+
+static unsigned bcd2hour(u8 bcd)
+{
+	if (bcd & DS1305_HR_12) {
+		unsigned	hour = 0;
+
+		bcd &= ~DS1305_HR_12;
+		if (bcd & DS1305_HR_PM) {
+			hour = 12;
+			bcd &= ~DS1305_HR_PM;
+		}
+		hour += bcd2bin(bcd);
+		return hour - 1;
+	}
+	return bcd2bin(bcd);
+}
+
+static u8 hour2bcd(bool hr12, int hour)
+{
+	if (hr12) {
+		hour++;
+		if (hour <= 12)
+			return DS1305_HR_12 | bin2bcd(hour);
+		hour -= 12;
+		return DS1305_HR_12 | DS1305_HR_PM | bin2bcd(hour);
+	}
+	return bin2bcd(hour);
+}
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Interface to RTC framework
+ */
+
+static int ds1305_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		buf[2];
+	long		err = -EINVAL;
+
+	buf[0] = DS1305_WRITE | DS1305_CONTROL;
+	buf[1] = ds1305->ctrl[0];
+
+	if (enabled) {
+		if (ds1305->ctrl[0] & DS1305_AEI0)
+			goto done;
+		buf[1] |= DS1305_AEI0;
+	} else {
+		if (!(buf[1] & DS1305_AEI0))
+			goto done;
+		buf[1] &= ~DS1305_AEI0;
+	}
+	err = spi_write_then_read(ds1305->spi, buf, sizeof(buf), NULL, 0);
+	if (err >= 0)
+		ds1305->ctrl[0] = buf[1];
+done:
+	return err;
+
+}
+
+
+/*
+ * Get/set of date and time is pretty normal.
+ */
+
+static int ds1305_get_time(struct device *dev, struct rtc_time *time)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		addr = DS1305_SEC;
+	u8		buf[DS1305_RTC_LEN];
+	int		status;
+
+	/* Use write-then-read to get all the date/time registers
+	 * since dma from stack is nonportable
+	 */
+	status = spi_write_then_read(ds1305->spi, &addr, sizeof(addr),
+			buf, sizeof(buf));
+	if (status < 0)
+		return status;
+
+	dev_vdbg(dev, ""%s: %02x %02x %02x, %02x %02x %02x %02x\n"",
+		""read"", buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5], buf[6]);
+
+	/* Decode the registers
+Query:
+-- 2. Select the file paths of all files
+SELECT "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100
+Answer:
+Too long, hard cut:
+sample_path
+drivers/rtc/rtc-ds1305.c
+files/core-js/0.9.12/library.min.js
+twmap_gen/lib/adodb5/perf/perf-db2.inc.php
+drivers/devfreq/governor_simpleondemand.c
+book/_themes/pydoctheme/static/pydoctheme.css
+src/main/java/io/mycat/manager/response/ShowSQLSumUser.java
+src/main/java/com/whammich/sstow/compat/hardmode/HandlerHardMode.java
+src/main/java/flaxbeard/steamcraft/item/ItemSteamcraftNugget.java
+src/router/tests/test_uri.cc
+plugins/User/src/Notification/Message/PasswordRequestMessage.php
+plugins/BackendTheme/src/Template/Element/settings.ctp
+plg_midi_device/src/SConscript
+vendor/doctrine/common/tests/Doctrine/Tests/Common/Persistence/Mapping/_files/.DS_Store
+FAQ-USER
+ProcessHacker/pcre/pcre2_config.c
+document/static/js/es6_modules/exporter/epub.js
+platform-api-client-gwt/che-core-client-gwt-runner/src/main/java/org/eclipse/che/api/runner/gwt/client/utils/RunnerUtils.java
+framework/src/java/org/apache/tapestry/form/validator/MaxLength.java
+framework/src/documentation/content/xdocs/tapestry/ComponentReference/ActionLink.xml
+commonjs/google-map/map.js
+tapestry-core/src/test/java/org/apache/tapestry5/internal/services/RequestPathOptimizerImplTest.java
+tapestry-core/src/test/java/org/apache/tapestry5/ContentTypeTest.java
+vio/vio.c
+product_taxes_group/tests/test_product_taxes_group.py
+mozaik_portal/static/src/js/portal.js
+mozaik_email/wizard/allow_duplicate_view.xml
+rtmpdump.c
+tests/benchmarks/benchmarks.pro
+src/webengine/api/qquickwebengineprofile.cpp
+trunk/Documentation/KamanjaAPIDocs/com/ligadata/InputOutputAdapterInfo/CountersAdapter.html
+src/backend/test/main.cpp
+src/Ractive/prototype/fire.js
+build/cmd/hilo/loader/ImageLoader.js
+temp/com.tecnalia.ossmeter.model/src/com/tecnalia/ossmeter/model/eclipseproject/EclipseprojectFactory.java
+assets/variants/light/buttons/button_reverse.png
+docs/api-en/symbols/BitmapText.html
+assets/css/sass/admin/_posts.scss
+web/files/css/desktop/windows/inv_search_window.css
+Server/src/org/openas2/message/DataHistory.java
+Modules/BetterCms.Module.Root/Commands/Tag/SaveTag/SaveTagCommand.cs
+test/less/stylesheet/compress.less3.selectors.part2.test24.c.json
+README.md
+arch/arm/mach-tegra/board-cardhu-panel.c
+lib/entities/plants/peatbog.dart
+src/filesystem/ZWorkerPool.h
+userspace/libsinsp/filterchecks.h
+third-party/org.carrot2.api/javadoc/org/carrot2/text/preprocessing/CaseNormalizerDescriptor.Keys.html
+src/systeminfo/qnetworkinfo.h
+docdoku-server/docdoku-server-web/src/main/java/com/docdoku/server/rest/AdminResource.java
+icons/file_type_source@3x.png
+sample/test-elements/callbacks.html
+assets/apple-touch-icon.acorn
+tests/quicktestbrowser/ApplicationRoot.qml
+trunk/Documentation/KamanjaAPIDocs/com/ligadata/kamanja/metadata/ModelDef.html
+build/changelog/entries/2015/10/10337.enhancement
+newsfeed/migrations/0004_auto__chg_field_featuredsection_image.py
+README.md
+source/ed/ed_reader.h
+samples/bunnymark/Main.hx
+client/components/characters/charactersAdd.html
+ulauncher/search/file_browser/FileBrowserMode.py
+core/lib/dr_config.h
+core/kernel_linux/clients/umbra/memcheck.h
+src/server/game/DungeonFinding/LFGQueue.cpp
+src/main/java/net/blay09/mods/cookingforblockheads/CookingConfig.java
+symposion/static/img/stripe.png
+ME3Explorer/Resources/property_database_64x64.png
+src/administrator/components/com_kunena/controllers/plugins.php
+View/Factory/Html/Objects/HtmlStrong.php
+module/plugins/crypter/UploadableChFolder.py
+src/3rdparty/Relinq-1.15.15.0/SharedSource/Core/ReSharperAnnotations/PublicAPIAttribute.cs
+src/clustering/administration/main/directory_lock.cc
+src/maidsafe/routing/async_queue.h
+src/3rdparty/Relinq-1.15.15.0/Relinq/Core/Parsing/ExpressionTreeVisitors/TreeEvaluation/EvaluatableTreeFindingExpressionTreeVisitor.cs
+mm/ktsan/ktsan.c
+sbt/src/sbt-test/dependency-management/publish-local/changes/RetrieveTest.sbt
+build.xml
+src/main/resources/assets/titanite/textures/items/tansanitePearl.png
+src/commands/CmdInfo.cpp
+www/lib/HTML/QuickForm/date.php
+doc/fr/installation/index.rst
+doc/stdlibref/stable-partition.html
+ModelItems/InstModelItem.cpp
+Documentation/DocuBlocks/foxxQueuesPollInterval.md
+module/EcampCore/src/EcampCore/Fieldset/User/UserCreateFieldset.php
+resources/public/android-chrome-48x48.png
+Documentation/Books/Manual/Administration/Upgrading/Upgrading30.mdpp
+plugins/org.jkiss.dbeaver.ext.db2/src/org/jkiss/dbeaver/ext/db2/model/dict/DB2TablespaceType.java
+examples/react-in-blaze/packages/npm-container/.npm/package/npm-shrinkwrap.json
+src/github.com/getlantern/lantern-mobile/app/src/main/res/values-et/strings.xml
+Documentation/Examples/generalGraphModulePaths2.generated
+server/templates/emailTemplate.handlebars
+Yupi.Messages/Handlers/Groups/RemoveGroupAdminMessageEvent.cs
+server/src/main/java/com/vaadin/ui/Upload.java
+WARZONE_ASSETS/models/Weapons/DC-15A_Rifle/model.glm
+WARZONE_ASSETS/sound/tts/dimitrissad22k/A280 Clone Blaster.mp3
+WARZONE_ASSETS/sound/tts/harry22k/E-11 Blaster Rifle.mp3
+WARZONE_ASSETS/sound/tts/andreas22k/Westarm 5 Blaster.mp3
+WARZONE_ASSETS/sound/tts/willbadguy22k/hmmm. 
+Query:
+-- 3. Select the content of all non-binary files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE
+LIMIT 100
+Answer:
+Too long, hard cut:
+content
+"#pragma once
+/*
+ *      Copyright (C) 2005-2012 Team XBMC
+ *      http://xbmc.org
+ *
+ *  This Program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2, or (at your option)
+ *  any later version.
+ *
+ *  This Program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with XBMC; see the file COPYING.  If not, see
+ *  <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include ""utils/StdString.h""
+#include <vector>
+
+#include ""pictures/PictureScalingAlgorithm.h""
+#include ""utils/GlobalsHandling.h""
+
+class TiXmlElement;
+
+class DatabaseSettings
+{
+public:
+  void Reset()
+  {
+    type.clear();
+    host.clear();
+    port.clear();
+    user.clear();
+    pass.clear();
+    name.clear();
+  };
+  CStdString type;
+  CStdString host;
+  CStdString port;
+  CStdString user;
+  CStdString pass;
+  CStdString name;
+};
+
+struct TVShowRegexp
+{
+  bool byDate;
+  CStdString regexp;
+  int defaultSeason;
+  TVShowRegexp(bool d, const CStdString& r, int s = 1)
+  {
+    byDate = d;
+    regexp = r;
+    defaultSeason = s;
+  }
+};
+
+struct RefreshOverride
+{
+  float fpsmin;
+  float fpsmax;
+
+  float refreshmin;
+  float refreshmax;
+
+  bool  fallback;
+};
+
+
+struct RefreshVideoLatency
+{
+  float refreshmin;
+  float refreshmax;
+
+  float delay;
+};
+
+typedef std::vector<TVShowRegexp> SETTINGS_TVSHOWLIST;
+
+class CAdvancedSettings
+{
+  public:
+    CAdvancedSettings();
+
+    static CAdvancedSettings* getInstance();
+
+    void Initialize();
+    bool Initialized() { return m_initialized; };
+    void AddSettingsFile(const CStdString &filename);
+    bool Load();
+    void Clear();
+
+    static void GetCustomTVRegexps(TiXmlElement *pRootElement, SETTINGS_TVSHOWLIST& settings);
+    static void GetCustomRegexps(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomRegexpReplacers(TiXmlElement *pRootElement, CStdStringArray& settings);
+    static void GetCustomExtensions(TiXmlElement *pRootElement, CStdString& extensions);
+
+    bool CanLogComponent(int component) const;
+
+    int m_audioHeadRoom;
+#ifdef TARGET_OPENELEC
+    // OpenELEC workaround for minimum sample Rate
+    int m_minimumSampleRate;
+#endif
+    float m_ac3Gain;
+    int m_maxPllAdjust;
+    CStdString m_audioDefaultPlayer;
+    float m_audioPlayCountMinimumPercent;
+    bool m_dvdplayerIgnoreDTSinWAV;
+    float m_limiterHold;
+    float m_limiterRelease;
+
+    bool  m_omxHWAudioDecode;
+    bool  m_omxDecodeStartWithValidFrame;
+
+    float m_videoSubsDelayRange;
+    float m_videoAudioDelayRange;
+    int m_videoSmallStepBackSeconds;
+    int m_videoSmallStepBackTries;
+    int m_videoSmallStepBackDelay;
+    bool m_videoUseTimeSeeking;
+    int m_videoTimeSeekForward;
+    int m_videoTimeSeekBackward;
+    int m_videoTimeSeekForwardBig;
+    int m_videoTimeSeekBackwardBig;
+    int m_videoPercentSeekForward;
+    int m_videoPercentSeekBackward;
+    int m_videoPercentSeekForwardBig;
+    int m_videoPercentSeekBackwardBig;
+    CStdString m_videoPPFFmpegDeint;
+    CStdString m_videoPPFFmpegPostProc;
+    bool m_videoVDPAUtelecine;
+    bool m_videoVDPAUdeintSkipChromaHD;
+    bool m_musicUseTimeSeeking;
+    int m_musicTimeSeekForward;
+    int m_musicTimeSeekBackward;
+    int m_musicTimeSeekForwardBig;
+    int m_musicTimeSeekBackwardBig;
+    int m_musicPercentSeekForward;
+    int m_musicPercentSeekBackward;
+    int m_musicPercentSeekForwardBig;
+    int m_musicPercentSeekBackwardBig;
+    int m_videoBlackBarColour;
+    int m_videoIgnoreSecondsAtStart;
+    float m_videoIgnorePercentAtEnd;
+    float m_audioApplyDrc;
+    bool m_useFfmpegVda;
+
+    int   m_videoVDPAUScaling;
+    bool  m_videoVAAPIforced;
+    float m_videoNonLinStretchRatio;
+    bool  m_videoEnableHighQualityHwScalers;
+    float m_videoAutoScaleMaxFps;
+    std::vector<RefreshOverride> m_videoAdjustRefreshOverrides;
+    std::vector<RefreshVideoLatency> m_videoRefreshLatency;
+    float m_videoDefaultLatency;
+    bool m_videoDisableBackgroundDeinterlace;
+    int  m_videoCaptureUseOcclusionQuery;
+    bool m_DXVACheckCompatibility;
+    bool m_DXVACheckCompatibilityPresent;
+    bool m_DXVAForceProcessorRenderer;
+    bool m_DXVANoDeintProcForProgressive;
+    bool m_DXVAAllowHqScaling;
+    int  m_videoFpsDetect;
+    int  m_videoBusyDialogDelay_ms;
+
+    CStdString m_videoDefaultPlayer;
+    CStdString m_videoDefaultDVDPlayer;
+    float m_videoPlayCountMinimumPercent;
+
+    float m_slideshowBlackBarCompensation;
+    float m_slideshowZoomAmount;
+    float m_slideshowPanAmount;
+
+    bool m_lcdHeartbeat;
+    bool m_lcdDimOnScreenSave;
+    int m_lcdScrolldelay;
+    CStdString m_lcdHostName;
+
+    int m_songInfoDuration;
+    int m_logLevel;
+    int m_logLevelHint;
+    CStdString m_cd
+Query:
+-- 4. Select the paths of all Java source files
+SELECT "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" LIKE '%.java'
+LIMIT 100
+Answer:
+Too long, hard cut:
+sample_path
+flexmojos-testing/flexmojos-test-harness/src/test/java/net/flexmojos/oss/tests/concept/AttachAsdocTest.java
+gemfirexd/client/src/main/java/io/snappydata/thrift/internal/ClientParameterMetaData.java
+libjava/javax/naming/spi/NamingManager.java
+lionengine-network/src/main/java/com/b3dgs/lionengine/network/Networker.java
+lionengine-core/src/main/java/com/b3dgs/lionengine/drawable/Image.java
+src/test/org/apache/lucene/analysis/TestCachingTokenFilter.java
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/orchestration/NhinAggregator.java
+Product/Production/Services/PatientDiscoveryCore/src/main/java/gov/hhs/fha/nhinc/patientdiscovery/model/builder/impl/PatientSearchResultsModelBuilderImpl.java
+Product/Production/Common/CONNECTCoreLib/src/main/java/gov/hhs/fha/nhinc/messaging/client/CONNECTCXFClientFactory.java
+pcap4j-core/src/main/java/org/pcap4j/core/NativePacketDllMappings.java
+framework/src/java/org/apache/tapestry/coerce/BooleanArrayToIteratorConverter.java
+mapfishapp/src/main/java/org/georchestra/mapfishapp/ws/upload/FeatureGeoFileReader.java
+src/test/org/apache/sqoop/hcat/HCatalogImportTest.java
+velocity-tools-generic/src/test/java/org/apache/velocity/tools/generic/DateToolTests.java
+jca/src/main/java/org/apache/qpid/ra/tm/WLSTransactionManagerLocator.java
+src/java/org/apache/cassandra/db/commitlog/ReplayPosition.java
+uimaj-json/src/main/java/org/apache/uima/json/impl/MetaDataObjectSerializer_json.java
+core/sis-metadata/src/test/java/org/apache/sis/metadata/iso/DefaultMetadataTest.java
+uimaj-core/src/main/java/org/apache/uima/collection/CasConsumerDescription.java
+microscope-collector/src/test/java/com/lmax/disruptor/sequenced/OneToThreePipelineSequencedThroughputTest.java
+bundles/binding/org.openhab.binding.zwave/src/main/java/org/openhab/binding/zwave/internal/protocol/commandclass/ZWaveWakeUpCommandClass.java
+clients/java/src/main/java/com/senseidb/search/client/req/SenseiClientRequest.java
+src/java/net/p455w0rd/wirelesscraftingterminal/core/sync/packets/PacketSetMagnet.java
+src/test/java/de/is24/infrastructure/gridfs/http/web/controller/StatusControllerWithInactiveDatabaseIT.java
+whois-endtoend/src/test/java/net/ripe/db/whois/changedphase3/util/Scenario.java
+main/source/org/apach3/http/nio/NHttpServerEventHandler.java
+commons/ihe/xds/src/main/java/org/openehealth/ipf/commons/ihe/xds/core/ebxml/EbXMLRetrieveDocumentSetRequest.java
+xxl-job-admin/src/main/java/com/xxl/job/admin/core/jobbean/impl/DemoConcurrentJobBean.java
+src/test/java/edu/jhuapl/tinkerpop/mapreduce/InputFormatsTest.java
+src/org/javacore/nio/FileChannelTransferTo.java
+common/java/core/net/i2p/client/naming/ExecNamingService.java
+src/main/java/com/airbnb/metrics/ParserForNoTag.java
+src/net/rec/contra/cjbe/editor/detail/attributes/GenericAttributeDetailPane.java
+client/cli/src/main/java/org/apache/syncope/client/cli/commands/domain/DomainList.java
+cloudfoundry-client/src/main/java/org/cloudfoundry/client/v2/userprovidedserviceinstances/_ListUserProvidedServiceInstancesResponse.java
+cdk-morphlines/cdk-morphlines-hadoop-core/src/test/java/com/cloudera/cdk/morphline/hadoop/core/MiniDFSTest.java
+dbunit/src/main/java/org/jboss/arquillian/persistence/dbunit/filter/OracleDatabaseSequenceFilter.java
+gradle/wrapper/dists/gradle-2.2.1-all/c64ydeuardnfqctvr1gm30w53/gradle-2.2.1/src/dependency-management/org/gradle/api/internal/notations/ModuleIdentiferNotationParser.java
+app/src/main/java/in/co/praveenkumar/mdroid/helper/ImageLoader.java
+common_wiki_jdbc/src/wikokit/base/wikt/sql/quote/TQuotTranslation.java
+src/dr/app/tempest/TempestPanel.java
+core/src/com/clarkparsia/owlwg/testrun/SyntaxConstraintRun.java
+app-starters-test-support/src/main/java/org/springframework/cloud/stream/app/test/sftp/SftpSinkTestConfiguration.java
+java/com/l2jserver/gameserver/network/BlowFishKeygen.java
+src/keel/Algorithms/Preprocess/Converter/CsvToKeel.java
+src/com/vonglasow/michael/satstat/widgets/NetworkTypePreference.java
+src/main/java/com/github/fge/jsonschema/load/JsonPatchLoader.java
+src/main/java/rtg/world/biome/realistic/highlands/RealisticBiomeHLMesa.java
+src/test/java/com/alibaba/wasp/WaspCluster.java
+src/edu/fudan/ontology/graph/SparseMatrixT.java
+jtransc-asm/src/com/jtransc/org/objectweb/asm/util/CheckMethodAdapter.java
+APDE/src/main/java/com/calsignlabs/apde/FileMeta.java
+gomint-api/src/main/java/io/gomint/scheduler/Task.java
+luna/org.eclipse.jdt.core/compiler/org/eclipse/jdt/internal/compiler/ast/JavadocAllocationExpression.java
+main/recognition/test/boofcv/alg/tracker/tld/TestTldFernDescription.java
+squidlib-util/src/main/java/squidpony/tileset/Maze2Wide.java
+backend/manager/modules/common/src/test/java/org/ovirt/engine/core/common/validation/Ipv6ConstraintTest.java
+zanata-war/src/main/java/org/zanata/security/CheckPermissionDecisionVoter.java
+src/main/java/org/codinjutsu/tools/jenkins/logic/BuildStatusVisitor.java
+whois-commons/src/test/java/net/ripe/db/whois/common/domain/IpRangesTest.java
+vlo-web-app/src/main/java/eu/clarin
+Query:
+-- 5. Select the content of all non-binary Java source files
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+LIMIT 100
+Answer:
+Too long, hard cut:
+content
+"/**
+ * Flexmojos is a set of maven goals to allow maven users to compile, optimize and test Flex SWF, Flex SWC, Air SWF and Air SWC.
+ * Copyright (C) 2008-2012  Marvin Froeder <marvin@flexmojos.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package net.flexmojos.oss.tests.concept;
+
+import java.io.File;
+
+import net.flexmojos.oss.test.FMVerifier;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+public class AttachAsdocTest
+    extends AbstractConceptTest
+{
+
+    @Test
+    public void attachAsdoc()
+        throws Exception
+    {
+        FMVerifier v = standardConceptTester( ""attach-asdoc"" );
+        File target = new File( v.getBasedir(), ""target"" );
+
+        Assert.assertTrue( target.exists() );
+
+        File doc = new File( target, ""attach-asdoc-1.0-SNAPSHOT-asdoc.zip"" );
+        Assert.assertTrue( doc.exists() );
+    }
+}
+"
+"/*
+ * Copyright (c) 2010-2015 Pivotal Software, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+
+package io.snappydata.thrift.internal;
+
+import java.sql.ParameterMetaData;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.pivotal.gemfirexd.internal.shared.common.reference.SQLState;
+import io.snappydata.thrift.ColumnDescriptor;
+import io.snappydata.thrift.common.Converters;
+import io.snappydata.thrift.common.ThriftExceptionUtil;
+import io.snappydata.thrift.snappydataConstants;
+
+/**
+ * Implementation of JDBC {@link ParameterMetaData} for the thrift JDBC driver.
+ */
+public class ClientParameterMetaData implements ParameterMetaData {
+
+  private final List<ColumnDescriptor> descriptors;
+
+  ClientParameterMetaData(List<ColumnDescriptor> metadata) {
+    this.descriptors = metadata;
+  }
+
+  /** check if 1-based index of column is valid one */
+  final void checkForValidColumn(int column) throws SQLException {
+    final int numColumns = this.descriptors.size();
+    if (column < 1 || column > numColumns) {
+      throw ThriftExceptionUtil.newSQLException(
+          SQLState.LANG_INVALID_PARAM_POSITION, null, column, numColumns);
+    }
+  }
+
+  final ColumnDescriptor getDescriptor(int column) throws SQLException {
+    checkForValidColumn(column);
+    return this.descriptors.get(column - 1);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getParameterCount() throws SQLException {
+    return this.descriptors.size();
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int isNullable(int param) throws SQLException {
+    ColumnDescriptor desc = getDescriptor(param);
+    if (desc.isSetNullable()) {
+      return desc.isNullable() ? parameterNullable : parameterNoNulls;
+    } else {
+      return parameterNullableUnknown;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public boolean isSigned(int param) throws SQLException {
+    switch (getDescriptor(param).getType()) {
+      case INTEGER:
+      case REAL:
+      case DECIMAL:
+      case SMALLINT:
+      case BIGINT:
+      case TINYINT:
+      case DOUBLE:
+      case FLOAT:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getPrecision(int param) throws SQLExcepti
+Query:
+-- 6. Select distinct repository names from the contents table
+SELECT DISTINCT "sample_repo_name"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+LIMIT 100
+Answer:
+sample_repo_name
+pelya/commandergenius
+cloudera/impala-kudu
+khasang/SmartForecast
+urjaman/flashrom
+velo/flexmojos
+SnappyDataInc/snappy-store
+XyrusWorx/apophysis7x
+drdaeman/accel-ppp
+tokee/lucene
+webscalesql/webscalesql-5.6
+CONNECT-Solution/CONNECT
+DoSomething/voting-app
+apache/sqoop
+AbiWord/abiword
+meta-debian/meta-debian
+Cerberuss/GofPatterns
+cloudmatrix/esky
+Mygod/Skylark
+JHUAPL/AccumuloGraph
+vmesel/GeoMath
+mapbender/mapbender
+sfmskywalker/Orchard
+ovh/overthebox-openwrt
+Caltech-IPAC/firefly
+Kunena/Kunena-Forum
+nickkolok/chas-ege
+apache/uima-uimaj
+apache/sis
+bombmanual/bombmanual.github.io
+pplante/droidtowers
+Nexus-Mods/Nexus-Mod-Manager
+jmaih/RISE_toolbox
+headwirecom/aem-solr-search
+glmcdona/strings2
+anycmd/anycmd
+linuxdeepin/deepin-wm
+mempo/mempo-kernel
+apache/qpid-java
+ImmobilienScout24/yum-repo-server
+gorescript/gorescript
+oehf/ipf
+findsorguk/findsorguk
+garyKeorkunian/squants
+Sitecore/Habitat
+StefanoFiumara/Harry-Potter-Unity
+gr8pefish/IronBackpacks
+iridium-browser/iridium-browser-ubuntu
+sam408130/Ionic-Demos
+Glimpse/Glimpse.Prototype
+coinkite/cloudfire
+b3dgs/lionengine
+Incubaid/arakoon
+aspnetboilerplate/aspnetboilerplate
+jaquadro/StorageDrawers
+Job-Yang/YTZImageComparison
+awslabs/aws-sdk-cpp
+ghxiao/drew
+aasensio/pySIR
+epiSurg/EpiSurg
+googlei18n/language-resources
+crossbario/crossbarexamples
+ezScrum/ezScrum
+fxos-components/bridge
+LibreOffice/core
+KDE/krita
+mdaniel/virtualbox-org-svn-vbox-trunk
+hroptatyr/dateutils
+espadrine/opera
+digama0/mmj2
+nathansttt/hog2
+google/binexport
+biocaml/biocaml
+tatsuhiro-t/aria2
+albertz/openlierox
+Open-Transport/synthese
+danielnaber/openthesaurus
+scrollback/io.scrollback.neighborhoods
+project-store/theme
+sileht/check_mk
+umbraco/Umbraco-CMS
+nigelsmall/py2neo
+Esteemed-Innovation/Flaxbeards-Steam-Power
+TheTechnobear/EigenD
+sonata-project/sandbox-build
+koala-framework/koala-framework
+ligaDATA/Kamanja
+hiloteam/Hilo
+oivva/boxy
+ChildrenOfUr/coUclient
+timduru/tf300t-katkernel
+ChildrenOfUr/coUserver
+draios/sysdig
+bosonic/bosonic
+Ulauncher/Ulauncher
+DynamoRIO/drk
+google/ktsan
+apache/tomcat-native
+erasaur/binary
+jdahlstrom/vaadin.react
+pfirmstone/river-internet
+Query:
+-- 7. Select sizes and paths of Java source files, ordered by size descending
+SELECT "size", "sample_path"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+ORDER BY "size" DESC
+LIMIT 100
+Answer:
+Too long, hard cut:
+size,sample_path
+201543,gemfirexd/tools/src/dunit/java/com/pivotal/gemfirexd/wan/GfxdSerialWanDUnit.java
+175045,src/org/apache/velocity/runtime/parser/ParserTokenManager.java
+170837,cosmic-core/server/src/main/java/com/cloud/api/query/QueryManagerImpl.java
+139740,squidlib-util/src/main/java/squidpony/tileset/Maze2Wide.java
+106992,源包/server/MapleStatEffect.java
+101004,src/com/dabomstew/pkrandom/romhandlers/Gen5RomHandler.java
+100348,Plugins/Instantiation/de.uni_hildesheim.sse.vil.rt.ui/src-gen/de/uni_hildesheim/sse/vil/rt/ui/contentassist/antlr/internal/InternalRtVilLexer.java
+98056,src/share/classes/sun/security/tools/jarsigner/Main.java
+75174,com/planet_ink/coffee_mud/Items/Basic/GenSailingShip.java
+71563,vlc-android/src/org/videolan/vlc/PlaybackService.java
+71289,components/tools/OmeroJava/test/integration/AdminServiceTest.java
+70269,src/freenet/clients/fcp/FCPPluginConnectionImpl.java
+69399,tddl-parser/src/main/java/com/alibaba/cobar/parser/visitor/MySQLOutputASTVisitor.java
+62548,src/flow/java/java8/util/concurrent/SubmissionPublisher.java
+61594,Source Library/openmaxims_workspace/ValueObjects/src/ims/RefMan/vo/CatsReferralWizardVo.java
+59692,core/src/main/java/net/time4j/PlainTimestamp.java
+58888,Source Library/openmaxims_workspace/Admin/src/ims/admin/forms/dataview/GenForm.java
+57213,CodenameOne/src/com/codename1/io/gzip/Deflate.java
+56599,examples/Math-issue-288/src/main/java/org/apache/commons/math/linear/BigMatrixImpl.java
+55887,components/org.apache.stratos.autoscaler/src/main/java/org/apache/stratos/autoscaler/monitor/component/GroupMonitor.java
+54176,jaxws/src/jdk.xml.bind/share/classes/com/sun/xml/internal/xsom/impl/parser/state/particle.java
+53901,junit/org/dyn4j/geometry/GeometryTest.java
+52533,jtransc-asm/src/com/jtransc/org/objectweb/asm/util/CheckMethodAdapter.java
+51947,jdk/src/java.base/share/classes/java/net/SocketPermission.java
+44341,core/src/main/java/edu/mines/jtk/mosaic/PlotPanel.java
+44132,mina.core/core/src/main/java/org/apache/mina/core/buffer/IoBuffer.java
+42231,app/documents/Helper.java
+42207,src/main/java/java8/util/stream/ReduceOps.java
+42186,ui/src/org/pentaho/di/ui/trans/steps/sqlfileoutput/SQLFileOutputDialog.java
+41248,app/src/production/java/se/leap/bitmaskclient/ProviderAPI.java
+38229,src/test/org/apache/sqoop/hcat/HCatalogImportTest.java
+38147,java/sage/SageTVWindow.java
+36887,tests/integration-tests/src/test/java/org/apache/activemq/artemis/tests/integration/proton/ProtonTest.java
+36652,lib/server-core/src/test/java/org/apache/olingo/server/core/uri/parser/UriTokenizerTest.java
+36383,sakai-evaluation-impl/src/java/org/sakaiproject/evaluation/logic/EvalCommonLogicImpl.java
+35768,easyrec-utils/src/main/java/gnu/trove/map/hash/TLongIntHashMap.java
+35302,sdk/src/com/constellio/app/api/search/MultilingualFreeTextSearchBrokenAcceptTest.java
+34862,src/main/java/com/elmakers/mine/bukkit/action/CastContext.java
+34847,components/camel-spring/src/main/java/org/apache/camel/spring/handler/CamelNamespaceHandler.java
+34758,src/dr/app/tempest/TempestPanel.java
+33562,presto-main/src/main/java/com/facebook/presto/operator/scalar/ReflectionParametricScalar.java
+33149,source/src/com/espertech/esper/epl/join/plan/NStreamOuterQueryPlanBuilder.java
+32398,cassandra-unit/src/test/java/org/cassandraunit/dataset/xml/ClasspathXmlDataSetTest.java
+32287,genie-web/src/test/java/com/netflix/genie/web/controllers/ClusterRestControllerIntegrationTests.java
+32262,luna/org.eclipse.jdt.core/model/org/eclipse/jdt/internal/core/CompilationUnitStructureRequestor.java
+32132,server/src/main/java/com/vaadin/ui/Upload.java
+30710,mbhd-swing/src/test/java/FontAwesomeTools.java
+30653,core/ide/che-core-ide-app/src/main/java/org/eclipse/che/ide/part/explorer/project/ProjectExplorerPresenter.java
+28739,Source Library/openmaxims_workspace/ValueObjects/src/ims/icp/vo/domain/ICPFullVoAssembler.java
+28521,src/test/java/one/util/streamex/DoubleStreamExTest.java
+28437,hyracks-fullstack/hyracks/hyracks-dataflow-std/src/main/java/org/apache/hyracks/dataflow/std/join/HybridHashJoinOperatorDescriptor.java
+28121,AIMSICD/src/main/java/com/secupwn/aimsicd/activities/MapViewerOsmDroid.java
+27844,Source Library/openmaxims_workspace-archive/Admin/src/ims/admin/domain/impl/HcpAdminImpl.java
+27048,fit/src/test/java/org/apache/olingo/fit/base/BatchTestITCase.java
+26710,Original Files/source/src/android/support/v4/app/Fragment.java
+26568,alljoyn/alljoyn_java/test/org/alljoyn/bus/AboutIconProxyTest.java
+26451,Source Library/openmaxims_workspace/Scheduling/src/ims/scheduling/forms/ocsexternalevents/GenForm.java
+26197,src/java/org/apache/cassandra/streaming/StreamSession.java
+26144,lucee-java/lucee-core/src/lucee/runtime/tag/Feed.java
+25050,src/main/java/com/persado/oss/quality/stevia/testng/Verify.java
+24624,src/main/java/com/amazonaws/services/storagegateway/model/CreateStorediSCSIVolumeRequest.java
+23979,app/src/main/java/com/yydcdut/note/view/fab/FloatingActionsMenu.java
+23511,app/src/org/runnerup/export/GarminSynchronizer.java
+23420
+Query:
+-- 8. Select the content of text files containing 'import' statements
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "content" LIKE '%import%'
+LIMIT 100
+Answer:
+Too long, hard cut:
+content
+"# -*- coding: utf-8 -*-
+# Copyright (C) 2015 mulhern <amulhern@redhat.com>
+
+# This library is free software; you can redistribute it and/or modify it
+# under the terms of the GNU Lesser General Public License as published by the
+# Free Software Foundation; either version 2.1 of the License, or (at your
+# option) any later version.
+
+# This library is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
+# for more details.
+
+# You should have received a copy of the GNU Lesser General Public License
+# along with this library; if not, write to the Free Software Foundation,
+# Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+
+""""""
+    pyudev._ctypeslib
+    =================
+
+    Wrappers for libraries.
+
+    .. moduleauthor::  mulhern  <amulhern@redhat.com>
+""""""
+
+from . import libc
+from . import libudev
+"
+"<?php
+/**
+ * Subclass for representing a row from the 'entry' table.
+ *
+ *
+ *
+ * @package Core
+ * @subpackage model
+ */
+class entry extends Baseentry implements ISyncableFile, IIndexable, IOwnable, IRelatedObject
+{
+	protected $new_categories = '';
+	protected $new_categories_ids = '';
+	protected $old_categories;
+	protected $is_categories_modified = false;
+	protected $is_categories_names_modified = false;
+	protected $creator_kuser_id = null;
+	
+	const MINIMUM_ID_TO_DISPLAY = 8999;
+	
+	const ROOTS_FIELD_PREFIX = 'K_Pref';
+	const ROOTS_FIELD_ENTRY_PREFIX = 'KP_Entry';
+	const ROOTS_FIELD_PARENT_ENTRY_PREFIX = 'KP_Parent';
+	const ROOTS_FIELD_BULK_UPLOAD_PREFIX = 'KP_Bulk';
+
+	// NOTE - CHANGES MUST BE MADE TO LAYOUT.PHP JS PART AS WELL
+	// different sort orders for browsing entries
+	const ENTRY_SORT_MOST_VIEWED = 0;
+	const ENTRY_SORT_MOST_RECENT = 1;
+	const ENTRY_SORT_MOST_COMMENTS = 2;
+	const ENTRY_SORT_MOST_FAVORITES = 3;
+	const ENTRY_SORT_RANK = 4;
+	const ENTRY_SORT_MEDIA_TYPE = 5;
+	const ENTRY_SORT_NAME = 6;
+	const ENTRY_SORT_KUSER_SCREEN_NAME = 7;
+
+	// NOTE - CHANGES MUST BE MADE TO LAYOUT.PHP JS PART AS WELL
+	const ENTRY_MEDIA_TYPE_AUTOMATIC = -1;
+	const ENTRY_MEDIA_TYPE_ANY = 0;
+	const ENTRY_MEDIA_TYPE_VIDEO = 1;
+	const ENTRY_MEDIA_TYPE_IMAGE = 2;
+	const ENTRY_MEDIA_TYPE_TEXT = 3;
+	const ENTRY_MEDIA_TYPE_HTML = 4;
+	const ENTRY_MEDIA_TYPE_AUDIO = 5;
+	const ENTRY_MEDIA_TYPE_SHOW = 6;
+	const ENTRY_MEDIA_TYPE_SHOW_XML = 7; // for the kplayer: the data contains the xml itself and not a url
+	const ENTRY_MEDIA_TYPE_BUBBLES = 9;
+	const ENTRY_MEDIA_TYPE_XML = 10;
+	const ENTRY_MEDIA_TYPE_DOCUMENT = 11;
+	const ENTRY_MEDIA_TYPE_SWF = 12;
+	const ENTRY_MEDIA_TYPE_PDF = 13;
+	
+	const ENTRY_MEDIA_TYPE_GENERIC_1= 101;	// these types can be used for derived classes - assume this is some kind of TXT file
+	const ENTRY_MEDIA_TYPE_GENERIC_2= 102;	// these types can be used for derived classes
+	const ENTRY_MEDIA_TYPE_GENERIC_3= 103;	// these types can be used for derived classes
+	const ENTRY_MEDIA_TYPE_GENERIC_4= 104;	// these types can be used for derived classes
+	
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_FLASH = 201;
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_WINDOWS_MEDIA = 202;
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_REAL_MEDIA = 203;
+	const ENTRY_MEDIA_TYPE_LIVE_STREAM_QUICKTIME = 204;
+	
+	// NOTE - CHANGES MUST BE MADE TO LAYOUT.PHP JS PART AS WELL
+	const ENTRY_MEDIA_SOURCE_FILE = 1;
+	const ENTRY_MEDIA_SOURCE_WEBCAM = 2;
+	const ENTRY_MEDIA_SOURCE_FLICKR = 3;
+	const ENTRY_MEDIA_SOURCE_YOUTUBE = 4;
+	const ENTRY_MEDIA_SOURCE_URL = 5;
+	const ENTRY_MEDIA_SOURCE_TEXT = 6;
+	const ENTRY_MEDIA_SOURCE_MYSPACE = 7;
+	const ENTRY_MEDIA_SOURCE_PHOTOBUCKET = 8;
+	const ENTRY_MEDIA_SOURCE_JAMENDO = 9;
+	const ENTRY_MEDIA_SOURCE_CCMIXTER = 10;
+	const ENTRY_MEDIA_SOURCE_NYPL = 11;
+	const ENTRY_MEDIA_SOURCE_CURRENT = 12;
+	const ENTRY_MEDIA_SOURCE_MEDIA_COMMONS = 13;
+	const ENTRY_MEDIA_SOURCE_KALTURA = 20;
+	const ENTRY_MEDIA_SOURCE_KALTURA_USER_CLIPS = 21;
+	const ENTRY_MEDIA_SOURCE_ARCHIVE_ORG = 22;
+	const ENTRY_MEDIA_SOURCE_KALTURA_PARTNER = 23;
+	const ENTRY_MEDIA_SOURCE_METACAFE = 24;
+	const ENTRY_MEDIA_SOURCE_KALTURA_QA = 25;
+	const ENTRY_MEDIA_SOURCE_KALTURA_KSHOW = 26;
+	const ENTRY_MEDIA_SOURCE_KALTURA_PARTNER_KSHOW = 27;
+	const ENTRY_MEDIA_SOURCE_SEARCH_PROXY = 28;
+	const ENTRY_MEDIA_SOURCE_AKAMAI_LIVE = 29;
+	const ENTRY_MEDIA_SOURCE_MANUAL_LIVE_STREAM = 30;
+	const ENTRY_MEDIA_SOURCE_AKAMAI_UNIVERSAL_LIVE = 31;
+	const ENTRY_MEDIA_SOURCE_LIVE_STREAM = 32;
+	const ENTRY_MEDIA_SOURCE_LIVE_CHANNEL = 33;
+	const ENTRY_MEDIA_SOURCE_RECORDED_LIVE = 34;
+	const ENTRY_MEDIA_SOURCE_CLIP = 35;
+	const ENTRY_MEDIA_SOURCE_PARTNER_SPECIFIC = 100;
+		
+	const ENTRY_MODERATION_STATUS_PENDING_MODERATION = 1;
+	const ENTRY_MODERATION_STATUS_APPROVED = 2;
+	const ENTRY_MODERATION_STATUS_REJECTED = 3;
+	const ENTRY_MODERATION_STATUS_FLAGGED_FOR_REVIEW = 5;
+	const ENTRY_MODERATION_STATUS_AUTO_APPROVED = 6;
+	
+	const MAX_NORMALIZED_RANK = 5;
+
+	const MAX_CATEGORIES_PER_ENTRY = 32;
+	const MAX_CATEGORIES_PER_ENTRY_DISAB
+Query:
+-- 9. Select the content of Java files containing 'import java' statements
+SELECT "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java' AND "content" LIKE '%import java%'
+LIMIT 100
+Answer:
+Too long, hard cut:
+content
+"/**
+ * Flexmojos is a set of maven goals to allow maven users to compile, optimize and test Flex SWF, Flex SWC, Air SWF and Air SWC.
+ * Copyright (C) 2008-2012  Marvin Froeder <marvin@flexmojos.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package net.flexmojos.oss.tests.concept;
+
+import java.io.File;
+
+import net.flexmojos.oss.test.FMVerifier;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+public class AttachAsdocTest
+    extends AbstractConceptTest
+{
+
+    @Test
+    public void attachAsdoc()
+        throws Exception
+    {
+        FMVerifier v = standardConceptTester( ""attach-asdoc"" );
+        File target = new File( v.getBasedir(), ""target"" );
+
+        Assert.assertTrue( target.exists() );
+
+        File doc = new File( target, ""attach-asdoc-1.0-SNAPSHOT-asdoc.zip"" );
+        Assert.assertTrue( doc.exists() );
+    }
+}
+"
+"/*
+ * Copyright (c) 2010-2015 Pivotal Software, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+
+package io.snappydata.thrift.internal;
+
+import java.sql.ParameterMetaData;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.pivotal.gemfirexd.internal.shared.common.reference.SQLState;
+import io.snappydata.thrift.ColumnDescriptor;
+import io.snappydata.thrift.common.Converters;
+import io.snappydata.thrift.common.ThriftExceptionUtil;
+import io.snappydata.thrift.snappydataConstants;
+
+/**
+ * Implementation of JDBC {@link ParameterMetaData} for the thrift JDBC driver.
+ */
+public class ClientParameterMetaData implements ParameterMetaData {
+
+  private final List<ColumnDescriptor> descriptors;
+
+  ClientParameterMetaData(List<ColumnDescriptor> metadata) {
+    this.descriptors = metadata;
+  }
+
+  /** check if 1-based index of column is valid one */
+  final void checkForValidColumn(int column) throws SQLException {
+    final int numColumns = this.descriptors.size();
+    if (column < 1 || column > numColumns) {
+      throw ThriftExceptionUtil.newSQLException(
+          SQLState.LANG_INVALID_PARAM_POSITION, null, column, numColumns);
+    }
+  }
+
+  final ColumnDescriptor getDescriptor(int column) throws SQLException {
+    checkForValidColumn(column);
+    return this.descriptors.get(column - 1);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getParameterCount() throws SQLException {
+    return this.descriptors.size();
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int isNullable(int param) throws SQLException {
+    ColumnDescriptor desc = getDescriptor(param);
+    if (desc.isSetNullable()) {
+      return desc.isNullable() ? parameterNullable : parameterNoNulls;
+    } else {
+      return parameterNullableUnknown;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public boolean isSigned(int param) throws SQLException {
+    switch (getDescriptor(param).getType()) {
+      case INTEGER:
+      case REAL:
+      case DECIMAL:
+      case SMALLINT:
+      case BIGINT:
+      case TINYINT:
+      case DOUBLE:
+      case FLOAT:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getPrecision(int param) throws SQLExcepti
+Query:
+-- 10. Select paths and content of Java files that contain 'import' statements
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = FALSE AND "sample_path" LIKE '%.java' AND "content" LIKE '%import%'
+LIMIT 100
+Answer:
+Too long, hard cut:
+sample_path,content
+flexmojos-testing/flexmojos-test-harness/src/test/java/net/flexmojos/oss/tests/concept/AttachAsdocTest.java,"/**
+ * Flexmojos is a set of maven goals to allow maven users to compile, optimize and test Flex SWF, Flex SWC, Air SWF and Air SWC.
+ * Copyright (C) 2008-2012  Marvin Froeder <marvin@flexmojos.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+package net.flexmojos.oss.tests.concept;
+
+import java.io.File;
+
+import net.flexmojos.oss.test.FMVerifier;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+public class AttachAsdocTest
+    extends AbstractConceptTest
+{
+
+    @Test
+    public void attachAsdoc()
+        throws Exception
+    {
+        FMVerifier v = standardConceptTester( ""attach-asdoc"" );
+        File target = new File( v.getBasedir(), ""target"" );
+
+        Assert.assertTrue( target.exists() );
+
+        File doc = new File( target, ""attach-asdoc-1.0-SNAPSHOT-asdoc.zip"" );
+        Assert.assertTrue( doc.exists() );
+    }
+}
+"
+gemfirexd/client/src/main/java/io/snappydata/thrift/internal/ClientParameterMetaData.java,"/*
+ * Copyright (c) 2010-2015 Pivotal Software, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+/*
+ * Changes for SnappyData data platform.
+ *
+ * Portions Copyright (c) 2016 SnappyData, Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the ""License""); you
+ * may not use this file except in compliance with the License. You
+ * may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an ""AS IS"" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+ * implied. See the License for the specific language governing
+ * permissions and limitations under the License. See accompanying
+ * LICENSE file.
+ */
+
+package io.snappydata.thrift.internal;
+
+import java.sql.ParameterMetaData;
+import java.sql.SQLException;
+import java.util.List;
+
+import com.pivotal.gemfirexd.internal.shared.common.reference.SQLState;
+import io.snappydata.thrift.ColumnDescriptor;
+import io.snappydata.thrift.common.Converters;
+import io.snappydata.thrift.common.ThriftExceptionUtil;
+import io.snappydata.thrift.snappydataConstants;
+
+/**
+ * Implementation of JDBC {@link ParameterMetaData} for the thrift JDBC driver.
+ */
+public class ClientParameterMetaData implements ParameterMetaData {
+
+  private final List<ColumnDescriptor> descriptors;
+
+  ClientParameterMetaData(List<ColumnDescriptor> metadata) {
+    this.descriptors = metadata;
+  }
+
+  /** check if 1-based index of column is valid one */
+  final void checkForValidColumn(int column) throws SQLException {
+    final int numColumns = this.descriptors.size();
+    if (column < 1 || column > numColumns) {
+      throw ThriftExceptionUtil.newSQLException(
+          SQLState.LANG_INVALID_PARAM_POSITION, null, column, numColumns);
+    }
+  }
+
+  final ColumnDescriptor getDescriptor(int column) throws SQLException {
+    checkForValidColumn(column);
+    return this.descriptors.get(column - 1);
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int getParameterCount() throws SQLException {
+    return this.descriptors.size();
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public int isNullable(int param) throws SQLException {
+    ColumnDescriptor desc = getDescriptor(param);
+    if (desc.isSetNullable()) {
+      return desc.isNullable() ? parameterNullable : parameterNoNulls;
+    } else {
+      return parameterNullableUnknown;
+    }
+  }
+
+  /**
+   * {@inheritDoc}
+   */
+  @Override
+  public boolean isSigned(int param) throws SQLException {
+    switch (getDescriptor(param).getType()) {
+      case INTEGER:
+      case REAL:
+      case DECIMAL:
+      case SMALLINT:
+      case BIGINT:
+      case TI
+End Exploring Related Columns
+Task: Identify the top 10 most frequently imported packages and their counts in Java source files.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+Package,Count
+package_name1:str,count1:int
+package_name2:str,count2:int
+package_name3:str,count3:int
+package_name4:str,count4:int
+package_name5:str,count5:int
+package_name6:str,count6:int
+package_name7:str,count7:int
+package_name8:str,count8:int
+package_name9:str,count9:int
+package_name10:str,count10:int
+(Attention: answer in top 10 rows)
+```
+
+**Explanation**: The table above lists the top 10 most frequently imported packages in Java source files, along with the number of times (`Count`) each package was imported. This information was derived by analyzing Java source files in the `SAMPLE_CONTENTS` and `SAMPLE_FILES` tables, extracting the import statements, and counting the occurrences of each package..
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: ({database name: {schema name: {table name}}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_FILES', 'SAMPLE_REPOS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.Keep all decimals to four decimal places.
+Be careful of information in nested columns. e.g. When it comes to completed purchase, `hits.eCommerceAction.action_type` Indicates the type of ecommerce action and '6' represents completed purchases.
+Be careful one country may have different country_name and country_region in different columns in a database.
+Don't be misled by examples. For instance, a question related to Android development on StackOverflow might include tags like 'android-layout,' 'android-activity,' or 'android-intent.' However, you should not limit your analysis to just these three tags; instead, consider all tags related to Android: "tags" LIKE '%android%'.
+
+2025-01-23 12:40:26 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-23 12:40:26 - root - INFO - ```sql
+SELECT package_name, COUNT(*) AS "Count"
+FROM (
+    SELECT
+        REGEXP_SUBSTR(content_line.value, '^import\\s+(?:static\\s+)?([\\w\\.]+)', 1, 1, 'e', 1) AS package_name
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+        LATERAL FLATTEN(input => SPLIT("content", '\n')) AS content_line
+    WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+        AND content_line.value LIKE 'import %'
+) AS imports
+WHERE package_name IS NOT NULL
+GROUP BY package_name
+ORDER BY "Count" DESC
+LIMIT 10;
+```
+2025-01-23 12:40:26 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:40:26 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:40:26 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:40:32 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:40:32 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:40:33 - root - INFO - itercount: 1
+2025-01-23 12:40:33 - root - INFO - 100048 (2201B): 01b9e758-0004-8054-0001-11c300f6a422: Invalid regular expression: '^import\s+(?:static\s+)?([\w\.]+)', no argument for repetition operator: ?
+2025-01-23 12:40:33 - root - INFO - Input sql:
+SELECT package_name, COUNT(*) AS "Count"
+FROM (
+    SELECT
+        REGEXP_SUBSTR(content_line.value, '^import\\s+(?:static\\s+)?([\\w\\.]+)', 1, 1, 'e', 1) AS package_name
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+        LATERAL FLATTEN(input => SPLIT("content", '\n')) AS content_line
+    WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+        AND content_line.value LIKE 'import %'
+) AS imports
+WHERE package_name IS NOT NULL
+GROUP BY package_name
+ORDER BY "Count" DESC
+LIMIT 10;
+The error information is:
+100048 (2201B): 01b9e758-0004-8054-0001-11c300f6a422: Invalid regular expression: '^import\s+(?:static\s+)?([\w\.]+)', no argument for repetition operator: ?
+Please correct it and output only 1 complete SQL query.When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+
+2025-01-23 12:41:11 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-23 12:41:11 - root - INFO - ```sql
+SELECT package_name, COUNT(*) AS "Count"
+FROM (
+    SELECT
+        REGEXP_SUBSTR(content_line.value, '^import(\\s+static)?\\s+([a-zA-Z0-9_\\.]+)', 1, 1, 'c', 2) AS package_name
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+        LATERAL FLATTEN(input => SPLIT("content", '\n')) AS content_line
+    WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+        AND content_line.value LIKE 'import %'
+) AS imports
+WHERE package_name IS NOT NULL
+GROUP BY package_name
+ORDER BY "Count" DESC NULLS LAST
+LIMIT 10;
+```
+2025-01-23 12:41:11 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:41:11 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:41:11 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:41:13 - snowflake.connector.cursor - INFO - Number of results in first chunk: 10
+2025-01-23 12:41:13 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:41:13 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:41:13 - root - INFO - itercount: 2
+2025-01-23 12:41:13 - root - INFO - 0
+2025-01-23 12:41:13 - root - INFO - results: 
+PACKAGE_NAME,Count
+java.util.List,385
+java.util.ArrayList,240
+java.io.IOException,221
+java.util.Map,194
+org.junit.Test,169
+java.util.HashMap,104
+java.util.Set,104
+java.util.Iterator,97
+java.io.File,95
+java.util.Collection,91
+
+
+2025-01-23 12:41:13 - root - INFO - Please check the answer again by reviewing Identify the top 10 most frequently imported packages and their counts in Java source files., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+Keep all decimals to four decimal places.
+The answer format should be like: ```csv
+Package,Count
+package_name1:str,count1:int
+package_name2:str,count2:int
+package_name3:str,count3:int
+package_name4:str,count4:int
+package_name5:str,count5:int
+package_name6:str,count6:int
+package_name7:str,count7:int
+package_name8:str,count8:int
+package_name9:str,count9:int
+package_name10:str,count10:int
+(Attention: answer in top 10 rows)
+```
+
+**Explanation**: The table above lists the top 10 most frequently imported packages in Java source files, along with the number of times (`Count`) each package was imported. This information was derived by analyzing Java source files in the `SAMPLE_CONTENTS` and `SAMPLE_FILES` tables, extracting the import statements, and counting the occurrences of each package. The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+PACKAGE_NAME,Count
+java.util.List,385
+java.util.ArrayList,240
+java.io.IOException,221
+java.util.Map,194
+org.junit.Test,169
+java.util.HashMap,104
+java.util.Set,104
+java.util.Iterator,97
+java.io.File,95
+java.util.Collection,91
+Current sql:
+SELECT package_name, COUNT(*) AS "Count"
+FROM (
+    SELECT
+        REGEXP_SUBSTR(content_line.value, '^import(\\s+static)?\\s+([a-zA-Z0-9_\\.]+)', 1, 1, 'c', 2) AS package_name
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+        LATERAL FLATTEN(input => SPLIT("content", '\n')) AS content_line
+    WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+        AND content_line.value LIKE 'import %'
+) AS imports
+WHERE package_name IS NOT NULL
+GROUP BY package_name
+ORDER BY "Count" DESC NULLS LAST
+LIMIT 10;
+2025-01-23 12:41:35 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-23 12:41:35 - root - INFO - ```sql
+SELECT package_name, COUNT(*) AS "Count"
+FROM (
+    SELECT
+        REGEXP_SUBSTR(content_line.value, '^import(\\s+static)?\\s+([a-zA-Z0-9_\\.]+)', 1, 1, 'c', 2) AS package_name
+    FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS",
+        LATERAL FLATTEN(input => SPLIT("content", '\n')) AS content_line
+    WHERE "binary" = FALSE AND "sample_path" LIKE '%.java'
+        AND content_line.value LIKE 'import %'
+) AS imports
+WHERE package_name IS NOT NULL
+GROUP BY package_name
+ORDER BY "Count" DESC NULLS LAST
+LIMIT 10;
+```
+2025-01-23 12:41:35 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.62-x86_64-with-glibc2.31
+2025-01-23 12:41:35 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-23 12:41:35 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-23 12:41:36 - snowflake.connector.cursor - INFO - Number of results in first chunk: 10
+2025-01-23 12:41:36 - snowflake.connector.connection - INFO - closed
+2025-01-23 12:41:37 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-23 12:41:37 - root - INFO - itercount: 3
+2025-01-23 12:41:37 - root - INFO - 0
+2025-01-23 12:41:37 - root - INFO - Total iteration counts: 3

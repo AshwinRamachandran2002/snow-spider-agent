@@ -1,0 +1,29 @@
+WITH magnificent7 AS (
+    SELECT *
+    FROM FINANCE__ECONOMICS.CYBERSYN.STOCK_PRICE_TIMESERIES
+    WHERE "VARIABLE" = 'post-market_close'
+      AND "TICKER" IN ('AAPL','MSFT','AMZN','GOOGL','NVDA','META','TSLA')
+      AND "DATE" BETWEEN '2024-01-01' AND '2024-06-30'
+),
+start_prices AS (
+    SELECT
+        "TICKER",
+        FIRST_VALUE("VALUE") OVER (PARTITION BY "TICKER" ORDER BY "DATE") AS "START_VALUE"
+    FROM magnificent7
+),
+end_prices AS (
+    SELECT
+        "TICKER",
+        FIRST_VALUE("VALUE") OVER (PARTITION BY "TICKER" ORDER BY "DATE" DESC) AS "END_VALUE"
+    FROM magnificent7
+)
+SELECT
+    s."TICKER",
+    s."START_VALUE",
+    e."END_VALUE",
+    ROUND( (e."END_VALUE" - s."START_VALUE") / s."START_VALUE" * 100, 4) AS "PCT_CHANGE_2024H1"
+FROM start_prices s
+JOIN end_prices e
+  ON s."TICKER" = e."TICKER"
+GROUP BY s."TICKER", s."START_VALUE", e."END_VALUE"
+ORDER BY "TICKER";

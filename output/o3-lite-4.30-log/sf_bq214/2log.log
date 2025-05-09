@@ -1,0 +1,1065 @@
+2025-05-01 00:44:25 - Thread-51 (execute) - INFO - [Answer format]
+```csv
+patent_number,forward_citations_within_30_days,most_similar_patent_from_same_filing_year
+```
+[Answer format]
+2025-05-01 00:46:07 - Thread-51 (execute) - INFO - [Exploration]
+Relevant columns, their potential usage, and the most obvious conditions
+
+• "publication_number": unique identifier of every patent – used for joins and final display  
+• "country_code": patent jurisdiction – filter to 'US'  
+• "kind_code": document kind – filter to 'B2' (granted US utility)  
+• "grant_date": grant (publication) date – restrict to 20100101‑20141231  
+• "filing_date": application filing date – used to measure ± 30‑day window for forward citations  
+• "citation": VARIANT array containing publication numbers cited BY each patent – after FLATTEN, used to create a forward‑citation count (by matching our candidate’s number to the citing patent’s list)  
+• "family_id": allows aggregation across simple‑family if desired (not needed here, but sometimes helpful)  
+• "embedding_v1" (in ABS_AND_EMB): vector of floats – used to compute cosine/dot‑product similarity between patents  
+• "abstract" / "title" (ABS_AND_EMB): only for human diagnostic checks  
+• "application_kind": can be checked for 'A' (utility application) though "kind_code"='B2' already implies a US utility grant  
+• "grant_date", "filing_date": numeric YYYYMMDD – date filters, time‑difference calculation  
+• "art_unit", "ipc", "cpc": other technology classifications – not necessary for requested answer but sometimes convenient for tie‑breaking / exploration  
+
+Typical conditions  
+• WHERE "country_code" = 'US'  
+• AND   "kind_code"   = 'B2'  
+• AND   "grant_date" BETWEEN 20100101 AND 20141231  
+• In forward‑citation sub‑query: difference between citing patent’s "filing_date" and focal patent’s "filing_date" ≤ 30  
+
+Below are 10 exploratory Snowflake SQL snippets (LIMIT 20) that progressively build toward the final result.  
+All column names are enclosed in double quotes; comments precede each query.
+
+```sql
+-- 1. Description: List a few U.S. B2 utility patents granted between 2010‑2014
+SELECT 
+    "publication_number",
+    "grant_date",
+    "filing_date",
+    "kind_code"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+WHERE "country_code" = 'US'
+  AND "kind_code" = 'B2'
+  AND "grant_date" BETWEEN 20100101 AND 20141231
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: Distinct grant years of U.S. B2 patents in 2010‑2014 span
+SELECT DISTINCT 
+       FLOOR("grant_date"/10000) AS "grant_year"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+WHERE "country_code" = 'US'
+  AND "kind_code" = 'B2'
+  AND "grant_date" BETWEEN 20100101 AND 20141231
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: Inspect the structure of the "citation" array for one random patent
+SELECT 
+    t."publication_number",
+    f.value AS "raw_citation"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."citation") f
+WHERE t."publication_number" = 'US-7650331-B1' -- replace with any example if empty
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: Count forward citations that EACH U.S. patent (any kind) makes to others
+SELECT 
+    citing."publication_number"       AS "citing_pub",
+    f.value::STRING                   AS "cited_pub"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+     LATERAL FLATTEN(input => citing."citation") f
+WHERE citing."country_code" = 'US'
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: Forward‑citation counts received by U.S. B2 patents (no time limit)
+WITH cited_map AS (
+    SELECT 
+        f.value::STRING                      AS "cited_pub",
+        COUNT(*) AS "forward_cite_cnt"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+    GROUP BY f.value
+)
+SELECT 
+    p."publication_number",
+    cm."forward_cite_cnt"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+LEFT JOIN cited_map cm
+       ON cm."cited_pub" = p."publication_number"
+WHERE p."country_code" = 'US'
+  AND p."kind_code" = 'B2'
+  AND p."grant_date" BETWEEN 20100101 AND 20141231
+ORDER BY cm."forward_cite_cnt" DESC NULLS LAST
+LIMIT 20;
+```
+
+```sql
+-- 6. Description: Forward citations RECEIVED within 30 days of the focal patent’s filing date
+WITH citing_pairs AS (
+    SELECT 
+        citing."publication_number"     AS "citing_pub",
+        f.value::STRING                 AS "cited_pub",
+        citing."filing_date"            AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+),
+focal AS (
+    SELECT 
+        "publication_number",
+        "filing_date"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "country_code" = 'US'
+      AND "kind_code"   = 'B2'
+      AND "grant_date" BETWEEN 20100101 AND 20141231
+)
+SELECT 
+    focal."publication_number"           AS "focal_pub",
+    COUNT(*)                             AS "fwd_cites_in_30d"
+FROM focal
+JOIN citing_pairs
+  ON citing_pairs."cited_pub" = focal."publication_number"
+ WHERE ABS(citing_pairs."citing_file" - focal."filing_date") <= 30
+GROUP BY focal."publication_number"
+ORDER BY "fwd_cites_in_30d" DESC
+LIMIT 20;
+```
+
+```sql
+-- 7. Description: Retrieve embedding vectors for patents filed in 2012
+SELECT 
+    a."publication_number",
+    a."embedding_v1"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a
+JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+  ON a."publication_number" = p."publication_number"
+WHERE p."country_code" = 'US'
+  AND p."filing_date" BETWEEN 20120101 AND 20121231
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: Compute naive dot‑product similarity between two arbitrary 2012 patents (for demo)
+WITH pair AS (
+    SELECT 
+        a1."publication_number" AS "pub1",
+        a2."publication_number" AS "pub2",
+        DOT_PRODUCT(a1."embedding_v1", a2."embedding_v1") AS "dot_sim"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a1
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a2
+      ON TRUE
+    WHERE a1."publication_number" <> a2."publication_number"
+      AND a1."publication_number"  IN (SELECT "publication_number" 
+                                        FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS 
+                                        WHERE "filing_date" BETWEEN 20120101 AND 20121231 LIMIT 1)
+      AND a2."publication_number"  IN (SELECT "publication_number" 
+                                        FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS 
+                                        WHERE "filing_date" BETWEEN 20120101 AND 20121231 LIMIT 1)
+)
+SELECT * FROM pair LIMIT 20;
+```
+
+```sql
+-- 9. Description: For each filing year 2010‑2014, pull the B2 patent with most 30‑day forward cites
+WITH citing_pairs AS (
+    SELECT 
+        citing."publication_number"     AS "citing_pub",
+        f.value::STRING                 AS "cited_pub",
+        citing."filing_date"            AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+),
+focal AS (
+    SELECT 
+        "publication_number",
+        "filing_date",
+        FLOOR("filing_date"/10000) AS "file_year"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "country_code" = 'US'
+      AND "kind_code"   = 'B2'
+      AND "grant_date" BETWEEN 20100101 AND 20141231
+)
+SELECT 
+    focal."file_year",
+    focal."publication_number",
+    COUNT(*) AS "fwd_cites_30d"
+FROM focal
+JOIN citing_pairs
+  ON citing_pairs."cited_pub" = focal."publication_number"
+ WHERE ABS(citing_pairs."citing_file" - focal."filing_date") <= 30
+GROUP BY focal."file_year", focal."publication_number"
+QUALIFY ROW_NUMBER() OVER (PARTITION BY focal."file_year" 
+                           ORDER BY COUNT(*) DESC) = 1
+LIMIT 20;
+```
+
+```sql
+-- 10. Description: FINAL‑style query – returns the single focal patent (2010‑2014) 
+--     with the overall highest 30‑day forward cites and the most similar same‑year patent
+WITH citing_pairs AS (
+    SELECT 
+        citing."publication_number"     AS "citing_pub",
+        f.value::STRING                 AS "cited_pub",
+        citing."filing_date"            AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+),
+focal_rank AS (
+    SELECT 
+        p."publication_number",
+        p."filing_date",
+        FLOOR(p."filing_date"/10000) AS "file_year",
+        COUNT(*) AS "fwd_cites_30d"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+    JOIN citing_pairs
+      ON citing_pairs."cited_pub" = p."publication_number"
+     AND ABS(citing_pairs."citing_file" - p."filing_date") <= 30
+    WHERE p."country_code" = 'US'
+      AND p."kind_code"   = 'B2'
+      AND p."grant_date" BETWEEN 20100101 AND 20141231
+    GROUP BY p."publication_number", p."filing_date"
+    ORDER BY "fwd_cites_30d" DESC
+    LIMIT 1
+),
+same_year AS (
+    SELECT 
+        a."publication_number",
+        DOT_PRODUCT(a."embedding_v1", b."embedding_v1") AS "dot_sim"
+    FROM focal_rank fr
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p2
+      ON FLOOR(p2."filing_date"/10000) = fr."file_year"
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a
+      ON a."publication_number" = p2."publication_number"
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB b
+      ON b."publication_number" = fr."publication_number"
+    WHERE p2."publication_number" <> fr."publication_number"
+    ORDER BY "dot_sim" DESC
+    LIMIT 1
+)
+SELECT 
+    fr."publication_number"         AS "top_cited_B2_patent",
+    fr."fwd_cites_30d",
+    sy."publication_number"         AS "most_similar_same_year",
+    sy."dot_sim"
+FROM focal_rank fr
+CROSS JOIN same_year sy
+LIMIT 20;
+```
+
+Each query returns up to 20 rows and incrementally builds up from basic exploration to the logic required for the stated task.
+[Exploration]
+2025-05-01 00:46:07 - Thread-51 (execute) - INFO - [Try to execute]
+-- 1. Description: List a few U.S. B2 utility patents granted between 2010‑2014
+SELECT 
+    "publication_number",
+    "grant_date",
+    "filing_date",
+    "kind_code"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+WHERE "country_code" = 'US'
+  AND "kind_code" = 'B2'
+  AND "grant_date" BETWEEN 20100101 AND 20141231
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:46:08 - Thread-51 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Description: List a few U.S. B2 utility patents granted between 2010‑2014
+SELECT 
+    "publication_number",
+    "grant_date",
+    "filing_date",
+    "kind_code"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+WHERE "country_code" = 'US'
+  AND "kind_code" = 'B2'
+  AND "grant_date" BETWEEN 20100101 AND 20141231
+LIMIT 20;
+Results:
+publication_number,grant_date,filing_date,kind_code
+US-8719279-B2,20140506,20120224,B2
+US-8600107-B2,20131203,20110331,B2
+US-8370222-B2,20130205,20120621,B2
+US-8334212-B2,20121218,20100129,B2
+US-8666920-B2,20140304,20100215,B2
+US-8661280-B2,20140225,20120924,B2
+US-8197428-B2,20120612,20071003,B2
+US-8503036-B2,20130806,20080623,B2
+US-8178184-B2,20120515,20050615,B2
+US-8879934-B2,20141104,20110902,B2
+US-8547039-B2,20131001,20090825,B2
+US-8802933-B2,20140812,20110812,B2
+
+[Successfully executed]
+2025-05-01 00:46:08 - Thread-51 (execute) - INFO - [Try to execute]
+-- 2. Description: Distinct grant years of U.S. B2 patents in 2010‑2014 span
+SELECT DISTINCT 
+       FLOOR("grant_date"/10000) AS "grant_year"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+WHERE "country_code" = 'US'
+  AND "kind_code" = 'B2'
+  AND "grant_date" BETWEEN 20100101 AND 20141231
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:46:08 - Thread-51 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Description: Distinct grant years of U.S. B2 patents in 2010‑2014 span
+SELECT DISTINCT 
+       FLOOR("grant_date"/10000) AS "grant_year"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+WHERE "country_code" = 'US'
+  AND "kind_code" = 'B2'
+  AND "grant_date" BETWEEN 20100101 AND 20141231
+LIMIT 20;
+Results:
+grant_year
+2012
+2011
+2014
+2010
+2013
+
+[Successfully executed]
+2025-05-01 00:46:08 - Thread-51 (execute) - INFO - [Try to execute]
+-- 3. Description: Inspect the structure of the "citation" array for one random patent
+SELECT 
+    t."publication_number",
+    f.value AS "raw_citation"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."citation") f
+WHERE t."publication_number" = 'US-7650331-B1' -- replace with any example if empty
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:46:09 - Thread-51 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 00:47:16 - Thread-51 (execute) - INFO - [Corrected SQL]
+```sql
+--Description (thinking process embedded):
+-- • Task: inspect how the "citation" column is stored for any record.
+-- • Reasoning: earlier attempts with specific publication numbers returned no rows;
+--              therefore, remove most filters and simply grab the first record whose
+--              "citation" field is not NULL.
+-- • Steps:
+--      1. In a CTE (“first_with_cites”) select one arbitrary record where "citation" IS NOT NULL.
+--      2. FLATTEN that JSON array so each cited publication is a separate row.
+--      3. Show at most 20 cited items for quick structural inspection.
+WITH first_with_cites AS (
+    SELECT 
+        "publication_number",
+        "citation"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "citation" IS NOT NULL
+    LIMIT 1
+)
+SELECT
+    fwc."publication_number",
+    f.value AS "cited_publication"
+FROM first_with_cites fwc,
+     LATERAL FLATTEN(input => fwc."citation") f
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 00:47:16 - Thread-51 (execute) - INFO - [Results for corrected sql]
+publication_number,cited_publication
+US-3386882-A,"{
+  ""application_number"": """",
+  ""category"": ""SEA"",
+  ""filing_date"": 0,
+  ""npl_text"": ""None"",
+  ""publication_number"": """",
+  ""type"": """"
+}"
+
+[Results for corrected sql]
+2025-05-01 00:49:27 - Thread-51 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: List 20 citing‑cited pairs for U.S. patents
+SELECT
+    citing."publication_number" AS "citing_pub",
+    CAST(f.value AS STRING)     AS "cited_pub"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+     LATERAL FLATTEN(input => citing."citation") f
+WHERE citing."country_code" = 'US'
+  AND citing."citation" IS NOT NULL
+LIMIT 20;
+```
+
+```sql
+--Description: Compute how many forward citations each U.S. B2 patent (2010‑2014) receives, list top 20
+WITH cited_map AS (
+    SELECT
+        CAST(f.value AS STRING)            AS "cited_pub",
+        COUNT(*)                           AS "forward_cite_cnt"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+    GROUP BY CAST(f.value AS STRING)
+)
+SELECT
+    p."publication_number",
+    cm."forward_cite_cnt"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+LEFT JOIN cited_map cm
+       ON cm."cited_pub" = p."publication_number"
+WHERE p."country_code" = 'US'
+  AND p."kind_code"   = 'B2'
+  AND p."grant_date" BETWEEN 20100101 AND 20141231
+ORDER BY cm."forward_cite_cnt" DESC NULLS LAST
+LIMIT 20;
+```
+
+```sql
+--Description: Forward citations received within ±30 (numeric) days of filing for each 2010‑2014 U.S. B2 patent
+WITH citing_pairs AS (
+    SELECT
+        citing."publication_number"        AS "citing_pub",
+        CAST(f.value AS STRING)            AS "cited_pub",
+        citing."filing_date"               AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+      AND citing."filing_date" IS NOT NULL
+),
+focal AS (
+    SELECT
+        "publication_number",
+        "filing_date"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "country_code" = 'US'
+      AND "kind_code"   = 'B2'
+      AND "grant_date" BETWEEN 20100101 AND 20141231
+      AND "filing_date" IS NOT NULL
+)
+SELECT
+    focal."publication_number"                  AS "focal_pub",
+    COUNT(*)                                    AS "fwd_cites_in_30d"
+FROM focal
+JOIN citing_pairs
+  ON citing_pairs."cited_pub" = focal."publication_number"
+ WHERE ABS(citing_pairs."citing_file" - focal."filing_date") <= 30
+GROUP BY focal."publication_number"
+ORDER BY "fwd_cites_in_30d" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Retrieve embeddings for U.S. patents filed during calendar‑year 2012
+SELECT
+    a."publication_number",
+    a."embedding_v1"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB       a
+JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS      p
+      ON a."publication_number" = p."publication_number"
+WHERE p."country_code" = 'US'
+  AND p."filing_date" BETWEEN 20120101 AND 20121231
+LIMIT 20;
+```
+
+```sql
+--Description: Demonstration of dot‑product similarity for two random 2012 U.S. patents (if DOT_PRODUCT is available)
+WITH sample_2012 AS (
+    SELECT "publication_number"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "country_code" = 'US'
+      AND "filing_date" BETWEEN 20120101 AND 20121231
+    LIMIT 2
+),
+embeds AS (
+    SELECT
+        s."publication_number",
+        a."embedding_v1"
+    FROM sample_2012 s
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a
+      ON a."publication_number" = s."publication_number"
+)
+SELECT
+    e1."publication_number" AS "pub1",
+    e2."publication_number" AS "pub2",
+    DOT_PRODUCT(e1."embedding_v1", e2."embedding_v1") AS "dot_sim"
+FROM embeds e1
+JOIN embeds e2
+  ON e1."publication_number" <> e2."publication_number"
+LIMIT 20;
+```
+
+```sql
+--Description: For each filing year 2010‑2014, return the single U.S. B2 patent with the most ±30‑day forward citations
+WITH citing_pairs AS (
+    SELECT
+        CAST(f.value AS STRING)            AS "cited_pub",
+        citing."filing_date"               AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+      AND citing."filing_date" IS NOT NULL
+),
+focal AS (
+    SELECT
+        "publication_number",
+        "filing_date",
+        FLOOR("filing_date"/10000) AS "file_year"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "country_code" = 'US'
+      AND "kind_code"   = 'B2'
+      AND "grant_date" BETWEEN 20100101 AND 20141231
+      AND "filing_date" IS NOT NULL
+)
+SELECT
+    focal."file_year",
+    focal."publication_number",
+    COUNT(*) AS "fwd_cites_30d"
+FROM focal
+JOIN citing_pairs
+  ON citing_pairs."cited_pub" = focal."publication_number"
+ WHERE ABS(citing_pairs."citing_file" - focal."filing_date") <= 30
+GROUP BY focal."file_year", focal."publication_number"
+QUALIFY ROW_NUMBER() OVER (PARTITION BY focal."file_year"
+                           ORDER BY COUNT(*) DESC) = 1
+LIMIT 20;
+```
+
+```sql
+--Description: Final query – patent with highest ±30‑day forward citations (2010‑2014, US‑B2) and its most similar same‑year peer
+WITH citing_pairs AS (
+    SELECT
+        CAST(f.value AS STRING)            AS "cited_pub",
+        citing."filing_date"               AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+      AND citing."filing_date" IS NOT NULL
+),
+focal_rank AS (
+    SELECT
+        p."publication_number",
+        p."filing_date",
+        FLOOR(p."filing_date"/10000)                AS "file_year",
+        COUNT(*)                                    AS "fwd_cites_30d"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+    JOIN citing_pairs
+      ON citing_pairs."cited_pub" = p."publication_number"
+     AND ABS(citing_pairs."citing_file" - p."filing_date") <= 30
+    WHERE p."country_code" = 'US'
+      AND p."kind_code"   = 'B2'
+      AND p."grant_date" BETWEEN 20100101 AND 20141231
+      AND p."filing_date" IS NOT NULL
+    GROUP BY p."publication_number", p."filing_date"
+    ORDER BY "fwd_cites_30d" DESC
+    LIMIT 1
+),
+same_year_similarity AS (
+    SELECT
+        p2."publication_number"                          AS "peer_pub",
+        DOT_PRODUCT(a2."embedding_v1", a1."embedding_v1") AS "dot_sim"
+    FROM focal_rank fr
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p2
+      ON FLOOR(p2."filing_date"/10000) = fr."file_year"
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a1
+      ON a1."publication_number" = fr."publication_number"
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB a2
+      ON a2."publication_number" = p2."publication_number"
+    WHERE p2."publication_number" <> fr."publication_number"
+    ORDER BY "dot_sim" DESC
+    LIMIT 1
+)
+SELECT
+    fr."publication_number"        AS "top_cited_B2_patent",
+    fr."fwd_cites_30d",
+    sys."peer_pub"                 AS "most_similar_same_year",
+    sys."dot_sim"
+FROM focal_rank fr
+CROSS JOIN same_year_similarity sys
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 00:49:27 - Thread-51 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description (thinking process embedded):
+-- • Task: inspect how the "citation" column is stored for any record.
+-- • Reasoning: earlier attempts with specific publication numbers returned no rows;
+--              therefore, remove most filters and simply grab the first record whose
+--              "citation" field is not NULL.
+-- • Steps:
+--      1. In a CTE (“first_with_cites”) select one arbitrary record where "citation" IS NOT NULL.
+--      2. FLATTEN that JSON array so each cited publication is a separate row.
+--      3. Show at most 20 cited items for quick structural inspection.
+WITH first_with_cites AS (
+    SELECT 
+        "publication_number",
+        "citation"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "citation" IS NOT NULL
+    LIMIT 1
+)
+SELECT
+    fwc."publication_number",
+    f.value AS "cited_publication"
+FROM first_with_cites fwc,
+     LATERAL FLATTEN(input => fwc."citation") f
+LIMIT 20;
+Results:
+publication_number,cited_publication
+US-3386882-A,"{
+  ""application_number"": """",
+  ""category"": ""SEA"",
+  ""filing_date"": 0,
+  ""npl_text"": ""None"",
+  ""publication_number"": """",
+  ""type"": """"
+}"
+
+[Successfully corrected]
+2025-05-01 00:49:27 - Thread-51 (execute) - INFO - [Try to execute]
+--Description: List 20 citing‑cited pairs for U.S. patents
+SELECT
+    citing."publication_number" AS "citing_pub",
+    CAST(f.value AS STRING)     AS "cited_pub"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+     LATERAL FLATTEN(input => citing."citation") f
+WHERE citing."country_code" = 'US'
+  AND citing."citation" IS NOT NULL
+LIMIT 20
+[Try to execute]
+2025-05-01 00:49:28 - Thread-51 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: List 20 citing‑cited pairs for U.S. patents
+SELECT
+    citing."publication_number" AS "citing_pub",
+    CAST(f.value AS STRING)     AS "cited_pub"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+     LATERAL FLATTEN(input => citing."citation") f
+WHERE citing."country_code" = 'US'
+  AND citing."citation" IS NOT NULL
+LIMIT 20
+Results:
+citing_pub,cited_pub
+US-3713044-A,"{""application_number"":"""",""category"":""SEA"",""filing_date"":0,""npl_text"":""Capelle et al., Tuned Nitrogen Laser Pumped Dye Laser. Applied Optics, Vol. 9, No. 12 (Dec. 1970) pp. 2742 2745."",""publication_number"":"""",""type"":""""}"
+US-3713044-A,"{""application_number"":"""",""category"":""SEA"",""filing_date"":0,""npl_text"":""Sousa et al., A New Tuning Method for Dye Lasers. Rev. Sci. Instr., Vol. 42, No. 11 (Nov. 1971) pp. 1736 and 1737."",""publi
+
+[Successfully executed]
+2025-05-01 00:49:28 - Thread-51 (execute) - INFO - [Try to execute]
+--Description: Compute how many forward citations each U.S. B2 patent (2010‑2014) receives, list top 20
+WITH cited_map AS (
+    SELECT
+        CAST(f.value AS STRING)            AS "cited_pub",
+        COUNT(*)                           AS "forward_cite_cnt"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+    GROUP BY CAST(f.value AS STRING)
+)
+SELECT
+    p."publication_number",
+    cm."forward_cite_cnt"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+LEFT JOIN cited_map cm
+       ON cm."cited_pub" = p."publication_number"
+WHERE p."country_code" = 'US'
+  AND p."kind_code"   = 'B2'
+  AND p."grant_date" BETWEEN 20100101 AND 20141231
+ORDER BY cm."forward_cite_cnt" DESC NULLS LAST
+LIMIT 20
+[Try to execute]
+2025-05-01 00:49:30 - Thread-51 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Compute how many forward citations each U.S. B2 patent (2010‑2014) receives, list top 20
+WITH cited_map AS (
+    SELECT
+        CAST(f.value AS STRING)            AS "cited_pub",
+        COUNT(*)                           AS "forward_cite_cnt"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+    GROUP BY CAST(f.value AS STRING)
+)
+SELECT
+    p."publication_number",
+    cm."forward_cite_cnt"
+FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+LEFT JOIN cited_map cm
+       ON cm."cited_pub" = p."publication_number"
+WHERE p."country_code" = 'US'
+  AND p."kind_code"   = 'B2'
+  AND p."grant_date" BETWEEN 20100101 AND 20141231
+ORDER BY cm."forward_cite_cnt" DESC NULLS LAST
+LIMIT 20
+Results:
+publication_number,forward_cite_cnt
+US-8092398-B2,
+US-8746962-B2,
+US-8743203-B2,
+US-8269143-B2,
+US-8456704-B2,
+US-8558514-B2,
+US-8566236-B2,
+US-7805918-B2,
+US-8263740-B2,
+US-7644492-B2,
+US-8864545-B2,
+US-8333336-B2,
+US-7896161-B2,
+US-8338562-B2,
+US-8442933-B2,
+US-8735738-B2,
+US-8166097-B2,
+US-8645271-B2,
+US-7829693-B2,
+US-8500735-B2,
+
+[Successfully executed]
+2025-05-01 00:49:30 - Thread-51 (execute) - INFO - [Try to execute]
+--Description: Forward citations received within ±30 (numeric) days of filing for each 2010‑2014 U.S. B2 patent
+WITH citing_pairs AS (
+    SELECT
+        citing."publication_number"        AS "citing_pub",
+        CAST(f.value AS STRING)            AS "cited_pub",
+        citing."filing_date"               AS "citing_file"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS citing,
+         LATERAL FLATTEN(input => citing."citation") f
+    WHERE citing."country_code" = 'US'
+      AND citing."citation" IS NOT NULL
+      AND citing."filing_date" IS NOT NULL
+),
+focal AS (
+    SELECT
+        "publication_number",
+        "filing_date"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS
+    WHERE "country_code" = 'US'
+      AND "kind_code"   = 'B2'
+      AND "grant_date" BETWEEN 20100101 AND 20141231
+      AND "filing_date" IS NOT NULL
+)
+SELECT
+    focal."publication_number"                  AS "focal_pub",
+    COUNT(*)                                    AS "fwd_cites_in_30d"
+FROM focal
+JOIN citing_pairs
+  ON citing_pairs."cited_pub" = focal."publication_number"
+ WHERE ABS(citing_pairs."citing_file" - focal."filing_date") <= 30
+GROUP BY focal."publication_number"
+ORDER BY "fwd_cites_in_30d" DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 00:49:32 - Thread-51 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 00:51:43 - Thread-51 (execute) - INFO - [Corrected SQL]
+```sql
+--Description (thinking process embedded):
+-- Goal:  (a) identify the single U.S. B2 patent granted 2010‑2014 that has the
+--        highest overall forward‑citation count, and
+--        (b) within the SAME filing year, find the patent whose abstract/description
+--        embedding is most textually similar to that top‑cited patent, regardless of kind.
+--
+-- Key steps
+-- 1. Build `citing_map`: flatten every U.S. patent’s "citation" array, extract the
+--    JSON field "publication_number" of each cited reference, and count how many times
+--    each publication is cited (forward‑citation frequency).
+-- 2. Limit our candidate set to B2 patents granted 2010‑2014, join to `citing_map`,
+--    and pick the one with the highest forward‑citation count (`top_p`).
+-- 3. Capture its filing year, then look at ALL U.S. patents filed in that year that
+--    have embeddings.  For each, compute the dot product similarity against the
+--    embedding of `top_p`.  Rank descending, keep the most similar (`most_similar`).
+-- 4. Return publication numbers, forward‑citation count, similarity score.
+--
+-- Notes
+-- • DOT_PRODUCT() is assumed to be available in Snowflake for ARRAY<FLOAT> vectors.
+-- • Empty citation JSON objects are ignored by requiring a non‑null "publication_number".
+-- • Forward‑citation count has no time window (all citations up to present).
+WITH citing_map AS (
+    SELECT
+        f.value:"publication_number"::STRING  AS cited_pub,
+        COUNT(*)                              AS fwd_cite_cnt
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."citation") f
+    WHERE p."country_code" = 'US'
+      AND f.value:"publication_number" IS NOT NULL
+      AND f.value:"publication_number"::STRING <> ''
+    GROUP BY f.value:"publication_number"::STRING
+),
+b2_candidates AS (
+    SELECT
+        p."publication_number",
+        p."filing_date",
+        FLOOR(p."filing_date"/10000)      AS file_year,
+        COALESCE(cm.fwd_cite_cnt, 0)      AS fwd_cite_cnt
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+    LEFT JOIN citing_map cm
+           ON cm.cited_pub = p."publication_number"
+    WHERE p."country_code" = 'US'
+      AND p."kind_code"   = 'B2'
+      AND p."grant_date" BETWEEN 20100101 AND 20141231
+),
+top_p AS (       -- patent with max forward citations
+    SELECT *
+    FROM b2_candidates
+    ORDER BY fwd_cite_cnt DESC
+    LIMIT 1
+),
+top_embed AS (
+    SELECT
+        tp."publication_number",
+        tp."fwd_cite_cnt",
+        tp."file_year",
+        ae."embedding_v1"                 AS top_vec
+    FROM top_p tp
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB ae
+          ON ae."publication_number" = tp."publication_number"
+),
+same_year_embeds AS (
+    SELECT
+        p."publication_number",
+        ae."embedding_v1"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB ae
+          ON ae."publication_number" = p."publication_number"
+    JOIN top_embed te
+          ON FLOOR(p."filing_date"/10000) = te."file_year"
+    WHERE p."publication_number" <> te."publication_number"
+      AND p."country_code" = 'US'
+),
+most_similar AS (
+    SELECT
+        te."publication_number"           AS top_cited_patent,
+        te."fwd_cite_cnt",
+        sy."publication_number"           AS similar_patent,
+        DOT_PRODUCT(sy."embedding_v1", te.top_vec) AS similarity
+    FROM top_embed te
+    JOIN same_year_embeds sy
+      ON TRUE
+    ORDER BY similarity DESC
+    LIMIT 1
+)
+SELECT *
+FROM most_similar;
+```
+[Corrected SQL]
+2025-05-01 00:51:43 - Thread-51 (execute) - INFO - [Results for corrected sql]
+000904 (42000): SQL compilation error: error line 34 at position 8
+invalid identifier 'TP."fwd_cite_cnt"'
+[Results for corrected sql]
+2025-05-01 00:53:57 - Thread-51 (execute) - INFO - [Corrected SQL]
+```sql
+--Description (thinking process embedded):
+-- Task:  Find the U.S. B2 patent granted 2010‑2014 that receives the greatest
+--        number of forward citations made by U.S. patents whose filing dates
+--        fall within ±30 (numeric) days of the focal patent’s filing date, then
+--        identify the patent filed in the SAME year (any kind) that is most
+--        text‑similar to the focal patent (via dot‑product of embeddings).
+--
+-- Steps
+-- 1. citing_pairs  – flatten every U.S. patent’s "citation" array, extract the
+--    cited publication number (JSON key "publication_number") and keep its
+--    filing_date.  This yields (cited_pub, citing_file).
+-- 2. focal_b2      – all U.S. patents of kind B2, granted 2010‑2014, with a
+--    non‑null filing_date.
+-- 3. focal_counts  – join citing_pairs to focal_b2 and retain citing events
+--    whose filing_date is within ±30 days of the focal filing_date; count them.
+-- 4. top_p         – select the patent with the maximum of these 30‑day counts.
+-- 5. top_embed     – fetch its embedding vector.
+-- 6. same_year_set – all U.S. patents (any kind) filed in the SAME filing year
+--    and possessing an embedding; exclude the focal patent.
+-- 7. most_similar  – compute dot‑product similarity between each candidate’s
+--    embedding and the focal’s embedding; keep the highest.
+-- 8. Return focal patent number, its 30‑day forward‑citation count, the most
+--    similar same‑year patent number, and their similarity score.
+WITH citing_pairs AS (
+    SELECT
+        f.value:"publication_number"::STRING   AS cited_pub,
+        c."filing_date"                        AS citing_file
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS c,
+         LATERAL FLATTEN(input => c."citation") f
+    WHERE c."country_code" = 'US'
+      AND c."filing_date"  IS NOT NULL
+      AND f.value:"publication_number" IS NOT NULL
+      AND f.value:"publication_number"::STRING <> ''
+),
+focal_b2 AS (
+    SELECT
+        p."publication_number",
+        p."filing_date",
+        FLOOR(p."filing_date"/10000)           AS file_year
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+    WHERE p."country_code" = 'US'
+      AND p."kind_code"   = 'B2'
+      AND p."grant_date" BETWEEN 20100101 AND 20141231
+      AND p."filing_date" IS NOT NULL
+),
+focal_counts AS (
+    SELECT
+        f."publication_number",
+        f."filing_date",
+        f."file_year",
+        COUNT(*) AS fwd_cites_30d
+    FROM focal_b2 f
+    JOIN citing_pairs cp
+      ON cp.cited_pub = f."publication_number"
+     AND ABS(cp.citing_file - f."filing_date") <= 30
+    GROUP BY f."publication_number", f."filing_date", f."file_year"
+),
+top_p AS (
+    SELECT *
+    FROM focal_counts
+    ORDER BY fwd_cites_30d DESC
+    LIMIT 1
+),
+top_embed AS (
+    SELECT
+        tp."publication_number"                AS focal_pub,
+        tp."fwd_cites_30d",
+        tp."file_year",
+        ae."embedding_v1"                      AS focal_vec
+    FROM top_p tp
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB ae
+      ON ae."publication_number" = tp."publication_number"
+),
+same_year_set AS (
+    SELECT
+        p."publication_number",
+        ae."embedding_v1"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB ae
+      ON ae."publication_number" = p."publication_number"
+    JOIN top_embed te
+      ON FLOOR(p."filing_date"/10000) = te."file_year"
+    WHERE p."publication_number" <> te."focal_pub"
+),
+most_similar AS (
+    SELECT
+        te."focal_pub",
+        te."fwd_cites_30d",
+        sys."publication_number"                          AS similar_pub,
+        DOT_PRODUCT(sys."embedding_v1", te.focal_vec)     AS similarity
+    FROM top_embed te
+    JOIN same_year_set sys
+      ON TRUE
+    ORDER BY similarity DESC
+    LIMIT 1
+)
+SELECT *
+FROM most_similar;
+```
+[Corrected SQL]
+2025-05-01 00:53:58 - Thread-51 (execute) - INFO - [Results for corrected sql]
+000904 (42000): SQL compilation error: error line 27 at position 8
+invalid identifier 'F."file_year"'
+[Results for corrected sql]
+2025-05-01 00:56:42 - Thread-51 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Locate the U.S. B2 patent (grant‑year 2010‑2014) that receives the largest
+-- number of forward citations made by other U.S. patents whose filing dates are
+-- within ±30 days of the focal patent’s filing date, then find (via dot‑product
+-- on embeddings) the most text‑similar U.S. patent filed in the same year.
+--
+-- Logical flow (mirrored by CTEs):
+-- 1. citing_pairs   – Flatten every U.S. patent’s “citation” array, extract each
+--    cited publication number (JSON key "publication_number") together with the
+--    citing patent’s filing_date.
+-- 2. focal_b2       – All U.S. B2 patents granted 2010‑2014 with valid filing_date.
+-- 3. counts_30d     – Join citing_pairs to focal_b2 where ABS(citing_file ‑ filing_date)
+--    ≤ 30; count citations for each focal patent.
+-- 4. top_p          – Select the B2 patent with the highest 30‑day citation count.
+-- 5. top_embed      – Fetch its embedding vector.
+-- 6. same_year_vecs – All U.S. patents (any kind) filed in the same filing year
+--    that have embeddings (excluding the focal patent).
+-- 7. most_similar   – Compute DOT_PRODUCT similarity against the focal vector and
+--    keep the highest‑scoring patent.
+WITH citing_pairs AS (
+    SELECT
+        f.value:"publication_number"::STRING  AS cited_pub,
+        p."filing_date"                       AS citing_file
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."citation") f
+    WHERE p."country_code" = 'US'
+      AND p."filing_date" IS NOT NULL
+      AND f.value:"publication_number" IS NOT NULL
+      AND f.value:"publication_number"::STRING <> ''
+),
+focal_b2 AS (
+    SELECT
+        pub."publication_number",
+        pub."filing_date",
+        FLOOR(pub."filing_date" / 10000)      AS file_year
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS pub
+    WHERE pub."country_code" = 'US'
+      AND pub."kind_code"   = 'B2'
+      AND pub."grant_date" BETWEEN 20100101 AND 20141231
+      AND pub."filing_date" IS NOT NULL
+),
+counts_30d AS (
+    SELECT
+        f."publication_number",
+        f."filing_date",
+        f."file_year",
+        COUNT(*)                              AS fwd_cites_30d
+    FROM focal_b2 f
+    JOIN citing_pairs cp
+      ON cp.cited_pub = f."publication_number"
+     AND ABS(cp.citing_file - f."filing_date") <= 30
+    GROUP BY f."publication_number", f."filing_date", f."file_year"
+),
+top_p AS (
+    SELECT *
+    FROM counts_30d
+    ORDER BY fwd_cites_30d DESC
+    LIMIT 1
+),
+top_embed AS (
+    SELECT
+        tp."publication_number"              AS focal_pub,
+        tp."fwd_cites_30d",
+        tp."file_year",
+        emb."embedding_v1"                   AS focal_vec
+    FROM top_p tp
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB emb
+      ON emb."publication_number" = tp."publication_number"
+),
+same_year_vecs AS (
+    SELECT
+        p2."publication_number",
+        emb2."embedding_v1"
+    FROM PATENTS_GOOGLE.PATENTS_GOOGLE.PUBLICATIONS p2
+    JOIN PATENTS_GOOGLE.PATENTS_GOOGLE.ABS_AND_EMB emb2
+      ON emb2."publication_number" = p2."publication_number"
+    JOIN top_embed te
+      ON FLOOR(p2."filing_date" / 10000) = te."file_year"
+    WHERE p2."publication_number" <> te."focal_pub"
+),
+most_similar AS (
+    SELECT
+        te."focal_pub",
+        te."fwd_cites_30d",
+        sv."publication_number"                    AS similar_pub,
+        DOT_PRODUCT(sv."embedding_v1", te.focal_vec) AS similarity
+    FROM top_embed te
+    JOIN same_year_vecs sv
+      ON TRUE
+    ORDER BY similarity DESC
+    LIMIT 1
+)
+SELECT *
+FROM most_similar;
+```
+[Corrected SQL]
+2025-05-01 00:56:42 - Thread-51 (execute) - INFO - [Results for corrected sql]
+000904 (42000): SQL compilation error: error line 27 at position 8
+invalid identifier 'F."file_year"'
+[Results for corrected sql]

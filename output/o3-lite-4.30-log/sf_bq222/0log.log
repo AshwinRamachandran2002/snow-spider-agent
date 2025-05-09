@@ -1,0 +1,2743 @@
+2025-05-01 00:44:09 - Thread-13 (execute) - INFO - [Answer format]
+```csv
+cpc_title,cpc_group,year_with_max_exponential_moving_average
+```
+[Answer format]
+2025-05-01 00:47:01 - Thread-13 (execute) - INFO - [Exploration]
+Relevant columns, their potential usage, and typical conditions
+• PUBLICATIONS."country_code": filter to German patents ➜  WHERE "country_code" = 'DE'  
+• PUBLICATIONS."grant_date": locate patents granted in Dec‑2016 ➜ WHERE "grant_date" BETWEEN 20161201 AND 20161231  
+• PUBLICATIONS."filing_date": extract the filing year of every patent ➜  FLOOR("filing_date"/10000) AS filing_year  
+• PUBLICATIONS."cpc": JSON array that lists CPC symbols for every publication; needs FLATTEN to read individual codes  
+• PUBLICATIONS."publication_number": handy identifier when inspecting data  
+• PUBLICATIONS."family_id": optional, if one wants one record per family  
+• CPC_DEFINITION."symbol": full CPC symbol; join on level‑4 symbol (e.g., ‘A01B’)  
+• CPC_DEFINITION."level": keep only level‑4 groups ➜ WHERE "level" = 4  
+• CPC_DEFINITION."titleFull": the long human‑readable title of the CPC group  
+
+Typical conditions  
+– German patents: "country_code" = 'DE'  
+– Granted in December‑2016: "grant_date" BETWEEN 20161201 AND 20161231  
+– CPC group level‑4: LEFT(cpc_symbol,4) and CPC_DEFINITION."level" = 4  
+
+Below are ten exploratory Snowflake SQL queries (LIMIT 20 each), progressing from simple inspection to the complete analytical query.  
+Every identifier is wrapped in double quotes and comments are provided before each query.
+
+```sql
+--Description: Inspect a handful of German patents that were granted in December‑2016
+SELECT 
+    p."publication_number",
+    p."grant_date",
+    p."filing_date",
+    p."country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Look at the raw CPC JSON column for those same patents
+SELECT 
+    p."publication_number",
+    p."cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Flatten the CPC array to list individual CPC symbols per publication
+SELECT
+    p."publication_number",
+    f.value:"symbol"::STRING AS "cpc_symbol"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Extract distinct level‑4 CPC groups (first 4 characters)
+SELECT DISTINCT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Count patent filings per year for each level‑4 CPC group
+SELECT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+    FLOOR(p."filing_date" / 10000)    AS "filing_year",
+    COUNT(*)                          AS "filings"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+GROUP BY
+    LEFT(f.value:"symbol"::STRING, 4),
+    FLOOR(p."filing_date" / 10000)
+ORDER BY 3 DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Show cumulative average filings per CPC group (first step toward smoothing)
+SELECT
+    t."cpc_group_level4",
+    t."filing_year",
+    t."filings",
+    AVG(t."filings") OVER (PARTITION BY t."cpc_group_level4"
+                           ORDER BY t."filing_year"
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cumulative_avg"
+FROM (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+) t
+ORDER BY t."cpc_group_level4", t."filing_year"
+LIMIT 20;
+```
+
+```sql
+--Description: Compute an exponential moving average (α = 0.1) for each CPC group & year
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+)
+SELECT 
+    s1."cpc_group_level4",
+    s1."filing_year",
+    SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+FROM seq s1
+JOIN seq s2
+  ON s1."cpc_group_level4" = s2."cpc_group_level4"
+ AND s2."rn" <= s1."rn"
+GROUP BY 
+    s1."cpc_group_level4",
+    s1."filing_year",
+    s1."rn"
+ORDER BY s1."cpc_group_level4", s1."filing_year"
+LIMIT 20;
+```
+
+```sql
+--Description: Preview CPC definition records at level 4 (title & symbol)
+SELECT
+    d."symbol"   AS "cpc_group_level4",
+    d."titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION d
+WHERE d."level" = 4
+LIMIT 20;
+```
+
+```sql
+--Description: Combine EMA result with CPC titles; show the best EMA year per CPC group (top 20 groups)
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT 
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4" ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+)
+SELECT
+    d."titleFull",
+    b."cpc_group_level4",
+    b."filing_year" AS "best_year",
+    b."ema_0_1"     AS "highest_ema"
+FROM best_year b
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b."cpc_group_level4"
+WHERE d."level" = 4
+  AND b."rank_ema" = 1
+ORDER BY b."highest_ema" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Same as above but returns only the single CPC group whose EMA is the overall maximum
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT 
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4" ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+),
+global_best AS (
+    SELECT
+        d."titleFull",
+        b."cpc_group_level4",
+        b."filing_year" AS "best_year",
+        b."ema_0_1"     AS "highest_ema",
+        ROW_NUMBER() OVER (ORDER BY b."ema_0_1" DESC) AS "overall_rank"
+    FROM best_year b
+    JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."symbol" = b."cpc_group_level4"
+    WHERE d."level" = 4
+      AND b."rank_ema" = 1
+)
+SELECT
+    "titleFull",
+    "cpc_group_level4",
+    "best_year",
+    "highest_ema"
+FROM global_best
+WHERE "overall_rank" = 1
+LIMIT 20;
+```
+
+These ten queries gradually reveal the data needed and culminate in a reproducible method to obtain, for every CPC technology area (level‑4) found in German patents granted during December 2016, the filing year with the highest exponential moving average (α = 0.1) of patent‑filing activity.
+[Exploration]
+2025-05-01 00:47:01 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Inspect a handful of German patents that were granted in December‑2016
+SELECT 
+    p."publication_number",
+    p."grant_date",
+    p."filing_date",
+    p."country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:02 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Inspect a handful of German patents that were granted in December‑2016
+SELECT 
+    p."publication_number",
+    p."grant_date",
+    p."filing_date",
+    p."country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Results:
+publication_number,grant_date,filing_date,country_code
+DE-102011005349-B4,20161215,20110310,DE
+DE-102012004706-B4,20161222,20120307,DE
+DE-102015114819-B3,20161222,20150904,DE
+DE-112006001900-B4,20161215,20060622,DE
+DE-102013203286-B4,20161222,20130227,DE
+DE-112013006743-B4,20161208,20131227,DE
+DE-102009051197-B4,20161222,20091029,DE
+
+[Successfully executed]
+2025-05-01 00:47:02 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Look at the raw CPC JSON column for those same patents
+SELECT 
+    p."publication_number",
+    p."cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:02 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Look at the raw CPC JSON column for those same patents
+SELECT 
+    p."publication_number",
+    p."cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Results:
+publication_number,cpc
+DE-102015114819-B3,"[
+  {
+    ""code"": ""B64G1/283"",
+    ""first"": true,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""F16C33/66"",
+    ""first"": false,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""F16C33/6603"",
+    ""first"": false,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""B64G1/283"",
+    ""first"": true,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""F16C2326/47"",
+    ""first
+
+[Successfully executed]
+2025-05-01 00:47:02 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Flatten the CPC array to list individual CPC symbols per publication
+SELECT
+    p."publication_number",
+    f.value:"symbol"::STRING AS "cpc_symbol"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:02 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Flatten the CPC array to list individual CPC symbols per publication
+SELECT
+    p."publication_number",
+    f.value:"symbol"::STRING AS "cpc_symbol"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Results:
+publication_number,cpc_symbol
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-102013203286-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+
+[Successfully executed]
+2025-05-01 00:47:02 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Extract distinct level‑4 CPC groups (first 4 characters)
+SELECT DISTINCT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:03 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Extract distinct level‑4 CPC groups (first 4 characters)
+SELECT DISTINCT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Results:
+cpc_group_level4
+""
+
+[Successfully executed]
+2025-05-01 00:47:03 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Count patent filings per year for each level‑4 CPC group
+SELECT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+    FLOOR(p."filing_date" / 10000)    AS "filing_year",
+    COUNT(*)                          AS "filings"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+GROUP BY
+    LEFT(f.value:"symbol"::STRING, 4),
+    FLOOR(p."filing_date" / 10000)
+ORDER BY 3 DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:03 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Count patent filings per year for each level‑4 CPC group
+SELECT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+    FLOOR(p."filing_date" / 10000)    AS "filing_year",
+    COUNT(*)                          AS "filings"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+GROUP BY
+    LEFT(f.value:"symbol"::STRING, 4),
+    FLOOR(p."filing_date" / 10000)
+ORDER BY 3 DESC
+LIMIT 20;
+Results:
+cpc_group_level4,filing_year,filings
+,2011,18
+,2015,12
+,2006,11
+,2013,6
+,2009,6
+,2012,2
+
+[Successfully executed]
+2025-05-01 00:47:03 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Show cumulative average filings per CPC group (first step toward smoothing)
+SELECT
+    t."cpc_group_level4",
+    t."filing_year",
+    t."filings",
+    AVG(t."filings") OVER (PARTITION BY t."cpc_group_level4"
+                           ORDER BY t."filing_year"
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cumulative_avg"
+FROM (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+) t
+ORDER BY t."cpc_group_level4", t."filing_year"
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:04 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Show cumulative average filings per CPC group (first step toward smoothing)
+SELECT
+    t."cpc_group_level4",
+    t."filing_year",
+    t."filings",
+    AVG(t."filings") OVER (PARTITION BY t."cpc_group_level4"
+                           ORDER BY t."filing_year"
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cumulative_avg"
+FROM (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+) t
+ORDER BY t."cpc_group_level4", t."filing_year"
+LIMIT 20;
+Results:
+cpc_group_level4,filing_year,filings,cumulative_avg
+,2006,11,11.000
+,2009,6,8.500
+,2011,18,11.666
+,2012,2,9.250
+,2013,6,8.600
+,2015,12,9.166
+
+[Successfully executed]
+2025-05-01 00:47:04 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Compute an exponential moving average (α = 0.1) for each CPC group & year
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+)
+SELECT 
+    s1."cpc_group_level4",
+    s1."filing_year",
+    SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+FROM seq s1
+JOIN seq s2
+  ON s1."cpc_group_level4" = s2."cpc_group_level4"
+ AND s2."rn" <= s1."rn"
+GROUP BY 
+    s1."cpc_group_level4",
+    s1."filing_year",
+    s1."rn"
+ORDER BY s1."cpc_group_level4", s1."filing_year"
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:47:04 - Thread-13 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 00:48:52 - Thread-13 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- We discovered that the CPC JSON objects store the key "code", not "symbol", so the previous
+-- joins returned NULL.  To verify the data pipeline step‑by‑step, the query below:
+--   • Flattens the "cpc" array, extracts f.value:"code" and truncates it to four characters
+--     to obtain the level‑4 CPC group (e.g. “F16C”).
+--   • Filters to German patents (country_code = 'DE') granted in December 2016.
+--   • Simply counts how many times each level‑4 CPC group appears in this subset.
+--   • ORDER BY count DESC so we can quickly validate that we now receive non‑empty CPC groups.
+-- This “sanity‑check” query is a simpler prerequisite before re‑running the full EMA logic.
+SELECT
+    LEFT(f.value:"code"::STRING, 4)          AS "cpc_group_level4",
+    COUNT(*)                                 AS "patent_count"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+  AND f.value:"code" IS NOT NULL
+GROUP BY
+    LEFT(f.value:"code"::STRING, 4)
+ORDER BY
+    "patent_count" DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 00:48:53 - Thread-13 (execute) - INFO - [Results for corrected sql]
+cpc_group_level4,patent_count
+H03H,16
+B22F,8
+B64G,6
+F16C,6
+H04N,5
+Y10S,2
+C21B,2
+H04B,2
+F16K,2
+F27D,1
+F27B,1
+B82Y,1
+B60R,1
+G03G,1
+C22B,1
+
+[Results for corrected sql]
+2025-05-01 00:49:48 - Thread-13 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Preview CPC definition records at level‑4 (title & symbol) – no change needed
+SELECT
+    d."symbol"    AS "cpc_group_level4",
+    d."titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION d
+WHERE d."level" = 4
+LIMIT 20;
+```
+
+```sql
+--Description: Combine EMA result with CPC titles; show the best EMA year per CPC group (top‑20 groups)
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"code"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)  AS "filing_year",
+        COUNT(*)                        AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4"
+                           ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4"
+                           ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+)
+SELECT
+    d."titleFull",
+    b."cpc_group_level4",
+    b."filing_year" AS "best_year",
+    b."ema_0_1"     AS "highest_ema"
+FROM best_year b
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b."cpc_group_level4"
+WHERE d."level" = 4
+  AND b."rank_ema" = 1
+ORDER BY b."highest_ema" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Same logic, but return only the single CPC group whose EMA is the overall maximum
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"code"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)  AS "filing_year",
+        COUNT(*)                        AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4"
+                           ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4"
+                           ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+),
+global_best AS (
+    SELECT
+        d."titleFull",
+        b."cpc_group_level4",
+        b."filing_year" AS "best_year",
+        b."ema_0_1"     AS "highest_ema",
+        ROW_NUMBER() OVER (ORDER BY b."ema_0_1" DESC) AS "overall_rank"
+    FROM best_year b
+    JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."symbol" = b."cpc_group_level4"
+    WHERE d."level" = 4
+      AND b."rank_ema" = 1
+)
+SELECT
+    "titleFull",
+    "cpc_group_level4",
+    "best_year",
+    "highest_ema"
+FROM global_best
+WHERE "overall_rank" = 1
+LIMIT 1;
+```
+[Corrected other sqls]
+2025-05-01 00:49:48 - Thread-13 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+-- We discovered that the CPC JSON objects store the key "code", not "symbol", so the previous
+-- joins returned NULL.  To verify the data pipeline step‑by‑step, the query below:
+--   • Flattens the "cpc" array, extracts f.value:"code" and truncates it to four characters
+--     to obtain the level‑4 CPC group (e.g. “F16C”).
+--   • Filters to German patents (country_code = 'DE') granted in December 2016.
+--   • Simply counts how many times each level‑4 CPC group appears in this subset.
+--   • ORDER BY count DESC so we can quickly validate that we now receive non‑empty CPC groups.
+-- This “sanity‑check” query is a simpler prerequisite before re‑running the full EMA logic.
+SELECT
+    LEFT(f.value:"code"::STRING, 4)          AS "cpc_group_level4",
+    COUNT(*)                                 AS "patent_count"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+  AND f.value:"code" IS NOT NULL
+GROUP BY
+    LEFT(f.value:"code"::STRING, 4)
+ORDER BY
+    "patent_count" DESC
+LIMIT 20;
+Results:
+cpc_group_level4,patent_count
+H03H,16
+B22F,8
+B64G,6
+F16C,6
+H04N,5
+Y10S,2
+C21B,2
+H04B,2
+F16K,2
+F27D,1
+F27B,1
+B82Y,1
+B60R,1
+G03G,1
+C22B,1
+
+[Successfully corrected]
+2025-05-01 00:49:48 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Preview CPC definition records at level‑4 (title & symbol) – no change needed
+SELECT
+    d."symbol"    AS "cpc_group_level4",
+    d."titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION d
+WHERE d."level" = 4
+LIMIT 20
+[Try to execute]
+2025-05-01 00:49:48 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Preview CPC definition records at level‑4 (title & symbol) – no change needed
+SELECT
+    d."symbol"    AS "cpc_group_level4",
+    d."titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION d
+WHERE d."level" = 4
+LIMIT 20
+Results:
+cpc_group_level4,titleFull
+A45,HAND OR TRAVELLING ARTICLES
+A24,TOBACCO; CIGARS; CIGARETTES; SIMULATED SMOKING DEVICES; SMOKERS' REQUISITES
+A61,MEDICAL OR VETERINARY SCIENCE; HYGIENE
+A63,SPORTS; GAMES; AMUSEMENTS
+A22,BUTCHERING; MEAT TREATMENT; PROCESSING POULTRY OR FISH
+A42,HEADWEAR
+A99,SUBJECT MATTER NOT OTHERWISE PROVIDED FOR IN THIS SECTION
+A43,FOOTWEAR
+A01,AGRICULTURE; FORESTRY; ANIMAL HUSBANDRY; HUNTING; TRAPPING; FISHING
+A62,LIFE-SAVING; FIRE-FIGHTING
+A23,"FOODS OR FOODSTUFFS; T
+
+[Successfully executed]
+2025-05-01 00:49:48 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: Combine EMA result with CPC titles; show the best EMA year per CPC group (top‑20 groups)
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"code"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)  AS "filing_year",
+        COUNT(*)                        AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4"
+                           ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4"
+                           ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+)
+SELECT
+    d."titleFull",
+    b."cpc_group_level4",
+    b."filing_year" AS "best_year",
+    b."ema_0_1"     AS "highest_ema"
+FROM best_year b
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b."cpc_group_level4"
+WHERE d."level" = 4
+  AND b."rank_ema" = 1
+ORDER BY b."highest_ema" DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 00:49:49 - Thread-13 (execute) - INFO - [Error occurred]
+000904 (42000): SQL compilation error: error line 53 at position 9
+invalid identifier 'B."highest_ema"'
+[Error occurred]
+2025-05-01 00:51:46 - Thread-13 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Compute, for every CPC level‑4 technology area appearing in German patents granted
+-- during December 2016, the filing‑year in which that group reaches its highest
+-- exponential moving average (EMA, α = 0.1) of annual filings.  Then attach the
+-- full CPC title and list the top‑20 groups by their peak EMA.
+-- Key implementation notes
+--  • Flatten PUBLICATIONS."cpc" and read f.value:"code" (the CPC symbol), take its
+--    first 4 characters to obtain the level‑4 group (e.g., “H03H”).
+--  • Aggregate filings per (group, year) and use row numbers to calculate the EMA.
+--  • Pick the year with the maximum EMA for each group.
+--  • Join to CPC_DEFINITION for the human‑readable title.
+--  • ORDER BY the peak EMA (b.ema_0_1) descending; LIMIT 20 for brevity.
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)        AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)         AS "filing_year",
+        COUNT(*)                               AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4"
+                           ORDER BY f."filing_year") AS rn
+    FROM filings f
+),
+ema AS (
+    SELECT
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1.rn
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4"
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+)
+SELECT
+    d."titleFull",
+    b."cpc_group_level4",
+    b."filing_year" AS "best_year",
+    b.ema_0_1       AS "highest_ema"
+FROM best_year b
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b."cpc_group_level4"
+WHERE d."level" = 4
+  AND b.rank_ema = 1
+ORDER BY
+    b.ema_0_1 DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 00:51:49 - Thread-13 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-01 00:54:46 - Thread-13 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Objective: for German patents granted in December 2016, find each CPC level‑4 group’s
+-- filing‑year with the highest exponential moving average (EMA, α = 0.1) of annual
+-- patent filings, and attach any available CPC title.  
+-- Why this should return data now:
+--   • Uses f.value:"code" (correct key) → derive 4‑character group.
+--   • No restrictive filter on CPC_DEFINITION."level"; we LEFT JOIN so missing titles
+--     won’t discard rows.  
+-- Steps
+-- 1. filings  – count filings per (group, year).  
+-- 2. seq      – add chronological index per group.  
+-- 3. ema      – compute EMA with α = 0.1.  
+-- 4. best_year– keep the year with the peak EMA for each group.  
+-- 5. Final SELECT lists top‑20 groups by that peak EMA, with titles when available.
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)       AS cpc_group,
+        FLOOR(p."filing_date" / 10000)        AS filing_year,
+        COUNT(*)                              AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN( INPUT => p."cpc" ) f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM( s2.filings * POWER(0.9, s1.rn - s2.rn) ) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group, s1.filing_year, s1.rn
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+)
+SELECT
+    COALESCE(d."titleFull", 'N/A')            AS cpc_title,
+    b.cpc_group                               AS cpc_group_level4,
+    b.filing_year                             AS best_year,
+    b.ema_0_1                                 AS highest_ema
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+       ON d."symbol" = b.cpc_group
+WHERE b.rank_ema = 1
+ORDER BY
+    highest_ema DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 00:54:47 - Thread-13 (execute) - INFO - [Results for corrected sql]
+CPC_TITLE,CPC_GROUP_LEVEL4,BEST_YEAR,HIGHEST_EMA
+"IMPEDANCE NETWORKS, e.g. RESONANT CIRCUITS; RESONATORS",H03H,2011,1.6
+WORKING METALLIC POWDER; MANUFACTURE OF ARTICLES FROM METALLIC POWDER; MAKING METALLIC POWDER; APPARATUS OR DEVICES SPECIALLY ADAPTED FOR METALLIC POWDER,B22F,2006,0.8
+COSMONAUTICS; VEHICLES OR EQUIPMENT THEREFOR,B64G,2015,0.6000000000000001
+SHAFTS; FLEXIBLE SHAFTS; ELEMENTS OR CRANKSHAFT MECHANISMS; ROTARY BODIES OTHER THAN GEARING ELEMENTS; BEARINGS,F16C,2015,0.6000000000
+
+[Results for corrected sql]
+2025-05-01 00:55:22 - Thread-13 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 
+-- Return the single CPC level‑4 group whose exponential moving average (α = 0.1) of
+-- annual filings is the highest among German patents granted in December 2016, plus
+-- its “best” filing year and CPC title (if available).  Uses f.value:"code", LEFT JOIN
+-- to CPC_DEFINITION (no filter on d."level") so absence of a title will not drop rows.
+WITH filings AS (                                   -- annual counts per group
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)  AS cpc_group,
+        FLOOR(p."filing_date" / 10000)   AS filing_year,
+        COUNT(*)                         AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                             -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                             -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group, s1.filing_year, s1.rn
+),
+best_year AS (                                       -- peak EMA per group
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+),
+global_best AS (                                     -- overall maximum
+    SELECT
+        COALESCE(d."titleFull", 'N/A')  AS cpc_title,
+        b.cpc_group                     AS cpc_group_level4,
+        b.filing_year                   AS best_year,
+        b.ema_0_1                       AS highest_ema,
+        ROW_NUMBER() OVER (ORDER BY b.ema_0_1 DESC) AS overall_rank
+    FROM best_year b
+    LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+           ON d."symbol" = b.cpc_group
+    WHERE b.rank_ema = 1
+)
+SELECT
+    cpc_title,
+    cpc_group_level4,
+    best_year,
+    highest_ema
+FROM global_best
+WHERE overall_rank = 1
+LIMIT 1;
+```
+[Corrected other sqls]
+2025-05-01 00:55:22 - Thread-13 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+-- Objective: for German patents granted in December 2016, find each CPC level‑4 group’s
+-- filing‑year with the highest exponential moving average (EMA, α = 0.1) of annual
+-- patent filings, and attach any available CPC title.  
+-- Why this should return data now:
+--   • Uses f.value:"code" (correct key) → derive 4‑character group.
+--   • No restrictive filter on CPC_DEFINITION."level"; we LEFT JOIN so missing titles
+--     won’t discard rows.  
+-- Steps
+-- 1. filings  – count filings per (group, year).  
+-- 2. seq      – add chronological index per group.  
+-- 3. ema      – compute EMA with α = 0.1.  
+-- 4. best_year– keep the year with the peak EMA for each group.  
+-- 5. Final SELECT lists top‑20 groups by that peak EMA, with titles when available.
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)       AS cpc_group,
+        FLOOR(p."filing_date" / 10000)        AS filing_year,
+        COUNT(*)                              AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN( INPUT => p."cpc" ) f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM( s2.filings * POWER(0.9, s1.rn - s2.rn) ) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group, s1.filing_year, s1.rn
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+)
+SELECT
+    COALESCE(d."titleFull", 'N/A')            AS cpc_title,
+    b.cpc_group                               AS cpc_group_level4,
+    b.filing_year                             AS best_year,
+    b.ema_0_1                                 AS highest_ema
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+       ON d."symbol" = b.cpc_group
+WHERE b.rank_ema = 1
+ORDER BY
+    highest_ema DESC
+LIMIT 20;
+Results:
+CPC_TITLE,CPC_GROUP_LEVEL4,BEST_YEAR,HIGHEST_EMA
+"IMPEDANCE NETWORKS, e.g. RESONANT CIRCUITS; RESONATORS",H03H,2011,1.6
+WORKING METALLIC POWDER; MANUFACTURE OF ARTICLES FROM METALLIC POWDER; MAKING METALLIC POWDER; APPARATUS OR DEVICES SPECIALLY ADAPTED FOR METALLIC POWDER,B22F,2006,0.8
+COSMONAUTICS; VEHICLES OR EQUIPMENT THEREFOR,B64G,2015,0.6000000000000001
+SHAFTS; FLEXIBLE SHAFTS; ELEMENTS OR CRANKSHAFT MECHANISMS; ROTARY BODIES OTHER THAN GEARING ELEMENTS; BEARINGS,F16C,2015,0.6000000000
+
+[Successfully corrected]
+2025-05-01 00:55:22 - Thread-13 (execute) - INFO - [Try to execute]
+--Description: 
+-- Return the single CPC level‑4 group whose exponential moving average (α = 0.1) of
+-- annual filings is the highest among German patents granted in December 2016, plus
+-- its “best” filing year and CPC title (if available).  Uses f.value:"code", LEFT JOIN
+-- to CPC_DEFINITION (no filter on d."level") so absence of a title will not drop rows.
+WITH filings AS (                                   -- annual counts per group
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)  AS cpc_group,
+        FLOOR(p."filing_date" / 10000)   AS filing_year,
+        COUNT(*)                         AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                             -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                             -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group, s1.filing_year, s1.rn
+),
+best_year AS (                                       -- peak EMA per group
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+),
+global_best AS (                                     -- overall maximum
+    SELECT
+        COALESCE(d."titleFull", 'N/A')  AS cpc_title,
+        b.cpc_group                     AS cpc_group_level4,
+        b.filing_year                   AS best_year,
+        b.ema_0_1                       AS highest_ema,
+        ROW_NUMBER() OVER (ORDER BY b.ema_0_1 DESC) AS overall_rank
+    FROM best_year b
+    LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+           ON d."symbol" = b.cpc_group
+    WHERE b.rank_ema = 1
+)
+SELECT
+    cpc_title,
+    cpc_group_level4,
+    best_year,
+    highest_ema
+FROM global_best
+WHERE overall_rank = 1
+LIMIT 1
+[Try to execute]
+2025-05-01 00:55:43 - Thread-13 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 
+-- Return the single CPC level‑4 group whose exponential moving average (α = 0.1) of
+-- annual filings is the highest among German patents granted in December 2016, plus
+-- its “best” filing year and CPC title (if available).  Uses f.value:"code", LEFT JOIN
+-- to CPC_DEFINITION (no filter on d."level") so absence of a title will not drop rows.
+WITH filings AS (                                   -- annual counts per group
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)  AS cpc_group,
+        FLOOR(p."filing_date" / 10000)   AS filing_year,
+        COUNT(*)                         AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                             -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                             -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group, s1.filing_year, s1.rn
+),
+best_year AS (                                       -- peak EMA per group
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+),
+global_best AS (                                     -- overall maximum
+    SELECT
+        COALESCE(d."titleFull", 'N/A')  AS cpc_title,
+        b.cpc_group                     AS cpc_group_level4,
+        b.filing_year                   AS best_year,
+        b.ema_0_1                       AS highest_ema,
+        ROW_NUMBER() OVER (ORDER BY b.ema_0_1 DESC) AS overall_rank
+    FROM best_year b
+    LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+           ON d."symbol" = b.cpc_group
+    WHERE b.rank_ema = 1
+)
+SELECT
+    cpc_title,
+    cpc_group_level4,
+    best_year,
+    highest_ema
+FROM global_best
+WHERE overall_rank = 1
+LIMIT 1
+Results:
+CPC_TITLE,CPC_GROUP_LEVEL4,BEST_YEAR,HIGHEST_EMA
+"IMPEDANCE NETWORKS, e.g. RESONANT CIRCUITS; RESONATORS",H03H,2011,1.6
+
+[Successfully executed]
+2025-05-01 00:55:43 - Thread-13 (execute) - INFO - itercount: 0
+2025-05-01 00:55:43 - Thread-13 (execute) - INFO - [Self-refine]
+Table full name: PATENTS.PATENTS.DISCLOSURES_13
+Column name: serial_cleaned Type: TEXT Description: None
+Column name: sso Type: TEXT Description: None
+Column name: disclosure_event Type: TEXT Description: None
+Column name: reciprocity Type: TEXT Description: None
+Column name: patent_owner_harmonized Type: TEXT Description: None
+Column name: record_id Type: TEXT Description: None
+Column name: family_id Type: TEXT Description: None
+Column name: blanket_scope Type: TEXT Description: None
+Column name: copyright Type: TEXT Description: None
+Column name: standard Type: TEXT Description: None
+Column name: licensing_commitment Type: TEXT Description: None
+Column name: committee_project Type: TEXT Description: None
+Column name: sc_name Type: TEXT Description: None
+Column name: blanket_type Type: TEXT Description: None
+Column name: pub_cleaned Type: TEXT Description: None
+Column name: third_party Type: TEXT Description: None
+Column name: wg_name Type: TEXT Description: None
+Column name: patent_owner_unharmonized Type: TEXT Description: None
+Column name: tc_name Type: TEXT Description: None
+Column name: date Type: NUMBER Description: None
+Sample rows:
+[{'family_id': '22549751', 'record_id': 'REC00002', 'disclosure_event': 'DE0001', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19751124, 'standard': 'X3.55;X3.56', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3692255'}, {'family_id': '23170520', 'record_id': 'REC00001', 'disclosure_event': 'DE0001', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19751124, 'standard': 'X3.55;X3.56', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3861619'}, {'family_id': '23170520', 'record_id': 'REC00006', 'disclosure_event': 'DE0
+
+
+--------------------------------------------------
+Table full name: PATENTS.PATENTS.PUBLICATIONS
+Column name: examiner Type: VARIANT Description: Is this text truncated?
+Column name: fterm Type: VARIANT Description: For US publications only, the description in HTML, limited to the first 9 megabytes
+Column name: application_number_formatted Type: TEXT Description: Application number, formatted to the patent office format where possible.
+Column name: application_number Type: TEXT Description: Patent application number (DOCDB compatible), eg: 'US-87124404-A'. This may not always be set.
+Column name: grant_date Type: NUMBER Description: For US publications only, the claims in plain text
+Column name: cpc Type: VARIANT Description: Two-letter language code for this text
+Column name: locarno Type: VARIANT Description: Localized text
+Column name: description_localized_html Type: VARIANT Description: Localized text
+Column name: publication_date Type: NUMBER Description: Two-letter language code for this text
+Column name: kind_code Type: TEXT Description: Kind code, indicating application, grant, search report, correction, etc. These are different for each country.
+Column name: spif_publication_number Type: TEXT Description: SPIF standard (spif.group) publication number, after 2000
+Column name: ipc Type: VARIANT Description: Localized text
+Column name: pct_number Type: TEXT Description: PCT number for this application if it was part of a PCT filing, eg: 'PCT/EP2008/062623'.
+Column name: entity_status Type: TEXT Description: The filing date.
+Column name: filing_date Type: NUMBER Description: Is this text truncated?
+Column name: abstract_localized Type: VARIANT Description: Localized text
+Column name: description_localized Type: VARIANT Description: The publication abstracts in different languages
+Column name: assignee Type: VARIANT Description: Localized text
+Column name: citation Type: VARIANT Description: Two-letter language code for this text
+Column name: fi Type: VARIANT Description: Is this text truncated?
+Column name: claims_localized_html Type: VARIANT Description: Is this text truncated?
+Column name: inventor_harmonized Type: VARIANT Description: For US publications only, the claims in HTML
+Column name: inventor Type: VARIANT Description: Is this text truncated?
+Column name: claims_localized Type: VARIANT Description: Two-letter language code for this text
+Column name: priority_date Type: NUMBER Description: Localized text
+Column name: application_kind Type: TEXT Description: High-level kind of the application: A=patent; U=utility; P=provision; W= PCT; F=design; T=translation.
+Column name: priority_claim Type: VARIANT Description: Two-letter language code for this text
+Column name: assignee_harmonized Type: VARIANT Description: Two-letter language code for this text
+Column name: title_localized Type: VARIANT Description: The publication titles in different languages
+Column name: art_unit Type: TEXT Description: The grant date, or 0 if not granted.
+Column name: child Type: VARIANT Description: The publication date.
+Column name: family_id Type: TEXT Description: Family ID (simple family). Grouping on family ID will return all publications associated with a simple patent family (all publications share the same priority claims).
+Column name: spif_application_number Type: TEXT Description: SPIF standard (spif.group) application number, after 2000
+Column name: uspc Type: VARIANT Description: For US publications only, the description in plain text, limited to the first 9 megabytes
+Column name: publication_number Type: TEXT Description: Patent publication number (DOCDB compatible), eg: 'US-7650331-B1'
+Column name: country_code Type: TEXT Description: Country code, eg: 'US', 'EP', etc
+Column name: parent Type: VARIANT Description: Is this text truncated?
+Sample rows:
+[{'publication_number': 'DE-69611147-T2', 'application_number': 'DE-69611147-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996611147', 'pct_number': '', 'family_id': '9483724', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Schloss vom Typ eines entkuppelbaren Rotors",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20010621, 'filing_date': 19961015, 'grant_date': 20010621, 'priority_date': 19951018, 'priority_claim': '[\n  {\n    "application_number": "FR-9512326-A",\n    "category": "",\n    "filing_date": 19951018,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "MENAGER, CHRISTOPHE",\n  "CANARD, LOUIS",\n  "CADOUOT, PATRICK",\n  "GOURDIN, DOMI
+
+
+--------------------------------------------------
+Table full name: PATENTS.PATENTS.CPC_DEFINITION
+Column name: status Type: TEXT Description: None
+Column name: precedenceLimitingReferences Type: VARIANT Description: None
+Column name: rules Type: VARIANT Description: None
+Column name: childGroups Type: VARIANT Description: None
+Column name: scopeLimitingReferences Type: VARIANT Description: None
+Column name: level Type: FLOAT Description: None
+Column name: titlePart Type: VARIANT Description: None
+Column name: residualReferences Type: VARIANT Description: None
+Column name: definition Type: VARIANT Description: None
+Column name: breakdownCode Type: BOOLEAN Description: None
+Column name: limitingReferences Type: VARIANT Description: None
+Column name: glossary Type: VARIANT Description: None
+Column name: applicationReferences Type: VARIANT Description: None
+Column name: notAllocatable Type: BOOLEAN Description: None
+Column name: titleFull Type: TEXT Description: None
+Column name: dateRevised Type: FLOAT Description: None
+Column name: informativeReferences Type: VARIANT Description: None
+Column name: symbol Type: TEXT Description: None
+Column name: synonyms Type: VARIANT Description: None
+Column name: children Type: VARIANT Description: None
+Column name: parents Type: VARIANT Description: None
+Column name: ipcConcordant Type: TEXT Description: None
+Sample rows:
+[{'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/108', 'synonyms': '[]', 'titleFull': 'Swine', 'titlePart': '[\n  "Swine"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferenc
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+### Document: Sliding Window Calculation for Weighted Moving Average
+
+#### 1. **Overview**
+In the SQL query, the **Weighted Moving Average (WMA)** method is applied to smooth the annual patent filing counts for each CPC technology area and identify the "best year" for each CPC group. This sliding window calculation is used to highlight years with significant patent filing activity by giving more weight to recent years while considering past data.
+
+The goal of this method is to reduce the impact of short-term fluctuations and better capture long-term trends in patent filing activities, particularly in fast-evolving technology areas.
+
+#### 2. **Weighted Moving Average (WMA) Calculation**
+
+##### 2.1 **Definition**
+Weighted Moving Average (WMA) is a method where each data point is given a different weight, with more recent data points typically receiving higher weights. This approach is useful for identifying trends over time while minimizing the effect of older data that might not be as relevant.
+
+##### 2.2 **Formula**
+The formula for calculating the Weighted Moving Average is as follows:
+
+\[
+WMA_t = \alpha \cdot x_t + (1 - \alpha) \cdot WMA_{t-1}
+\]
+
+Where:
+- \(WMA_t\): The weighted moving average for the current year (t).
+- \(x_t\): The patent filing count for the current year.
+- \(WMA_{t-1}\): The weighted moving average for the previous year.
+- \(\alpha\): The smoothing factor (in this case, 0.1).
+
+##### 2.3 **Explanation**
+- **Smoothing Factor (\(\alpha\))**: The smoothing factor determines how much weight is given to the most recent data point. In this case, the smoothing factor is 0.1, meaning 10% of the weight is assigned to the current year's filing count, and the remaining 90% is based on the previous year’s moving average.
+- **Sliding Window**: As we move through the years, the weighted average continuously updates using the most recent filing count and the previous year's weighted average. This creates a "sliding window" where each year's filing count is incorporated into the calculation.
+
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'PATENTS': {'PATENTS': ['DISCLOSURES_13', 'PUBLICATIONS', 'CPC_DEFINITION']}}
+Begin Exploring Related Columns
+Relevant columns, their potential usage, and typical conditions
+• PUBLICATIONS."country_code": filter to German patents ➜  WHERE "country_code" = 'DE'  
+• PUBLICATIONS."grant_date": locate patents granted in Dec‑2016 ➜ WHERE "grant_date" BETWEEN 20161201 AND 20161231  
+• PUBLICATIONS."filing_date": extract the filing year of every patent ➜  FLOOR("filing_date"/10000) AS filing_year  
+• PUBLICATIONS."cpc": JSON array that lists CPC symbols for every publication; needs FLATTEN to read individual codes  
+• PUBLICATIONS."publication_number": handy identifier when inspecting data  
+• PUBLICATIONS."family_id": optional, if one wants one record per family  
+• CPC_DEFINITION."symbol": full CPC symbol; join on level‑4 symbol (e.g., ‘A01B’)  
+• CPC_DEFINITION."level": keep only level‑4 groups ➜ WHERE "level" = 4  
+• CPC_DEFINITION."titleFull": the long human‑readable title of the CPC group  
+
+Typical conditions  
+– German patents: "country_code" = 'DE'  
+– Granted in December‑2016: "grant_date" BETWEEN 20161201 AND 20161231  
+– CPC group level‑4: LEFT(cpc_symbol,4) and CPC_DEFINITION."level" = 4  
+
+Below are ten exploratory Snowflake SQL queries (LIMIT 20 each), progressing from simple inspection to the complete analytical query.  
+Every identifier is wrapped in double quotes and comments are provided before each query.
+
+```sql
+--Description: Inspect a handful of German patents that were granted in December‑2016
+SELECT 
+    p."publication_number",
+    p."grant_date",
+    p."filing_date",
+    p."country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Look at the raw CPC JSON column for those same patents
+SELECT 
+    p."publication_number",
+    p."cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Flatten the CPC array to list individual CPC symbols per publication
+SELECT
+    p."publication_number",
+    f.value:"symbol"::STRING AS "cpc_symbol"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Extract distinct level‑4 CPC groups (first 4 characters)
+SELECT DISTINCT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: Count patent filings per year for each level‑4 CPC group
+SELECT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+    FLOOR(p."filing_date" / 10000)    AS "filing_year",
+    COUNT(*)                          AS "filings"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+GROUP BY
+    LEFT(f.value:"symbol"::STRING, 4),
+    FLOOR(p."filing_date" / 10000)
+ORDER BY 3 DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Show cumulative average filings per CPC group (first step toward smoothing)
+SELECT
+    t."cpc_group_level4",
+    t."filing_year",
+    t."filings",
+    AVG(t."filings") OVER (PARTITION BY t."cpc_group_level4"
+                           ORDER BY t."filing_year"
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cumulative_avg"
+FROM (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+) t
+ORDER BY t."cpc_group_level4", t."filing_year"
+LIMIT 20;
+```
+
+```sql
+--Description: Compute an exponential moving average (α = 0.1) for each CPC group & year
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+)
+SELECT 
+    s1."cpc_group_level4",
+    s1."filing_year",
+    SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+FROM seq s1
+JOIN seq s2
+  ON s1."cpc_group_level4" = s2."cpc_group_level4"
+ AND s2."rn" <= s1."rn"
+GROUP BY 
+    s1."cpc_group_level4",
+    s1."filing_year",
+    s1."rn"
+ORDER BY s1."cpc_group_level4", s1."filing_year"
+LIMIT 20;
+```
+
+```sql
+--Description: Preview CPC definition records at level 4 (title & symbol)
+SELECT
+    d."symbol"   AS "cpc_group_level4",
+    d."titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION d
+WHERE d."level" = 4
+LIMIT 20;
+```
+
+```sql
+--Description: Combine EMA result with CPC titles; show the best EMA year per CPC group (top 20 groups)
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT 
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4" ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+)
+SELECT
+    d."titleFull",
+    b."cpc_group_level4",
+    b."filing_year" AS "best_year",
+    b."ema_0_1"     AS "highest_ema"
+FROM best_year b
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b."cpc_group_level4"
+WHERE d."level" = 4
+  AND b."rank_ema" = 1
+ORDER BY b."highest_ema" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Same as above but returns only the single CPC group whose EMA is the overall maximum
+WITH filings AS (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f."cpc_group_level4" ORDER BY f."filing_year") AS "rn"
+    FROM filings f
+),
+ema AS (
+    SELECT 
+        s1."cpc_group_level4",
+        s1."filing_year",
+        SUM(s2."filings" * POWER(0.9, s1."rn" - s2."rn")) * 0.1 AS "ema_0_1"
+    FROM seq s1
+    JOIN seq s2
+      ON s1."cpc_group_level4" = s2."cpc_group_level4"
+     AND s2."rn" <= s1."rn"
+    GROUP BY
+        s1."cpc_group_level4",
+        s1."filing_year",
+        s1."rn"
+),
+best_year AS (
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e."cpc_group_level4" ORDER BY e."ema_0_1" DESC) AS "rank_ema"
+    FROM ema e
+),
+global_best AS (
+    SELECT
+        d."titleFull",
+        b."cpc_group_level4",
+        b."filing_year" AS "best_year",
+        b."ema_0_1"     AS "highest_ema",
+        ROW_NUMBER() OVER (ORDER BY b."ema_0_1" DESC) AS "overall_rank"
+    FROM best_year b
+    JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."symbol" = b."cpc_group_level4"
+    WHERE d."level" = 4
+      AND b."rank_ema" = 1
+)
+SELECT
+    "titleFull",
+    "cpc_group_level4",
+    "best_year",
+    "highest_ema"
+FROM global_best
+WHERE "overall_rank" = 1
+LIMIT 20;
+```
+
+These ten queries gradually reveal the data needed and culminate in a reproducible method to obtain, for every CPC technology area (level‑4) found in German patents granted during December 2016, the filing year with the highest exponential moving average (α = 0.1) of patent‑filing activity.
+Refined SQLs and results:
+Query:
+--Description: Inspect a handful of German patents that were granted in December‑2016
+SELECT 
+    p."publication_number",
+    p."grant_date",
+    p."filing_date",
+    p."country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Answer:
+publication_number,grant_date,filing_date,country_code
+DE-102011005349-B4,20161215,20110310,DE
+DE-102012004706-B4,20161222,20120307,DE
+DE-102015114819-B3,20161222,20150904,DE
+DE-112006001900-B4,20161215,20060622,DE
+DE-102013203286-B4,20161222,20130227,DE
+DE-112013006743-B4,20161208,20131227,DE
+DE-102009051197-B4,20161222,20091029,DE
+Query:
+--Description: Look at the raw CPC JSON column for those same patents
+SELECT 
+    p."publication_number",
+    p."cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Answer:
+publication_number,cpc
+DE-102015114819-B3,"[
+  {
+    ""code"": ""B64G1/283"",
+    ""first"": true,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""F16C33/66"",
+    ""first"": false,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""F16C33/6603"",
+    ""first"": false,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""B64G1/283"",
+    ""first"": true,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""F16C2326/47"",
+    ""first
+Query:
+--Description: Flatten the CPC array to list individual CPC symbols per publication
+SELECT
+    p."publication_number",
+    f.value:"symbol"::STRING AS "cpc_symbol"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Answer:
+publication_number,cpc_symbol
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-112013006743-B4,
+DE-102013203286-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102009051197-B4,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+DE-102015114819-B3,
+Query:
+--Description: Extract distinct level‑4 CPC groups (first 4 characters)
+SELECT DISTINCT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Answer:
+cpc_group_level4
+""
+Query:
+--Description: Count patent filings per year for each level‑4 CPC group
+SELECT
+    LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+    FLOOR(p."filing_date" / 10000)    AS "filing_year",
+    COUNT(*)                          AS "filings"
+FROM PATENTS.PATENTS.PUBLICATIONS p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+  AND p."grant_date" BETWEEN 20161201 AND 20161231
+GROUP BY
+    LEFT(f.value:"symbol"::STRING, 4),
+    FLOOR(p."filing_date" / 10000)
+ORDER BY 3 DESC
+LIMIT 20;
+Answer:
+cpc_group_level4,filing_year,filings
+,2011,18
+,2015,12
+,2006,11
+,2013,6
+,2009,6
+,2012,2
+Query:
+--Description: Show cumulative average filings per CPC group (first step toward smoothing)
+SELECT
+    t."cpc_group_level4",
+    t."filing_year",
+    t."filings",
+    AVG(t."filings") OVER (PARTITION BY t."cpc_group_level4"
+                           ORDER BY t."filing_year"
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "cumulative_avg"
+FROM (
+    SELECT
+        LEFT(f.value:"symbol"::STRING, 4) AS "cpc_group_level4",
+        FLOOR(p."filing_date" / 10000)    AS "filing_year",
+        COUNT(*)                          AS "filings"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+    GROUP BY
+        LEFT(f.value:"symbol"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+) t
+ORDER BY t."cpc_group_level4", t."filing_year"
+LIMIT 20;
+Answer:
+cpc_group_level4,filing_year,filings,cumulative_avg
+,2006,11,11.000
+,2009,6,8.500
+,2011,18,11.666
+,2012,2,9.250
+,2013,6,8.600
+,2015,12,9.166
+Query:
+--Description: Preview CPC definition records at level‑4 (title & symbol) – no change needed
+SELECT
+    d."symbol"    AS "cpc_group_level4",
+    d."titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION d
+WHERE d."level" = 4
+LIMIT 20
+Answer:
+cpc_group_level4,titleFull
+A45,HAND OR TRAVELLING ARTICLES
+A24,TOBACCO; CIGARS; CIGARETTES; SIMULATED SMOKING DEVICES; SMOKERS' REQUISITES
+A61,MEDICAL OR VETERINARY SCIENCE; HYGIENE
+A63,SPORTS; GAMES; AMUSEMENTS
+A22,BUTCHERING; MEAT TREATMENT; PROCESSING POULTRY OR FISH
+A42,HEADWEAR
+A99,SUBJECT MATTER NOT OTHERWISE PROVIDED FOR IN THIS SECTION
+A43,FOOTWEAR
+A01,AGRICULTURE; FORESTRY; ANIMAL HUSBANDRY; HUNTING; TRAPPING; FISHING
+A62,LIFE-SAVING; FIRE-FIGHTING
+A23,"FOODS OR FOODSTUFFS; T
+Query:
+--Description: 
+-- Return the single CPC level‑4 group whose exponential moving average (α = 0.1) of
+-- annual filings is the highest among German patents granted in December 2016, plus
+-- its “best” filing year and CPC title (if available).  Uses f.value:"code", LEFT JOIN
+-- to CPC_DEFINITION (no filter on d."level") so absence of a title will not drop rows.
+WITH filings AS (                                   -- annual counts per group
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)  AS cpc_group,
+        FLOOR(p."filing_date" / 10000)   AS filing_year,
+        COUNT(*)                         AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date"  BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                             -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                             -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_0_1
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group, s1.filing_year, s1.rn
+),
+best_year AS (                                       -- peak EMA per group
+    SELECT
+        e.*,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_0_1 DESC) AS rank_ema
+    FROM ema e
+),
+global_best AS (                                     -- overall maximum
+    SELECT
+        COALESCE(d."titleFull", 'N/A')  AS cpc_title,
+        b.cpc_group                     AS cpc_group_level4,
+        b.filing_year                   AS best_year,
+        b.ema_0_1                       AS highest_ema,
+        ROW_NUMBER() OVER (ORDER BY b.ema_0_1 DESC) AS overall_rank
+    FROM best_year b
+    LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+           ON d."symbol" = b.cpc_group
+    WHERE b.rank_ema = 1
+)
+SELECT
+    cpc_title,
+    cpc_group_level4,
+    best_year,
+    highest_ema
+FROM global_best
+WHERE overall_rank = 1
+LIMIT 1
+Answer:
+CPC_TITLE,CPC_GROUP_LEVEL4,BEST_YEAR,HIGHEST_EMA
+"IMPEDANCE NETWORKS, e.g. RESONANT CIRCUITS; RESONATORS",H03H,2011,1.6
+End Exploring Related Columns
+Task: Find the CPC technology areas in Germany that had the highest exponential moving average (smoothing factor 0.1) of patent filings per year, specifically for patents granted in December 2016. For each CPC group at level 4, show the full title, CPC group, and the year with the highest exponential moving average of patent filings.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+cpc_title,cpc_group,year_with_max_exponential_moving_average
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'PATENTS': {'PATENTS': ['DISCLOSURES_13', 'PUBLICATIONS', 'CPC_DEFINITION']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 00:56:26 - Thread-13 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  ---------------------------------------------------------------
+    CPC level‑4 groups in German patents granted in Dec‑2016 whose
+    annual filing counts (by filing_date year) reach the maximum
+    exponential moving average (α = 0.1).  
+    Returns one row per CPC group: title, group code, best year.
+    --------------------------------------------------------------- */
+WITH filings AS (          /* annual patent counts per CPC‑L4 group */
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)      AS cpc_group,
+        FLOOR(p."filing_date" / 10000)       AS filing_year,
+        COUNT(*)                             AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231   -- granted in Dec‑2016
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (               /* chronological index for each CPC group   */
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (               /* exponential moving average, α = 0.1      */
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (         /* select the year with the highest EMA      */
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+)
+SELECT
+    COALESCE(d."titleFull", 'N/A')           AS cpc_title,
+    b.cpc_group                              AS cpc_group,
+    b.filing_year                            AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+       ON d."symbol" = b.cpc_group
+      AND d."level"  = 4                    -- ensure level‑4 title
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+```
+[Try to run SQL in self-refine]
+2025-05-01 00:56:26 - Thread-13 (execute) - INFO - [Executed results in self-refine]
+CPC_TITLE,CPC_GROUP,YEAR_WITH_MAX_EXPONENTIAL_MOVING_AVERAGE
+N/A,B22F,2006
+N/A,B60R,2013
+N/A,B64G,2015
+N/A,B82Y,2006
+N/A,C21B,2013
+N/A,C22B,2013
+N/A,F16C,2015
+N/A,F16K,2012
+N/A,F27B,2013
+N/A,F27D,2013
+N/A,G03G,2009
+N/A,H03H,2011
+N/A,H04B,2011
+N/A,H04N,2009
+N/A,Y10S,2006
+
+[Executed results in self-refine]
+2025-05-01 00:56:26 - Thread-13 (execute) - INFO - itercount: 1
+2025-05-01 00:56:26 - Thread-13 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Find the CPC technology areas in Germany that had the highest exponential moving average (smoothing factor 0.1) of patent filings per year, specifically for patents granted in December 2016. For each CPC group at level 4, show the full title, CPC group, and the year with the highest exponential moving average of patent filings., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+cpc_title,cpc_group,year_with_max_exponential_moving_average
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+CPC_TITLE,CPC_GROUP,YEAR_WITH_MAX_EXPONENTIAL_MOVING_AVERAGE
+N/A,B22F,2006
+N/A,B60R,2013
+N/A,B64G,2015
+N/A,B82Y,2006
+N/A,C21B,2013
+N/A,C22B,2013
+N/A,F16C,2015
+N/A,F16K,2012
+N/A,F27B,2013
+N/A,F27D,2013
+N/A,G03G,2009
+N/A,H03H,2011
+N/A,H04B,2011
+N/A,H04N,2009
+N/A,Y10S,2006
+Current sql:
+/*  ---------------------------------------------------------------
+    CPC level‑4 groups in German patents granted in Dec‑2016 whose
+    annual filing counts (by filing_date year) reach the maximum
+    exponential moving average (α = 0.1).  
+    Returns one row per CPC group: title, group code, best year.
+    --------------------------------------------------------------- */
+WITH filings AS (          /* annual patent counts per CPC‑L4 group */
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)      AS cpc_group,
+        FLOOR(p."filing_date" / 10000)       AS filing_year,
+        COUNT(*)                             AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231   -- granted in Dec‑2016
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (               /* chronological index for each CPC group   */
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (               /* exponential moving average, α = 0.1      */
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (         /* select the year with the highest EMA      */
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+)
+SELECT
+    COALESCE(d."titleFull", 'N/A')           AS cpc_title,
+    b.cpc_group                              AS cpc_group,
+    b.filing_year                            AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+       ON d."symbol" = b.cpc_group
+      AND d."level"  = 4                    -- ensure level‑4 title
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;Empty results in Column ['CPC_TITLE']. Please correct them.
+
+[Self-refine]
+2025-05-01 00:58:54 - Thread-13 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  ---------------------------------------------------------------
+    CPC technology areas (4‑character subclass codes) present in
+    German patents granted during December‑2016 whose annual filing
+    counts reach the maximum exponential moving average (α = 0.1).
+    For every CPC‑L4 group return its title, the 4‑char code and the
+    year in which that EMA is highest.
+    --------------------------------------------------------------- */
+WITH filings AS (      /* yearly filing counts per CPC‑L4 group          */
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)    AS cpc_group,
+        FLOOR(p."filing_date" / 10000)     AS filing_year,
+        COUNT(*)                           AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231   -- granted in Dec‑2016
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (             /* chronological index inside each CPC group        */
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (             /* exponential moving average, α = 0.1              */
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (       /* year with the highest EMA for each CPC group     */
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+),
+titles AS (          /* pick one title per CPC code from definition tbl. */
+    SELECT
+        symbol,
+        titleFull,
+        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY "level") AS lvl_rn
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+)
+SELECT
+    COALESCE(t.titleFull, 'N/A')                        AS cpc_title,
+    b.cpc_group                                         AS cpc_group,
+    b.filing_year                                       AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN titles t
+       ON t.symbol = b.cpc_group
+      AND t.lvl_rn = 1
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+```
+[Try to run SQL in self-refine]
+2025-05-01 00:58:55 - Thread-13 (execute) - INFO - itercount: 2
+2025-05-01 00:58:55 - Thread-13 (execute) - INFO - [Self-refine]
+Input sql:
+/*  ---------------------------------------------------------------
+    CPC technology areas (4‑character subclass codes) present in
+    German patents granted during December‑2016 whose annual filing
+    counts reach the maximum exponential moving average (α = 0.1).
+    For every CPC‑L4 group return its title, the 4‑char code and the
+    year in which that EMA is highest.
+    --------------------------------------------------------------- */
+WITH filings AS (      /* yearly filing counts per CPC‑L4 group          */
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)    AS cpc_group,
+        FLOOR(p."filing_date" / 10000)     AS filing_year,
+        COUNT(*)                           AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231   -- granted in Dec‑2016
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (             /* chronological index inside each CPC group        */
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (             /* exponential moving average, α = 0.1              */
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (       /* year with the highest EMA for each CPC group     */
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+),
+titles AS (          /* pick one title per CPC code from definition tbl. */
+    SELECT
+        symbol,
+        titleFull,
+        ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY "level") AS lvl_rn
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+)
+SELECT
+    COALESCE(t.titleFull, 'N/A')                        AS cpc_title,
+    b.cpc_group                                         AS cpc_group,
+    b.filing_year                                       AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN titles t
+       ON t.symbol = b.cpc_group
+      AND t.lvl_rn = 1
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+The error information is:
+000904 (42000): SQL compilation error: error line 47 at position 8
+invalid identifier 'SYMBOL'
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 00:59:56 - Thread-13 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  ---------------------------------------------------------------
+   CPC technology areas (4‑character level‑4 codes) appearing in
+   German patents granted during December‑2016.  
+   For each CPC‑L4 group, return its CPC title, the 4‑char code, and
+   the year in which the exponential moving average (α = 0.1) of
+   annual patent‑filing counts reaches its maximum.
+   --------------------------------------------------------------- */
+WITH filings AS (                    -- yearly filing counts
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)          AS cpc_group,
+        FLOOR(p."filing_date" / 10000)           AS filing_year,
+        COUNT(*)                                 AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231   -- granted in Dec‑2016
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                          -- chronological index per group
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                          -- exponential moving average α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (                    -- year with highest EMA per group
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+)
+SELECT
+    COALESCE(d."titleFull", 'N/A')  AS cpc_title,
+    b.cpc_group                     AS cpc_group,
+    b.filing_year                   AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b.cpc_group
+ AND d."level"  = 4                -- only level‑4 titles
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+```
+[Try to run SQL in self-refine]
+2025-05-01 00:59:56 - Thread-13 (execute) - INFO - [Executed results in self-refine]
+CPC_TITLE,CPC_GROUP,YEAR_WITH_MAX_EXPONENTIAL_MOVING_AVERAGE
+N/A,B22F,2006
+N/A,B60R,2013
+N/A,B64G,2015
+N/A,B82Y,2006
+N/A,C21B,2013
+N/A,C22B,2013
+N/A,F16C,2015
+N/A,F16K,2012
+N/A,F27B,2013
+N/A,F27D,2013
+N/A,G03G,2009
+N/A,H03H,2011
+N/A,H04B,2011
+N/A,H04N,2009
+N/A,Y10S,2006
+
+[Executed results in self-refine]
+2025-05-01 00:59:56 - Thread-13 (execute) - INFO - itercount: 3
+2025-05-01 00:59:56 - Thread-13 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Find the CPC technology areas in Germany that had the highest exponential moving average (smoothing factor 0.1) of patent filings per year, specifically for patents granted in December 2016. For each CPC group at level 4, show the full title, CPC group, and the year with the highest exponential moving average of patent filings., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+cpc_title,cpc_group,year_with_max_exponential_moving_average
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+CPC_TITLE,CPC_GROUP,YEAR_WITH_MAX_EXPONENTIAL_MOVING_AVERAGE
+N/A,B22F,2006
+N/A,B60R,2013
+N/A,B64G,2015
+N/A,B82Y,2006
+N/A,C21B,2013
+N/A,C22B,2013
+N/A,F16C,2015
+N/A,F16K,2012
+N/A,F27B,2013
+N/A,F27D,2013
+N/A,G03G,2009
+N/A,H03H,2011
+N/A,H04B,2011
+N/A,H04N,2009
+N/A,Y10S,2006
+Current sql:
+/*  ---------------------------------------------------------------
+   CPC technology areas (4‑character level‑4 codes) appearing in
+   German patents granted during December‑2016.  
+   For each CPC‑L4 group, return its CPC title, the 4‑char code, and
+   the year in which the exponential moving average (α = 0.1) of
+   annual patent‑filing counts reaches its maximum.
+   --------------------------------------------------------------- */
+WITH filings AS (                    -- yearly filing counts
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)          AS cpc_group,
+        FLOOR(p."filing_date" / 10000)           AS filing_year,
+        COUNT(*)                                 AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231   -- granted in Dec‑2016
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                          -- chronological index per group
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                          -- exponential moving average α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (                    -- year with highest EMA per group
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+)
+SELECT
+    COALESCE(d."titleFull", 'N/A')  AS cpc_title,
+    b.cpc_group                     AS cpc_group,
+    b.filing_year                   AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = b.cpc_group
+ AND d."level"  = 4                -- only level‑4 titles
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;Empty results in Column ['CPC_TITLE']. Please correct them.
+
+[Self-refine]
+2025-05-01 01:00:37 - Thread-13 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------
+   CPC technology areas (4‑character codes) that occur in German
+   patents granted during December‑2016.  
+   For each CPC‑L4 group return its title, the code itself, and the
+   year in which the exponential moving average (α = 0.1) of annual
+   patent‑filing counts reaches its maximum.
+   --------------------------------------------------------------- */
+WITH filings AS (                                   -- yearly counts
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)        AS cpc_group,
+        FLOOR(p."filing_date" / 10000)         AS filing_year,
+        COUNT(*)                               AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                          -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                          -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (                                    -- peak EMA per group
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+),
+titles AS (                                       -- pick one title / code
+    SELECT
+        symbol,
+        titleFull,
+        ROW_NUMBER() OVER (PARTITION BY symbol
+                           ORDER BY COALESCE(level, 99)) AS rn
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+)
+SELECT
+    COALESCE(t.titleFull, 'N/A')  AS cpc_title,
+    b.cpc_group                   AS cpc_group,
+    b.filing_year                 AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN titles t
+       ON t.symbol = b.cpc_group
+      AND t.rn     = 1
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:00:37 - Thread-13 (execute) - INFO - itercount: 4
+2025-05-01 01:00:37 - Thread-13 (execute) - INFO - [Self-refine]
+Input sql:
+/* ---------------------------------------------------------------
+   CPC technology areas (4‑character codes) that occur in German
+   patents granted during December‑2016.  
+   For each CPC‑L4 group return its title, the code itself, and the
+   year in which the exponential moving average (α = 0.1) of annual
+   patent‑filing counts reaches its maximum.
+   --------------------------------------------------------------- */
+WITH filings AS (                                   -- yearly counts
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)        AS cpc_group,
+        FLOOR(p."filing_date" / 10000)         AS filing_year,
+        COUNT(*)                               AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                          -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                          -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (                                    -- peak EMA per group
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        e.ema_val,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+),
+titles AS (                                       -- pick one title / code
+    SELECT
+        symbol,
+        titleFull,
+        ROW_NUMBER() OVER (PARTITION BY symbol
+                           ORDER BY COALESCE(level, 99)) AS rn
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+)
+SELECT
+    COALESCE(t.titleFull, 'N/A')  AS cpc_title,
+    b.cpc_group                   AS cpc_group,
+    b.filing_year                 AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN titles t
+       ON t.symbol = b.cpc_group
+      AND t.rn     = 1
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+The error information is:
+000904 (42000): SQL compilation error: error line 47 at position 8
+invalid identifier 'SYMBOL'
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-01 01:01:22 - Thread-13 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* ---------------------------------------------------------------
+   CPC technology areas (4‑character codes) occurring in German
+   patents granted during December‑2016.
+   For each CPC‑L4 group, return its title, the 4‑char code, and the
+   year in which the exponential moving average (α = 0.1) of annual
+   patent‑filing counts reaches its maximum.
+   --------------------------------------------------------------- */
+WITH filings AS (                                   -- yearly counts
+    SELECT
+        LEFT(f.value:"code"::STRING, 4)          AS cpc_group,
+        FLOOR(p."filing_date" / 10000)           AS filing_year,
+        COUNT(*)                                 AS filings
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND p."grant_date" BETWEEN 20161201 AND 20161231
+      AND f.value:"code" IS NOT NULL
+    GROUP BY
+        LEFT(f.value:"code"::STRING, 4),
+        FLOOR(p."filing_date" / 10000)
+),
+seq AS (                                          -- chronological index
+    SELECT
+        f.*,
+        ROW_NUMBER() OVER (PARTITION BY f.cpc_group
+                           ORDER BY f.filing_year) AS rn
+    FROM filings f
+),
+ema AS (                                          -- EMA α = 0.1
+    SELECT
+        s1.cpc_group,
+        s1.filing_year,
+        SUM(s2.filings * POWER(0.9, s1.rn - s2.rn)) * 0.1 AS ema_val
+    FROM seq s1
+    JOIN seq s2
+      ON s1.cpc_group = s2.cpc_group
+     AND s2.rn <= s1.rn
+    GROUP BY
+        s1.cpc_group,
+        s1.filing_year,
+        s1.rn
+),
+best_year AS (                                    -- peak EMA per group
+    SELECT
+        e.cpc_group,
+        e.filing_year,
+        ROW_NUMBER() OVER (PARTITION BY e.cpc_group
+                           ORDER BY e.ema_val DESC, e.filing_year) AS rnk
+    FROM ema e
+),
+titles AS (                                       -- level‑4 CPC titles
+    SELECT
+        "symbol"                       AS cpc_group,
+        MAX("titleFull")               AS cpc_title
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+    WHERE "level" = 4
+    GROUP BY "symbol"
+)
+SELECT
+    COALESCE(t.cpc_title, 'N/A')       AS cpc_title,
+    b.cpc_group                        AS cpc_group,
+    b.filing_year                      AS year_with_max_exponential_moving_average
+FROM best_year b
+LEFT JOIN titles t
+       ON t.cpc_group = b.cpc_group
+WHERE b.rnk = 1
+ORDER BY b.cpc_group;
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:02:59 - Thread-13 (execute) - INFO - [Executed results in self-refine]
+CPC_TITLE,CPC_GROUP,YEAR_WITH_MAX_EXPONENTIAL_MOVING_AVERAGE
+N/A,B22F,2006
+N/A,B60R,2013
+N/A,B64G,2015
+N/A,B82Y,2006
+N/A,C21B,2013
+N/A,C22B,2013
+N/A,F16C,2015
+N/A,F16K,2012
+N/A,F27B,2013
+N/A,F27D,2013
+N/A,G03G,2009
+N/A,H03H,2011
+N/A,H04B,2011
+N/A,H04N,2009
+N/A,Y10S,2006
+
+[Executed results in self-refine]
+2025-05-01 01:02:59 - Thread-13 (execute) - INFO - Total iteration counts: 5
+2025-05-01 01:02:59 - Thread-13 (execute) - INFO - Max Iter, remove file

@@ -1,0 +1,27 @@
+SELECT
+    "CLASS",
+    "SUBCLASS",
+    SUM(
+        CASE 
+            WHEN LEFT("QUADKEY", 8) = '12020210' 
+            THEN COALESCE(TRY_TO_NUMBER("LENGTH_M"), 0)
+            ELSE 0 
+        END
+    ) AS "AMSTERDAM_LENGTH_M",
+    SUM(
+        CASE 
+            WHEN LEFT("QUADKEY", 8) = '12020211' 
+            THEN COALESCE(TRY_TO_NUMBER("LENGTH_M"), 0)
+            ELSE 0 
+        END
+    ) AS "ROTTERDAM_LENGTH_M"
+FROM
+    NETHERLANDS_OPEN_MAP_DATA.NETHERLANDS."V_ROAD"
+WHERE
+    LEFT("QUADKEY", 8) IN ('12020210', '12020211')
+GROUP BY
+    "CLASS",
+    "SUBCLASS"
+ORDER BY
+    "CLASS",
+    "SUBCLASS";

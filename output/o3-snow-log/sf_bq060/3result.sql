@@ -1,0 +1,11 @@
+SELECT
+    t."country_name",
+    t."net_migration"
+FROM CENSUS_BUREAU_INTERNATIONAL.CENSUS_BUREAU_INTERNATIONAL."BIRTH_DEATH_GROWTH_RATES" AS t
+JOIN CENSUS_BUREAU_INTERNATIONAL.CENSUS_BUREAU_INTERNATIONAL."COUNTRY_NAMES_AREA" AS a
+      ON t."country_code" = a."country_code"
+WHERE t."year" = 2017
+  AND a."country_area" > 500
+  AND t."net_migration" IS NOT NULL
+ORDER BY t."net_migration" DESC NULLS LAST
+LIMIT 3;

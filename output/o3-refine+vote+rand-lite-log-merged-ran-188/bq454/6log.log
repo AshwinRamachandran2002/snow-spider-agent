@@ -1,0 +1,357 @@
+2025-05-05 03:58:57 - Thread-2511 (execute) - INFO - [Exploration]
+Below are up-to-ten exploratory BigQuery statements that go step-by-step from very simple inspection of the tables to the complete aggregation asked for in the task.  
+All queries only touch the three tables that belong to the 1000 Genomes dataset and all of them finish with `LIMIT 20`.
+
+```sql
+-- 1. Description: how many samples belong to every super-population
+SELECT
+  Super_Population,
+  COUNT(*) AS pop_size
+FROM `spider2-public-data.1000_genomes.sample_info`
+GROUP BY Super_Population
+LIMIT 20;
+```
+
+```sql
+-- 2. Description: see the distinct chromosome (reference_name) values that exist
+SELECT DISTINCT reference_name
+FROM `spider2-public-data.1000_genomes.variants`
+LIMIT 20;
+```
+
+```sql
+-- 3. Description: preview a handful of autosomal variants (chromosome ‘1’) only
+SELECT
+  reference_name,
+  start,
+  alternate_bases,
+  AA,
+  AC1,
+  AF1
+FROM `spider2-public-data.1000_genomes.variants`
+WHERE reference_name = '1'
+LIMIT 20;
+```
+
+```sql
+-- 4. Description: explode one variant’s calls, join to sample_info and
+--     calculate how many non-reference alleles each sample carries
+SELECT
+  v.reference_name,
+  v.start,
+  c.call_set_name AS sample,
+  s.Super_Population,
+  ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)) AS alt_allele_count
+FROM `spider2-public-data.1000_genomes.variants` AS v
+CROSS JOIN UNNEST(v.call) AS c
+JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+  ON s.Sample = c.call_set_name
+WHERE v.reference_name = '1'
+LIMIT 20;
+```
+
+```sql
+-- 5. Description: per-variant / per-super-population counts of
+--     samples with any alternate allele and estimated allele frequency (AF)
+SELECT
+  CONCAT(v.reference_name,'-',v.start) AS variant_id,
+  s.Super_Population,
+  COUNTIF(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))>0) AS samples_with_alt,
+  SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))) AS alt_alleles,
+  COUNT(*)*2 AS total_alleles,
+  SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)))/(COUNT(*)*2.0) AS allele_freq
+FROM `spider2-public-data.1000_genomes.variants` AS v
+CROSS JOIN UNNEST(v.call) AS c
+JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+  ON s.Sample = c.call_set_name
+WHERE v.reference_name NOT IN ('X','Y','MT')  -- autosomes only
+GROUP BY variant_id, s.Super_Population
+LIMIT 20;
+```
+
+```sql
+-- 6. Description: restrict to COMMON autosomal variants inside every
+--     super-population (AF ≥ 0.05) and keep the number of samples that carry them
+WITH per_var AS (
+  SELECT
+    CONCAT(v.reference_name,'-',v.start) AS variant_id,
+    s.Super_Population,
+    COUNTIF(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))>0) AS samples_with_alt,
+    SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)))/(COUNT(*)*2.0) AS allele_freq
+  FROM `spider2-public-data.1000_genomes.variants` AS v
+  CROSS JOIN UNNEST(v.call) AS c
+  JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+    ON s.Sample = c.call_set_name
+  WHERE v.reference_name NOT IN ('X','Y','MT')
+  GROUP BY variant_id, s.Super_Population
+)
+SELECT *
+FROM per_var
+WHERE allele_freq >= 0.05
+LIMIT 20;
+```
+
+```sql
+-- 7. Description: for each super-population, bucket common variants by the
+--     exact number of samples that share them
+WITH common_variants AS (
+  /* re-use query (6) */
+  SELECT
+    variant_id,
+    Super_Population,
+    samples_with_alt
+  FROM (
+    SELECT
+      CONCAT(v.reference_name,'-',v.start) AS variant_id,
+      s.Super_Population,
+      COUNTIF(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))>0) AS samples_with_alt,
+      SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)))/(COUNT(*)*2.0) AS allele_freq
+    FROM `spider2-public-data.1000_genomes.variants` AS v
+    CROSS JOIN UNNEST(v.call) AS c
+    JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+      ON s.Sample = c.call_set_name
+    WHERE v.reference_name NOT IN ('X','Y','MT')
+    GROUP BY variant_id, s.Super_Population
+    HAVING allele_freq >= 0.05
+  )
+)
+SELECT
+  Super_Population,
+  samples_with_alt,
+  COUNT(*) AS variant_count
+FROM common_variants
+GROUP BY Super_Population, samples_with_alt
+ORDER BY Super_Population, samples_with_alt
+LIMIT 20;
+```
+
+```sql
+-- 8. Description: bring in population sizes so we can report them together
+WITH pop_size AS (
+  SELECT Super_Population, COUNT(*) AS pop_size
+  FROM `spider2-public-data.1000_genomes.sample_info`
+  GROUP BY Super_Population
+),
+common_variants AS (
+  /* same sub-query logic as in (7) */
+  SELECT
+    CONCAT(v.reference_name,'-',v.start) AS variant_id,
+    s.Super_Population,
+    COUNTIF(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))>0) AS samples_with_alt
+  FROM `spider2-public-data.1000_genomes.variants` AS v
+  CROSS JOIN UNNEST(v.call) AS c
+  JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+    ON s.Sample = c.call_set_name
+  WHERE v.reference_name NOT IN ('X','Y','MT')
+  GROUP BY variant_id, s.Super_Population
+  HAVING SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)))/(COUNT(*)*2.0) >= 0.05
+)
+SELECT
+  cv.Super_Population,
+  ps.pop_size,
+  cv.samples_with_alt,
+  COUNT(*) AS variant_count
+FROM common_variants AS cv
+JOIN pop_size AS ps
+  ON ps.Super_Population = cv.Super_Population
+GROUP BY cv.Super_Population, ps.pop_size, cv.samples_with_alt
+ORDER BY cv.Super_Population, cv.samples_with_alt
+LIMIT 20;
+```
+
+```sql
+-- 9. Description: explicitly flag that the variants being summarised are ‘common’
+--     (AF ≥ 0.05); the aggregation stays the same
+SELECT
+  *, TRUE AS is_common_variant
+FROM (
+  /* wrap query (8) without ORDER BY for brevity */
+  WITH pop_size AS (
+    SELECT Super_Population, COUNT(*) AS pop_size
+    FROM `spider2-public-data.1000_genomes.sample_info`
+    GROUP BY Super_Population
+  ),
+  common_variants AS (
+    SELECT
+      CONCAT(v.reference_name,'-',v.start) AS variant_id,
+      s.Super_Population,
+      COUNTIF(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))>0) AS samples_with_alt
+    FROM `spider2-public-data.1000_genomes.variants` AS v
+    CROSS JOIN UNNEST(v.call) AS c
+    JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+      ON s.Sample = c.call_set_name
+    WHERE v.reference_name NOT IN ('X','Y','MT')
+    GROUP BY variant_id, s.Super_Population
+    HAVING SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)))/(COUNT(*)*2.0) >= 0.05
+  )
+  SELECT
+    cv.Super_Population,
+    ps.pop_size,
+    cv.samples_with_alt,
+    COUNT(*) AS variant_count
+  FROM common_variants AS cv
+  JOIN pop_size AS ps
+    ON ps.Super_Population = cv.Super_Population
+  GROUP BY cv.Super_Population, ps.pop_size, cv.samples_with_alt
+)
+LIMIT 20;
+```
+
+```sql
+-- 10. Description: inspect one super-population (e.g., AFR) in detail –
+--      list 20 common autosomal variants and how many AFR samples carry each.
+WITH afr AS (
+  SELECT
+    CONCAT(v.reference_name,'-',v.start) AS variant_id,
+    COUNTIF(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0))>0) AS afr_samples_with_alt,
+    SUM(ARRAY_LENGTH(ARRAY(SELECT g FROM UNNEST(c.genotype) g WHERE g>0)))/(COUNT(*)*2.0) AS afr_af
+  FROM `spider2-public-data.1000_genomes.variants` AS v
+  CROSS JOIN UNNEST(v.call) AS c
+  JOIN `spider2-public-data.1000_genomes.sample_info` AS s
+    ON s.Sample = c.call_set_name
+  WHERE v.reference_name NOT IN ('X','Y','MT')
+    AND s.Super_Population = 'AFR'
+  GROUP BY variant_id
+  HAVING afr_af >= 0.05
+)
+SELECT *
+FROM afr
+LIMIT 20;
+```
+
+These ten queries progress from basic table understanding toward a complete answer:  
+• population size,  
+• autosomal filtering,  
+• per-variant allele-counting,  
+• allele-frequency threshold (≥ 0.05 → common),  
+• sample-sharing buckets,  
+• final aggregation that reports, for every super-population, the population size, the exact number of samples that share a common autosomal variant, and the total count of such variants.
+[Exploration]
+2025-05-05 03:58:57 - Thread-2511 (execute) - INFO - [Try to execute]
+-- 1. Description: how many samples belong to every super-population
+SELECT
+  Super_Population,
+  COUNT(*) AS pop_size
+FROM `spider2-public-data.1000_genomes.sample_info`
+GROUP BY Super_Population
+LIMIT 20;
+[Try to execute]
+2025-05-05 03:58:58 - Thread-2511 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: 057774bb-5150-48df-92ea-849be199c395\n'}
+[Error occurred]
+2025-05-05 03:59:39 - Thread-2511 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+--To analyse variant sharing we must first know how many samples exist in each super-population.
+--The publicly accessible 1000 Genomes metadata is in project `bigquery-public-data`, dataset `1000_genomes`.
+--Group by `Super_Population`, count rows (each row = one sample), order by size, show up to 20 results.
+SELECT
+  Super_Population,
+  COUNT(*) AS pop_size
+FROM `bigquery-public-data.1000_genomes.sample_info`
+GROUP BY Super_Population
+ORDER BY pop_size DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 03:59:40 - Thread-2511 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table bigquery-public-data:1000_genomes.sample_info: User does not have permission to query table bigquery-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table bigquery-public-data:1000_genomes.sample_info: User does not have permission to query table bigquery-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: 7e63514c-cfd0-4de8-a95e-4a1a4e1528ae\n'}
+[Results for corrected sql]
+2025-05-05 04:00:33 - Thread-2511 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+--Goal: count the number of samples that fall into each super-population.
+--Access the internal mirror of 1000 Genomes located at project `spider2-public-data`,
+--dataset `1000_genomes`, table `sample_info`.  Because the project ID contains a
+--hyphen we wrap the FULL path (project.dataset.table) in a single pair of back-ticks.
+SELECT
+  Super_Population,
+  COUNT(*) AS pop_size
+FROM `spider2-public-data.1000_genomes.sample_info`
+GROUP BY Super_Population
+ORDER BY pop_size DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:00:35 - Thread-2511 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: 2fb70cc9-17fd-4579-ad3f-cc8c24de6f8f\n'}
+[Results for corrected sql]
+2025-05-05 04:01:32 - Thread-2511 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+--First, retrieve the size of each super-population.  
+--The internal copy of the 1000 Genomes metadata sits in project `spider2-public-data`,  
+--dataset `1000_genomes`, table `sample_info`.  Because the project name has a hyphen
+--and the dataset name starts with a digit, wrap each identifier part in back-ticks.
+SELECT
+  Super_Population,
+  COUNT(*) AS pop_size
+FROM `spider2-public-data`.`1000_genomes`.`sample_info`
+GROUP BY Super_Population
+ORDER BY pop_size DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:01:33 - Thread-2511 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.sample_info: User does not have permission to query table spider2-public-data:1000_genomes.sample_info, or perhaps it does not exist.\n\nLocation: US\nJob ID: 6c6a8cf6-d28a-47ba-96a0-b92332fbf8bd\n'}
+[Results for corrected sql]
+2025-05-05 04:01:33 - Thread-2511 (execute) - INFO - [Try to execute]
+-- 2. Description: see the distinct chromosome (reference_name) values that exist
+SELECT DISTINCT reference_name
+FROM `spider2-public-data.1000_genomes.variants`
+LIMIT 20;
+[Try to execute]
+2025-05-05 04:01:35 - Thread-2511 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.\n\nLocation: US\nJob ID: b447772b-e91f-41f7-9452-0051d88d8d9d\n'}
+[Error occurred]
+2025-05-05 04:01:59 - Thread-2511 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process: identify all unique chromosome identifiers in the internal 1000 Genomes variants table (fully-quoted path because the project name contains a hyphen and the dataset starts with a digit), then sort them alphabetically and return up to 20 rows.
+SELECT DISTINCT
+  reference_name
+FROM `spider2-public-data`.`1000_genomes`.`variants`
+ORDER BY reference_name
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:02:00 - Thread-2511 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.\n\nLocation: US\nJob ID: 666d6f1a-f97c-4f00-bd29-0871a3b26be9\n'}
+[Results for corrected sql]
+2025-05-05 04:02:38 - Thread-2511 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+--Inspect which chromosome identifiers appear in the internal 1000 Genomes
+--variants table.  The fully-qualified table path is
+--`spider2-public-data.1000_genomes.variants` and—in BigQuery—when an identifier
+--contains special characters (hyphen in the project ID, digit-leading dataset
+--name) we wrap the ENTIRE path (project.dataset.table) in one pair of back-ticks.
+--We select DISTINCT reference_name, order them alphabetically, and keep 20 rows.
+SELECT DISTINCT
+  reference_name
+FROM `spider2-public-data.1000_genomes.variants`
+ORDER BY reference_name
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:02:39 - Thread-2511 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.\n\nLocation: US\nJob ID: ce1ed32a-02b3-4421-be1a-c5a0cc7edfee\n'}
+[Results for corrected sql]
+2025-05-05 04:04:15 - Thread-2511 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / Thinking process:
+--Identify the set of chromosome identifiers recorded in the 1000 Genomes
+--internal variants table.  Because the project name contains a hyphen
+--(spider2-public-data) and the dataset name starts with a digit (1000_genomes),
+--each component is wrapped in its own back-ticks:
+--      `spider2-public-data`.`1000_genomes`.`variants`
+--Select DISTINCT reference_name, order alphabetically, show up to 20 rows.
+SELECT DISTINCT
+  reference_name
+FROM `spider2-public-data`.`1000_genomes`.`variants`
+ORDER BY reference_name
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 04:04:17 - Thread-2511 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##403 Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.; reason: accessDenied, message: Access Denied: Table spider2-public-data:1000_genomes.variants: User does not have permission to query table spider2-public-data:1000_genomes.variants, or perhaps it does not exist.\n\nLocation: US\nJob ID: 99ebebcd-c4fc-4880-9e3c-3c1080802a2c\n'}
+[Results for corrected sql]

@@ -1,0 +1,1780 @@
+2025-05-01 01:45:13 - Thread-447 (execute) - INFO - [Answer format]
+```csv
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+```
+[Answer format]
+2025-05-01 01:47:56 - Thread-447 (execute) - INFO - [Exploration]
+Relevant columns and their possible use  
+
+ORDERS  
+• "user_id": identifies each customer; primary key for user‑level grouping.  
+• "order_id": identifies a unique purchase event; used for de‑duplication.  
+• "created_at": micro‑second epoch time of the order; used to define (1) the customer’s first purchase month and (2) the month offsets (month 1, month 2 …).  
+• "status": lets us keep only real purchases (usually ‘Complete’, ‘Shipped’, ‘Processing’).  
+• "delivered_at", "returned_at": optional filters; may be checked to be sure an order was not returned.  
+
+ORDER_ITEMS  
+• "user_id": second route to the customer id (helpful when an order lacks the id).  
+• "created_at": time stamp on the line‑item; sometimes safer than the order header.  
+• "status": same idea as in ORDERS.  
+
+USERS  
+• "id": joins to ORDERS / ORDER_ITEMS when we want demographics or to ensure the user exists.  
+
+Typical conditions you will use  
+• "created_at" < 1672531200000000   -- everything up to 31‑Dec‑2022 23:59:59 UTC  
+• "status" IN ('Complete','Shipped','Processing')   -- keep only real purchases  
+• Use DATE_TRUNC('month', TO_TIMESTAMP_LTZ("created_at"/1e6)) to isolate a purchase month.  
+
+Below are ten exploratory Snowflake SQL statements (progressing from simple to complex) that help you look at the data you will need for the requested retention calculation.  
+All column names are wrapped in double quotes, each query is annotated, and every query is capped with LIMIT 20.
+
+```sql
+-- 1) Description: Show the distinct order‑level statuses that exist, so we know which ones represent real purchases.
+SELECT DISTINCT "status"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+LIMIT 20;
+```
+
+```sql
+-- 2) Description: Count how many orders of each status happened up to the end of 2022.
+SELECT "status",
+       COUNT(*) AS "orders_through_2022"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+GROUP BY "status"
+ORDER BY "orders_through_2022" DESC
+LIMIT 20;
+```
+
+```sql
+-- 3) Description: Glimpse at raw timestamps vs. human‑readable form for orders before 2023.
+SELECT "order_id",
+       "user_id",
+       "created_at",
+       TO_TIMESTAMP_LTZ("created_at"/1e6) AS "order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+ORDER BY "created_at" DESC
+LIMIT 20;
+```
+
+```sql
+-- 4) Description: For each user, pull out the very first purchase (order header view, good‑status only, through 2022).
+SELECT "user_id",
+       MIN("created_at") AS "first_order_ts_raw",
+       TO_TIMESTAMP_LTZ(MIN("created_at")/1e6) AS "first_order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+  AND "status" IN ('Complete','Shipped','Processing')
+GROUP BY "user_id"
+LIMIT 20;
+```
+
+```sql
+-- 5) Description: See how many NEW customers there were in each first‑purchase month (cohort size).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+)
+SELECT "first_purchase_month",
+       COUNT(DISTINCT "user_id") AS "new_users"
+FROM firsts
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+```
+
+```sql
+-- 6) Description: Generate every user’s purchases (good statuses) plus their *offset* in months since first purchase.
+WITH firsts AS (
+  SELECT "user_id",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         o."created_at",
+         f."first_created_at",
+         DATEDIFF('month',
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(f."first_created_at"/1e6)),
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"  -- 1 = cohort month
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT *
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+ORDER BY "user_id", "month_number"
+LIMIT 20;
+```
+
+```sql
+-- 7) Description: Count unique users who placed an order in each cohort month (1‑4) *within* the same cohort.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "first_purchase_month",
+       "month_number",
+       COUNT(DISTINCT "user_id") AS "active_users"
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+GROUP BY "first_purchase_month", "month_number"
+ORDER BY "first_purchase_month", "month_number"
+LIMIT 20;
+```
+
+```sql
+-- 8) Description: Add cohort size to compute the retention percentage month by month.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT a."first_purchase_month",
+       a."month_number",
+       COUNT(DISTINCT a."user_id") AS "active_users",
+       c."cohort_users",
+       ROUND(COUNT(DISTINCT a."user_id")*100.0 / c."cohort_users", 2) AS "pct_of_cohort"
+FROM activity a
+JOIN cohort_size c
+  ON a."first_purchase_month" = c."first_purchase_month"
+WHERE a."month_number" BETWEEN 1 AND 4
+GROUP BY a."first_purchase_month", a."month_number", c."cohort_users"
+ORDER BY a."first_purchase_month", a."month_number"
+LIMIT 20;
+```
+
+```sql
+-- 9) Description: Summarize the retention percentages averaged across all cohorts (overall view for months 1‑4).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "month_number",
+       ROUND(SUM(CASE WHEN a."month_number" BETWEEN 1 AND 4 THEN 1 ELSE 0 END)::FLOAT /
+             COUNT(*) * 100, 2) AS "overall_pct_users"
+FROM activity a
+GROUP BY "month_number"
+HAVING "month_number" BETWEEN 1 AND 4
+ORDER BY "month_number"
+LIMIT 20;
+```
+
+```sql
+-- 10) Description: Same as query 8 but expressed as a pivot, giving one row per cohort and separate columns for months 1‑4.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+    AND DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 BETWEEN 1 AND 4
+)
+SELECT "first_purchase_month",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m1_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m2_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m3_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m4_pct"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+```
+
+The ten statements above progress from verifying basic data quality to producing the cohort‑based retention percentages you need, all while staying within the required table set and Snowflake SQL syntax.
+[Exploration]
+2025-05-01 01:47:56 - Thread-447 (execute) - INFO - [Try to execute]
+-- 1) Description: Show the distinct order‑level statuses that exist, so we know which ones represent real purchases.
+SELECT DISTINCT "status"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:47:57 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1) Description: Show the distinct order‑level statuses that exist, so we know which ones represent real purchases.
+SELECT DISTINCT "status"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+LIMIT 20;
+Results:
+status
+Cancelled
+Complete
+Processing
+Shipped
+Returned
+
+[Successfully executed]
+2025-05-01 01:47:57 - Thread-447 (execute) - INFO - [Try to execute]
+-- 2) Description: Count how many orders of each status happened up to the end of 2022.
+SELECT "status",
+       COUNT(*) AS "orders_through_2022"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+GROUP BY "status"
+ORDER BY "orders_through_2022" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:47:57 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2) Description: Count how many orders of each status happened up to the end of 2022.
+SELECT "status",
+       COUNT(*) AS "orders_through_2022"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+GROUP BY "status"
+ORDER BY "orders_through_2022" DESC
+LIMIT 20;
+Results:
+status,orders_through_2022
+Shipped,11916
+Complete,9991
+Processing,7951
+Cancelled,6027
+Returned,4013
+
+[Successfully executed]
+2025-05-01 01:47:57 - Thread-447 (execute) - INFO - [Try to execute]
+-- 3) Description: Glimpse at raw timestamps vs. human‑readable form for orders before 2023.
+SELECT "order_id",
+       "user_id",
+       "created_at",
+       TO_TIMESTAMP_LTZ("created_at"/1e6) AS "order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+ORDER BY "created_at" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:47:58 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3) Description: Glimpse at raw timestamps vs. human‑readable form for orders before 2023.
+SELECT "order_id",
+       "user_id",
+       "created_at",
+       TO_TIMESTAMP_LTZ("created_at"/1e6) AS "order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+ORDER BY "created_at" DESC
+LIMIT 20;
+Results:
+order_id,user_id,created_at,order_ts
+61381,49265,1672513140000000,2022-12-31 10:59:00-08:00
+49046,39361,1672512540000000,2022-12-31 10:49:00-08:00
+92232,73942,1672512540000000,2022-12-31 10:49:00-08:00
+60329,48410,1672505940000000,2022-12-31 08:59:00-08:00
+
+[Successfully executed]
+2025-05-01 01:47:58 - Thread-447 (execute) - INFO - [Try to execute]
+-- 4) Description: For each user, pull out the very first purchase (order header view, good‑status only, through 2022).
+SELECT "user_id",
+       MIN("created_at") AS "first_order_ts_raw",
+       TO_TIMESTAMP_LTZ(MIN("created_at")/1e6) AS "first_order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+  AND "status" IN ('Complete','Shipped','Processing')
+GROUP BY "user_id"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:47:58 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4) Description: For each user, pull out the very first purchase (order header view, good‑status only, through 2022).
+SELECT "user_id",
+       MIN("created_at") AS "first_order_ts_raw",
+       TO_TIMESTAMP_LTZ(MIN("created_at")/1e6) AS "first_order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+  AND "status" IN ('Complete','Shipped','Processing')
+GROUP BY "user_id"
+LIMIT 20;
+Results:
+user_id,first_order_ts_raw,first_order_ts
+52,1593392280000000,2020-06-28 16:58:00-08:00
+100,1636387140000000,2021-11-08 07:59:00-08:00
+133,1623901860000000,2021-06-16 19:51:00-08:00
+168,1670464980000000,2022-12-07 18:03:00-08:00
+
+[Successfully executed]
+2025-05-01 01:47:58 - Thread-447 (execute) - INFO - [Try to execute]
+-- 5) Description: See how many NEW customers there were in each first‑purchase month (cohort size).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+)
+SELECT "first_purchase_month",
+       COUNT(DISTINCT "user_id") AS "new_users"
+FROM firsts
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:47:59 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5) Description: See how many NEW customers there were in each first‑purchase month (cohort size).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+)
+SELECT "first_purchase_month",
+       COUNT(DISTINCT "user_id") AS "new_users"
+FROM firsts
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+Results:
+first_purchase_month,new_users
+2019-01-01 00:00:00-08:00,2
+2019-02-01 00:00:00-08:00,30
+2019-03-01 00:00:00-08:00,41
+2019-04-01 00:00:00-07:00,66
+2019-05-01 00:00:00-07:00,67
+
+[Successfully executed]
+2025-05-01 01:47:59 - Thread-447 (execute) - INFO - [Try to execute]
+-- 6) Description: Generate every user’s purchases (good statuses) plus their *offset* in months since first purchase.
+WITH firsts AS (
+  SELECT "user_id",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         o."created_at",
+         f."first_created_at",
+         DATEDIFF('month',
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(f."first_created_at"/1e6)),
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"  -- 1 = cohort month
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT *
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+ORDER BY "user_id", "month_number"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:48:00 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6) Description: Generate every user’s purchases (good statuses) plus their *offset* in months since first purchase.
+WITH firsts AS (
+  SELECT "user_id",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         o."created_at",
+         f."first_created_at",
+         DATEDIFF('month',
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(f."first_created_at"/1e6)),
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"  -- 1 = cohort month
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT *
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+ORDER BY "user_id", "month_number"
+LIMIT 20;
+Results:
+user_id,created_at,first_created_at,month_number
+15,1648039860000000,1648039860000000,1
+20,1621254480000000,1621254480000000,1
+26,1622744340000000,1622744340000000,1
+28,1670405700000000,1670405700000000,1
+33,1631508420000000,1631508420000000,1
+36,1616073840000000,1616073840000000,1
+44,1664889540000000,1664889540000000,1
+47,1662175140000000,1662175140000000,1
+52,1593392280000000,1593392280000000,1
+64,1625110620000000,1625110620000000,1
+68,1591415040000000,1591415040000000,1
+71,1640108
+
+[Successfully executed]
+2025-05-01 01:48:00 - Thread-447 (execute) - INFO - [Try to execute]
+-- 7) Description: Count unique users who placed an order in each cohort month (1‑4) *within* the same cohort.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "first_purchase_month",
+       "month_number",
+       COUNT(DISTINCT "user_id") AS "active_users"
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+GROUP BY "first_purchase_month", "month_number"
+ORDER BY "first_purchase_month", "month_number"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:48:00 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7) Description: Count unique users who placed an order in each cohort month (1‑4) *within* the same cohort.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "first_purchase_month",
+       "month_number",
+       COUNT(DISTINCT "user_id") AS "active_users"
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+GROUP BY "first_purchase_month", "month_number"
+ORDER BY "first_purchase_month", "month_number"
+LIMIT 20;
+Results:
+first_purchase_month,month_number,active_users
+2019-01-01 00:00:00-08:00,1,2
+2019-02-01 00:00:00-08:00,1,30
+2019-02-01 00:00:00-08:00,2,1
+2019-03-01 00:00:00-08:00,1,41
+2019-03-01 00:00:00-08:00,4,1
+
+[Successfully executed]
+2025-05-01 01:48:00 - Thread-447 (execute) - INFO - [Try to execute]
+-- 8) Description: Add cohort size to compute the retention percentage month by month.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT a."first_purchase_month",
+       a."month_number",
+       COUNT(DISTINCT a."user_id") AS "active_users",
+       c."cohort_users",
+       ROUND(COUNT(DISTINCT a."user_id")*100.0 / c."cohort_users", 2) AS "pct_of_cohort"
+FROM activity a
+JOIN cohort_size c
+  ON a."first_purchase_month" = c."first_purchase_month"
+WHERE a."month_number" BETWEEN 1 AND 4
+GROUP BY a."first_purchase_month", a."month_number", c."cohort_users"
+ORDER BY a."first_purchase_month", a."month_number"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:48:02 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8) Description: Add cohort size to compute the retention percentage month by month.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT a."first_purchase_month",
+       a."month_number",
+       COUNT(DISTINCT a."user_id") AS "active_users",
+       c."cohort_users",
+       ROUND(COUNT(DISTINCT a."user_id")*100.0 / c."cohort_users", 2) AS "pct_of_cohort"
+FROM activity a
+JOIN cohort_size c
+  ON a."first_purchase_month" = c."first_purchase_month"
+WHERE a."month_number" BETWEEN 1 AND 4
+GROUP BY a."first_purchase_month", a."month_number", c."cohort_users"
+ORDER BY a."first_purchase_month", a."month_number"
+LIMIT 20;
+Results:
+first_purchase_month,month_number,active_users,cohort_users,pct_of_cohort
+2019-01-01 00:00:00-08:00,1,2,2,100.00
+2019-02-01 00:00:00-08:00,1,30,30,100.00
+2019-02-01 00:00:00-08:00,2,1,30,3.33
+2019-03-01 00:00:00-08:00,1,41,41,100.00
+
+[Successfully executed]
+2025-05-01 01:48:02 - Thread-447 (execute) - INFO - [Try to execute]
+-- 9) Description: Summarize the retention percentages averaged across all cohorts (overall view for months 1‑4).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "month_number",
+       ROUND(SUM(CASE WHEN a."month_number" BETWEEN 1 AND 4 THEN 1 ELSE 0 END)::FLOAT /
+             COUNT(*) * 100, 2) AS "overall_pct_users"
+FROM activity a
+GROUP BY "month_number"
+HAVING "month_number" BETWEEN 1 AND 4
+ORDER BY "month_number"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:48:03 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 9) Description: Summarize the retention percentages averaged across all cohorts (overall view for months 1‑4).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "month_number",
+       ROUND(SUM(CASE WHEN a."month_number" BETWEEN 1 AND 4 THEN 1 ELSE 0 END)::FLOAT /
+             COUNT(*) * 100, 2) AS "overall_pct_users"
+FROM activity a
+GROUP BY "month_number"
+HAVING "month_number" BETWEEN 1 AND 4
+ORDER BY "month_number"
+LIMIT 20;
+Results:
+month_number,overall_pct_users
+1,100.0
+2,100.0
+3,100.0
+4,100.0
+
+[Successfully executed]
+2025-05-01 01:48:03 - Thread-447 (execute) - INFO - [Try to execute]
+-- 10) Description: Same as query 8 but expressed as a pivot, giving one row per cohort and separate columns for months 1‑4.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+    AND DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 BETWEEN 1 AND 4
+)
+SELECT "first_purchase_month",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m1_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m2_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m3_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m4_pct"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:48:04 - Thread-447 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 10) Description: Same as query 8 but expressed as a pivot, giving one row per cohort and separate columns for months 1‑4.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+    AND DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 BETWEEN 1 AND 4
+)
+SELECT "first_purchase_month",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m1_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m2_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m3_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m4_pct"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+Results:
+first_purchase_month,m1_pct,m2_pct,m3_pct,m4_pct
+2019-01-01 00:00:00-08:00,100.00,0.00,0.00,0.00
+2019-02-01 00:00:00-08:00,100.00,3.33,0.00,0.00
+2019-03-01 00:00:00-08:00,100.00,0.00,0.00,2.44
+
+[Successfully executed]
+2025-05-01 01:48:04 - Thread-447 (execute) - INFO - itercount: 0
+2025-05-01 01:48:04 - Thread-447 (execute) - INFO - [Self-refine]
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.DISTRIBUTION_CENTERS
+Column name: name Type: TEXT Description: None
+Column name: longitude Type: FLOAT Description: None
+Column name: latitude Type: FLOAT Description: None
+Column name: id Type: NUMBER Description: None
+Sample rows:
+[{'id': 2, 'name': 'Chicago IL', 'latitude': 41.8369, 'longitude': -87.6847}, {'id': 3, 'name': 'Houston TX', 'latitude': 29.7604, 'longitude': -95.3698}, {'id': 4, 'name': 'Los Angeles CA', 'latitude': 34.05, 'longitude': -118.25}, {'id': 6, 'name': 'Port Authority of New York/New Jersey NY/NJ', 'latitude': 40.634, 'longitude': -73.7834}, {'id': 7, 'name': 'Philadelphia PA', 'latitude': 39.95, 'longitude': -75.1667}]
+
+--------------------------------------------------
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.ORDERS
+Column name: gender Type: TEXT Description: None
+Column name: created_at Type: NUMBER Description: None
+Column name: user_id Type: NUMBER Description: None
+Column name: shipped_at Type: NUMBER Description: None
+Column name: returned_at Type: NUMBER Description: None
+Column name: num_of_item Type: NUMBER Description: None
+Column name: delivered_at Type: NUMBER Description: None
+Column name: order_id Type: NUMBER Description: None
+Column name: status Type: TEXT Description: None
+Sample rows:
+[{'order_id': 45, 'user_id': 52, 'status': 'Cancelled', 'gender': 'F', 'created_at': 1584925080000000, 'returned_at': None, 'shipped_at': None, 'delivered_at': None, 'num_of_item': 2}, {'order_id': 136, 'user_id': 120, 'status': 'Cancelled', 'gender': 'F', 'created_at': 1703481840000000, 'returned_at': None, 'shipped_at': None, 'delivered_at': None, 'num_of_item': 1}, {'order_id': 165, 'user_id': 150, 'status': 'Cancelled', 'gender': 'F', 'created_at': 1663130700000000, 'returned_at': None, 'shipped_at': None, 'delivered_at': None, 'num_of_item': 1}, {'order_id': 167, 'user_id': 150, 'status': 'Cancelled', 'gender': 'F', 'created_at': 1696049100000000, 'returned_at': None, 'shipped_at': None, 'delivered_at': None, 'num_of_item': 1}, {'order_id': 176, 'user_id': 157, 'status': 'Cancelled', 'gender': 'F', 'created_at': 1728450960000000, 'returned_at': None, 'shipped_at': None, 'delivered_at': None, 'num_of_item': 2}]
+
+--------------------------------------------------
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.USERS
+Column name: longitude Type: FLOAT Description: None
+Column name: age Type: NUMBER Description: None
+Column name: email Type: TEXT Description: None
+Column name: country Type: TEXT Description: None
+Column name: city Type: TEXT Description: None
+Column name: street_address Type: TEXT Description: None
+Column name: last_name Type: TEXT Description: None
+Column name: created_at Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: first_name Type: TEXT Description: None
+Column name: traffic_source Type: TEXT Description: None
+Column name: latitude Type: FLOAT Description: None
+Column name: postal_code Type: TEXT Description: None
+Column name: gender Type: TEXT Description: None
+Column name: state Type: TEXT Description: None
+Sample rows:
+[{'id': 11668, 'first_name': 'Breanna', 'last_name': 'Ritter', 'email': 'breannaritter@example.net', 'age': 63, 'gender': 'F', 'state': 'Acre', 'street_address': '046 Tracy Loaf', 'postal_code': '69980-000', 'city': 'null', 'country': 'Brasil', 'latitude': -8.065346116, 'longitude': -72.87094866, 'traffic_source': 'Search', 'created_at': 1680349680000000}, {'id': 81441, 'first_name': 'Richard', 'last_name': 'Smith', 'email': 'richardsmith@example.net', 'age': 38, 'gender': 'M', 'state': 'Acre', 'street_address': '5962 Smith Hills Apt. 774', 'postal_code': '69980-000', 'city': 'null', 'country': 'Brasil', 'latitude': -8.065346116, 'longitude': -72.87094866, 'traffic_source': 'Search', 'created_at': 1712810340000000}, {'id': 85935, 'first_name': 'Daniel', 'last_name': 'Burton', 'email': 'danielburton@example.org', 'age': 68, 'gender': 'M', 'state': 'Acre', 'street_address': '4801 Johnson Fields', 'postal_code': '69980-000', 'city': 'null', 'country': 'Brasil', 'latitude': -8.065346116, '
+
+
+--------------------------------------------------
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.EVENTS
+Column name: sequence_number Type: NUMBER Description: None
+Column name: state Type: TEXT Description: None
+Column name: city Type: TEXT Description: None
+Column name: uri Type: TEXT Description: None
+Column name: user_id Type: NUMBER Description: None
+Column name: traffic_source Type: TEXT Description: None
+Column name: browser Type: TEXT Description: None
+Column name: created_at Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: ip_address Type: TEXT Description: None
+Column name: session_id Type: TEXT Description: None
+Column name: event_type Type: TEXT Description: None
+Column name: postal_code Type: TEXT Description: None
+Sample rows:
+[{'id': 2105244, 'user_id': None, 'sequence_number': 3, 'session_id': '6c0e961a-bfac-462c-bd39-a52426df7ce7', 'created_at': 1576417200000000, 'ip_address': '94.182.172.118', 'city': 'Morioka City', 'state': 'Iwate', 'postal_code': '020-0866', 'browser': 'Firefox', 'traffic_source': 'Email', 'uri': '/cancel', 'event_type': 'cancel'}, {'id': 1820591, 'user_id': None, 'sequence_number': 3, 'session_id': '004548b4-5bf8-457b-bb88-22b06f2d5ab5', 'created_at': 1612523820000000, 'ip_address': '88.133.113.172', 'city': 'São Paulo', 'state': 'São Paulo', 'postal_code': '02220-000', 'browser': 'Chrome', 'traffic_source': 'Adwords', 'uri': '/cancel', 'event_type': 'cancel'}, {'id': 1508063, 'user_id': None, 'sequence_number': 3, 'session_id': 'e30bf7f2-82db-4b73-8dea-b774c88d5da1', 'created_at': 1602595560000000, 'ip_address': '154.88.22.81', 'city': 'São Paulo', 'state': 'São Paulo', 'postal_code': '02675-031', 'browser': 'Firefox', 'traffic_source': 'Email', 'uri': '/cancel', 'event_type': 'canc
+
+
+--------------------------------------------------
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.INVENTORY_ITEMS
+Column name: product_sku Type: TEXT Description: None
+Column name: sold_at Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: product_department Type: TEXT Description: None
+Column name: product_distribution_center_id Type: NUMBER Description: None
+Column name: cost Type: FLOAT Description: None
+Column name: product_name Type: TEXT Description: None
+Column name: product_category Type: TEXT Description: None
+Column name: product_retail_price Type: FLOAT Description: None
+Column name: product_id Type: NUMBER Description: None
+Column name: product_brand Type: TEXT Description: None
+Column name: created_at Type: NUMBER Description: None
+Sample rows:
+[{'id': 30266, 'product_id': 13844, 'created_at': 1697415641000000, 'sold_at': 1702053341000000.0, 'cost': 2.768039897618853, 'product_category': 'Accessories', 'product_name': '(ONE) 1 Satin Headband', 'product_brand': 'Funny Girl Designs', 'product_retail_price': 6.989999771118164, 'product_department': 'Women', 'product_sku': '2A3E953A5E3D81E67945BCE5519F84C8', 'product_distribution_center_id': 7}, {'id': 30267, 'product_id': 13844, 'created_at': 1701168720000000, 'sold_at': nan, 'cost': 2.768039897618853, 'product_category': 'Accessories', 'product_name': '(ONE) 1 Satin Headband', 'product_brand': 'Funny Girl Designs', 'product_retail_price': 6.989999771118164, 'product_department': 'Women', 'product_sku': '2A3E953A5E3D81E67945BCE5519F84C8', 'product_distribution_center_id': 7}, {'id': 30268, 'product_id': 13844, 'created_at': 1621069920000000, 'sold_at': nan, 'cost': 2.768039897618853, 'product_category': 'Accessories', 'product_name': '(ONE) 1 Satin Headband', 'product_brand': 'F
+
+
+--------------------------------------------------
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.PRODUCTS
+Column name: sku Type: TEXT Description: None
+Column name: distribution_center_id Type: NUMBER Description: None
+Column name: name Type: TEXT Description: None
+Column name: category Type: TEXT Description: None
+Column name: cost Type: FLOAT Description: None
+Column name: id Type: NUMBER Description: None
+Column name: brand Type: TEXT Description: None
+Column name: retail_price Type: FLOAT Description: None
+Column name: department Type: TEXT Description: None
+Sample rows:
+[{'id': 14115, 'cost': 4.879559879379869, 'category': 'Accessories', 'name': 'Enzyme Regular Solid Army Caps-Black W35S45D', 'brand': 'MG', 'retail_price': 10.989999771118164, 'department': 'Women', 'sku': 'EE364229B2791D1EF9355708EFF0BA34', 'distribution_center_id': 1}, {'id': 14157, 'cost': 4.648769887297898, 'category': 'Accessories', 'name': 'Enzyme Regular Solid Army Caps-Olive W35S45D (One Size)', 'brand': 'MG', 'retail_price': 10.989999771118164, 'department': 'Women', 'sku': '00BD13095D06C20B11A2993CA419D16B', 'distribution_center_id': 1}, {'id': 14273, 'cost': 6.507929886473045, 'category': 'Accessories', 'name': 'Washed Canvas Ivy Cap - Black W11S64C', 'brand': 'MG', 'retail_price': 15.989999771118164, 'department': 'Women', 'sku': 'F531DC20FDE20B7ADF3A73F52B71D0AF', 'distribution_center_id': 1}, {'id': 15816, 'cost': 3.1772999091416594, 'category': 'Plus', 'name': 'Low Profile Dyed Cotton Twill Cap - Putty W39S55D', 'brand': 'MG', 'retail_price': 5.949999809265137, 'departme
+
+
+--------------------------------------------------
+Table full name: THELOOK_ECOMMERCE.THELOOK_ECOMMERCE.ORDER_ITEMS
+Column name: id Type: NUMBER Description: None
+Column name: status Type: TEXT Description: None
+Column name: product_id Type: NUMBER Description: None
+Column name: shipped_at Type: NUMBER Description: None
+Column name: order_id Type: NUMBER Description: None
+Column name: sale_price Type: FLOAT Description: None
+Column name: inventory_item_id Type: NUMBER Description: None
+Column name: user_id Type: NUMBER Description: None
+Column name: delivered_at Type: NUMBER Description: None
+Column name: created_at Type: NUMBER Description: None
+Column name: returned_at Type: NUMBER Description: None
+Sample rows:
+[{'id': 21512, 'order_id': 14805, 'user_id': 12024, 'product_id': 14235, 'inventory_item_id': 58236, 'status': 'Cancelled', 'created_at': 1720493802000000, 'shipped_at': nan, 'delivered_at': nan, 'returned_at': None, 'sale_price': 0.0199999995529651}, {'id': 117211, 'order_id': 81114, 'user_id': 64965, 'product_id': 14235, 'inventory_item_id': 316883, 'status': 'Complete', 'created_at': 1661055328000000, 'shipped_at': 1661118900000000.0, 'delivered_at': 1661222940000000.0, 'returned_at': None, 'sale_price': 0.0199999995529651}, {'id': 158811, 'order_id': 109826, 'user_id': 88004, 'product_id': 14235, 'inventory_item_id': 429135, 'status': 'Complete', 'created_at': 1705966661000000, 'shipped_at': 1706189340000000.0, 'delivered_at': 1706461140000000.0, 'returned_at': None, 'sale_price': 0.0199999995529651}, {'id': 9787, 'order_id': 6684, 'user_id': 5524, 'product_id': 14235, 'inventory_item_id': 26401, 'status': 'Shipped', 'created_at': 1660568548000000, 'shipped_at': 1660791780000000.0,
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'THELOOK_ECOMMERCE': {'THELOOK_ECOMMERCE': ['DISTRIBUTION_CENTERS', 'ORDERS', 'USERS', 'EVENTS', 'INVENTORY_ITEMS', 'PRODUCTS', 'ORDER_ITEMS']}}
+Begin Exploring Related Columns
+Relevant columns and their possible use  
+
+ORDERS  
+• "user_id": identifies each customer; primary key for user‑level grouping.  
+• "order_id": identifies a unique purchase event; used for de‑duplication.  
+• "created_at": micro‑second epoch time of the order; used to define (1) the customer’s first purchase month and (2) the month offsets (month 1, month 2 …).  
+• "status": lets us keep only real purchases (usually ‘Complete’, ‘Shipped’, ‘Processing’).  
+• "delivered_at", "returned_at": optional filters; may be checked to be sure an order was not returned.  
+
+ORDER_ITEMS  
+• "user_id": second route to the customer id (helpful when an order lacks the id).  
+• "created_at": time stamp on the line‑item; sometimes safer than the order header.  
+• "status": same idea as in ORDERS.  
+
+USERS  
+• "id": joins to ORDERS / ORDER_ITEMS when we want demographics or to ensure the user exists.  
+
+Typical conditions you will use  
+• "created_at" < 1672531200000000   -- everything up to 31‑Dec‑2022 23:59:59 UTC  
+• "status" IN ('Complete','Shipped','Processing')   -- keep only real purchases  
+• Use DATE_TRUNC('month', TO_TIMESTAMP_LTZ("created_at"/1e6)) to isolate a purchase month.  
+
+Below are ten exploratory Snowflake SQL statements (progressing from simple to complex) that help you look at the data you will need for the requested retention calculation.  
+All column names are wrapped in double quotes, each query is annotated, and every query is capped with LIMIT 20.
+
+```sql
+-- 1) Description: Show the distinct order‑level statuses that exist, so we know which ones represent real purchases.
+SELECT DISTINCT "status"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+LIMIT 20;
+```
+
+```sql
+-- 2) Description: Count how many orders of each status happened up to the end of 2022.
+SELECT "status",
+       COUNT(*) AS "orders_through_2022"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+GROUP BY "status"
+ORDER BY "orders_through_2022" DESC
+LIMIT 20;
+```
+
+```sql
+-- 3) Description: Glimpse at raw timestamps vs. human‑readable form for orders before 2023.
+SELECT "order_id",
+       "user_id",
+       "created_at",
+       TO_TIMESTAMP_LTZ("created_at"/1e6) AS "order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+ORDER BY "created_at" DESC
+LIMIT 20;
+```
+
+```sql
+-- 4) Description: For each user, pull out the very first purchase (order header view, good‑status only, through 2022).
+SELECT "user_id",
+       MIN("created_at") AS "first_order_ts_raw",
+       TO_TIMESTAMP_LTZ(MIN("created_at")/1e6) AS "first_order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+  AND "status" IN ('Complete','Shipped','Processing')
+GROUP BY "user_id"
+LIMIT 20;
+```
+
+```sql
+-- 5) Description: See how many NEW customers there were in each first‑purchase month (cohort size).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+)
+SELECT "first_purchase_month",
+       COUNT(DISTINCT "user_id") AS "new_users"
+FROM firsts
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+```
+
+```sql
+-- 6) Description: Generate every user’s purchases (good statuses) plus their *offset* in months since first purchase.
+WITH firsts AS (
+  SELECT "user_id",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         o."created_at",
+         f."first_created_at",
+         DATEDIFF('month',
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(f."first_created_at"/1e6)),
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"  -- 1 = cohort month
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT *
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+ORDER BY "user_id", "month_number"
+LIMIT 20;
+```
+
+```sql
+-- 7) Description: Count unique users who placed an order in each cohort month (1‑4) *within* the same cohort.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "first_purchase_month",
+       "month_number",
+       COUNT(DISTINCT "user_id") AS "active_users"
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+GROUP BY "first_purchase_month", "month_number"
+ORDER BY "first_purchase_month", "month_number"
+LIMIT 20;
+```
+
+```sql
+-- 8) Description: Add cohort size to compute the retention percentage month by month.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT a."first_purchase_month",
+       a."month_number",
+       COUNT(DISTINCT a."user_id") AS "active_users",
+       c."cohort_users",
+       ROUND(COUNT(DISTINCT a."user_id")*100.0 / c."cohort_users", 2) AS "pct_of_cohort"
+FROM activity a
+JOIN cohort_size c
+  ON a."first_purchase_month" = c."first_purchase_month"
+WHERE a."month_number" BETWEEN 1 AND 4
+GROUP BY a."first_purchase_month", a."month_number", c."cohort_users"
+ORDER BY a."first_purchase_month", a."month_number"
+LIMIT 20;
+```
+
+```sql
+-- 9) Description: Summarize the retention percentages averaged across all cohorts (overall view for months 1‑4).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "month_number",
+       ROUND(SUM(CASE WHEN a."month_number" BETWEEN 1 AND 4 THEN 1 ELSE 0 END)::FLOAT /
+             COUNT(*) * 100, 2) AS "overall_pct_users"
+FROM activity a
+GROUP BY "month_number"
+HAVING "month_number" BETWEEN 1 AND 4
+ORDER BY "month_number"
+LIMIT 20;
+```
+
+```sql
+-- 10) Description: Same as query 8 but expressed as a pivot, giving one row per cohort and separate columns for months 1‑4.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+    AND DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 BETWEEN 1 AND 4
+)
+SELECT "first_purchase_month",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m1_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m2_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m3_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m4_pct"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+```
+
+The ten statements above progress from verifying basic data quality to producing the cohort‑based retention percentages you need, all while staying within the required table set and Snowflake SQL syntax.
+Refined SQLs and results:
+Query:
+-- 1) Description: Show the distinct order‑level statuses that exist, so we know which ones represent real purchases.
+SELECT DISTINCT "status"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+LIMIT 20;
+Answer:
+status
+Cancelled
+Complete
+Processing
+Shipped
+Returned
+Query:
+-- 2) Description: Count how many orders of each status happened up to the end of 2022.
+SELECT "status",
+       COUNT(*) AS "orders_through_2022"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+GROUP BY "status"
+ORDER BY "orders_through_2022" DESC
+LIMIT 20;
+Answer:
+status,orders_through_2022
+Shipped,11916
+Complete,9991
+Processing,7951
+Cancelled,6027
+Returned,4013
+Query:
+-- 3) Description: Glimpse at raw timestamps vs. human‑readable form for orders before 2023.
+SELECT "order_id",
+       "user_id",
+       "created_at",
+       TO_TIMESTAMP_LTZ("created_at"/1e6) AS "order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+ORDER BY "created_at" DESC
+LIMIT 20;
+Answer:
+order_id,user_id,created_at,order_ts
+61381,49265,1672513140000000,2022-12-31 10:59:00-08:00
+49046,39361,1672512540000000,2022-12-31 10:49:00-08:00
+92232,73942,1672512540000000,2022-12-31 10:49:00-08:00
+60329,48410,1672505940000000,2022-12-31 08:59:00-08:00
+Query:
+-- 4) Description: For each user, pull out the very first purchase (order header view, good‑status only, through 2022).
+SELECT "user_id",
+       MIN("created_at") AS "first_order_ts_raw",
+       TO_TIMESTAMP_LTZ(MIN("created_at")/1e6) AS "first_order_ts"
+FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+WHERE "created_at" < 1672531200000000
+  AND "status" IN ('Complete','Shipped','Processing')
+GROUP BY "user_id"
+LIMIT 20;
+Answer:
+user_id,first_order_ts_raw,first_order_ts
+52,1593392280000000,2020-06-28 16:58:00-08:00
+100,1636387140000000,2021-11-08 07:59:00-08:00
+133,1623901860000000,2021-06-16 19:51:00-08:00
+168,1670464980000000,2022-12-07 18:03:00-08:00
+Query:
+-- 5) Description: See how many NEW customers there were in each first‑purchase month (cohort size).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+)
+SELECT "first_purchase_month",
+       COUNT(DISTINCT "user_id") AS "new_users"
+FROM firsts
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+Answer:
+first_purchase_month,new_users
+2019-01-01 00:00:00-08:00,2
+2019-02-01 00:00:00-08:00,30
+2019-03-01 00:00:00-08:00,41
+2019-04-01 00:00:00-07:00,66
+2019-05-01 00:00:00-07:00,67
+Query:
+-- 6) Description: Generate every user’s purchases (good statuses) plus their *offset* in months since first purchase.
+WITH firsts AS (
+  SELECT "user_id",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         o."created_at",
+         f."first_created_at",
+         DATEDIFF('month',
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(f."first_created_at"/1e6)),
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"  -- 1 = cohort month
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT *
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+ORDER BY "user_id", "month_number"
+LIMIT 20;
+Answer:
+user_id,created_at,first_created_at,month_number
+15,1648039860000000,1648039860000000,1
+20,1621254480000000,1621254480000000,1
+26,1622744340000000,1622744340000000,1
+28,1670405700000000,1670405700000000,1
+33,1631508420000000,1631508420000000,1
+36,1616073840000000,1616073840000000,1
+44,1664889540000000,1664889540000000,1
+47,1662175140000000,1662175140000000,1
+52,1593392280000000,1593392280000000,1
+64,1625110620000000,1625110620000000,1
+68,1591415040000000,1591415040000000,1
+71,1640108
+Query:
+-- 7) Description: Count unique users who placed an order in each cohort month (1‑4) *within* the same cohort.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month",
+         MIN("created_at") AS "first_created_at"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+purchases AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "first_purchase_month",
+       "month_number",
+       COUNT(DISTINCT "user_id") AS "active_users"
+FROM purchases
+WHERE "month_number" BETWEEN 1 AND 4
+GROUP BY "first_purchase_month", "month_number"
+ORDER BY "first_purchase_month", "month_number"
+LIMIT 20;
+Answer:
+first_purchase_month,month_number,active_users
+2019-01-01 00:00:00-08:00,1,2
+2019-02-01 00:00:00-08:00,1,30
+2019-02-01 00:00:00-08:00,2,1
+2019-03-01 00:00:00-08:00,1,41
+2019-03-01 00:00:00-08:00,4,1
+Query:
+-- 8) Description: Add cohort size to compute the retention percentage month by month.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT a."first_purchase_month",
+       a."month_number",
+       COUNT(DISTINCT a."user_id") AS "active_users",
+       c."cohort_users",
+       ROUND(COUNT(DISTINCT a."user_id")*100.0 / c."cohort_users", 2) AS "pct_of_cohort"
+FROM activity a
+JOIN cohort_size c
+  ON a."first_purchase_month" = c."first_purchase_month"
+WHERE a."month_number" BETWEEN 1 AND 4
+GROUP BY a."first_purchase_month", a."month_number", c."cohort_users"
+ORDER BY a."first_purchase_month", a."month_number"
+LIMIT 20;
+Answer:
+first_purchase_month,month_number,active_users,cohort_users,pct_of_cohort
+2019-01-01 00:00:00-08:00,1,2,2,100.00
+2019-02-01 00:00:00-08:00,1,30,30,100.00
+2019-02-01 00:00:00-08:00,2,1,30,3.33
+2019-03-01 00:00:00-08:00,1,41,41,100.00
+Query:
+-- 9) Description: Summarize the retention percentages averaged across all cohorts (overall view for months 1‑4).
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+)
+SELECT "month_number",
+       ROUND(SUM(CASE WHEN a."month_number" BETWEEN 1 AND 4 THEN 1 ELSE 0 END)::FLOAT /
+             COUNT(*) * 100, 2) AS "overall_pct_users"
+FROM activity a
+GROUP BY "month_number"
+HAVING "month_number" BETWEEN 1 AND 4
+ORDER BY "month_number"
+LIMIT 20;
+Answer:
+month_number,overall_pct_users
+1,100.0
+2,100.0
+3,100.0
+4,100.0
+Query:
+-- 10) Description: Same as query 8 but expressed as a pivot, giving one row per cohort and separate columns for months 1‑4.
+WITH firsts AS (
+  SELECT "user_id",
+         DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+  WHERE "created_at" < 1672531200000000
+    AND "status" IN ('Complete','Shipped','Processing')
+  GROUP BY "user_id"
+),
+cohort_size AS (
+  SELECT "first_purchase_month",
+         COUNT(DISTINCT "user_id") AS "cohort_users"
+  FROM firsts
+  GROUP BY "first_purchase_month"
+),
+activity AS (
+  SELECT o."user_id",
+         f."first_purchase_month",
+         DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 AS "month_number"
+  FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+  JOIN firsts f ON o."user_id" = f."user_id"
+  WHERE o."created_at" < 1672531200000000
+    AND o."status" IN ('Complete','Shipped','Processing')
+    AND DATEDIFF('month',
+                  f."first_purchase_month",
+                  DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))) + 1 BETWEEN 1 AND 4
+)
+SELECT "first_purchase_month",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m1_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m2_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m3_pct",
+       ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) * 100.0 /
+             MAX("cohort_users"), 2) AS "m4_pct"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month"
+LIMIT 20;
+Answer:
+first_purchase_month,m1_pct,m2_pct,m3_pct,m4_pct
+2019-01-01 00:00:00-08:00,100.00,0.00,0.00,0.00
+2019-02-01 00:00:00-08:00,100.00,3.33,0.00,0.00
+2019-03-01 00:00:00-08:00,100.00,0.00,0.00,2.44
+End Exploring Related Columns
+Task: Using data up to the end of 2022 and organized by the month of each user's first purchase, can you provide the percentage of users who made a purchase in each of the first, second, third, and fourth months since their initial purchase, where the "first month" refers to the month of their initial purchase?
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'THELOOK_ECOMMERCE': {'THELOOK_ECOMMERCE': ['DISTRIBUTION_CENTERS', 'ORDERS', 'USERS', 'EVENTS', 'INVENTORY_ITEMS', 'PRODUCTS', 'ORDER_ITEMS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 01:49:08 - Thread-447 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH firsts AS (
+    SELECT 
+        "user_id",
+        DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+    FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+    WHERE "created_at" < 1672531200000000         -- up to 2022‑12‑31
+      AND "status" IN ('Complete','Shipped','Processing')
+    GROUP BY "user_id"
+),
+cohort_size AS (
+    SELECT 
+        "first_purchase_month",
+        COUNT(DISTINCT "user_id") AS "cohort_users"
+    FROM firsts
+    GROUP BY "first_purchase_month"
+),
+activity AS (
+    SELECT  
+        o."user_id",
+        f."first_purchase_month",
+        DATEDIFF(
+            'month',
+            f."first_purchase_month",
+            DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))
+        ) + 1 AS "month_number"                   -- 1 = month of first purchase
+    FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+    JOIN firsts f  ON o."user_id" = f."user_id"
+    WHERE o."created_at" < 1672531200000000
+      AND o."status" IN ('Complete','Shipped','Processing')
+      AND DATEDIFF(
+            'month',
+            f."first_purchase_month",
+            DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))
+        ) + 1 BETWEEN 1 AND 4                    -- keep only first 4 months
+)
+SELECT 
+    TO_CHAR("first_purchase_month",'YYYY-MM')                               AS "first_purchase_month",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month1",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month2",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month3",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month4"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month";
+```
+
+```csv
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:49:09 - Thread-447 (execute) - INFO - [Executed results in self-refine]
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+2019-01,100.00,0.00,0.00,0.00
+2019-02,100.00,3.33,0.00,0.00
+2019-03,100.00,0.00,0.00,2.44
+2019-04,100.00,1.52,1.52,3.03
+2019-05,100.00,2.99,1.49,1.49
+2019-06,100.00,1.87,0.00,0.93
+2019-07,100.00,0.00,0.78,3.10
+2019-08,100.00,1.23,1.85,0.62
+2019-09,100.00,1.14,0.57,0.00
+2019-10,100.00,2.15,0.54,1.61
+2019-11,100.00,0.49,1.48,1.48
+2019-12,100.00,0.90,1.36,0.90
+2020-01,100.00,0.00,1.57,0.39
+2020-02,100.00,2.18,1
+
+[Executed results in self-refine]
+2025-05-01 01:49:09 - Thread-447 (execute) - INFO - itercount: 1
+2025-05-01 01:49:09 - Thread-447 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Using data up to the end of 2022 and organized by the month of each user's first purchase, can you provide the percentage of users who made a purchase in each of the first, second, third, and fourth months since their initial purchase, where the "first month" refers to the month of their initial purchase?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+2019-01,100.00,0.00,0.00,0.00
+2019-02,100.00,3.33,0.00,0.00
+2019-03,100.00,0.00,0.00,2.44
+2019-04,100.00,1.52,1.52,3.03
+2019-05,100.00,2.99,1.49,1.49
+2019-06,100.00,1.87,0.00,0.93
+2019-07,100.00,0.00,0.78,3.10
+2019-08,100.00,1.23,1.85,0.62
+2019-09,100.00,1.14,0.57,0.00
+2019-10,100.00,2.15,0.54,1.61
+2019-11,100.00,0.49,1.48,1.48
+2019-12,100.00,0.90,1.36,0.90
+2020-01,100.00,0.00,1.57,0.39
+2020-02,100.00,2.18,1
+Current sql:
+WITH firsts AS (
+    SELECT 
+        "user_id",
+        DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+    FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+    WHERE "created_at" < 1672531200000000         -- up to 2022‑12‑31
+      AND "status" IN ('Complete','Shipped','Processing')
+    GROUP BY "user_id"
+),
+cohort_size AS (
+    SELECT 
+        "first_purchase_month",
+        COUNT(DISTINCT "user_id") AS "cohort_users"
+    FROM firsts
+    GROUP BY "first_purchase_month"
+),
+activity AS (
+    SELECT  
+        o."user_id",
+        f."first_purchase_month",
+        DATEDIFF(
+            'month',
+            f."first_purchase_month",
+            DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))
+        ) + 1 AS "month_number"                   -- 1 = month of first purchase
+    FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+    JOIN firsts f  ON o."user_id" = f."user_id"
+    WHERE o."created_at" < 1672531200000000
+      AND o."status" IN ('Complete','Shipped','Processing')
+      AND DATEDIFF(
+            'month',
+            f."first_purchase_month",
+            DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))
+        ) + 1 BETWEEN 1 AND 4                    -- keep only first 4 months
+)
+SELECT 
+    TO_CHAR("first_purchase_month",'YYYY-MM')                               AS "first_purchase_month",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month1",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month2",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month3",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END) 
+          * 100.0 / MAX("cohort_users"), 2)                                 AS "pct_users_month4"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month";
+[Self-refine]
+2025-05-01 01:49:46 - Thread-447 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH firsts AS (
+    SELECT 
+        "user_id",
+        DATE_TRUNC('month', TO_TIMESTAMP_LTZ(MIN("created_at")/1e6)) AS "first_purchase_month"
+    FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS"
+    WHERE "created_at" < 1672531200000000           -- up to 2022‑12‑31 23:59:59
+      AND "status" IN ('Complete','Shipped','Processing')
+    GROUP BY "user_id"
+),
+cohort_size AS (
+    SELECT 
+        "first_purchase_month",
+        COUNT(DISTINCT "user_id") AS "cohort_users"
+    FROM firsts
+    GROUP BY "first_purchase_month"
+),
+activity AS (
+    SELECT  
+        o."user_id",
+        f."first_purchase_month",
+        DATEDIFF(
+            'month',
+            f."first_purchase_month",
+            DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))
+        ) + 1 AS "month_number"                     -- 1 = month of first purchase
+    FROM THELOOK_ECOMMERCE.THELOOK_ECOMMERCE."ORDERS" o
+    JOIN firsts f ON o."user_id" = f."user_id"
+    WHERE o."created_at" < 1672531200000000
+      AND o."status" IN ('Complete','Shipped','Processing')
+      AND DATEDIFF(
+            'month',
+            f."first_purchase_month",
+            DATE_TRUNC('month', TO_TIMESTAMP_LTZ(o."created_at"/1e6))
+        ) + 1 BETWEEN 1 AND 4                      -- keep only first 4 months
+)
+SELECT 
+    TO_CHAR("first_purchase_month",'YYYY-MM')                                AS "first_purchase_month",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 1 THEN "user_id" END)
+          * 100.0 / MAX("cohort_users"), 4)                                  AS "pct_users_month1",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 2 THEN "user_id" END)
+          * 100.0 / MAX("cohort_users"), 4)                                  AS "pct_users_month2",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 3 THEN "user_id" END)
+          * 100.0 / MAX("cohort_users"), 4)                                  AS "pct_users_month3",
+    ROUND(COUNT(DISTINCT CASE WHEN "month_number" = 4 THEN "user_id" END)
+          * 100.0 / MAX("cohort_users"), 4)                                  AS "pct_users_month4"
+FROM activity
+JOIN cohort_size USING("first_purchase_month")
+GROUP BY "first_purchase_month"
+ORDER BY "first_purchase_month";
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:49:46 - Thread-447 (execute) - INFO - [Executed results in self-refine]
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+2019-01,100.0000,0.0000,0.0000,0.0000
+2019-02,100.0000,3.3333,0.0000,0.0000
+2019-03,100.0000,0.0000,0.0000,2.4390
+2019-04,100.0000,1.5152,1.5152,3.0303
+2019-05,100.0000,2.9851,1.4925,1.4925
+2019-06,100.0000,1.8692,0.0000,0.9346
+2019-07,100.0000,0.0000,0.7752,3.1008
+2019-08,100.0000,1.2346,1.8519,0.6173
+2019-09,100.0000,1.1364,0.5682,0.0000
+2019-10,100.0000,2.1505,0.5376,1.6129
+2019-11,100.0000,0.4926,1.4778,
+
+[Executed results in self-refine]
+2025-05-01 01:49:46 - Thread-447 (execute) - INFO - [Consistent results]
+first_purchase_month,pct_users_month1,pct_users_month2,pct_users_month3,pct_users_month4
+2019-01,100.0000,0.0000,0.0000,0.0000
+2019-02,100.0000,3.3333,0.0000,0.0000
+2019-03,100.0000,0.0000,0.0000,2.4390
+2019-04,100.0000,1.5152,1.5152,3.0303
+2019-05,100.0000,2.9851,1.4925,1.4925
+2019-06,100.0000,1.8692,0.0000,0.9346
+2019-07,100.0000,0.0000,0.7752,3.1008
+2019-08,100.0000,1.2346,1.8519,0.6173
+2019-09,100.0000,1.1364,0.5682,0.0000
+2019-10,100.0000,2.1505,0.5376,1.6129
+2019-11,100.0000,0.4926,1.4778,
+
+[Consistent results]
+2025-05-01 01:49:46 - Thread-447 (execute) - INFO - Total iteration counts: 1

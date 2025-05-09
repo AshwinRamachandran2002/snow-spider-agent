@@ -1,0 +1,1661 @@
+2025-05-01 00:56:44 - Thread-150 (execute) - INFO - [Answer format]
+```csv
+line,occurrences,languages
+```
+[Answer format]
+2025-05-01 00:58:16 - Thread-150 (execute) - INFO - [Exploration]
+Relevant columns and their potential usage
+
+GITHUB_REPOS.GITHUB_REPOS.SAMPLE_FILES  
+• "repo_name":  repository‑id – used to join to LANGUAGES and to SAMPLE_CONTENTS  
+• "path":        full file path – filter for 'README.md' (or case variants)  
+• "id":          blob SHA – join key to "id" in SAMPLE_CONTENTS to obtain the file body  
+• "ref":         branch / tag – normally ‘refs/heads/master’, not strictly needed here  
+• "mode":        unix permissions – not required for this task  
+• "symlink_target":  only needed if README is a symlink (skip when NULL)
+
+GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS  
+• "id":              blob SHA – joins to SAMPLE_FILES."id"  
+• "content":         complete file text – split into individual lines and strip blanks / comments  
+• "binary":          boolean – exclude binary blobs (binary = TRUE)  
+• "sample_repo_name": repo id duplicate – alternative to SAMPLE_FILES."repo_name"  
+• "sample_path":     duplicate of file path – alternative to SAMPLE_FILES."path"
+
+GITHUB_REPOS.GITHUB_REPOS.LANGUAGES  
+• "repo_name":  repository‑id – join to SAMPLE_FILES."repo_name"  
+• "language":   JSON/VARIANT list of language names – explode & aggregate into CSV
+
+
+
+10 exploratory Snowflake SQL queries
+(each returns ≤ 20 rows, all identifiers in double quotes)
+
+```sql
+-- 1.  Peek at files that look like README.md (case‑insensitive)  
+SELECT  "repo_name",
+        "path",
+        "id"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE   LOWER("path") LIKE '%readme.md'
+LIMIT 20;
+```
+
+```sql
+-- 2.  Verify that those README candidates really exist in SAMPLE_CONTENTS  
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;
+```
+
+```sql
+-- 3.  Pull one README’s raw content to inspect line structure  
+SELECT  c."content"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;          -- each row is a full README blob
+```
+
+```sql
+-- 4.  Split README blobs into individual lines (first repository only)  
+SELECT  f."repo_name",
+        l.value::STRING  AS "readme_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l      -- line‑by‑line
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   f."repo_name" = (SELECT MIN("repo_name") 
+                         FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+                         WHERE LOWER("path") LIKE '%readme.md')
+LIMIT 20;
+```
+
+```sql
+-- 5.  Filter out empty lines and Markdown or code comments  
+SELECT  l.value::STRING AS "clean_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE   -- rejects '#' or '//' lines
+  AND   TRIM(l.value) <> ''
+LIMIT 20;
+```
+
+```sql
+-- 6.  Count how many times each cleaned line appears (sample set)  
+SELECT  TRIM(l.value)                             AS "clean_line",
+        COUNT(*)                                  AS "occurrences"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+  AND   TRIM(l.value) <> ''
+GROUP BY 1
+ORDER BY "occurrences" DESC
+LIMIT 20;
+```
+
+```sql
+-- 7.  Find languages used by each repository (one repo sample)  
+SELECT  "repo_name",
+        ARRAY_TO_STRING(ARRAY_AGG(DISTINCT value::STRING ORDER BY value::STRING), ',') 
+        AS "languages_csv"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+     ,  LATERAL FLATTEN(input => lg."language") lf
+WHERE   lg."repo_name" = (SELECT MIN("repo_name") FROM "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES")
+GROUP BY "repo_name"
+LIMIT 20;
+```
+
+```sql
+-- 8.  Combine lines with the repo in which they appear  
+SELECT  DISTINCT
+        f."repo_name",
+        TRIM(l.value)  AS "clean_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+  AND   TRIM(l.value) <> ''
+LIMIT 20;
+```
+
+```sql
+-- 9.  Map each unique line to the languages used by repos containing it  
+SELECT  ln."clean_line",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lg_lang.value::STRING ORDER BY lg_lang.value::STRING), ','
+        ) AS "languages_csv"
+FROM   ( /* lines‑per‑repo */ 
+        SELECT  DISTINCT
+                f."repo_name",
+                TRIM(l.value) AS "clean_line"
+        FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+        JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+                  ON c."id" = f."id"
+             ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+        WHERE   LOWER(f."path") LIKE '%readme.md'
+          AND   c."binary" = FALSE
+          AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+          AND   TRIM(l.value) <> ''
+      ) ln
+JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+        ON lg."repo_name" = ln."repo_name"
+     , LATERAL FLATTEN(input => lg."language") lg_lang
+GROUP BY ln."clean_line"
+LIMIT 20;
+```
+
+```sql
+-- 10.  Full solution pattern: frequency, languages CSV, ordered by frequency desc  
+SELECT  ln."clean_line",
+        COUNT(DISTINCT ln."repo_name")                         AS "repo_count",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lg_lang.value::STRING ORDER BY lg_lang.value::STRING),
+            ','
+        )                                                      AS "languages_csv"
+FROM   (  -- derive non‑empty, non‑comment lines per repo  
+        SELECT  DISTINCT
+                f."repo_name",
+                TRIM(l.value) AS "clean_line"
+        FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+        JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+                  ON c."id" = f."id"
+             ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+        WHERE   LOWER(f."path") LIKE '%readme.md'
+          AND   c."binary" = FALSE
+          AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+          AND   TRIM(l.value) <> ''
+      ) ln
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+          ON lg."repo_name" = ln."repo_name"
+     ,    LATERAL FLATTEN(input => lg."language") lg_lang
+GROUP BY ln."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20;
+```
+
+
+
+Explanation  
+• Queries 1‑3 inspect README candidates and their raw contents.  
+• Queries 4‑6 demonstrate line splitting, cleaning, and frequency counting.  
+• Query 7 shows how to turn the VARIANT language array into a comma‑separated list.  
+• Queries 8‑10 gradually combine everything: link cleaned lines to their repositories, attach languages, aggregate, and finally rank by how many repositories share the same line, returning the languages in alphabetic CSV format.
+[Exploration]
+2025-05-01 00:58:16 - Thread-150 (execute) - INFO - [Try to execute]
+-- 1.  Peek at files that look like README.md (case‑insensitive)  
+SELECT  "repo_name",
+        "path",
+        "id"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE   LOWER("path") LIKE '%readme.md'
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:58:23 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1.  Peek at files that look like README.md (case‑insensitive)  
+SELECT  "repo_name",
+        "path",
+        "id"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE   LOWER("path") LIKE '%readme.md'
+LIMIT 20;
+Results:
+repo_name,path,id
+hatajoe/github-notification-gopherjs,GitHub-Notification-GopherJS-darwin-x64/GitHub-Notification-GopherJS.app/Contents/Resources/app/node_modules/octonode/node_modules/request/node_modules/bl/node_modules/readable-stream/node_modules/string_decoder/README.md,4d2aa001501107cd2792f385ad62237dc3757521
+itsthejb/ObjcAssociatedObjectHelpers,README.md,b618db0b7811ca2f6619bf52cbb5532cad0152c9
+jdhoek/inkscape-isometric-projection,README.md,a770e8d8ad235d5d18238b8e6f854f4285e7e6fd
+
+[Successfully executed]
+2025-05-01 00:58:23 - Thread-150 (execute) - INFO - [Try to execute]
+-- 2.  Verify that those README candidates really exist in SAMPLE_CONTENTS  
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:58:47 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2.  Verify that those README candidates really exist in SAMPLE_CONTENTS  
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;
+Results:
+repo_name,path,size,binary
+DaMSL/K3,tools/scripts/docker/README.md,1095,False
+briancavalier/todomvc-fab,examples/cujo/bower_components/curl/src/curl/plugin/README.md,561,False
+rgardler/azure-quickstart-templates,emercoin-ubuntu/README.md,2246,False
+waydelyle/openfund,public/js/ckeditor/README.md,1342,False
+
+[Successfully executed]
+2025-05-01 00:58:47 - Thread-150 (execute) - INFO - [Try to execute]
+-- 3.  Pull one README’s raw content to inspect line structure  
+SELECT  c."content"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;          -- each row is a full README blob
+[Try to execute]
+2025-05-01 00:59:10 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3.  Pull one README’s raw content to inspect line structure  
+SELECT  c."content"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;          -- each row is a full README blob
+Results:
+content
+"curl.js loader plugins
+===
+
+Please see the wiki for information about using plugins.  If you're interested
+in creating your own plugins, please check out the Plugin Author's Guide
+on the wiki (TBD).
+
+All of these plugins conform to the AMD specification.  However, that
+doesn't necessarily mean that they'll work with other AMD loaders or
+builders.  Until the build-time API of AMD is finalized, there will be
+incompatibilities.
+
+Modules that should work with any loader/builder:
+
+async!
+do
+
+[Successfully executed]
+2025-05-01 00:59:10 - Thread-150 (execute) - INFO - [Try to execute]
+-- 4.  Split README blobs into individual lines (first repository only)  
+SELECT  f."repo_name",
+        l.value::STRING  AS "readme_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l      -- line‑by‑line
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   f."repo_name" = (SELECT MIN("repo_name") 
+                         FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+                         WHERE LOWER("path") LIKE '%readme.md')
+LIMIT 20;
+[Try to execute]
+2025-05-01 00:59:19 - Thread-150 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-01 01:00:35 - Thread-150 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Find the very first text README.md we can guarantee exists,
+--             then split its contents into individual lines and list the
+--             first 20 of them.  By pre‑filtering on c."binary" = FALSE
+--             we avoid empty results caused by accidentally selecting a
+--             binary blob.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"             -- deterministic “first” repo/file
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        l.value::STRING AS "readme_line"
+FROM    first_readme                                       fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"    c
+       ON c."id" = fr."id"
+     , LATERAL SPLIT_TO_TABLE(c."content", '\n')           l
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-01 01:02:42 - Thread-150 (execute) - INFO - [Results for corrected sql]
+repo_name,readme_line
+DaMSL/K3,K3 Dockerfiles
+DaMSL/K3,==========
+DaMSL/K3,
+DaMSL/K3,Dockerfiles are updated for three images:
+DaMSL/K3,
+DaMSL/K3,1. **k3-app** -- (~250MB) light-weight image to run a K3 program. Based on debian:jessie. It contains only the necessary dependency libraries.
+DaMSL/K3,2. **k3-compiler** -- (~2 GB) Image containing the GHC and GCC tool chains to compile a K3 program to binary. Based on debian:jessie
+DaMSL/K3,"3. **k3-dev** (~2.5 GB)  -- Larger container with a
+
+[Results for corrected sql]
+2025-05-01 01:04:33 - Thread-150 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Filter non‑empty, non‑comment lines out of the first non‑binary
+--             README.md we can find and show 20 such cleaned lines.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value)::STRING AS "clean_line"
+FROM    first_readme                                      fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+       ON c."id" = fr."id",
+     LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+LIMIT 20;
+```
+
+```sql
+--Description: Count how many times each cleaned line appears across ALL
+--             non‑binary README.md files.  Show the 20 most common lines.
+WITH clean_lines AS (
+    SELECT  DISTINCT
+            f."repo_name",
+            TRIM(l.value) AS "line"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+      AND   TRIM(l.value) <> ''
+      AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+)
+SELECT  "line"    AS "clean_line",
+        COUNT(*)  AS "occurrences"
+FROM    clean_lines
+GROUP BY "line"
+ORDER BY "occurrences" DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Show a comma‑separated list of languages for the alphabetically
+--             first repository that actually has at least one language entry.
+WITH repo_with_lang AS (
+    SELECT  DISTINCT lg."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+            LATERAL FLATTEN(input => lg."language") lf
+    WHERE   lf.value IS NOT NULL
+    ORDER BY lg."repo_name"
+    LIMIT 1
+)
+SELECT  lg."repo_name",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lf.value::STRING ORDER BY lf.value::STRING),
+            ','
+        ) AS "languages_csv"
+FROM    repo_with_lang r
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+          ON lg."repo_name" = r."repo_name",
+        LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lg."repo_name"
+LIMIT 20;
+```
+
+```sql
+--Description: List (repo, line) pairs for the first non‑binary README after
+--             removing blank lines and lines beginning with '#' or '//'.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value) AS "clean_line"
+FROM    first_readme                                      fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+       ON c."id" = fr."id",
+     LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+LIMIT 20;
+```
+
+```sql
+--Description: For the 20 most frequent cleaned README lines, list the
+--             distinct languages (alphabetically) used by repos containing
+--             each line.
+WITH lines_per_repo AS (
+    SELECT  DISTINCT
+            f."repo_name",
+            TRIM(l.value) AS "clean_line"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+      AND   TRIM(l.value) <> ''
+      AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+), top_lines AS (
+    SELECT  "clean_line",
+            COUNT(*) AS repo_cnt
+    FROM    lines_per_repo
+    GROUP BY "clean_line"
+    ORDER BY repo_cnt DESC
+    LIMIT 20
+)
+SELECT  tl."clean_line",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lf.value::STRING ORDER BY lf.value::STRING),
+            ','
+        ) AS "languages_csv"
+FROM     top_lines tl
+JOIN     lines_per_repo lr          ON lr."clean_line" = tl."clean_line"
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY tl."clean_line";
+```
+
+```sql
+--Description: Full solution – across all non‑binary README.md files, compute
+--             how many repositories contain each non‑comment, non‑empty line,
+--             and list the distinct languages used by those repositories.
+WITH lines_per_repo AS (
+    SELECT  DISTINCT
+            f."repo_name",
+            TRIM(l.value) AS "clean_line"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+      AND   TRIM(l.value) <> ''
+      AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+)
+SELECT  lr."clean_line",
+        COUNT(DISTINCT lr."repo_name") AS "repo_count",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lf.value::STRING ORDER BY lf.value::STRING),
+            ','
+        ) AS "languages_csv"
+FROM     lines_per_repo lr
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lr."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 01:04:33 - Thread-150 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Find the very first text README.md we can guarantee exists,
+--             then split its contents into individual lines and list the
+--             first 20 of them.  By pre‑filtering on c."binary" = FALSE
+--             we avoid empty results caused by accidentally selecting a
+--             binary blob.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"             -- deterministic “first” repo/file
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        l.value::STRING AS "readme_line"
+FROM    first_readme                                       fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"    c
+       ON c."id" = fr."id"
+     , LATERAL SPLIT_TO_TABLE(c."content", '\n')           l
+LIMIT 20;
+Results:
+repo_name,readme_line
+DaMSL/K3,K3 Dockerfiles
+DaMSL/K3,==========
+DaMSL/K3,
+DaMSL/K3,Dockerfiles are updated for three images:
+DaMSL/K3,
+DaMSL/K3,1. **k3-app** -- (~250MB) light-weight image to run a K3 program. Based on debian:jessie. It contains only the necessary dependency libraries.
+DaMSL/K3,2. **k3-compiler** -- (~2 GB) Image containing the GHC and GCC tool chains to compile a K3 program to binary. Based on debian:jessie
+DaMSL/K3,"3. **k3-dev** (~2.5 GB)  -- Larger container with a
+
+[Successfully corrected]
+2025-05-01 01:04:33 - Thread-150 (execute) - INFO - [Try to execute]
+--Description: Filter non‑empty, non‑comment lines out of the first non‑binary
+--             README.md we can find and show 20 such cleaned lines.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value)::STRING AS "clean_line"
+FROM    first_readme                                      fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+       ON c."id" = fr."id",
+     LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:33 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Filter non‑empty, non‑comment lines out of the first non‑binary
+--             README.md we can find and show 20 such cleaned lines.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value)::STRING AS "clean_line"
+FROM    first_readme                                      fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+       ON c."id" = fr."id",
+     LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+LIMIT 20
+Results:
+repo_name,clean_line
+DaMSL/K3,K3 Dockerfiles
+DaMSL/K3,==========
+DaMSL/K3,Dockerfiles are updated for three images:
+DaMSL/K3,1. **k3-app** -- (~250MB) light-weight image to run a K3 program. Based on debian:jessie. It contains only the necessary dependency libraries.
+DaMSL/K3,2. **k3-compiler** -- (~2 GB) Image containing the GHC and GCC tool chains to compile a K3 program to binary. Based on debian:jessie
+DaMSL/K3,"3. **k3-dev** (~2.5 GB)  -- Larger container with additional library and a
+
+[Successfully executed]
+2025-05-01 01:04:33 - Thread-150 (execute) - INFO - [Try to execute]
+--Description: Count how many times each cleaned line appears across ALL
+--             non‑binary README.md files.  Show the 20 most common lines.
+WITH clean_lines AS (
+    SELECT  DISTINCT
+            f."repo_name",
+            TRIM(l.value) AS "line"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+      AND   TRIM(l.value) <> ''
+      AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+)
+SELECT  "line"    AS "clean_line",
+        COUNT(*)  AS "occurrences"
+FROM    clean_lines
+GROUP BY "line"
+ORDER BY "occurrences" DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:34 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Count how many times each cleaned line appears across ALL
+--             non‑binary README.md files.  Show the 20 most common lines.
+WITH clean_lines AS (
+    SELECT  DISTINCT
+            f."repo_name",
+            TRIM(l.value) AS "line"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+      AND   TRIM(l.value) <> ''
+      AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+)
+SELECT  "line"    AS "clean_line",
+        COUNT(*)  AS "occurrences"
+FROM    clean_lines
+GROUP BY "line"
+ORDER BY "occurrences" DESC
+LIMIT 20
+Results:
+clean_line,occurrences
+==========,2
+```,1
+1. **Download** the latest version from the CKEditor website:,1
+[![Deploy to Azure](http://azuredeploy.net/deploybutton.png)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FAzure%2Fazure-quickstart-templates%2Fmaster%2Femercoin-ubuntu%2Fazuredeploy.json),1
+"* `adminPassword`: self-explanatory. Be aware that Azure requires passwords to have One upper case, one lower case, a special character, and a n
+
+[Successfully executed]
+2025-05-01 01:04:34 - Thread-150 (execute) - INFO - [Try to execute]
+--Description: Show a comma‑separated list of languages for the alphabetically
+--             first repository that actually has at least one language entry.
+WITH repo_with_lang AS (
+    SELECT  DISTINCT lg."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+            LATERAL FLATTEN(input => lg."language") lf
+    WHERE   lf.value IS NOT NULL
+    ORDER BY lg."repo_name"
+    LIMIT 1
+)
+SELECT  lg."repo_name",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lf.value::STRING ORDER BY lf.value::STRING),
+            ','
+        ) AS "languages_csv"
+FROM    repo_with_lang r
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+          ON lg."repo_name" = r."repo_name",
+        LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lg."repo_name"
+LIMIT 20
+[Try to execute]
+2025-05-01 01:04:34 - Thread-150 (execute) - INFO - [Error occurred]
+001003 (42000): SQL compilation error:
+syntax error line 11 at position 48 unexpected 'ORDER'.
+syntax error line 11 at position 73 unexpected ')'.
+[Error occurred]
+2025-05-01 01:06:25 - Thread-150 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Identify the lexicographically‑smallest repository that has at least
+--             one language specified, then return all of its languages in a single
+--             comma‑separated, alphabetically‑sorted string.
+WITH first_repo AS (
+    SELECT MIN(lg."repo_name") AS "repo_name"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+           LATERAL FLATTEN(input => lg."language") lf   -- ensures repo actually has language entries
+)
+SELECT  fr."repo_name",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING)  AS "languages_csv"
+FROM    first_repo fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+          ON lg."repo_name" = fr."repo_name",
+        LATERAL FLATTEN(input => lg."language") lf
+GROUP BY fr."repo_name";
+```
+[Corrected SQL]
+2025-05-01 01:06:25 - Thread-150 (execute) - INFO - [Results for corrected sql]
+repo_name,languages_csv
+0--------------------------------------/Trivia-Crack-DNS,"{""bytes"":3540,""name"":""PHP""}"
+
+[Results for corrected sql]
+2025-05-01 01:07:10 - Thread-150 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: (1) Return (repo, clean_line) pairs from the first non‑binary
+--             README.md, stripping blank lines and those beginning with “#” or “//”.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+              ON c."id" = f."id" AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value) AS "clean_line"
+FROM    first_readme                                     fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  c
+          ON c."id" = fr."id",
+      LATERAL SPLIT_TO_TABLE(c."content", '\n')          l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+LIMIT 20;
+```
+
+```sql
+--Description: (2) For the 20 most frequent cleaned README lines, list the
+--             languages (comma‑separated & alphabetically) used by repos
+--             containing each line.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+), top_lines AS (
+    SELECT  "clean_line",
+            COUNT(*) AS repo_cnt
+    FROM    lines_per_repo
+    GROUP BY "clean_line"
+    ORDER BY repo_cnt DESC
+    LIMIT 20
+)
+SELECT  tl."clean_line",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING)  AS "languages_csv"
+FROM     top_lines tl
+JOIN     lines_per_repo   lr  ON lr."clean_line" = tl."clean_line"
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY tl."clean_line";
+```
+
+```sql
+--Description: (3) Complete solution – for every unique, non‑comment line in
+--             all non‑binary README.md files, count how many repositories
+--             share that line and list the distinct languages (alphabetically)
+--             used by those repositories.  Result ordered by frequency.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+)
+SELECT  lr."clean_line",
+        COUNT(DISTINCT lr."repo_name")               AS "repo_count",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING) AS "languages_csv"
+FROM     lines_per_repo lr
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lr."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-01 01:07:10 - Thread-150 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description: Identify the lexicographically‑smallest repository that has at least
+--             one language specified, then return all of its languages in a single
+--             comma‑separated, alphabetically‑sorted string.
+WITH first_repo AS (
+    SELECT MIN(lg."repo_name") AS "repo_name"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+           LATERAL FLATTEN(input => lg."language") lf   -- ensures repo actually has language entries
+)
+SELECT  fr."repo_name",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING)  AS "languages_csv"
+FROM    first_repo fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+          ON lg."repo_name" = fr."repo_name",
+        LATERAL FLATTEN(input => lg."language") lf
+GROUP BY fr."repo_name";
+Results:
+repo_name,languages_csv
+0--------------------------------------/Trivia-Crack-DNS,"{""bytes"":3540,""name"":""PHP""}"
+
+[Successfully corrected]
+2025-05-01 01:07:10 - Thread-150 (execute) - INFO - [Try to execute]
+--Description: (1) Return (repo, clean_line) pairs from the first non‑binary
+--             README.md, stripping blank lines and those beginning with “#” or “//”.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+              ON c."id" = f."id" AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value) AS "clean_line"
+FROM    first_readme                                     fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  c
+          ON c."id" = fr."id",
+      LATERAL SPLIT_TO_TABLE(c."content", '\n')          l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+LIMIT 20
+[Try to execute]
+2025-05-01 01:07:12 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (1) Return (repo, clean_line) pairs from the first non‑binary
+--             README.md, stripping blank lines and those beginning with “#” or “//”.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+              ON c."id" = f."id" AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value) AS "clean_line"
+FROM    first_readme                                     fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  c
+          ON c."id" = fr."id",
+      LATERAL SPLIT_TO_TABLE(c."content", '\n')          l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+LIMIT 20
+Results:
+repo_name,clean_line
+DaMSL/K3,K3 Dockerfiles
+DaMSL/K3,==========
+DaMSL/K3,Dockerfiles are updated for three images:
+DaMSL/K3,1. **k3-app** -- (~250MB) light-weight image to run a K3 program. Based on debian:jessie. It contains only the necessary dependency libraries.
+DaMSL/K3,2. **k3-compiler** -- (~2 GB) Image containing the GHC and GCC tool chains to compile a K3 program to binary. Based on debian:jessie
+DaMSL/K3,"3. **k3-dev** (~2.5 GB)  -- Larger container with additional library and a
+
+[Successfully executed]
+2025-05-01 01:07:12 - Thread-150 (execute) - INFO - [Try to execute]
+--Description: (2) For the 20 most frequent cleaned README lines, list the
+--             languages (comma‑separated & alphabetically) used by repos
+--             containing each line.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+), top_lines AS (
+    SELECT  "clean_line",
+            COUNT(*) AS repo_cnt
+    FROM    lines_per_repo
+    GROUP BY "clean_line"
+    ORDER BY repo_cnt DESC
+    LIMIT 20
+)
+SELECT  tl."clean_line",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING)  AS "languages_csv"
+FROM     top_lines tl
+JOIN     lines_per_repo   lr  ON lr."clean_line" = tl."clean_line"
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY tl."clean_line"
+[Try to execute]
+2025-05-01 01:07:14 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (2) For the 20 most frequent cleaned README lines, list the
+--             languages (comma‑separated & alphabetically) used by repos
+--             containing each line.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+), top_lines AS (
+    SELECT  "clean_line",
+            COUNT(*) AS repo_cnt
+    FROM    lines_per_repo
+    GROUP BY "clean_line"
+    ORDER BY repo_cnt DESC
+    LIMIT 20
+)
+SELECT  tl."clean_line",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING)  AS "languages_csv"
+FROM     top_lines tl
+JOIN     lines_per_repo   lr  ON lr."clean_line" = tl."clean_line"
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY tl."clean_line"
+Results:
+clean_line,languages_csv
+docker build -f k3-dev -t damsl/k3-dev:<your_tag> .,"{""bytes"":2265182,""name"":""Haskell""},{""bytes"":2285,""name"":""CMake""},{""bytes"":488,""name"":""Shell""},{""bytes"":530367,""name"":""C++""}"
+"* `adminPassword`: self-explanatory. Be aware that Azure requires passwords to have One upper case, one lower case, a special character, and a number","{""bytes"":1134131,""name"":""PowerShell""},{""bytes"":1192725,""name"":""Shell""},{""bytes"":1561,""name"":""Batchfil
+
+[Successfully executed]
+2025-05-01 01:07:14 - Thread-150 (execute) - INFO - [Try to execute]
+--Description: (3) Complete solution – for every unique, non‑comment line in
+--             all non‑binary README.md files, count how many repositories
+--             share that line and list the distinct languages (alphabetically)
+--             used by those repositories.  Result ordered by frequency.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+)
+SELECT  lr."clean_line",
+        COUNT(DISTINCT lr."repo_name")               AS "repo_count",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING) AS "languages_csv"
+FROM     lines_per_repo lr
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lr."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 01:07:16 - Thread-150 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: (3) Complete solution – for every unique, non‑comment line in
+--             all non‑binary README.md files, count how many repositories
+--             share that line and list the distinct languages (alphabetically)
+--             used by those repositories.  Result ordered by frequency.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+)
+SELECT  lr."clean_line",
+        COUNT(DISTINCT lr."repo_name")               AS "repo_count",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING) AS "languages_csv"
+FROM     lines_per_repo lr
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lr."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20
+Results:
+clean_line,repo_count,languages_csv
+==========,2,"{""bytes"":122722,""name"":""PHP""},{""bytes"":21196,""name"":""JavaScript""},{""bytes"":2265182,""name"":""Haskell""},{""bytes"":2285,""name"":""CMake""},{""bytes"":229930,""name"":""HTML""},{""bytes"":488,""name"":""Shell""},{""bytes"":530367,""name"":""C++""},{""bytes"":553,""name"":""ApacheConf""},{""bytes"":87973,""name"":""CSS""}"
+async!,1,"{""bytes"":11305,""name"":""Dart""},{""bytes"":16649,""name"":""TypeScript""},{""bytes"":25348,""na
+
+[Successfully executed]
+2025-05-01 01:07:16 - Thread-150 (execute) - INFO - itercount: 0
+2025-05-01 01:07:16 - Thread-150 (execute) - INFO - [Self-refine]
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_FILES
+Column name: symlink_target Type: TEXT Description: None
+Column name: id Type: TEXT Description: None
+Column name: mode Type: NUMBER Description: None
+Column name: path Type: TEXT Description: None
+Column name: repo_name Type: TEXT Description: None
+Column name: ref Type: TEXT Description: None
+Sample rows:
+[{'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'drivers/isdn/hisax/elsa.c', 'mode': 33188, 'id': '64ba26a4afe649818a23565fc4ae6631eaf9d9b1', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'arch/arm/mach-pxa/include/mach/smemc.h', 'mode': 33188, 'id': 'b802f285fe00e6dd3b39af77e3b351d3a4343316', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'drivers/i2c/busses/i2c-eg20t.c', 'mode': 33188, 'id': 'c811289b61e21628f28d79b71f27651c39e3e024', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'arch/arm/mm/proc-arm920.S', 'mode': 33188, 'id': 'b06224a692b9bc255c860f959b7fe5913e957852', 'symlink_target': None}, {'repo_name': 'dorimanx/DORIMANX_LG_STOCK_LP_KERNEL', 'ref': 'refs/heads/master', 'path': 'drivers/video/msm/lcdc_external.c', 'mode': 33188, 'id
+
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.LANGUAGES
+Column name: repo_name Type: TEXT Description: None
+Column name: language Type: VARIANT Description: None
+Sample rows:
+[{'repo_name': 'debjyoti385/awesome-data-mining-datasets', 'language': '[]'}, {'repo_name': 'graidl/test', 'language': '[]'}, {'repo_name': 'iBeacons/grape', 'language': '[]'}, {'repo_name': 'swapnil-pimpale/geep-kernel-training', 'language': '[]'}, {'repo_name': 'TheEvilDev/atom-yeoman', 'language': '[]'}]
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.LICENSES
+Column name: repo_name Type: TEXT Description: None
+Column name: license Type: TEXT Description: None
+Sample rows:
+[{'repo_name': 'npm/npmconf', 'license': 'isc'}, {'repo_name': 'live627/shiny-bear', 'license': 'isc'}, {'repo_name': 'k7hoven/spexcript', 'license': 'isc'}, {'repo_name': 'photofroggy/Reflex', 'license': 'isc'}, {'repo_name': 'sr-cafe/topisto', 'license': 'isc'}]
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_COMMITS
+Column name: parent Type: VARIANT Description: None
+Column name: committer Type: VARIANT Description: None
+Column name: difference Type: VARIANT Description: None
+Column name: message Type: TEXT Description: None
+Column name: author Type: VARIANT Description: None
+Column name: difference_truncated Type: BOOLEAN Description: None
+Column name: subject Type: TEXT Description: None
+Column name: trailer Type: VARIANT Description: None
+Column name: encoding Type: TEXT Description: None
+Column name: commit Type: TEXT Description: None
+Column name: repo_name Type: TEXT Description: None
+Column name: tree Type: TEXT Description: None
+Sample rows:
+[{'commit': '76cdd58e558669366adfaded436fda01b30cce3e', 'tree': 'deaccb499752c928919693edea65f9ea4c1fe756', 'parent': '[\n  "1c12c4cf9411eb130b245fa8d0fbbaf989477c7b"\n]', 'author': '{\n  "date": 1210806352000000,\n  "email": "8dcf0f69152f32f23184f83357a3731522e56b9c@de.ibm.com",\n  "name": "Heiko Carstens",\n  "time_sec": 1210806352,\n  "tz_offset": -420\n}', 'committer': '{\n  "date": 1210817475000000,\n  "email": "69652caca27c8b940640ad396ab71f93cacec34f@linux-foundation.org",\n  "name": "Linus Torvalds",\n  "time_sec": 1210817475,\n  "tz_offset": -420\n}', 'subject': 'memory_hotplug: always initialize pageblock bitmap', 'message': 'memory_hotplug: always initialize pageblock bitmap\n\nTrying to online a new memory section that was added via memory hotplug\nsometimes results in crashes when the new pages are added via __free_page.\n Reason for that is that the pageblock bitmap isn\'t initialized and hence\ncontains random stuff.  That means that get_pageblock_migratetype()\nreturns 
+
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+Column name: size Type: NUMBER Description: None
+Column name: binary Type: BOOLEAN Description: None
+Column name: sample_symlink_target Type: TEXT Description: None
+Column name: copies Type: NUMBER Description: None
+Column name: sample_mode Type: NUMBER Description: None
+Column name: sample_path Type: TEXT Description: None
+Column name: content Type: TEXT Description: None
+Column name: sample_ref Type: TEXT Description: None
+Column name: id Type: TEXT Description: None
+Column name: sample_repo_name Type: TEXT Description: None
+Sample rows:
+[{'id': '2dd586a19b594a73e9c6f7485d1e5da9203a4467', 'size': 21447, 'content': '/*\n * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips\n *\n * Copyright (C) 2008 David Brownell\n *\n * This program is free software; you can redistribute it and/or modify\n * it under the terms of the GNU General Public License version 2 as\n * published by the Free Software Foundation.\n *\n */\n#include <linux/kernel.h>\n#include <linux/init.h>\n#include <linux/bcd.h>\n#include <linux/slab.h>\n#include <linux/rtc.h>\n#include <linux/workqueue.h>\n\n#include <linux/spi/spi.h>\n#include <linux/spi/ds1305.h>\n#include <linux/module.h>\n\n\n/*\n * Registers ... mask DS1305_WRITE into register address to write,\n * otherwise you\'re reading it.  All non-bitmask values are BCD.\n */\n#define DS1305_WRITE\t\t0x80\n\n\n/* RTC date/time ... the main special cases are that we:\n *  - Need fancy "hours" encoding in 12hour mode\n *  - Don\'t rely on the "day-of-week" field (or tm_wday)\n *  - Are a 21st-
+
+
+--------------------------------------------------
+Table full name: GITHUB_REPOS.GITHUB_REPOS.SAMPLE_REPOS
+Column name: watch_count Type: NUMBER Description: None
+Column name: repo_name Type: TEXT Description: None
+Sample rows:
+[{'repo_name': 'kbandla/APTnotes', 'watch_count': 256}, {'repo_name': 'bigcompany/hook.io', 'watch_count': 256}, {'repo_name': 'krisk/Fuse', 'watch_count': 256}, {'repo_name': 'brigade/react-waypoint', 'watch_count': 256}, {'repo_name': 'Quartz/mapquery', 'watch_count': 256}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['SAMPLE_FILES', 'LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_REPOS']}}
+Begin Exploring Related Columns
+Relevant columns and their potential usage
+
+GITHUB_REPOS.GITHUB_REPOS.SAMPLE_FILES  
+• "repo_name":  repository‑id – used to join to LANGUAGES and to SAMPLE_CONTENTS  
+• "path":        full file path – filter for 'README.md' (or case variants)  
+• "id":          blob SHA – join key to "id" in SAMPLE_CONTENTS to obtain the file body  
+• "ref":         branch / tag – normally ‘refs/heads/master’, not strictly needed here  
+• "mode":        unix permissions – not required for this task  
+• "symlink_target":  only needed if README is a symlink (skip when NULL)
+
+GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS  
+• "id":              blob SHA – joins to SAMPLE_FILES."id"  
+• "content":         complete file text – split into individual lines and strip blanks / comments  
+• "binary":          boolean – exclude binary blobs (binary = TRUE)  
+• "sample_repo_name": repo id duplicate – alternative to SAMPLE_FILES."repo_name"  
+• "sample_path":     duplicate of file path – alternative to SAMPLE_FILES."path"
+
+GITHUB_REPOS.GITHUB_REPOS.LANGUAGES  
+• "repo_name":  repository‑id – join to SAMPLE_FILES."repo_name"  
+• "language":   JSON/VARIANT list of language names – explode & aggregate into CSV
+
+
+
+10 exploratory Snowflake SQL queries
+(each returns ≤ 20 rows, all identifiers in double quotes)
+
+```sql
+-- 1.  Peek at files that look like README.md (case‑insensitive)  
+SELECT  "repo_name",
+        "path",
+        "id"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE   LOWER("path") LIKE '%readme.md'
+LIMIT 20;
+```
+
+```sql
+-- 2.  Verify that those README candidates really exist in SAMPLE_CONTENTS  
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;
+```
+
+```sql
+-- 3.  Pull one README’s raw content to inspect line structure  
+SELECT  c."content"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;          -- each row is a full README blob
+```
+
+```sql
+-- 4.  Split README blobs into individual lines (first repository only)  
+SELECT  f."repo_name",
+        l.value::STRING  AS "readme_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l      -- line‑by‑line
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   f."repo_name" = (SELECT MIN("repo_name") 
+                         FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+                         WHERE LOWER("path") LIKE '%readme.md')
+LIMIT 20;
+```
+
+```sql
+-- 5.  Filter out empty lines and Markdown or code comments  
+SELECT  l.value::STRING AS "clean_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE   -- rejects '#' or '//' lines
+  AND   TRIM(l.value) <> ''
+LIMIT 20;
+```
+
+```sql
+-- 6.  Count how many times each cleaned line appears (sample set)  
+SELECT  TRIM(l.value)                             AS "clean_line",
+        COUNT(*)                                  AS "occurrences"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+  AND   TRIM(l.value) <> ''
+GROUP BY 1
+ORDER BY "occurrences" DESC
+LIMIT 20;
+```
+
+```sql
+-- 7.  Find languages used by each repository (one repo sample)  
+SELECT  "repo_name",
+        ARRAY_TO_STRING(ARRAY_AGG(DISTINCT value::STRING ORDER BY value::STRING), ',') 
+        AS "languages_csv"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+     ,  LATERAL FLATTEN(input => lg."language") lf
+WHERE   lg."repo_name" = (SELECT MIN("repo_name") FROM "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES")
+GROUP BY "repo_name"
+LIMIT 20;
+```
+
+```sql
+-- 8.  Combine lines with the repo in which they appear  
+SELECT  DISTINCT
+        f."repo_name",
+        TRIM(l.value)  AS "clean_line"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+     ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+  AND   TRIM(l.value) <> ''
+LIMIT 20;
+```
+
+```sql
+-- 9.  Map each unique line to the languages used by repos containing it  
+SELECT  ln."clean_line",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lg_lang.value::STRING ORDER BY lg_lang.value::STRING), ','
+        ) AS "languages_csv"
+FROM   ( /* lines‑per‑repo */ 
+        SELECT  DISTINCT
+                f."repo_name",
+                TRIM(l.value) AS "clean_line"
+        FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+        JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+                  ON c."id" = f."id"
+             ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+        WHERE   LOWER(f."path") LIKE '%readme.md'
+          AND   c."binary" = FALSE
+          AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+          AND   TRIM(l.value) <> ''
+      ) ln
+JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+        ON lg."repo_name" = ln."repo_name"
+     , LATERAL FLATTEN(input => lg."language") lg_lang
+GROUP BY ln."clean_line"
+LIMIT 20;
+```
+
+```sql
+-- 10.  Full solution pattern: frequency, languages CSV, ordered by frequency desc  
+SELECT  ln."clean_line",
+        COUNT(DISTINCT ln."repo_name")                         AS "repo_count",
+        ARRAY_TO_STRING(
+            ARRAY_AGG(DISTINCT lg_lang.value::STRING ORDER BY lg_lang.value::STRING),
+            ','
+        )                                                      AS "languages_csv"
+FROM   (  -- derive non‑empty, non‑comment lines per repo  
+        SELECT  DISTINCT
+                f."repo_name",
+                TRIM(l.value) AS "clean_line"
+        FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+        JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+                  ON c."id" = f."id"
+             ,  LATERAL SPLIT_TO_TABLE(c."content", '\n') l
+        WHERE   LOWER(f."path") LIKE '%readme.md'
+          AND   c."binary" = FALSE
+          AND   REGEXP_LIKE(TRIM(l.value), '^[#/]') = FALSE
+          AND   TRIM(l.value) <> ''
+      ) ln
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+          ON lg."repo_name" = ln."repo_name"
+     ,    LATERAL FLATTEN(input => lg."language") lg_lang
+GROUP BY ln."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20;
+```
+
+
+
+Explanation  
+• Queries 1‑3 inspect README candidates and their raw contents.  
+• Queries 4‑6 demonstrate line splitting, cleaning, and frequency counting.  
+• Query 7 shows how to turn the VARIANT language array into a comma‑separated list.  
+• Queries 8‑10 gradually combine everything: link cleaned lines to their repositories, attach languages, aggregate, and finally rank by how many repositories share the same line, returning the languages in alphabetic CSV format.
+Refined SQLs and results:
+Query:
+-- 1.  Peek at files that look like README.md (case‑insensitive)  
+SELECT  "repo_name",
+        "path",
+        "id"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"
+WHERE   LOWER("path") LIKE '%readme.md'
+LIMIT 20;
+Answer:
+repo_name,path,id
+hatajoe/github-notification-gopherjs,GitHub-Notification-GopherJS-darwin-x64/GitHub-Notification-GopherJS.app/Contents/Resources/app/node_modules/octonode/node_modules/request/node_modules/bl/node_modules/readable-stream/node_modules/string_decoder/README.md,4d2aa001501107cd2792f385ad62237dc3757521
+itsthejb/ObjcAssociatedObjectHelpers,README.md,b618db0b7811ca2f6619bf52cbb5532cad0152c9
+jdhoek/inkscape-isometric-projection,README.md,a770e8d8ad235d5d18238b8e6f854f4285e7e6fd
+Query:
+-- 2.  Verify that those README candidates really exist in SAMPLE_CONTENTS  
+SELECT  f."repo_name",
+        f."path",
+        c."size",
+        c."binary"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"  f
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;
+Answer:
+repo_name,path,size,binary
+DaMSL/K3,tools/scripts/docker/README.md,1095,False
+briancavalier/todomvc-fab,examples/cujo/bower_components/curl/src/curl/plugin/README.md,561,False
+rgardler/azure-quickstart-templates,emercoin-ubuntu/README.md,2246,False
+waydelyle/openfund,public/js/ckeditor/README.md,1342,False
+Query:
+-- 3.  Pull one README’s raw content to inspect line structure  
+SELECT  c."content"
+FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES" f
+          ON c."id" = f."id"
+WHERE   LOWER(f."path") LIKE '%readme.md'
+  AND   c."binary" = FALSE
+LIMIT 20;          -- each row is a full README blob
+Answer:
+content
+"curl.js loader plugins
+===
+
+Please see the wiki for information about using plugins.  If you're interested
+in creating your own plugins, please check out the Plugin Author's Guide
+on the wiki (TBD).
+
+All of these plugins conform to the AMD specification.  However, that
+doesn't necessarily mean that they'll work with other AMD loaders or
+builders.  Until the build-time API of AMD is finalized, there will be
+incompatibilities.
+
+Modules that should work with any loader/builder:
+
+async!
+do
+Query:
+--Description: Filter non‑empty, non‑comment lines out of the first non‑binary
+--             README.md we can find and show 20 such cleaned lines.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id"  AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value)::STRING AS "clean_line"
+FROM    first_readme                                      fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+       ON c."id" = fr."id",
+     LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+LIMIT 20
+Answer:
+repo_name,clean_line
+DaMSL/K3,K3 Dockerfiles
+DaMSL/K3,==========
+DaMSL/K3,Dockerfiles are updated for three images:
+DaMSL/K3,1. **k3-app** -- (~250MB) light-weight image to run a K3 program. Based on debian:jessie. It contains only the necessary dependency libraries.
+DaMSL/K3,2. **k3-compiler** -- (~2 GB) Image containing the GHC and GCC tool chains to compile a K3 program to binary. Based on debian:jessie
+DaMSL/K3,"3. **k3-dev** (~2.5 GB)  -- Larger container with additional library and a
+Query:
+--Description: Count how many times each cleaned line appears across ALL
+--             non‑binary README.md files.  Show the 20 most common lines.
+WITH clean_lines AS (
+    SELECT  DISTINCT
+            f."repo_name",
+            TRIM(l.value) AS "line"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"      f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"   c
+           ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')            l
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+      AND   TRIM(l.value) <> ''
+      AND   REGEXP_LIKE(TRIM(l.value), '^[#/]|^//') = FALSE
+)
+SELECT  "line"    AS "clean_line",
+        COUNT(*)  AS "occurrences"
+FROM    clean_lines
+GROUP BY "line"
+ORDER BY "occurrences" DESC
+LIMIT 20
+Answer:
+clean_line,occurrences
+==========,2
+```,1
+1. **Download** the latest version from the CKEditor website:,1
+[![Deploy to Azure](http://azuredeploy.net/deploybutton.png)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2FAzure%2Fazure-quickstart-templates%2Fmaster%2Femercoin-ubuntu%2Fazuredeploy.json),1
+"* `adminPassword`: self-explanatory. Be aware that Azure requires passwords to have One upper case, one lower case, a special character, and a n
+Query:
+--Description: (1) Return (repo, clean_line) pairs from the first non‑binary
+--             README.md, stripping blank lines and those beginning with “#” or “//”.
+WITH first_readme AS (
+    SELECT  f."id", f."repo_name"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+              ON c."id" = f."id" AND c."binary" = FALSE
+    WHERE   LOWER(f."path") LIKE '%readme.md'
+    ORDER BY f."repo_name"
+    LIMIT 1
+)
+SELECT  fr."repo_name",
+        TRIM(l.value) AS "clean_line"
+FROM    first_readme                                     fr
+JOIN    "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  c
+          ON c."id" = fr."id",
+      LATERAL SPLIT_TO_TABLE(c."content", '\n')          l
+WHERE   TRIM(l.value) <> ''
+  AND   REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+LIMIT 20
+Answer:
+repo_name,clean_line
+DaMSL/K3,K3 Dockerfiles
+DaMSL/K3,==========
+DaMSL/K3,Dockerfiles are updated for three images:
+DaMSL/K3,1. **k3-app** -- (~250MB) light-weight image to run a K3 program. Based on debian:jessie. It contains only the necessary dependency libraries.
+DaMSL/K3,2. **k3-compiler** -- (~2 GB) Image containing the GHC and GCC tool chains to compile a K3 program to binary. Based on debian:jessie
+DaMSL/K3,"3. **k3-dev** (~2.5 GB)  -- Larger container with additional library and a
+Query:
+--Description: (2) For the 20 most frequent cleaned README lines, list the
+--             languages (comma‑separated & alphabetically) used by repos
+--             containing each line.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+), top_lines AS (
+    SELECT  "clean_line",
+            COUNT(*) AS repo_cnt
+    FROM    lines_per_repo
+    GROUP BY "clean_line"
+    ORDER BY repo_cnt DESC
+    LIMIT 20
+)
+SELECT  tl."clean_line",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING)  AS "languages_csv"
+FROM     top_lines tl
+JOIN     lines_per_repo   lr  ON lr."clean_line" = tl."clean_line"
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY tl."clean_line"
+Answer:
+clean_line,languages_csv
+docker build -f k3-dev -t damsl/k3-dev:<your_tag> .,"{""bytes"":2265182,""name"":""Haskell""},{""bytes"":2285,""name"":""CMake""},{""bytes"":488,""name"":""Shell""},{""bytes"":530367,""name"":""C++""}"
+"* `adminPassword`: self-explanatory. Be aware that Azure requires passwords to have One upper case, one lower case, a special character, and a number","{""bytes"":1134131,""name"":""PowerShell""},{""bytes"":1192725,""name"":""Shell""},{""bytes"":1561,""name"":""Batchfil
+Query:
+--Description: (3) Complete solution – for every unique, non‑comment line in
+--             all non‑binary README.md files, count how many repositories
+--             share that line and list the distinct languages (alphabetically)
+--             used by those repositories.  Result ordered by frequency.
+WITH lines_per_repo AS (
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value) AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+             ON c."id" = f."id" AND c."binary" = FALSE,
+         LATERAL SPLIT_TO_TABLE(c."content", '\n')         l
+    WHERE  LOWER(f."path") LIKE '%readme.md'
+      AND  TRIM(l.value) <> ''
+      AND  REGEXP_LIKE(TRIM(l.value), '^(#|//)') = FALSE
+)
+SELECT  lr."clean_line",
+        COUNT(DISTINCT lr."repo_name")               AS "repo_count",
+        LISTAGG(DISTINCT lf.value::STRING, ',')
+              WITHIN GROUP (ORDER BY lf.value::STRING) AS "languages_csv"
+FROM     lines_per_repo lr
+JOIN     "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg
+           ON lg."repo_name" = lr."repo_name",
+         LATERAL FLATTEN(input => lg."language") lf
+GROUP BY lr."clean_line"
+ORDER BY "repo_count" DESC
+LIMIT 20
+Answer:
+clean_line,repo_count,languages_csv
+==========,2,"{""bytes"":122722,""name"":""PHP""},{""bytes"":21196,""name"":""JavaScript""},{""bytes"":2265182,""name"":""Haskell""},{""bytes"":2285,""name"":""CMake""},{""bytes"":229930,""name"":""HTML""},{""bytes"":488,""name"":""Shell""},{""bytes"":530367,""name"":""C++""},{""bytes"":553,""name"":""ApacheConf""},{""bytes"":87973,""name"":""CSS""}"
+async!,1,"{""bytes"":11305,""name"":""Dart""},{""bytes"":16649,""name"":""TypeScript""},{""bytes"":25348,""na
+End Exploring Related Columns
+Task: Retrieve all non-empty, non-commented lines from `README.md` files in GitHub repositories, excluding lines that are comments (either starting with `#` for Markdown or `//` for code comments). For each line, calculate how often each unique line appears across all repositories and return a comma-separated list of the programming languages used in each repository containing that line, sorted alphabetically, with the results ordered by the frequency of occurrence in descending order.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+line,occurrences,languages
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['SAMPLE_FILES', 'LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_REPOS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 01:08:24 - Thread-150 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH valid_readme_lines AS (
+    /* one row per (repo, cleaned‑up line) coming from non‑binary README.md files */
+    SELECT DISTINCT
+           f."repo_name"                                         AS "repo_name",
+           TRIM(l.value)::STRING                                 AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"     f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  c
+           ON c."id" = f."id"
+         , LATERAL SPLIT_TO_TABLE(c."content", '\n')        l
+    WHERE  LOWER(f."path") LIKE '%readme.md'      -- README files only
+      AND  c."binary" = FALSE                     -- skip binary blobs
+      AND  TRIM(l.value) <> ''                    -- skip blank lines
+      AND  NOT REGEXP_LIKE(TRIM(l.value), '^(#|//)')  -- skip comment lines
+),
+repo_languages AS (
+    /* explode the language array for each repository */
+    SELECT  lg."repo_name",
+            COALESCE(lf.value:"name"::STRING,         -- when element is an object
+                     lf.value::STRING)                -- when element is a string
+            AS "lang"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+            LATERAL FLATTEN(input => lg."language") lf
+)
+SELECT  v."clean_line"                                              AS "line",
+        COUNT(DISTINCT v."repo_name")                               AS "occurrences",
+        LISTAGG(DISTINCT rl."lang", ',') 
+            WITHIN GROUP (ORDER BY rl."lang")                       AS "languages"
+FROM    valid_readme_lines v
+LEFT JOIN repo_languages rl
+       ON rl."repo_name" = v."repo_name"
+GROUP BY v."clean_line"
+ORDER BY "occurrences" DESC NULLS LAST, "line";
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:08:25 - Thread-150 (execute) - INFO - [Executed results in self-refine]
+line,occurrences,languages
+==========,2,"ApacheConf,C++,CMake,CSS,HTML,Haskell,JavaScript,PHP,Shell"
+	http://<your site>/<CKEditor installation path>/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+	http://www.example.com/ckeditor/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+![Emercoin-Azure](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/emercoin-ubuntu/images/emercoin.png),1,"Batchfile,Groovy,HCL,HTML,JavaScript,PHP,Perl,PowerShell,Python,Ruby,
+
+[Executed results in self-refine]
+2025-05-01 01:08:25 - Thread-150 (execute) - INFO - itercount: 1
+2025-05-01 01:08:25 - Thread-150 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Retrieve all non-empty, non-commented lines from `README.md` files in GitHub repositories, excluding lines that are comments (either starting with `#` for Markdown or `//` for code comments). For each line, calculate how often each unique line appears across all repositories and return a comma-separated list of the programming languages used in each repository containing that line, sorted alphabetically, with the results ordered by the frequency of occurrence in descending order., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+line,occurrences,languages
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+line,occurrences,languages
+==========,2,"ApacheConf,C++,CMake,CSS,HTML,Haskell,JavaScript,PHP,Shell"
+	http://<your site>/<CKEditor installation path>/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+	http://www.example.com/ckeditor/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+![Emercoin-Azure](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/emercoin-ubuntu/images/emercoin.png),1,"Batchfile,Groovy,HCL,HTML,JavaScript,PHP,Perl,PowerShell,Python,Ruby,
+Current sql:
+WITH valid_readme_lines AS (
+    /* one row per (repo, cleaned‑up line) coming from non‑binary README.md files */
+    SELECT DISTINCT
+           f."repo_name"                                         AS "repo_name",
+           TRIM(l.value)::STRING                                 AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"     f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"  c
+           ON c."id" = f."id"
+         , LATERAL SPLIT_TO_TABLE(c."content", '\n')        l
+    WHERE  LOWER(f."path") LIKE '%readme.md'      -- README files only
+      AND  c."binary" = FALSE                     -- skip binary blobs
+      AND  TRIM(l.value) <> ''                    -- skip blank lines
+      AND  NOT REGEXP_LIKE(TRIM(l.value), '^(#|//)')  -- skip comment lines
+),
+repo_languages AS (
+    /* explode the language array for each repository */
+    SELECT  lg."repo_name",
+            COALESCE(lf.value:"name"::STRING,         -- when element is an object
+                     lf.value::STRING)                -- when element is a string
+            AS "lang"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+            LATERAL FLATTEN(input => lg."language") lf
+)
+SELECT  v."clean_line"                                              AS "line",
+        COUNT(DISTINCT v."repo_name")                               AS "occurrences",
+        LISTAGG(DISTINCT rl."lang", ',') 
+            WITHIN GROUP (ORDER BY rl."lang")                       AS "languages"
+FROM    valid_readme_lines v
+LEFT JOIN repo_languages rl
+       ON rl."repo_name" = v."repo_name"
+GROUP BY v."clean_line"
+ORDER BY "occurrences" DESC NULLS LAST, "line";
+[Self-refine]
+2025-05-01 01:08:52 - Thread-150 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH valid_readme_lines AS (
+    /* all non‑empty, non‑comment lines from non‑binary README.md files */
+    SELECT DISTINCT
+           f."repo_name",
+           TRIM(l.value)::STRING AS "clean_line"
+    FROM   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_FILES"    f
+    JOIN   "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS" c
+           ON c."id" = f."id"
+         , LATERAL SPLIT_TO_TABLE(c."content", '\n')       l
+    WHERE  LOWER(f."path") LIKE '%readme.md'      -- only README.md files
+      AND  c."binary" = FALSE                     -- skip binaries
+      AND  TRIM(l.value) <> ''                    -- skip blank lines
+      AND  NOT REGEXP_LIKE(TRIM(l.value), '^(#|//)')       -- skip comment lines
+),
+repo_languages AS (
+    /* explode language arrays so each repo‑language pair is explicit */
+    SELECT  lg."repo_name",
+            COALESCE(lf.value:"name"::STRING, lf.value::STRING) AS "lang"
+    FROM    "GITHUB_REPOS"."GITHUB_REPOS"."LANGUAGES" lg,
+            LATERAL FLATTEN(input => lg."language") lf
+)
+SELECT  v."clean_line"                                                  AS "line",
+        COUNT(DISTINCT v."repo_name")                                   AS "occurrences",
+        LISTAGG(DISTINCT rl."lang", ',') 
+            WITHIN GROUP (ORDER BY rl."lang")                           AS "languages"
+FROM    valid_readme_lines v
+LEFT JOIN repo_languages rl
+       ON rl."repo_name" = v."repo_name"
+GROUP BY v."clean_line"
+ORDER BY "occurrences" DESC NULLS LAST, "line";
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:08:53 - Thread-150 (execute) - INFO - [Executed results in self-refine]
+line,occurrences,languages
+==========,2,"ApacheConf,C++,CMake,CSS,HTML,Haskell,JavaScript,PHP,Shell"
+	http://<your site>/<CKEditor installation path>/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+	http://www.example.com/ckeditor/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+![Emercoin-Azure](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/emercoin-ubuntu/images/emercoin.png),1,"Batchfile,Groovy,HCL,HTML,JavaScript,PHP,Perl,PowerShell,Python,Ruby,
+
+[Executed results in self-refine]
+2025-05-01 01:08:53 - Thread-150 (execute) - INFO - [Consistent results]
+line,occurrences,languages
+==========,2,"ApacheConf,C++,CMake,CSS,HTML,Haskell,JavaScript,PHP,Shell"
+	http://<your site>/<CKEditor installation path>/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+	http://www.example.com/ckeditor/samples/index.html,1,"ApacheConf,CSS,HTML,JavaScript,PHP"
+![Emercoin-Azure](https://raw.githubusercontent.com/Azure/azure-quickstart-templates/master/emercoin-ubuntu/images/emercoin.png),1,"Batchfile,Groovy,HCL,HTML,JavaScript,PHP,Perl,PowerShell,Python,Ruby,
+
+[Consistent results]
+2025-05-01 01:08:53 - Thread-150 (execute) - INFO - Total iteration counts: 1

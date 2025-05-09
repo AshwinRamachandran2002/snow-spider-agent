@@ -1,0 +1,10 @@
+SELECT
+  t."BLOCK_NUMBER" AS "Block_number",
+  (PARSE_JSON(t."ARGS"))[0]::STRING AS "Source_address",
+  (PARSE_JSON(t."ARGS"))[1]::STRING AS "Destination_address",
+  ROUND(TRY_TO_NUMBER((PARSE_JSON(t."ARGS"))[2]::STRING) / 1000000, 4) AS "Transfer_amount"
+FROM "GOOG_BLOCKCHAIN"."GOOG_BLOCKCHAIN_ARBITRUM_ONE_US"."DECODED_EVENTS" t
+WHERE t."ADDRESS" = '0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9'
+  AND t."EVENT_HASH" = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+ORDER BY "Transfer_amount" DESC NULLS LAST
+LIMIT 3;

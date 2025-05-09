@@ -1,0 +1,10 @@
+SELECT
+  "Modality",
+  COUNT(*) AS "TotalSOPInstances"
+FROM
+  IDC.IDC_V17.DICOM_ALL
+GROUP BY
+  "Modality"
+ORDER BY
+  COUNT(*) DESC NULLS LAST
+LIMIT 1;

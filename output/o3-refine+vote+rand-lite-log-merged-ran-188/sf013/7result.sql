@@ -1,0 +1,44 @@
+/*  Side-by-side comparison of total road length (meters) 
+    for Amsterdam (quadkey prefix 12020210) vs. Rotterdam (quadkey prefix 12020211)  */
+
+WITH amsterdam AS (
+    SELECT
+        "CLASS",
+        "SUBCLASS",
+        SUM(TRY_TO_DOUBLE("LENGTH_M")) AS "amsterdam_total_length_m"
+    FROM
+        NETHERLANDS_OPEN_MAP_DATA.NETHERLANDS."V_ROAD"
+    WHERE
+        "QUADKEY" LIKE '12020210%'
+    GROUP BY
+        "CLASS",
+        "SUBCLASS"
+),
+rotterdam AS (
+    SELECT
+        "CLASS",
+        "SUBCLASS",
+        SUM(TRY_TO_DOUBLE("LENGTH_M")) AS "rotterdam_total_length_m"
+    FROM
+        NETHERLANDS_OPEN_MAP_DATA.NETHERLANDS."V_ROAD"
+    WHERE
+        "QUADKEY" LIKE '12020211%'
+    GROUP BY
+        "CLASS",
+        "SUBCLASS"
+)
+
+SELECT
+    COALESCE(a."CLASS", r."CLASS")      AS "CLASS",
+    COALESCE(a."SUBCLASS", r."SUBCLASS") AS "SUBCLASS",
+    a."amsterdam_total_length_m",
+    r."rotterdam_total_length_m"
+FROM
+    amsterdam a
+FULL JOIN
+    rotterdam r
+ON  a."CLASS" = r."CLASS"
+AND a."SUBCLASS" = r."SUBCLASS"
+ORDER BY
+    "CLASS",
+    "SUBCLASS";

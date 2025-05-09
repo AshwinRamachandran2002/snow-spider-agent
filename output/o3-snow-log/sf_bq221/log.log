@@ -1,0 +1,1269 @@
+2025-05-07 01:33:16 - Thread-15 (execute) - INFO - [Exploration]
+```sql
+-- 1. Quick look at a few core columns in PATENTS.PATENTS.PUBLICATIONS
+SELECT 
+    "publication_number",
+    "application_number",
+    "filing_date",
+    "cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS
+LIMIT 20;
+```
+
+```sql
+-- 2. Flatten the CPC JSON array to see individual CPC codes attached to one patent
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING              AS "cpc_code",
+    f.index                             AS "cpc_pos"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+LIMIT 20;
+```
+
+```sql
+-- 3. Grab ONLY the first CPC code for every patent that has both
+--    a non-empty application number and a valid filing date
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING  AS "first_cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+WHERE t."application_number" IS NOT NULL
+  AND t."application_number" != ''
+  AND t."filing_date"        > 0
+QUALIFY ROW_NUMBER() 
+        OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+LIMIT 20;
+```
+
+```sql
+-- 4. Derive the filing year from the numeric filing_date
+SELECT  
+    "publication_number",
+    "application_number",
+    "filing_date",
+    SUBSTR("filing_date"::STRING,1,4) AS "filing_year"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "filing_date" > 0
+LIMIT 20;
+```
+
+```sql
+-- 5. Count patents per (first) CPC code per filing year (sample)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    "filing_year",
+    "first_cpc_code",
+    COUNT(*) AS "patent_filings"
+FROM first_cpc
+GROUP BY "filing_year","first_cpc_code"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+```
+
+```sql
+-- 6. Inspect a few entries in the CPC definition table to understand levels & titles
+SELECT 
+    "symbol",
+    "level",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+LIMIT 20;
+```
+
+```sql
+-- 7. Show CPC groups that are exactly at level 5, together with their full titles
+SELECT 
+    "symbol",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+WHERE "level" = 5
+LIMIT 20;
+```
+
+```sql
+-- 8. Join the first CPC codes with their corresponding level-5 CPC groups
+--    (simple truncation to 4-letter/class symbol for a first look)
+WITH first_cpc AS (
+    SELECT  
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    SUBSTR(fc."first_cpc_code",1,4)         AS "cpc_root",
+    d."symbol"                              AS "level5_symbol",
+    d."titleFull"
+FROM first_cpc fc
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."level" = 5
+     AND d."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+LIMIT 20;
+```
+
+```sql
+-- 9. Count filings per year for each level-5 CPC symbol (using the same 4-char join rule)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+), level5_map AS (
+    SELECT 
+        "symbol", 
+        "titleFull"
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+    WHERE "level" = 5
+)
+SELECT  
+    fc."filing_year",
+    lm."symbol"          AS "level5_symbol",
+    lm."titleFull",
+    COUNT(*)             AS "patent_filings"
+FROM first_cpc fc
+JOIN level5_map lm
+      ON lm."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+GROUP BY fc."filing_year", lm."symbol", lm."titleFull"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+```
+
+```sql
+-- 10. Compute a (forward) exponential moving average (α = 0.2) of yearly counts
+--     for a sample CPC level-5 symbol to validate the EMA logic
+WITH yearly_counts AS (
+    SELECT  
+        fc."filing_year"::INT                AS "year",
+        lm."symbol"                          AS "level5_symbol",
+        COUNT(*)                             AS "cnt"
+    FROM (
+        SELECT  
+            SUBSTR("filing_date"::STRING,1,4) AS "filing_year",
+            f.value:"code"::STRING            AS "first_cpc_code"
+        FROM PATENTS.PATENTS.PUBLICATIONS t,
+             LATERAL FLATTEN(input => t."cpc") f
+        WHERE t."application_number" IS NOT NULL
+          AND t."application_number" != ''
+          AND t."filing_date"        > 0
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+    ) fc
+    JOIN PATENTS.PATENTS.CPC_DEFINITION lm
+          ON lm."level" = 5
+         AND lm."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+    GROUP BY fc."filing_year", lm."symbol"
+), ema_calc AS (
+    SELECT  
+        "level5_symbol",
+        "year",
+        "cnt",
+        -- EMA_t = α*cnt_t + (1-α)*EMA_t-1  (α = 0.2)
+        SUM(0.2*"cnt" * POWER(0.8, ROW_NUMBER() OVER 
+                (PARTITION BY "level5_symbol" ORDER BY "year" DESC) - 1)
+           ) OVER (PARTITION BY "level5_symbol" ORDER BY "year") AS "ema_forward"
+    FROM yearly_counts
+)
+SELECT *
+FROM ema_calc
+ORDER BY "level5_symbol", "year"
+LIMIT 20;
+```
+[Exploration]
+2025-05-07 01:33:16 - Thread-15 (execute) - INFO - [Try to execute]
+-- 1. Quick look at a few core columns in PATENTS.PATENTS.PUBLICATIONS
+SELECT 
+    "publication_number",
+    "application_number",
+    "filing_date",
+    "cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:17 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. Quick look at a few core columns in PATENTS.PATENTS.PUBLICATIONS
+SELECT 
+    "publication_number",
+    "application_number",
+    "filing_date",
+    "cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS
+LIMIT 20;
+Results:
+publication_number,application_number,filing_date,cpc
+CR-5634-A,CR-5634-A,19971015,[]
+CR-5990-A,CR-5990-A,19990322,[]
+FI-429-A,FI-429D-A,0,[]
+HK-6083-A,HK-6083-A,19830217,"[
+  {
+    ""code"": ""H02M5/00"",
+    ""first"": true,
+    ""inventive"": true,
+    ""tree"": []
+  }
+]"
+HU-T52763-A,HU-7590-A,19900109,"[
+  {
+    ""code"": ""A01N47/36"",
+    ""first"": false,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""C07D521/00"",
+    ""first"": true,
+    ""inventive"": true,
+   
+
+[Successfully executed]
+2025-05-07 01:33:17 - Thread-15 (execute) - INFO - [Try to execute]
+-- 2. Flatten the CPC JSON array to see individual CPC codes attached to one patent
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING              AS "cpc_code",
+    f.index                             AS "cpc_pos"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:19 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Flatten the CPC JSON array to see individual CPC codes attached to one patent
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING              AS "cpc_code",
+    f.index                             AS "cpc_pos"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+LIMIT 20;
+Results:
+publication_number,application_number,filing_date,cpc_code,cpc_pos
+US-2018247292-A1,US-201715445327-A,20170228,G06Q20/208,0
+US-2018247292-A1,US-201715445327-A,20170228,H04N1/00281,1
+US-2018247292-A1,US-201715445327-A,20170228,G06K7/10821,2
+US-2018247292-A1,US-201715445327-A,20170228,G06K19/06028,3
+US-2018247292-A1,US-201715445327-A,20170228,G06K7/1404,4
+US-2018247292-A1,US-201715445327-A,20170228,H04N1/00244,5
+US-2018247292-A1,US-201715445327-A,20170228,G06K7/1408,6
+US-2018247292-A1,US-2
+
+[Successfully executed]
+2025-05-07 01:33:19 - Thread-15 (execute) - INFO - [Try to execute]
+-- 3. Grab ONLY the first CPC code for every patent that has both
+--    a non-empty application number and a valid filing date
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING  AS "first_cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+WHERE t."application_number" IS NOT NULL
+  AND t."application_number" != ''
+  AND t."filing_date"        > 0
+QUALIFY ROW_NUMBER() 
+        OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:22 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. Grab ONLY the first CPC code for every patent that has both
+--    a non-empty application number and a valid filing date
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING  AS "first_cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+WHERE t."application_number" IS NOT NULL
+  AND t."application_number" != ''
+  AND t."filing_date"        > 0
+QUALIFY ROW_NUMBER() 
+        OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+LIMIT 20;
+Results:
+publication_number,application_number,filing_date,first_cpc_code
+US-8795299-B2,US-55611409-A,20090909,A61B17/3423
+JP-3789364-B2,JP-2002015839-A,20020124,H02M1/007
+WO-2019183115-A1,US-2019022998-W,20190319,F21S10/02
+CN-106331112-A,CN-201610732264-A,20160827,H04L67/025
+US-11128943-B2,US-201916564804-A,20190909,H04R1/105
+AU-2004290598-A1,AU-2004290598-A,20041117,A61P9/00
+US-2001042243-A1,US-22380998-A,19981231,G06F9/4401
+US-2009052088-A1,US-89487007-A,20070821,G11B5/4813
+JP-S4986538-A,JP-9
+
+[Successfully executed]
+2025-05-07 01:33:22 - Thread-15 (execute) - INFO - [Try to execute]
+-- 4. Derive the filing year from the numeric filing_date
+SELECT  
+    "publication_number",
+    "application_number",
+    "filing_date",
+    SUBSTR("filing_date"::STRING,1,4) AS "filing_year"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "filing_date" > 0
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:23 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4. Derive the filing year from the numeric filing_date
+SELECT  
+    "publication_number",
+    "application_number",
+    "filing_date",
+    SUBSTR("filing_date"::STRING,1,4) AS "filing_year"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "filing_date" > 0
+LIMIT 20;
+Results:
+publication_number,application_number,filing_date,filing_year
+IE-20080323-A1,IE-20080323-A,20080425,2008
+IT-BG950014-A1,IT-BG950014-A,19950404,1995
+IT-FI930220-A1,IT-FI930220-A,19931103,1993
+IT-GE990118-A1,IT-GE990118-A,19990929,1999
+IT-MI910192-A1,IT-MI910192-A,19910125,1991
+IT-MI920940-A1,IT-MI920940-A,19920416,1992
+IT-MI952143-A1,IT-MI952143-A,19951018,1995
+IT-MI960882-A1,IT-MI960882-A,19960503,1996
+IT-PR920011-A1,IT-PR920011-A,19920325,1992
+IT-PR990091-A1,IT-PR990091-A,19991210,199
+
+[Successfully executed]
+2025-05-07 01:33:23 - Thread-15 (execute) - INFO - [Try to execute]
+-- 5. Count patents per (first) CPC code per filing year (sample)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    "filing_year",
+    "first_cpc_code",
+    COUNT(*) AS "patent_filings"
+FROM first_cpc
+GROUP BY "filing_year","first_cpc_code"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:25 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5. Count patents per (first) CPC code per filing year (sample)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    "filing_year",
+    "first_cpc_code",
+    COUNT(*) AS "patent_filings"
+FROM first_cpc
+GROUP BY "filing_year","first_cpc_code"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+Results:
+filing_year,first_cpc_code,patent_filings
+2022,Y02P70/10,290
+2022,Y02E60/10,261
+2021,Y02E60/10,243
+2023,Y02P70/10,239
+2020,Y02E60/10,204
+2023,Y02E60/10,189
+2019,Y02E60/10,141
+2022,Y02E10/50,127
+2018,Y02E60/10,113
+2022,Y02A50/30,109
+2017,Y02E60/10,109
+2023,Y02D10/00,98
+2023,Y02E10/50,95
+2021,Y02P70/10,95
+2021,G06N3/045,90
+2022,Y02P10/20,87
+2021,Y02E10/50,85
+2020,Y02E10/50,78
+2016,A23V2002/00,77
+2022,Y02W30/62,74
+
+[Successfully executed]
+2025-05-07 01:33:25 - Thread-15 (execute) - INFO - [Try to execute]
+-- 6. Inspect a few entries in the CPC definition table to understand levels & titles
+SELECT 
+    "symbol",
+    "level",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:25 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6. Inspect a few entries in the CPC definition table to understand levels & titles
+SELECT 
+    "symbol",
+    "level",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+LIMIT 20;
+Results:
+symbol,level,titleFull
+B,2.0,PERFORMING OPERATIONS; TRANSPORTING
+H,2.0,ELECTRICITY
+Y,2.0,GENERAL TAGGING OF NEW TECHNOLOGICAL DEVELOPMENTS; GENERAL TAGGING OF CROSS-SECTIONAL TECHNOLOGIES SPANNING OVER SEVERAL SECTIONS OF THE IPC; TECHNICAL SUBJECTS COVERED BY FORMER USPC CROSS-REFERENCE ART COLLECTIONS [XRACs] AND DIGESTS
+D,2.0,TEXTILES; PAPER
+F,2.0,MECHANICAL ENGINEERING; LIGHTING; HEATING; WEAPONS; BLASTING
+E,2.0,FIXED CONSTRUCTIONS
+C,2.0,CHEMISTRY; METALLURGY
+G,2.0,PHYSICS
+
+[Successfully executed]
+2025-05-07 01:33:25 - Thread-15 (execute) - INFO - [Try to execute]
+-- 7. Show CPC groups that are exactly at level 5, together with their full titles
+SELECT 
+    "symbol",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+WHERE "level" = 5
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:26 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7. Show CPC groups that are exactly at level 5, together with their full titles
+SELECT 
+    "symbol",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+WHERE "level" = 5
+LIMIT 20;
+Results:
+symbol,titleFull
+A01H,NEW PLANTS OR NON-TRANSGENIC PROCESSES FOR OBTAINING THEM; PLANT REPRODUCTION BY TISSUE CULTURE TECHNIQUES
+A01F,PROCESSING OF HARVESTED PRODUCE; HAY OR STRAW PRESSES; DEVICES FOR STORING AGRICULTURAL OR HORTICULTURAL PRODUCE
+A01C,PLANTING; SOWING; FERTILISING
+A01G,"HORTICULTURE; CULTIVATION OF VEGETABLES, FLOWERS, RICE, FRUIT, VINES, HOPS OR SEAWEED; FORESTRY; WATERING"
+A01N,"PRESERVATION OF BODIES OF HUMANS OR ANIMALS OR PLANTS OR PARTS THEREOF; BIOCIDES, e.g. AS DISI
+
+[Successfully executed]
+2025-05-07 01:33:26 - Thread-15 (execute) - INFO - [Try to execute]
+-- 8. Join the first CPC codes with their corresponding level-5 CPC groups
+--    (simple truncation to 4-letter/class symbol for a first look)
+WITH first_cpc AS (
+    SELECT  
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    SUBSTR(fc."first_cpc_code",1,4)         AS "cpc_root",
+    d."symbol"                              AS "level5_symbol",
+    d."titleFull"
+FROM first_cpc fc
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."level" = 5
+     AND d."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:27 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8. Join the first CPC codes with their corresponding level-5 CPC groups
+--    (simple truncation to 4-letter/class symbol for a first look)
+WITH first_cpc AS (
+    SELECT  
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    SUBSTR(fc."first_cpc_code",1,4)         AS "cpc_root",
+    d."symbol"                              AS "level5_symbol",
+    d."titleFull"
+FROM first_cpc fc
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."level" = 5
+     AND d."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+LIMIT 20;
+Results:
+cpc_root,level5_symbol,titleFull
+A61Q,A61Q,SPECIFIC USE OF COSMETICS OR SIMILAR TOILETRY PREPARATIONS
+C07D,C07D,HETEROCYCLIC COMPOUNDS
+H04L,H04L,"TRANSMISSION OF DIGITAL INFORMATION, e.g. TELEGRAPHIC COMMUNICATION"
+H04W,H04W,WIRELESS COMMUNICATION NETWORKS
+A61P,A61P,SPECIFIC THERAPEUTIC ACTIVITY OF CHEMICAL COMPOUNDS OR MEDICINAL PREPARATIONS
+F16F,F16F,SPRINGS; SHOCK-ABSORBERS; MEANS FOR DAMPING VIBRATION
+Y02E,Y02E,"REDUCTION OF GREENHOUSE GAS [GHG] EMISSIONS, RELATED TO ENERGY GENERATION
+
+[Successfully executed]
+2025-05-07 01:33:27 - Thread-15 (execute) - INFO - [Try to execute]
+-- 9. Count filings per year for each level-5 CPC symbol (using the same 4-char join rule)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+), level5_map AS (
+    SELECT 
+        "symbol", 
+        "titleFull"
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+    WHERE "level" = 5
+)
+SELECT  
+    fc."filing_year",
+    lm."symbol"          AS "level5_symbol",
+    lm."titleFull",
+    COUNT(*)             AS "patent_filings"
+FROM first_cpc fc
+JOIN level5_map lm
+      ON lm."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+GROUP BY fc."filing_year", lm."symbol", lm."titleFull"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:28 - Thread-15 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 9. Count filings per year for each level-5 CPC symbol (using the same 4-char join rule)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+), level5_map AS (
+    SELECT 
+        "symbol", 
+        "titleFull"
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+    WHERE "level" = 5
+)
+SELECT  
+    fc."filing_year",
+    lm."symbol"          AS "level5_symbol",
+    lm."titleFull",
+    COUNT(*)             AS "patent_filings"
+FROM first_cpc fc
+JOIN level5_map lm
+      ON lm."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+GROUP BY fc."filing_year", lm."symbol", lm."titleFull"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+Results:
+filing_year,level5_symbol,titleFull,patent_filings
+2021,G06F,ELECTRIC DIGITAL DATA PROCESSING,873
+2018,G06F,ELECTRIC DIGITAL DATA PROCESSING,812
+2022,Y02P,CLIMATE CHANGE MITIGATION TECHNOLOGIES IN THE PRODUCTION OR PROCESSING OF GOODS,811
+2016,G06F,ELECTRIC DIGITAL DATA PROCESSING,805
+2017,G06F,ELECTRIC DIGITAL DATA PROCESSING,765
+2022,Y02E,"REDUCTION OF GREENHOUSE GAS [GHG] EMISSIONS, RELATED TO ENERGY GENERATION, TRANSMISSION OR DISTRIBUTION",700
+2022,G06F,ELECTRIC DIGITAL DATA PROCESSI
+
+[Successfully executed]
+2025-05-07 01:33:28 - Thread-15 (execute) - INFO - [Try to execute]
+-- 10. Compute a (forward) exponential moving average (α = 0.2) of yearly counts
+--     for a sample CPC level-5 symbol to validate the EMA logic
+WITH yearly_counts AS (
+    SELECT  
+        fc."filing_year"::INT                AS "year",
+        lm."symbol"                          AS "level5_symbol",
+        COUNT(*)                             AS "cnt"
+    FROM (
+        SELECT  
+            SUBSTR("filing_date"::STRING,1,4) AS "filing_year",
+            f.value:"code"::STRING            AS "first_cpc_code"
+        FROM PATENTS.PATENTS.PUBLICATIONS t,
+             LATERAL FLATTEN(input => t."cpc") f
+        WHERE t."application_number" IS NOT NULL
+          AND t."application_number" != ''
+          AND t."filing_date"        > 0
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+    ) fc
+    JOIN PATENTS.PATENTS.CPC_DEFINITION lm
+          ON lm."level" = 5
+         AND lm."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+    GROUP BY fc."filing_year", lm."symbol"
+), ema_calc AS (
+    SELECT  
+        "level5_symbol",
+        "year",
+        "cnt",
+        -- EMA_t = α*cnt_t + (1-α)*EMA_t-1  (α = 0.2)
+        SUM(0.2*"cnt" * POWER(0.8, ROW_NUMBER() OVER 
+                (PARTITION BY "level5_symbol" ORDER BY "year" DESC) - 1)
+           ) OVER (PARTITION BY "level5_symbol" ORDER BY "year") AS "ema_forward"
+    FROM yearly_counts
+)
+SELECT *
+FROM ema_calc
+ORDER BY "level5_symbol", "year"
+LIMIT 20;
+[Try to execute]
+2025-05-07 01:33:29 - Thread-15 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##002062 (42601): SQL compilation error:\nWindow function [ROW_NUMBER() OVER (PARTITION BY YEARLY_COUNTS."level5_symbol" ORDER BY YEARLY_COUNTS."year" DESC NULLS FIRST)] may not be nested inside another window function.'}
+[Error occurred]
+2025-05-07 01:37:09 - Thread-15 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  We want the forward exponential moving average (EMA, α = 0.2) of yearly
+--              patent-filing counts for every CPC technology area at level-5.
+--              Thinking process / steps encoded in CTEs:
+--              1) first_cpc  : keep only the first CPC code (index = 0) for each
+--                 publication that has a non-empty application number and a valid
+--                 filing date.
+--              2) yearly_cnt : map each first CPC code to its level-5 group
+--                 (match on the 4-character root) and count publications per year.
+--              3) add_rn     : within each CPC group, order the years chronologically
+--                 and assign a row number “rn”.
+--              4) final      : compute the EMA by a weighted cumulative sum
+--                 Σ α·cnt·(1-α)^(rn-1) over the ordered rows.
+WITH first_cpc AS (
+    SELECT
+        t."publication_number",
+        SUBSTR(t."filing_date"::STRING,1,4)::INT                    AS "year",
+        f.value:"code"::STRING                                      AS "cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" <> ''
+      AND t."filing_date"        > 0
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+), yearly_cnt AS (
+    SELECT
+        d."symbol"                                  AS "level5_symbol",
+        d."titleFull",
+        fc."year",
+        COUNT(*)                                    AS cnt
+    FROM first_cpc fc
+    JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."level" = 5
+     AND d."symbol" = SUBSTR(fc."cpc_code",1,4)     -- map to level-5 group
+    GROUP BY d."symbol", d."titleFull", fc."year"
+), add_rn AS (
+    SELECT
+        "level5_symbol",
+        "titleFull",
+        "year",
+        cnt,
+        ROW_NUMBER() OVER (PARTITION BY "level5_symbol" ORDER BY "year") AS rn
+    FROM yearly_cnt
+)
+SELECT
+    "level5_symbol",
+    "titleFull",
+    "year",
+    cnt,
+    -- EMA_t = α·cnt_t + (1-α)·EMA_(t-1)  →  weighted cumulative sum formulation
+    SUM(0.2 * cnt * POWER(0.8, rn - 1))
+        OVER (PARTITION BY "level5_symbol" ORDER BY rn) AS ema_forward
+FROM add_rn
+ORDER BY "level5_symbol", "year"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 01:38:06 - Thread-15 (execute) - INFO - [Results for corrected sql]
+level5_symbol,titleFull,year,CNT,EMA_FORWARD
+A01B,"SOIL WORKING IN AGRICULTURE OR FORESTRY; PARTS, DETAILS, OR ACCESSORIES OF AGRICULTURAL MACHINES OR IMPLEMENTS, IN GENERAL",1901,2,0.4
+A01B,"SOIL WORKING IN AGRICULTURE OR FORESTRY; PARTS, DETAILS, OR ACCESSORIES OF AGRICULTURAL MACHINES OR IMPLEMENTS, IN GENERAL",1902,2,0.7200000000000001
+A01B,"SOIL WORKING IN AGRICULTURE OR FORESTRY; PARTS, DETAILS, OR ACCESSORIES OF AGRICULTURAL MACHINES OR IMPLEMENTS, IN GENERAL",1904,1,0.8480000000000001
+
+[Results for corrected sql]
+2025-05-07 01:38:06 - Thread-15 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  We want the forward exponential moving average (EMA, α = 0.2) of yearly
+--              patent-filing counts for every CPC technology area at level-5.
+--              Thinking process / steps encoded in CTEs:
+--              1) first_cpc  : keep only the first CPC code (index = 0) for each
+--                 publication that has a non-empty application number and a valid
+--                 filing date.
+--              2) yearly_cnt : map each first CPC code to its level-5 group
+--                 (match on the 4-character root) and count publications per year.
+--              3) add_rn     : within each CPC group, order the years chronologically
+--                 and assign a row number “rn”.
+--              4) final      : compute the EMA by a weighted cumulative sum
+--                 Σ α·cnt·(1-α)^(rn-1) over the ordered rows.
+WITH first_cpc AS (
+    SELECT
+        t."publication_number",
+        SUBSTR(t."filing_date"::STRING,1,4)::INT                    AS "year",
+        f.value:"code"::STRING                                      AS "cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" <> ''
+      AND t."filing_date"        > 0
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+), yearly_cnt AS (
+    SELECT
+        d."symbol"                                  AS "level5_symbol",
+        d."titleFull",
+        fc."year",
+        COUNT(*)                                    AS cnt
+    FROM first_cpc fc
+    JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."level" = 5
+     AND d."symbol" = SUBSTR(fc."cpc_code",1,4)     -- map to level-5 group
+    GROUP BY d."symbol", d."titleFull", fc."year"
+), add_rn AS (
+    SELECT
+        "level5_symbol",
+        "titleFull",
+        "year",
+        cnt,
+        ROW_NUMBER() OVER (PARTITION BY "level5_symbol" ORDER BY "year") AS rn
+    FROM yearly_cnt
+)
+SELECT
+    "level5_symbol",
+    "titleFull",
+    "year",
+    cnt,
+    -- EMA_t = α·cnt_t + (1-α)·EMA_(t-1)  →  weighted cumulative sum formulation
+    SUM(0.2 * cnt * POWER(0.8, rn - 1))
+        OVER (PARTITION BY "level5_symbol" ORDER BY rn) AS ema_forward
+FROM add_rn
+ORDER BY "level5_symbol", "year"
+LIMIT 20;
+Results:
+level5_symbol,titleFull,year,CNT,EMA_FORWARD
+A01B,"SOIL WORKING IN AGRICULTURE OR FORESTRY; PARTS, DETAILS, OR ACCESSORIES OF AGRICULTURAL MACHINES OR IMPLEMENTS, IN GENERAL",1901,2,0.4
+A01B,"SOIL WORKING IN AGRICULTURE OR FORESTRY; PARTS, DETAILS, OR ACCESSORIES OF AGRICULTURAL MACHINES OR IMPLEMENTS, IN GENERAL",1902,2,0.7200000000000001
+A01B,"SOIL WORKING IN AGRICULTURE OR FORESTRY; PARTS, DETAILS, OR ACCESSORIES OF AGRICULTURAL MACHINES OR IMPLEMENTS, IN GENERAL",1904,1,0.8480000000000001
+
+[Successfully corrected]
+2025-05-07 01:38:06 - Thread-15 (execute) - INFO - itercount: 0
+2025-05-07 01:38:06 - Thread-15 (execute) - INFO - [Self-refine]
+Table full name: PATENTS.PATENTS.DISCLOSURES_13
+Column name: serial_cleaned Type: TEXT
+Column name: sso Type: TEXT
+Column name: disclosure_event Type: TEXT
+Column name: reciprocity Type: TEXT
+Column name: patent_owner_harmonized Type: TEXT
+Column name: record_id Type: TEXT
+Column name: family_id Type: TEXT
+Column name: blanket_scope Type: TEXT
+Column name: copyright Type: TEXT
+Column name: standard Type: TEXT
+Column name: licensing_commitment Type: TEXT
+Column name: committee_project Type: TEXT
+Column name: sc_name Type: TEXT
+Column name: blanket_type Type: TEXT
+Column name: pub_cleaned Type: TEXT
+Column name: third_party Type: TEXT
+Column name: wg_name Type: TEXT
+Column name: patent_owner_unharmonized Type: TEXT
+Column name: tc_name Type: TEXT
+Column name: date Type: NUMBER
+Sample rows:
+[{'family_id': '22549751', 'record_id': 'REC00002', 'disclosure_event': 'DE0001', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19751124, 'standard': 'X3.55;X3.56', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3692255'}, {'family_id': '23170520', 'record_id': 'REC00001', 'disclosure_event': 'DE0001', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19751124, 'standard': 'X3.55;X3.56', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3861619'}, {'family_id': '23170520', 'record_id': 'REC00006', 'disclosure_event': 'DE0003', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19890711, 'standard': 'X3.55;X3.56;X3.72;X3.116;X3.127;X3.136', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'Specific Terms', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3861619'}, {'family_id': '22549751', 'record_id': 'REC00008', 'disclosure_event': 'DE0004', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19890906, 'standard': '', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '2', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3692255'}, {'family_id': '23418274', 'record_id': 'REC00024', 'disclosure_event': 'DE0013', 'sso': 'ANSI', 'patent_owner_harmonized': 'Agilent Technologies', 'patent_owner_unharmonized': 'Agilent Technologies', 'date': 20020606, 'standard': '1588', 'committee_project': 'IEEE', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US5566180'}]
+
+--------------------------------------------------
+Table full name: PATENTS.PATENTS.PUBLICATIONS
+Column name: examiner Type: VARIANT Description: Is this text truncated?
+Column name: fterm Type: VARIANT Description: For US publications only, the description in HTML, limited to the first 9 megabytes
+Column name: application_number_formatted Type: TEXT Description: Application number, formatted to the patent office format where possible.
+Column name: application_number Type: TEXT Description: Patent application number (DOCDB compatible), eg: 'US-87124404-A'. This may not always be set.
+Column name: grant_date Type: NUMBER Description: For US publications only, the claims in plain text
+Column name: cpc Type: VARIANT Description: Two-letter language code for this text
+Column name: locarno Type: VARIANT Description: Localized text
+Column name: description_localized_html Type: VARIANT Description: Localized text
+Column name: publication_date Type: NUMBER Description: Two-letter language code for this text
+Column name: kind_code Type: TEXT Description: Kind code, indicating application, grant, search report, correction, etc. These are different for each country.
+Column name: spif_publication_number Type: TEXT Description: SPIF standard (spif.group) publication number, after 2000
+Column name: ipc Type: VARIANT Description: Localized text
+Column name: pct_number Type: TEXT Description: PCT number for this application if it was part of a PCT filing, eg: 'PCT/EP2008/062623'.
+Column name: entity_status Type: TEXT Description: The filing date.
+Column name: filing_date Type: NUMBER Description: Is this text truncated?
+Column name: abstract_localized Type: VARIANT Description: Localized text
+Column name: description_localized Type: VARIANT Description: The publication abstracts in different languages
+Column name: assignee Type: VARIANT Description: Localized text
+Column name: citation Type: VARIANT Description: Two-letter language code for this text
+Column name: fi Type: VARIANT Description: Is this text truncated?
+Column name: claims_localized_html Type: VARIANT Description: Is this text truncated?
+Column name: inventor_harmonized Type: VARIANT Description: For US publications only, the claims in HTML
+Column name: inventor Type: VARIANT Description: Is this text truncated?
+Column name: claims_localized Type: VARIANT Description: Two-letter language code for this text
+Column name: priority_date Type: NUMBER Description: Localized text
+Column name: application_kind Type: TEXT Description: High-level kind of the application: A=patent; U=utility; P=provision; W= PCT; F=design; T=translation.
+Column name: priority_claim Type: VARIANT Description: Two-letter language code for this text
+Column name: assignee_harmonized Type: VARIANT Description: Two-letter language code for this text
+Column name: title_localized Type: VARIANT Description: The publication titles in different languages
+Column name: art_unit Type: TEXT Description: The grant date, or 0 if not granted.
+Column name: child Type: VARIANT Description: The publication date.
+Column name: family_id Type: TEXT Description: Family ID (simple family). Grouping on family ID will return all publications associated with a simple patent family (all publications share the same priority claims).
+Column name: spif_application_number Type: TEXT Description: SPIF standard (spif.group) application number, after 2000
+Column name: uspc Type: VARIANT Description: For US publications only, the description in plain text, limited to the first 9 megabytes
+Column name: publication_number Type: TEXT Description: Patent publication number (DOCDB compatible), eg: 'US-7650331-B1'
+Column name: country_code Type: TEXT Description: Country code, eg: 'US', 'EP', etc
+Column name: parent Type: VARIANT Description: Is this text truncated?
+Sample rows:
+[{'publication_number': 'DE-69611147-T2', 'application_number': 'DE-69611147-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996611147', 'pct_number': '', 'family_id': '9483724', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Schloss vom Typ eines entkuppelbaren Rotors",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20010621, 'filing_date': 19961015, 'grant_date': 20010621, 'priority_date': 19951018, 'priority_claim': '[\n  {\n    "application_number": "FR-9512326-A",\n    "category": "",\n    "filing_date": 19951018,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "MENAGER, CHRISTOPHE",\n  "CANARD, LOUIS",\n  "CADOUOT, PATRICK",\n  "GOURDIN, DOMINIQUE"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "FR",\n    "name": "MENAGER CHRISTOPHE"\n  },\n  {\n    "country_code": "FR",\n    "name": "CANARD LOUIS"\n  },\n  {\n    "country_code": "FR",\n    "name": "CADOUOT PATRICK"\n  },\n  {\n    "country_code": "FR",\n    "name": "GOURDIN DOMINIQUE"\n  }\n]', 'assignee': '[\n  "Valeo Securite Habitacle, Creteil Cedex"\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "FR",\n    "name": "VALEO SECURITE HABITACLE"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "E05B17/04",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "E05B17/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "E05B77/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "E05B17/0058",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69630331-T2', 'application_number': 'DE-69630331-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996630331', 'pct_number': '', 'family_id': '23689246', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Verfahren zur gesicherten Sitzungsschlüsselerzeugung und zur Authentifizierung",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20040729, 'filing_date': 19960416, 'grant_date': 20040729, 'priority_date': 19950421, 'priority_claim': '[\n  {\n    "application_number": "US-42609095-A",\n    "category": "",\n    "filing_date": 19950421,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "VANSTONE SCOTT .A, WATERLOO",\n  "MENEZES ALFRED JOHN, AUBURN",\n  "MINGHUA QU,"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "CA",\n    "name": "VANSTONE SCOTT A WATERLOO"\n  },\n  {\n    "country_code": "US",\n    "name": "MENEZES ALFRED JOHN AUBURN"\n  },\n  {\n    "country_code": "CA",\n    "name": "MINGHUA QU"\n  }\n]', 'assignee': '[\n  "Certicom Corp., Mississauga"\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "CA",\n    "name": "CERTICOM CORP"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "H04L9/08",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G06F7/72",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "G06F7/725",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "H04L9/0844",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "H04L9/0838",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "H04L9/0844",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G06F7/725",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69636755-T2', 'application_number': 'DE-69636755-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996636755', 'pct_number': '', 'family_id': '8224764', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Immortalisierte menschliche Epithelzell-Linie",\n    "truncated": false\n  }\n]', 'abstract_localized': '[\n  {\n    "language": "en",\n    "text": "Immortalised human corneal epithelial cell line, comprises cells of the cell line which are capable of stratification and expressing metabolic markers specific for nonimmortalised human epithelial cells, differentiation markers specific for nonimmortalised human corneal epithelial cells and markers specific for an inflammatory reaction.",\n    "truncated": false\n  }\n]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20071011, 'filing_date': 19961224, 'grant_date': 20071011, 'priority_date': 19961224, 'priority_claim': '[\n  {\n    "application_number": "EP-96203707-A",\n    "category": "",\n    "filing_date": 19961224,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "OFFORD CAVIN, ELIZABETH",\n  "TROMVOUKIS, YVONNE",\n  "PFEIFER, ANDREA M.A.",\n  "SHARIF, NAJ"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "CH",\n    "name": "OFFORD CAVIN ELIZABETH"\n  },\n  {\n    "country_code": "CH",\n    "name": "TROMVOUKIS YVONNE"\n  },\n  {\n    "country_code": "CH",\n    "name": "PFEIFER ANDREA M A"\n  },\n  {\n    "country_code": "US",\n    "name": "SHARIF NAJ"\n  }\n]', 'assignee': '[\n  "Société des Produits Nestlé S.A."\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "CH",\n    "name": "NESTLE SA"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "C12N5/10",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N33/50",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12R1/91",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N15/09",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N5/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "A61K35/44",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N33/48",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12Q1/68",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N5/071",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "C12N2503/02",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N5/0621",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N2503/02",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N2510/04",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N5/0621",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N2510/04",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69728658-T2', 'application_number': 'DE-69728658-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1997628658', 'pct_number': '', 'family_id': '24437397', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Lithographische dünne filmstruktur und diese enthaltende druckplatte",\n    "truncated": false\n  }\n]', 'abstract_localized': '[\n  {\n    "language": "en",\n    "text": "A lithographic laser imageable thin film structure comprising a substrate having first and second surfaces. A vacuum-deposited metal layer is carried by the first surface of the substrate. A layer of semiconductor material is adhered to and overlies the metal layer. The metal layer and the semiconductor material have thicknesses which are selected to maximize absorption of laser energy impinging on the same.",\n    "truncated": false\n  }\n]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20040812, 'filing_date': 19970115, 'grant_date': 20040812, 'priority_date': 19960229, 'priority_claim': '[\n  {\n    "application_number": "US-9700408-W",\n    "category": "",\n    "filing_date": 19970115,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  },\n  {\n    "application_number": "US-60864696-A",\n    "category": "",\n    "filing_date": 19960229,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "FISHER, P.",\n  "PHILLIPS, W.",\n  "DAVIS, F.",\n  "LEGALLEE, CHARLOTTE"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "US",\n    "name": "FISHER P"\n  },\n  {\n    "country_code": "US",\n    "name": "PHILLIPS W"\n  },\n  {\n    "country_code": "US",\n    "name": "DAVIS F"\n  },\n  {\n    "country_code": "US",\n    "name": "LEGALLEE CHARLOTTE"\n  }\n]', 'assignee': '[\n  "Presstek, Inc."\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "US",\n    "name": "PRESSTEK INC"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "B32B15/04",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B41C1/10",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41N1/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B41N1/14",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B27/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B7/02",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "B32B15/04",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12674",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B27/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31678",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12458",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31678",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12458",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B15/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31504",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41N1/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B15/09",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B2367/00",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B27/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12493",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B15/043",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B27/36",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B27/08",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B15/04",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12493",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12674",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41C1/1033",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41N1/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12528",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31504",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41C1/1033",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B2311/24",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12528",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69807539-T2', 'application_number': 'DE-69807539-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1998607539', 'pct_number': '', 'family_id': '11877005', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Automatisches Analysegerät",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20030116, 'filing_date': 19980120, 'grant_date': 20030116, 'priority_date': 19970129, 'priority_claim': '[\n  {\n    "application_number": "JP-1501397-A",\n    "category": "",\n    "filing_date": 19970129,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "HANAWA, MASAAKI",\n  "MITSUMAKI, HIROSHI",\n  "OHISHI, TADASHI",\n  "KAI, SUSUMU",\n  "WATANABE, HIROSHI"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "JP",\n    "name": "HANAWA MASAAKI"\n  },\n  {\n    "country_code": "JP",\n    "name": "MITSUMAKI HIROSHI"\n  },\n  {\n    "country_code": "JP",\n    "name": "OHISHI TADASHI"\n  },\n  {\n    "country_code": "JP",\n    "name": "KAI SUSUMU"\n  },\n  {\n    "country_code": "JP",\n    "name": "WATANABE HIROSHI"\n  }\n]', 'assignee': '[\n  "Hitachi, Ltd."\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "JP",\n    "name": "HITACHI LTD"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "G01N35/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N35/02",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N35/04",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "Y10T436/115831",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/114165",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0465",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/026",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0467",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/113332",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/114165",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/00603",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/11",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/00326",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0467",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/00603",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/00326",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0465",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/026",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/11",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/113332",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/115831",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}]
+
+--------------------------------------------------
+Table full name: PATENTS.PATENTS.CPC_DEFINITION
+Column name: status Type: TEXT
+Column name: precedenceLimitingReferences Type: VARIANT
+Column name: rules Type: VARIANT
+Column name: childGroups Type: VARIANT
+Column name: scopeLimitingReferences Type: VARIANT
+Column name: level Type: FLOAT
+Column name: titlePart Type: VARIANT
+Column name: residualReferences Type: VARIANT
+Column name: definition Type: VARIANT
+Column name: breakdownCode Type: BOOLEAN
+Column name: limitingReferences Type: VARIANT
+Column name: glossary Type: VARIANT
+Column name: applicationReferences Type: VARIANT
+Column name: notAllocatable Type: BOOLEAN
+Column name: titleFull Type: TEXT
+Column name: dateRevised Type: FLOAT
+Column name: informativeReferences Type: VARIANT
+Column name: symbol Type: TEXT
+Column name: synonyms Type: VARIANT
+Column name: children Type: VARIANT
+Column name: parents Type: VARIANT
+Column name: ipcConcordant Type: TEXT
+Sample rows:
+[{'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/108', 'synonyms': '[]', 'titleFull': 'Swine', 'titlePart': '[\n  "Swine"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/105', 'synonyms': '[]', 'titleFull': 'Murine', 'titlePart': '[\n  "Murine"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/107', 'synonyms': '[]', 'titleFull': 'Rabbit', 'titlePart': '[\n  "Rabbit"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2267/02",\n  "A01K2267/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2267/025', 'synonyms': '[]', 'titleFull': 'Animal producing cells or organs for transplantation', 'titlePart': '[\n  "Animal producing cells or organs for transplantation"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[\n  "A01K2267/0312",\n  "A01K2267/0318",\n  "A01K2267/0325"\n]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2267/03",\n  "A01K2267/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2267/0306', 'synonyms': '[]', 'titleFull': 'Animal model for genetic diseases', 'titlePart': '[\n  "Animal model for genetic diseases"\n]'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'PATENTS': {'PATENTS': ['DISCLOSURES_13', 'PUBLICATIONS', 'CPC_DEFINITION']}}
+
+Some few-shot examples after column exploration may be helpful:
+Query:
+-- 1. Quick look at a few core columns in PATENTS.PATENTS.PUBLICATIONS
+SELECT 
+    "publication_number",
+    "application_number",
+    "filing_date",
+    "cpc"
+FROM PATENTS.PATENTS.PUBLICATIONS
+LIMIT 20;
+Answer:
+publication_number,application_number,filing_date,cpc
+CR-5634-A,CR-5634-A,19971015,[]
+CR-5990-A,CR-5990-A,19990322,[]
+FI-429-A,FI-429D-A,0,[]
+HK-6083-A,HK-6083-A,19830217,"[
+  {
+    ""code"": ""H02M5/00"",
+    ""first"": true,
+    ""inventive"": true,
+    ""tree"": []
+  }
+]"
+HU-T52763-A,HU-7590-A,19900109,"[
+  {
+    ""code"": ""A01N47/36"",
+    ""first"": false,
+    ""inventive"": true,
+    ""tree"": []
+  },
+  {
+    ""code"": ""C07D521/00"",
+    ""first"": true,
+    ""inventive"": true,
+   
+Query:
+-- 2. Flatten the CPC JSON array to see individual CPC codes attached to one patent
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING              AS "cpc_code",
+    f.index                             AS "cpc_pos"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+LIMIT 20;
+Answer:
+publication_number,application_number,filing_date,cpc_code,cpc_pos
+US-2018247292-A1,US-201715445327-A,20170228,G06Q20/208,0
+US-2018247292-A1,US-201715445327-A,20170228,H04N1/00281,1
+US-2018247292-A1,US-201715445327-A,20170228,G06K7/10821,2
+US-2018247292-A1,US-201715445327-A,20170228,G06K19/06028,3
+US-2018247292-A1,US-201715445327-A,20170228,G06K7/1404,4
+US-2018247292-A1,US-201715445327-A,20170228,H04N1/00244,5
+US-2018247292-A1,US-201715445327-A,20170228,G06K7/1408,6
+US-2018247292-A1,US-2
+Query:
+-- 3. Grab ONLY the first CPC code for every patent that has both
+--    a non-empty application number and a valid filing date
+SELECT  
+    t."publication_number",
+    t."application_number",
+    t."filing_date",
+    f.value:"code"::STRING  AS "first_cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS t,
+     LATERAL FLATTEN(input => t."cpc") f
+WHERE t."application_number" IS NOT NULL
+  AND t."application_number" != ''
+  AND t."filing_date"        > 0
+QUALIFY ROW_NUMBER() 
+        OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+LIMIT 20;
+Answer:
+publication_number,application_number,filing_date,first_cpc_code
+US-8795299-B2,US-55611409-A,20090909,A61B17/3423
+JP-3789364-B2,JP-2002015839-A,20020124,H02M1/007
+WO-2019183115-A1,US-2019022998-W,20190319,F21S10/02
+CN-106331112-A,CN-201610732264-A,20160827,H04L67/025
+US-11128943-B2,US-201916564804-A,20190909,H04R1/105
+AU-2004290598-A1,AU-2004290598-A,20041117,A61P9/00
+US-2001042243-A1,US-22380998-A,19981231,G06F9/4401
+US-2009052088-A1,US-89487007-A,20070821,G11B5/4813
+JP-S4986538-A,JP-9
+Query:
+-- 4. Derive the filing year from the numeric filing_date
+SELECT  
+    "publication_number",
+    "application_number",
+    "filing_date",
+    SUBSTR("filing_date"::STRING,1,4) AS "filing_year"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "filing_date" > 0
+LIMIT 20;
+Answer:
+publication_number,application_number,filing_date,filing_year
+IE-20080323-A1,IE-20080323-A,20080425,2008
+IT-BG950014-A1,IT-BG950014-A,19950404,1995
+IT-FI930220-A1,IT-FI930220-A,19931103,1993
+IT-GE990118-A1,IT-GE990118-A,19990929,1999
+IT-MI910192-A1,IT-MI910192-A,19910125,1991
+IT-MI920940-A1,IT-MI920940-A,19920416,1992
+IT-MI952143-A1,IT-MI952143-A,19951018,1995
+IT-MI960882-A1,IT-MI960882-A,19960503,1996
+IT-PR920011-A1,IT-PR920011-A,19920325,1992
+IT-PR990091-A1,IT-PR990091-A,19991210,199
+Query:
+-- 5. Count patents per (first) CPC code per filing year (sample)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    "filing_year",
+    "first_cpc_code",
+    COUNT(*) AS "patent_filings"
+FROM first_cpc
+GROUP BY "filing_year","first_cpc_code"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+Answer:
+filing_year,first_cpc_code,patent_filings
+2022,Y02P70/10,290
+2022,Y02E60/10,261
+2021,Y02E60/10,243
+2023,Y02P70/10,239
+2020,Y02E60/10,204
+2023,Y02E60/10,189
+2019,Y02E60/10,141
+2022,Y02E10/50,127
+2018,Y02E60/10,113
+2022,Y02A50/30,109
+2017,Y02E60/10,109
+2023,Y02D10/00,98
+2023,Y02E10/50,95
+2021,Y02P70/10,95
+2021,G06N3/045,90
+2022,Y02P10/20,87
+2021,Y02E10/50,85
+2020,Y02E10/50,78
+2016,A23V2002/00,77
+2022,Y02W30/62,74
+Query:
+-- 6. Inspect a few entries in the CPC definition table to understand levels & titles
+SELECT 
+    "symbol",
+    "level",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+LIMIT 20;
+Answer:
+symbol,level,titleFull
+B,2.0,PERFORMING OPERATIONS; TRANSPORTING
+H,2.0,ELECTRICITY
+Y,2.0,GENERAL TAGGING OF NEW TECHNOLOGICAL DEVELOPMENTS; GENERAL TAGGING OF CROSS-SECTIONAL TECHNOLOGIES SPANNING OVER SEVERAL SECTIONS OF THE IPC; TECHNICAL SUBJECTS COVERED BY FORMER USPC CROSS-REFERENCE ART COLLECTIONS [XRACs] AND DIGESTS
+D,2.0,TEXTILES; PAPER
+F,2.0,MECHANICAL ENGINEERING; LIGHTING; HEATING; WEAPONS; BLASTING
+E,2.0,FIXED CONSTRUCTIONS
+C,2.0,CHEMISTRY; METALLURGY
+G,2.0,PHYSICS
+Query:
+-- 7. Show CPC groups that are exactly at level 5, together with their full titles
+SELECT 
+    "symbol",
+    "titleFull"
+FROM PATENTS.PATENTS.CPC_DEFINITION
+WHERE "level" = 5
+LIMIT 20;
+Answer:
+symbol,titleFull
+A01H,NEW PLANTS OR NON-TRANSGENIC PROCESSES FOR OBTAINING THEM; PLANT REPRODUCTION BY TISSUE CULTURE TECHNIQUES
+A01F,PROCESSING OF HARVESTED PRODUCE; HAY OR STRAW PRESSES; DEVICES FOR STORING AGRICULTURAL OR HORTICULTURAL PRODUCE
+A01C,PLANTING; SOWING; FERTILISING
+A01G,"HORTICULTURE; CULTIVATION OF VEGETABLES, FLOWERS, RICE, FRUIT, VINES, HOPS OR SEAWEED; FORESTRY; WATERING"
+A01N,"PRESERVATION OF BODIES OF HUMANS OR ANIMALS OR PLANTS OR PARTS THEREOF; BIOCIDES, e.g. AS DISI
+Query:
+-- 8. Join the first CPC codes with their corresponding level-5 CPC groups
+--    (simple truncation to 4-letter/class symbol for a first look)
+WITH first_cpc AS (
+    SELECT  
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+)
+SELECT  
+    SUBSTR(fc."first_cpc_code",1,4)         AS "cpc_root",
+    d."symbol"                              AS "level5_symbol",
+    d."titleFull"
+FROM first_cpc fc
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+      ON d."level" = 5
+     AND d."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+LIMIT 20;
+Answer:
+cpc_root,level5_symbol,titleFull
+A61Q,A61Q,SPECIFIC USE OF COSMETICS OR SIMILAR TOILETRY PREPARATIONS
+C07D,C07D,HETEROCYCLIC COMPOUNDS
+H04L,H04L,"TRANSMISSION OF DIGITAL INFORMATION, e.g. TELEGRAPHIC COMMUNICATION"
+H04W,H04W,WIRELESS COMMUNICATION NETWORKS
+A61P,A61P,SPECIFIC THERAPEUTIC ACTIVITY OF CHEMICAL COMPOUNDS OR MEDICINAL PREPARATIONS
+F16F,F16F,SPRINGS; SHOCK-ABSORBERS; MEANS FOR DAMPING VIBRATION
+Y02E,Y02E,"REDUCTION OF GREENHOUSE GAS [GHG] EMISSIONS, RELATED TO ENERGY GENERATION
+Query:
+-- 9. Count filings per year for each level-5 CPC symbol (using the same 4-char join rule)
+WITH first_cpc AS (
+    SELECT  
+        SUBSTR("filing_date"::STRING,1,4)       AS "filing_year",
+        f.value:"code"::STRING                  AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS t,
+         LATERAL FLATTEN(input => t."cpc") f
+    WHERE t."application_number" IS NOT NULL
+      AND t."application_number" != ''
+      AND t."filing_date"        > 0
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY t."publication_number" ORDER BY f.index) = 1
+), level5_map AS (
+    SELECT 
+        "symbol", 
+        "titleFull"
+    FROM PATENTS.PATENTS.CPC_DEFINITION
+    WHERE "level" = 5
+)
+SELECT  
+    fc."filing_year",
+    lm."symbol"          AS "level5_symbol",
+    lm."titleFull",
+    COUNT(*)             AS "patent_filings"
+FROM first_cpc fc
+JOIN level5_map lm
+      ON lm."symbol" = SUBSTR(fc."first_cpc_code",1,4)
+GROUP BY fc."filing_year", lm."symbol", lm."titleFull"
+ORDER BY "patent_filings" DESC
+LIMIT 20;
+Answer:
+filing_year,level5_symbol,titleFull,patent_filings
+2021,G06F,ELECTRIC DIGITAL DATA PROCESSING,873
+2018,G06F,ELECTRIC DIGITAL DATA PROCESSING,812
+2022,Y02P,CLIMATE CHANGE MITIGATION TECHNOLOGIES IN THE PRODUCTION OR PROCESSING OF GOODS,811
+2016,G06F,ELECTRIC DIGITAL DATA PROCESSING,805
+2017,G06F,ELECTRIC DIGITAL DATA PROCESSING,765
+2022,Y02E,"REDUCTION OF GREENHOUSE GAS [GHG] EMISSIONS, RELATED TO ENERGY GENERATION, TRANSMISSION OR DISTRIBUTION",700
+2022,G06F,ELECTRIC DIGITAL DATA PROCESSI
+Task: Identify the CPC technology areas with the highest exponential moving average of patent filings each year (with a smoothing factor of 0.2), considering only the first CPC code for each patent that has a valid filing date and a non-empty application number, and report the full CPC title along with the best year associated with the highest exponential moving average for each CPC group at level 5.
+
+Please think step by step and answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'PATENTS': {'PATENTS': ['DISCLOSURES_13', 'PUBLICATIONS', 'CPC_DEFINITION']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-07 01:40:29 - Thread-15 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*--------------------------------------------------------------
+  1.  Get the FIRST CPC code for every patent that has
+      – a valid filing date (>0) and
+      – a non-empty application number.
+----------------------------------------------------------------*/
+WITH first_cpc AS (  
+    SELECT  
+        p."publication_number",
+        TO_NUMBER(SUBSTR(p."filing_date"::STRING,1,4))        AS "filing_year",
+        f.value:"code"::STRING                                AS "first_cpc_code"
+    FROM PATENTS.PATENTS.PUBLICATIONS              p,
+         LATERAL FLATTEN(input => p."cpc")         f
+    WHERE p."application_number" IS NOT NULL
+      AND p."application_number" <> ''
+      AND p."filing_date"        > 0
+    QUALIFY ROW_NUMBER() 
+            OVER (PARTITION BY p."publication_number" ORDER BY f.index) = 1
+),
+
+/*--------------------------------------------------------------
+  2.  Map every first CPC code to its LEVEL-5 CPC group
+----------------------------------------------------------------*/
+level5_map AS (
+    SELECT 
+        d."symbol"    AS "level5_symbol",
+        d."titleFull" AS "level5_title"
+    FROM PATENTS.PATENTS.CPC_DEFINITION d
+    WHERE d."level" = 5
+),
+
+/*--------------------------------------------------------------
+  3.  Count patent filings per year for every level-5 CPC group
+----------------------------------------------------------------*/
+yearly_counts AS (
+    SELECT
+        lm."level5_symbol",
+        lm."level5_title",
+        fc."filing_year"                       AS "year",
+        COUNT(*)                               AS "filings"
+    FROM first_cpc  fc
+    JOIN level5_map lm
+         ON lm."level5_symbol" = SUBSTR(fc."first_cpc_code",1,4)
+    WHERE fc."filing_year" IS NOT NULL
+    GROUP BY lm."level5_symbol", lm."level5_title", fc."filing_year"
+),
+
+/*--------------------------------------------------------------
+  4.  Give each (group, year) a running index to drive recursion
+----------------------------------------------------------------*/
+ranked_years AS (
+    SELECT
+        yc.*,
+        ROW_NUMBER() OVER (PARTITION BY yc."level5_symbol"
+                           ORDER BY yc."year")  AS "rn"
+    FROM yearly_counts yc
+),
+
+/*--------------------------------------------------------------
+  5.  Compute the Exponential Moving Average (α = 0.2)
+      EMAₜ = 0.2 · filingsₜ  + 0.8 · EMAₜ₋₁
+----------------------------------------------------------------*/
+EMA_RECURSIVE AS (
+    -- Base case : first year of each CPC group
+    SELECT
+        ry."level5_symbol",
+        ry."level5_title",
+        ry."year",
+        ry."filings",
+        ry."filings"::FLOAT                      AS "ema",
+        ry."rn"
+    FROM ranked_years ry
+    WHERE ry."rn" = 1
+    
+    UNION ALL
+    
+    -- Recursive step : all subsequent years
+    SELECT
+        nxt."level5_symbol",
+        nxt."level5_title",
+        nxt."year",
+        nxt."filings",
+        0.2 * nxt."filings" + 0.8 * prv."ema"    AS "ema",
+        nxt."rn"
+    FROM EMA_RECURSIVE  prv
+    JOIN ranked_years   nxt
+      ON nxt."level5_symbol" = prv."level5_symbol"
+     AND nxt."rn"        = prv."rn" + 1
+),
+
+/*--------------------------------------------------------------
+  6.  Pick the year where each CPC group hits its highest EMA
+----------------------------------------------------------------*/
+best_per_group AS (
+    SELECT
+        e."level5_symbol",
+        e."level5_title",
+        e."year"       AS "best_year",
+        e."ema"        AS "highest_ema",
+        ROW_NUMBER() OVER (PARTITION BY e."level5_symbol"
+                           ORDER BY e."ema" DESC) AS "rk"
+    FROM EMA_RECURSIVE e
+)
+
+/*--------------------------------------------------------------
+  7.  Final result
+----------------------------------------------------------------*/
+SELECT
+    b."level5_symbol"       AS "cpc_group",
+    b."level5_title"        AS "cpc_title",
+    b."best_year",
+    ROUND(b."highest_ema",4) AS "highest_ema"
+FROM best_per_group b
+WHERE b."rk" = 1
+ORDER BY b."highest_ema" DESC NULLS LAST;
+```
+[Try to run SQL in self-refine]
+2025-05-07 01:41:21 - Thread-15 (execute) - INFO - Total iteration counts: 0

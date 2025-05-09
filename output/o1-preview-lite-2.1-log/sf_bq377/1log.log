@@ -1,0 +1,3945 @@
+2025-01-20 12:04:13 - openai._base_client - INFO - Retrying request to /chat/completions in 0.498100 seconds
+2025-01-20 12:05:56 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-20 12:05:56 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:05:56 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:05:56 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:05:59 - snowflake.connector.cursor - INFO - Number of results in first chunk: 15
+2025-01-20 12:06:00 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:01 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:01 - root - INFO - SQL:
+SELECT "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   LIMIT 1000;
+Results:
+Too long, hard cut:
+content
+"/*
+ * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips
+ *
+ * Copyright (C) 2008 David Brownell
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/bcd.h>
+#include <linux/slab.h>
+#include <linux/rtc.h>
+#include <linux/workqueue.h>
+
+#include <linux/spi/spi.h>
+#include <linux/spi/ds1305.h>
+#include <linux/module.h>
+
+
+/*
+ * Registers ... mask DS1305_WRITE into register address to write,
+ * otherwise you're reading it.  All non-bitmask values are BCD.
+ */
+#define DS1305_WRITE		0x80
+
+
+/* RTC date/time ... the main special cases are that we:
+ *  - Need fancy ""hours"" encoding in 12hour mode
+ *  - Don't rely on the ""day-of-week"" field (or tm_wday)
+ *  - Are a 21st-century clock (2000 <= year < 2100)
+ */
+#define DS1305_RTC_LEN		7		/* bytes for RTC regs */
+
+#define DS1305_SEC		0x00		/* register addresses */
+#define DS1305_MIN		0x01
+#define DS1305_HOUR		0x02
+#	define DS1305_HR_12		0x40	/* set == 12 hr mode */
+#	define DS1305_HR_PM		0x20	/* set == PM (12hr mode) */
+#define DS1305_WDAY		0x03
+#define DS1305_MDAY		0x04
+#define DS1305_MON		0x05
+#define DS1305_YEAR		0x06
+
+
+/* The two alarms have only sec/min/hour/wday fields (ALM_LEN).
+ * DS1305_ALM_DISABLE disables a match field (some combos are bad).
+ *
+ * NOTE that since we don't use WDAY, we limit ourselves to alarms
+ * only one day into the future (vs potentially up to a week).
+ *
+ * NOTE ALSO that while we could generate once-a-second IRQs (UIE), we
+ * don't currently support them.  We'd either need to do it only when
+ * no alarm is pending (not the standard model), or to use the second
+ * alarm (implying that this is a DS1305 not DS1306, *and* that either
+ * it's wired up a second IRQ we know, or that INTCN is set)
+ */
+#define DS1305_ALM_LEN		4		/* bytes for ALM regs */
+#define DS1305_ALM_DISABLE	0x80
+
+#define DS1305_ALM0(r)		(0x07 + (r))	/* register addresses */
+#define DS1305_ALM1(r)		(0x0b + (r))
+
+
+/* three control registers */
+#define DS1305_CONTROL_LEN	3		/* bytes of control regs */
+
+#define DS1305_CONTROL		0x0f		/* register addresses */
+#	define DS1305_nEOSC		0x80	/* low enables oscillator */
+#	define DS1305_WP		0x40	/* write protect */
+#	define DS1305_INTCN		0x04	/* clear == only int0 used */
+#	define DS1306_1HZ		0x04	/* enable 1Hz output */
+#	define DS1305_AEI1		0x02	/* enable ALM1 IRQ */
+#	define DS1305_AEI0		0x01	/* enable ALM0 IRQ */
+#define DS1305_STATUS		0x10
+/* status has just AEIx bits, mirrored as IRQFx */
+#define DS1305_TRICKLE		0x11
+/* trickle bits are defined in <linux/spi/ds1305.h> */
+
+/* a bunch of NVRAM */
+#define DS1305_NVRAM_LEN	96		/* bytes of NVRAM */
+
+#define DS1305_NVRAM		0x20		/* register addresses */
+
+
+struct ds1305 {
+	struct spi_device	*spi;
+	struct rtc_device	*rtc;
+
+	struct work_struct	work;
+
+	unsigned long		flags;
+#define FLAG_EXITING	0
+
+	bool			hr12;
+	u8			ctrl[DS1305_CONTROL_LEN];
+};
+
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Utilities ...  tolerate 12-hour AM/PM notation in case of non-Linux
+ * software (like a bootloader) which may require it.
+ */
+
+static unsigned bcd2hour(u8 bcd)
+{
+	if (bcd & DS1305_HR_12) {
+		unsigned	hour = 0;
+
+		bcd &= ~DS1305_HR_12;
+		if (bcd & DS1305_HR_PM) {
+			hour = 12;
+			bcd &= ~DS1305_HR_PM;
+		}
+		hour += bcd2bin(bcd);
+		return hour - 1;
+	}
+	return bcd2bin(bcd);
+}
+
+static u8 hour2bcd(bool hr12, int hour)
+{
+	if (hr12) {
+		hour++;
+		if (hour <= 12)
+			return DS1305_HR_12 | bin2bcd(hour);
+		hour -= 12;
+		return DS1305_HR_12 | DS1305_HR_PM | bin2bcd(hour);
+	}
+	return bin2bcd(hour);
+}
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Interface to RTC framework
+ */
+
+static int ds1305_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		buf[2];
+	long		err = -EINVAL;
+
+	buf[0] = DS1305_WRITE | DS1305_CONTROL;
+	buf[1] = ds1305->ctrl[0];
+
+	if (enabled) {
+		if (ds1305->ctrl[0] & DS1305_AEI0)
+			goto done;
+		buf[1] |= DS1305_AEI0;
+	} else {
+		if (!(buf[1] & DS1305_AEI0))
+			goto done;
+		buf[1] &= ~DS1305_AEI0;
+	}
+	err = spi_write_then_read(ds1305->spi, buf, sizeof(buf), NULL, 0);
+	if (err >= 0)
+		ds1305->ctrl[0] = buf[1];
+done:
+	return err;
+
+}
+
+
+/*
+ * Get/set of date and time is pretty normal.
+ */
+
+static int ds1305_get_time(struct device *dev, struct rtc_time *time)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		addr = DS1305_SEC;
+	u8		buf[DS1305_RTC_LEN];
+	int		status;
+
+	/* Use write-then-read to get all the date/time registers
+	 * since dma from stack is nonportable
+	 */
+	status = spi_write_then_read(ds1305->spi, &addr, sizeof(addr),
+			buf, sizeof(buf));
+	if (status < 0)
+		return status;
+
+	dev_vdbg(dev, ""%s: %02x %02x %02x, %02x %02x %02x %02x\n"",
+		""read"", buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5], buf[6]);
+
+	/* Decode the registers
+
+2025-01-20 12:06:01 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:01 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:01 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:02 - snowflake.connector.cursor - INFO - Number of results in first chunk: 1000
+2025-01-20 12:06:02 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:03 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:03 - root - INFO - SQL:
+SELECT DISTINCT "sample_path"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   LIMIT 1000;
+Results:
+Too long, hard cut:
+sample_path
+common/thrift/CatalogService.thrift
+socketcan_interface/CMakeLists.txt
+bin/php7_linux1/bin/mbedtls_dh_client
+src/pocketmine/block/Sugarcane.php
+Install/Help/commands/3dmaths/SCALE VECTOR2.htm
+src/cinder/app/linux/WindowImplLinuxEgl.cpp
+libjava/javax/naming/spi/NamingManager.java
+lionengine-network/src/main/java/com/b3dgs/lionengine/network/Networker.java
+top_down_classifier/src/top_down_classifier/volume_visualizer.h
+networking_cisco/neutronclient/policyprofile.py
+third-party/org.svnkit/org/tmatesoft/svn/core/internal/wc2/ng/SvnNgRepositoryAccess.class
+share/gamedir/levels/ctf_duel2/sprites/flag_y.bmp
+aws-cpp-sdk-route53/include/aws/route53/model/CreateTrafficPolicyInstanceRequest.h
+backend/colorAdmin/form_editable.html
+src/BCR/BCRexternalBWT.cpp
+util/robodoc/Source/robodoc.c
+myblockchain-test/suite/rpl/r/rpl_loaddata_s.result
+myblockchain-test/suite/ndb_rpl/r/ndb_rpl_mixed_tables.result
+resources/assets/storagedrawers/textures/blocks/indicator/void_icon.png
+GPy/testing/state_space_main_tests.py
+tooling/support/provisioning-model/pom.xml
+src/java/org/apache/cassandra/db/commitlog/ReplayPosition.java
+chrome/browser/signin/about_signin_internals.cc
+core/sis-metadata/src/test/java/org/apache/sis/metadata/iso/DefaultMetadataTest.java
+src/include/platform.h
+lib/padding/pad_variable.m
+clients/java/src/main/java/com/senseidb/search/client/req/SenseiClientRequest.java
+sal/qa/rtl/strings/test_oustring_compare.cxx
+source/stylesheets/modules/_sortable.scss
+bin/Skylark.dll.config
+pos_position/cv483_16378.txt
+src/main/webapp/fonts/DigitalDream/DIGITALDREAMNARROW-webfont.ttf
+checks/decru_fans
+grails-app/controllers/TagController.groovy
+src/libc/stdio/FreeBSD/clrerr.c
+CommonProjects/AMDTBaseTools/Include/gtStringTokenizer.h
+libs/SDL2_ttf-2.0.14/debian/copyright
+lionengine-core/src/main/java/com/b3dgs/lionengine/drawable/Image.java
+src/main/resources/templates/layout/app.jade
+spec/models/i18n_spec.rb
+dbaccess/source/ui/misc/datasourceconnector.cxx
+SystemEx/Windows/Forms/IpcHelper.cs
+Assets/Scripts/HarryPotterUnity/Cards/Quidditch/Spells/QuickThinking.cs
+authmodules/TYPO3/privacyidea/Resources/Private/Language/locallang.xlf
+assets/src/scss/components/_logo.scss
+chef-repo/site-cookbooks/cloud-benchmarking-server/berks-cookbooks/databox/recipes/mysql.rb
+css/datachange-tracker.css
+public/javascripts/SVLabel/doc/svl.StatusMessage.html
+bootloader/swd-adapter/swduino/swd.h
+marathon/demo.yml
+tests/realapplications/vim/src/vim63/src/arabic.h
+mods/fft/fftw-3.3.4/rdft/scalar/r2cb/hb_8.lo
+src/Webiny/Component/Security/User/Providers/Memory/MemoryException.php
+db/migrate/20120727115954_add_category_to_document.rb
+framework/integrationtests/resources/mapreduce/hadoop-streaming.jar
+micro-infra-spring-base/src/test/groovy/com/ofg/infrastructure/base/MvcCorrelationIdSettingIntegrationSpec.groovy
+Muhelp/string_ext.hh
+build_dir/host/flex-2.5.35/tools/Makefile
+getopt.sml/getopt-test.smi
+crt_hash/e509500c8632b247ad4a45b3a301d58935430bf360c3d01d1458b1f5850c40ca.pem
+ckanext/pdfview/theme/templates/pdf.html
+lib/to_markdown.js
+mcscf/test/test_c2h4.py
+client/js/components/assessments/check_understanding.spec.js
+Assets/Graphics/Big.psd
+Product/Production/Services/PatientDiscoveryCore/src/main/java/gov/hhs/fha/nhinc/patientdiscovery/model/builder/impl/PatientSearchResultsModelBuilderImpl.java
+third_party/skia/src/gpu/effects/GrConfigConversionEffect.cpp
+deps/icu4c/source/i18n/hebrwcal.cpp
+mapfishapp/src/main/java/org/georchestra/mapfishapp/ws/upload/FeatureGeoFileReader.java
+uimaj-core/src/main/java/org/apache/uima/collection/CasConsumerDescription.java
+whois-endtoend/src/test/java/net/ripe/db/whois/changedphase3/util/Scenario.java
+JGTL/JGTL_API/latex/class_j_g_t_l_1_1_hex_tree_branch.tex
+resources/CAVP/Vectors/OpenSSL/testvectors.SuSE/testvectors/sha/req/SHA256Monte.req
+test/ddiff.052.clit
+common/java/core/net/i2p/client/naming/ExecNamingService.java
+third_party/skia/src/gpu/gl/GrGLProgram.cpp
+pack.cmd
+spec/test_app/spec-opal/active_record/update_associations_spec.rb
+classes/time_series/@ts/acosh.m
+html/partials/compare/os_table.html.haml
+app/src/main/res/drawable-xxxhdpi/ic_headphones_grey600_48dp.png
+app/src/main/res/drawable/key8.png
+src/libs/css/daterangepicker-bs3.css
+util/misc/cdna_fasta_file_to_transcript_gtf.pl
+docs/html/T_AForge_Video_Ximea_XimeaCamera.htm
+chromium/src/third_party/WebKit/Source/modules/webaudio/OfflineAudioDestinationNode.h
+Helpers/INRIAEval/data-USA/annotations/set06/V017.vbb
+include/bot-logic/behaviour_drive_neuralnet.h
+src/Scriban.Tests/TestFiles/100-expressions/150-range-expression.txt
+application/var/generation/Magento/AdminNotification/Controller/Adminhtml/Notification/Remove/Interceptor.php
+password_policies/tests/__init__.py
+templates/includes/htmlhead.jade
+tests/fixtures/ecma-version/6/arrowFunctions/error-strict-param-no-paren-eval.result.js
+pixmaps/feta26-scripts-reverseturn.xbm
+src_numeric/src_iterative/pgmresDR.m
+lib/spimasterdma.cpp
+2013-11-15 - High Performance Core Data by Matthew Morey.pdf
+js/sr
+
+2025-01-20 12:06:03 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:03 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:03 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:04 - snowflake.connector.cursor - INFO - Number of results in first chunk: 12
+2025-01-20 12:06:04 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:04 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:05 - root - INFO - SQL:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "sample_path" ILIKE '%composer.json%'
+   LIMIT 1000;
+Results:
+Too long, hard cut:
+sample_path,content
+app/protected/extensions/userinterface/lib/composer.json,"{
+    ""name"": ""mobiledetect/mobiledetectlib"",
+    ""type"": ""library"",
+    ""description"": ""Mobile_Detect is a lightweight PHP class for detecting mobile devices. It uses the User-Agent string combined with specific HTTP headers to detect the mobile environment."",
+    ""keywords"": [""mobile"", ""mobile detect"", ""mobile detector"", ""php mobile detect"", ""detect mobile devices""],
+    ""homepage"": ""https://github.com/serbanghita/Mobile-Detect"",
+    ""license"": ""MIT"",
+    ""authors"": [
+        {
+            ""name"": ""Serban Ghita"",
+            ""email"": ""serbanghita@gmail.com"",
+            ""homepage"": ""http://mobiledetect.net"",
+            ""role"": ""Developer""
+        }
+    ],
+    ""require"": {
+        ""php"": "">=5.0.0""
+    },
+    ""autoload"": {
+            ""classmap"": [""Mobile_Detect.php""]
+        }
+}"
+composer.json,"{
+    ""name"": ""scullwm/mailhookbundle"",
+    ""type"": ""library"",
+    ""description"": ""A bundle to catch API webhook from differents mail service"",
+    ""keywords"": [""symfony"", ""bundle"", ""mail"", ""api"", ""webhook"", ""hook"", ""mandrill"", ""mailjet""],
+    ""homepage"": ""http://github.com/ScullWM/MailHookBundle"",
+    ""license"": ""MIT"",
+    ""authors"": [
+        {
+            ""name"": ""Thomas Perez"",
+            ""email"": ""thomas@scullwm.com""
+        }
+    ],
+    ""require"": {
+        ""php"": "">=5.3.9"",
+        ""symfony/framework-bundle"": "">=2.3""
+    },
+    ""require-dev"": {
+        ""atoum/atoum"": ""dev-master""
+    },
+    ""config"": {
+        ""bin-dir"": ""bin""
+    },
+    ""autoload"": {
+        ""psr-4"": { ""Swm\\Bundle\\MailHookBundle\\"": """" }
+    }
+}"
+Entityform/composer.json,"{
+    ""name"": ""asgard/entityform"",
+    ""license"": ""MIT"",
+    ""authors"": [{
+        ""name"": ""Michel Hognerud"",
+        ""email"": ""michel@hognerud.net""
+    }],
+    ""autoload"": {
+        ""psr-4"": {""Asgard\\Entityform\\"": "".""}
+    },
+    ""require"": {
+        ""php"": "">=5.5.9"",
+        ""asgard/form"": ""~0.3.0"",
+        ""asgard/entity"": ""~0.3.0""
+    },
+    ""extra"": {
+        ""branch-alias"": {
+            ""dev-master"": ""0.3-dev""
+        }
+    },
+    ""minimum-stability"": ""dev""
+}"
+composer.json,"{
+    ""name"": ""navjobs/transmit"",
+    ""description"": ""A collection of Laravel api base classes and helpers."",
+    ""keywords"": [
+        ""laravel"",
+        ""fractal"",
+        ""api"",
+        ""transform"",
+        ""microservices""
+    ],
+    ""homepage"": ""https://kimmel.com"",
+    ""license"": ""MIT"",
+    ""require"": {
+        ""php"" : "">=5.5.0"",
+        ""league/fractal"": ""^0.13.0"",
+        ""illuminate/support"": ""^5.1""
+    },
+    ""require-dev"": {
+        ""phpunit/phpunit"" : ""^4.0"",
+        ""scrutinizer/ocular"": ""^1.1"",
+        ""orchestra/testbench"": ""^3.0"",
+        ""mockery/mockery"": ""^0.9.4"",
+        ""satooshi/php-coveralls"": ""1.*""
+    },
+    ""autoload"": {
+        ""psr-4"": {
+            ""NavJobs\\Transmit\\"": ""src""
+        }
+    },
+    ""autoload-dev"": {
+        ""psr-4"": {
+            ""NavJobs\\Transmit\\Test\\"": ""tests""
+        }
+    },
+    ""scripts"": {
+        ""test"": ""phpunit""
+    }
+}
+"
+src/IO/composer.json,"{
+    ""name"": ""windwalker/io"",
+    ""type"": ""windwalker-package"",
+    ""description"": ""Windwalker IO package"",
+    ""keywords"": [""windwalker"", ""framework"", ""io""],
+    ""homepage"": ""https://github.com/ventoviro/windwalker-io"",
+    ""license"": ""LGPL-2.0+"",
+    ""require"": {
+        ""php"": "">=5.3.10""
+    },
+    ""require-dev"": {
+        ""windwalker/test"": ""~2.0"",
+        ""windwalker/filter"": ""~2.0""
+    },
+    ""suggest"": {
+        ""windwalker/filter"": ""Install 2.* if you require filter support.""
+    },
+    ""minimum-stability"": ""beta"",
+    ""autoload"": {
+        ""psr-4"": {
+            ""Windwalker\\IO\\"": """"
+        }
+    },
+    ""extra"": {
+        ""branch-alias"": {
+            ""dev-master"": ""2.2-dev""
+        }
+    }
+}
+"
+composer.json,"{    ""name"": ""gointegro/hateoas-bundle"",    ""type"": ""symfony-bundle"",    ""description"": ""GOintegro HATEOAS Bundle"",    ""keywords"": [""Doctrine"", ""HATEOAS"", ""REST"", ""API"", ""JSON-API""],    ""homepage"": ""http://www.gointegro.com"",    ""license"": ""MIT"",    ""authors"": [        {            ""name"": ""Javier Lorenzana"",            ""email"": ""javier.lorenzana@gointegro.com""        },        {            ""name"": ""Adolfo Castro Menna"",            ""email"": ""adolfo.casto@gointegro.com""        },        {            ""name"": ""GOintegro Devs"",            ""homepage"": ""http://www.gointegro.com""        }    ],    ""require"": {        ""php"": "">=5.4.0"",        ""gointegro/hateoas"": ""*"",        ""symfony/framework-bundle"": ""*"",        ""symfony/doctrine-bridge"": ""*"",        ""doctrine/doctr
+
+2025-01-20 12:06:05 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:05 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:05 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:07 - snowflake.connector.cursor - INFO - Number of results in first chunk: 58
+2025-01-20 12:06:07 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:07 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:08 - root - INFO - SQL:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "sample_path" ILIKE '%package.json%'
+   LIMIT 1000;
+Results:
+Too long, hard cut:
+sample_path,content
+ioniclub-master/node_modules/bower/node_modules/request/node_modules/tough-cookie/node_modules/punycode/package.json,"{
+  ""name"": ""punycode"",
+  ""version"": ""1.3.2"",
+  ""description"": ""A robust Punycode converter that fully complies to RFC 3492 and RFC 5891, and works on nearly all JavaScript platforms."",
+  ""homepage"": ""https://mths.be/punycode"",
+  ""main"": ""punycode.js"",
+  ""keywords"": [
+    ""punycode"",
+    ""unicode"",
+    ""idn"",
+    ""idna"",
+    ""dns"",
+    ""url"",
+    ""domain""
+  ],
+  ""license"": ""MIT"",
+  ""author"": {
+    ""name"": ""Mathias Bynens"",
+    ""url"": ""https://mathiasbynens.be/""
+  },
+  ""contributors"": [
+    {
+      ""name"": ""Mathias Bynens"",
+      ""url"": ""https://mathiasbynens.be/""
+    },
+    {
+      ""name"": ""John-David Dalton"",
+      ""url"": ""http://allyoucanleet.com/""
+    }
+  ],
+  ""repository"": {
+    ""type"": ""git"",
+    ""url"": ""https://github.com/bestiejs/punycode.js.git""
+  },
+  ""bugs"": {
+    ""url"": ""https://github.com/bestiejs/punycode.js/issues""
+  },
+  ""files"": [
+    ""LICENSE-MIT.txt"",
+    ""punycode.js""
+  ],
+  ""scripts"": {
+    ""test"": ""node tests/tests.js""
+  },
+  ""devDependencies"": {
+    ""coveralls"": ""^2.10.1"",
+    ""grunt"": ""^0.4.5"",
+    ""grunt-contrib-uglify"": ""^0.5.0"",
+    ""grunt-shell"": ""^0.7.0"",
+    ""istanbul"": ""^0.2.13"",
+    ""qunit-extras"": ""^1.2.0"",
+    ""qunitjs"": ""~1.11.0"",
+    ""requirejs"": ""^2.1.14""
+  },
+  ""readme"": ""# Punycode.js [![Build status](https://travis-ci.org/bestiejs/punycode.js.svg?branch=master)](https://travis-ci.org/bestiejs/punycode.js) [![Code coverage status](http://img.shields.io/coveralls/bestiejs/punycode.js/master.svg)](https://coveralls.io/r/bestiejs/punycode.js) [![Dependency status](https://gemnasium.com/bestiejs/punycode.js.svg)](https://gemnasium.com/bestiejs/punycode.js)\n\nA robust Punycode converter that fully complies to [RFC 3492](http://tools.ietf.org/html/rfc3492) and [RFC 5891](http://tools.ietf.org/html/rfc5891), and works on nearly all JavaScript platforms.\n\nThis JavaScript library is the result of comparing, optimizing and documenting different open-source implementations of the Punycode algorithm:\n\n* [The C example code from RFC 3492](http://tools.ietf.org/html/rfc3492#appendix-C)\n* [`punycode.c` by _Markus W. Scherer_ (IBM)](http://opensource.apple.com/source/ICU/ICU-400.42/icuSources/common/punycode.c)\n* [`punycode.c` by _Ben Noordhuis_](https://github.com/bnoordhuis/punycode/blob/master/punycode.c)\n* [JavaScript implementation by _some_](http://stackoverflow.com/questions/183485/can-anyone-recommend-a-good-free-javascript-for-punycode-to-unicode-conversion/301287#301287)\n* [`punycode.js` by _Ben Noordhuis_](https://github.com/joyent/node/blob/426298c8c1c0d5b5224ac3658c41e7c2a3fe9377/lib/punycode.js) (note: [not fully compliant](https://github.com/joyent/node/issues/2072))\n\nThis project is [bundled](https://github.com/joyent/node/blob/master/lib/punycode.js) with [Node.js v0.6.2+](https://github.com/joyent/node/compare/975f1930b1...61e796decc).\n\n## Installation\n\nVia [npm](http://npmjs.org/) (only required for Node.js releases older than v0.6.2):\n\n```bash\nnpm install punycode\n```\n\nVia [Bower](http://bower.io/):\n\n```bash\nbower install punycode\n```\n\nVia [Component](https://github.com/component/component):\n\n```bash\ncomponent install bestiejs/punycode.js\n```\n\nIn a browser:\n\n```html\n<script src=\""punycode.js\""></script>\n```\n\nIn [Narwhal](http://narwhaljs.org/), [Node.js](http://nodejs.org/), and [RingoJS](http://ringojs.org/):\n\n```js\nvar punycode = require('punycode');\n```\n\nIn [Rhino](http://www.mozilla.org/rhino/):\n\n```js\nload('punycode.js');\n```\n\nUsing an AMD loader like [RequireJS](http://requirejs.org/):\n\n```js\nrequire(\n  {\n    'paths': {\n      'punycode': 'path/to/punycode'\n    }\n  },\n  ['punycode'],\n  function(punycode) {\n    console.log(punycode);\n  }\n);\n```\n\n## API\n\n### `punycode.decode(string)`\n\nConverts a Punycode string of ASCII symbols to a string of Unicode symbols.\n\n```js\n// decode domain name parts\npunycode.decode('maana-pta'); // 'mañana'\npunycode.decode('--dqo34k'); // '☃-⌘'\n```\n\n### `punycode.encode(string)`\n\nConverts a string of Unicode symbols to a Punycode string of ASCII symbols.\n\n```js\n// encode domain name parts\npunycode.encode('mañana'); // 'maana-pta'\npunycode.encode('☃-⌘'); // '--dqo34k'\n```\n\n### `punycode.toUnicode(input)`\n\nConverts a Punycode string representing a domain name or an email address to Unicode. Only the Punycoded parts of the input will be converted, i.e. it doesn’t matter if you call it on a string that has already been converted to Unicode.\n\n```js\n// decode domain names\npunycode.toUnicode('xn--maana-pta.com');\n// → 'mañana.com'\npunycode.toUnicode('xn----dqo34k.com');\n// → '☃-⌘.com'\n\n// decode email addresses\npunycode.toUnicode('джумла@xn--p-8sbkgc5ag7bhce.xn--ba-lmcq');\n/
+
+2025-01-20 12:06:08 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:08 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:08 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:10 - snowflake.connector.cursor - INFO - Number of results in first chunk: 2
+2025-01-20 12:06:11 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:11 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:11 - root - INFO - SQL:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "content" ILIKE '%"require"%:%'
+   LIMIT 1000;
+Results:
+Too long, hard cut:
+sample_path,content
+desktop/core/src/desktop/static/desktop/js/ace/mode-pgsql.js,"ace.define(""ace/mode/doc_comment_highlight_rules"",[""require"",""exports"",""module"",""ace/lib/oop"",""ace/mode/text_highlight_rules""],function(e,t,n){""use strict"";var r=e(""../lib/oop""),i=e(""./text_highlight_rules"").TextHighlightRules,s=function(){this.$rules={start:[{token:""comment.doc.tag"",regex:""@[\\w\\d_]+""},s.getTagRule(),{defaultToken:""comment.doc"",caseInsensitive:!0}]}};r.inherits(s,i),s.getTagRule=function(e){return{token:""comment.doc.tag.storage.type"",regex:""\\b(?:TODO|FIXME|XXX|HACK)\\b""}},s.getStartRule=function(e){return{token:""comment.doc"",regex:""\\/\\*(?=\\*)"",next:e}},s.getEndRule=function(e){return{token:""comment.doc"",regex:""\\*\\/"",next:e}},t.DocCommentHighlightRules=s}),ace.define(""ace/mode/perl_highlight_rules"",[""require"",""exports"",""module"",""ace/lib/oop"",""ace/mode/text_highlight_rules""],function(e,t,n){""use strict"";var r=e(""../lib/oop""),i=e(""./text_highlight_rules"").TextHighlightRules,s=function(){var e=""base|constant|continue|else|elsif|for|foreach|format|goto|if|last|local|my|next|no|package|parent|redo|require|scalar|sub|unless|until|while|use|vars"",t=""ARGV|ENV|INC|SIG"",n=""getprotobynumber|getprotobyname|getservbyname|gethostbyaddr|gethostbyname|getservbyport|getnetbyaddr|getnetbyname|getsockname|getpeername|setpriority|getprotoent|setprotoent|getpriority|endprotoent|getservent|setservent|endservent|sethostent|socketpair|getsockopt|gethostent|endhostent|setsockopt|setnetent|quotemeta|localtime|prototype|getnetent|endnetent|rewinddir|wantarray|getpwuid|closedir|getlogin|readlink|endgrent|getgrgid|getgrnam|shmwrite|shutdown|readline|endpwent|setgrent|readpipe|formline|truncate|dbmclose|syswrite|setpwent|getpwnam|getgrent|getpwent|ucfirst|sysread|setpgrp|shmread|sysseek|sysopen|telldir|defined|opendir|connect|lcfirst|getppid|binmode|syscall|sprintf|getpgrp|readdir|seekdir|waitpid|reverse|unshift|symlink|dbmopen|semget|msgrcv|rename|listen|chroot|msgsnd|shmctl|accept|unpack|exists|fileno|shmget|system|unlink|printf|gmtime|msgctl|semctl|values|rindex|substr|splice|length|msgget|select|socket|return|caller|delete|alarm|ioctl|index|undef|lstat|times|srand|chown|fcntl|close|write|umask|rmdir|study|sleep|chomp|untie|print|utime|mkdir|atan2|split|crypt|flock|chmod|BEGIN|bless|chdir|semop|shift|reset|link|stat|chop|grep|fork|dump|join|open|tell|pipe|exit|glob|warn|each|bind|sort|pack|eval|push|keys|getc|kill|seek|sqrt|send|wait|rand|tied|read|time|exec|recv|eof|chr|int|ord|exp|pos|pop|sin|log|abs|oct|hex|tie|cos|vec|END|ref|map|die|uc|lc|do"",r=this.createKeywordMapper({keyword:e,""constant.language"":t,""support.function"":n},""identifier"");this.$rules={start:[{token:""comment.doc"",regex:""^=(?:begin|item)\\b"",next:""block_comment""},{token:""string.regexp"",regex:""[/](?:(?:\\[(?:\\\\]|[^\\]])+\\])|(?:\\\\/|[^\\]/]))*[/]\\w*\\s*(?=[).,;]|$)""},{token:""string"",regex:'[""](?:(?:\\\\.)|(?:[^""\\\\]))*?[""]'},{token:""string"",regex:'[""].*\\\\$',next:""qqstring""},{token:""string"",regex:""['](?:(?:\\\\.)|(?:[^'\\\\]))*?[']""},{token:""string"",regex:""['].*\\\\$"",next:""qstring""},{token:""constant.numeric"",regex:""0x[0-9a-fA-F]+\\b""},{token:""constant.numeric"",regex:""[+-]?\\d+(?:(?:\\.\\d*)?(?:[eE][+-]?\\d+)?)?\\b""},{token:r,regex:""[a-zA-Z_$][a-zA-Z0-9_$]*\\b""},{token:""keyword.operator"",regex:""%#|\\$#|\\.\\.\\.|\\|\\|=|>>=|<<=|<=>|&&=|=>|!~|\\^=|&=|\\|=|\\.=|x=|%=|\\/=|\\*=|\\-=|\\+=|=~|\\*\\*|\\-\\-|\\.\\.|\\|\\||&&|\\+\\+|\\->|!=|==|>=|<=|>>|<<|,|=|\\?\\:|\\^|\\||x|%|\\/|\\*|<|&|\\\\|~|!|>|\\.|\\-|\\+|\\-C|\\-b|\\-S|\\-u|\\-t|\\-p|\\-l|\\-d|\\-f|\\-g|\\-s|\\-z|\\-k|\\-e|\\-O|\\-T|\\-B|\\-M|\\-A|\\-X|\\-W|\\-c|\\-R|\\-o|\\-x|\\-w|\\-r|\\b(?:and|cmp|eq|ge|gt|le|lt|ne|not|or|xor)""},{token:""comment"",regex:""#.*$""},{token:""lparen"",regex:""[[({]""},{token:""rparen"",regex:""[\\])}]""},{token:""text"",regex:""\\s+""}],qqstring:[{token:""string"",regex:'(?:(?:\\\\.)|(?:[^""\\\\]))*?""',next:""start""},{token:""string"",regex:"".+""}],qstring:[{token:""string"",regex:""(?:(?:\\\\.)|(?:[^'\\\\]))*?'"",next:""start""},{token:""string"",regex:"".+""}],block_comment:[{token:""comment.doc"",regex:""^=cut\\b"",next:""start""},{defaultToken:""comment.doc""}]}};r.inherits(s,i),t.PerlHighlightRules=s}),ace.define(""ace/mode/python_highlight_rules"",[""require"",""exports"",""module"",""ace/lib/oop"",""ace/mode/text_highlight_rules""],function(e,t,n){""use strict"";var r=e(""../lib/oop""),i=e(""./text_highlight_rules"").TextHighlightRules,s=function(){var e=""and|as|assert|break|class|continue|def|del|elif|else|except|exec|finally|for|from|global|if|import|in|is|lambda|not|or|pass|print|raise|return|try|while|with|yield"",t=""True|False|None|NotImplemented|Ellipsis|__debug__"",n=""abs|divmod|input|open|staticmethod|all|enumerate|int|ord|str|any|eval|isinstance|pow|sum|basestring|execfile|issubclass|print|super|binfile|iter|property|tuple|bool|filter|len|range|
+
+2025-01-20 12:06:11 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:11 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:11 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:14 - snowflake.connector.cursor - INFO - Number of results in first chunk: 3
+2025-01-20 12:06:16 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:16 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:17 - root - INFO - SQL:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE TRY_PARSE_JSON("content") IS NOT NULL
+   LIMIT 1000;
+Results:
+Too long, hard cut:
+sample_path,content
+src/main/resources/assets/ironbackpacks/models/item/backpackBasic.json,"{
+    ""__comment"": ""Model generated using MrCrayfish's Model Creator (http://mrcrayfish.com/modelcreator/)"",
+    ""textures"": {
+        ""0"": ""ironbackpacks:models/packBasicMain"",
+        ""1"": ""ironbackpacks:models/packBasicPouch""
+    },
+    ""elements"": [
+        {
+            ""name"": ""Main"",
+            ""from"": [ 7.0, 1.0, 5.0 ], 
+            ""to"": [ 9.0, 7.0, 11.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#0"", ""uv"": [ 16.0, 0.0, 12.0, 12.0 ] },
+                ""east"": { ""texture"": ""#0"", ""uv"": [ 12.0, 0.0, 0.0, 12.0 ] },
+                ""south"": { ""texture"": ""#0"", ""uv"": [ 12.0, 0.0, 16.0, 12.0 ] },
+                ""west"": { ""texture"": ""#0"", ""uv"": [ 0.0, 0.0, 12.0, 12.0 ] },
+                ""up"": { ""texture"": ""#0"", ""uv"": [ 0.0, 7.0, 12.0, 3.0 ], ""rotation"": 90 },
+                ""down"": { ""texture"": ""#0"", ""uv"": [ 0.0, 12.0, 12.0, 16.0 ], ""rotation"": 270 }
+            }
+        },
+        {
+            ""name"": ""pouch"",
+            ""from"": [ 6.0, 1.0, 6.0 ], 
+            ""to"": [ 7.0, 5.0, 10.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] },
+                ""east"": { ""texture"": ""#1"", ""uv"": [ 2.0, 2.0, 6.0, 6.0 ] },
+                ""south"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] },
+                ""west"": { ""texture"": ""#1"", ""uv"": [ 0.0, 0.0, 8.0, 8.0 ] },
+                ""up"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] },
+                ""down"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] }
+            }
+        },
+        {
+            ""name"": ""Cube"",
+            ""from"": [ 7.0, 0.0, 6.0 ], 
+            ""to"": [ 9.0, 1.0, 10.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#0"", ""uv"": [ 10.0, 10.0, 6.0, 12.0 ] },
+                ""east"": { ""texture"": ""#0"", ""uv"": [ 2.0, 10.0, 10.0, 12.0 ] },
+                ""south"": { ""texture"": ""#0"", ""uv"": [ 6.0, 10.0, 10.0, 12.0 ] },
+                ""west"": { ""texture"": ""#0"", ""uv"": [ 2.0, 10.0, 10.0, 12.0 ] },
+                ""up"": { ""texture"": ""#0"", ""uv"": [ 0.0, 0.0, 2.0, 4.0 ] },
+                ""down"": { ""texture"": ""#0"", ""uv"": [ 0.0, 12.0, 8.0, 16.0 ] }
+            }
+        },
+        {
+            ""name"": ""Cube"",
+            ""from"": [ 7.499999992549419, 7.0, 6.0 ], 
+            ""to"": [ 9.0, 7.499999992549419, 10.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#0"", ""uv"": [ 11.0, 12.0, 8.0, 11.0 ] },
+                ""east"": { ""texture"": ""#0"", ""uv"": [ 1.0, 11.0, 9.0, 12.0 ] },
+                ""south"": { ""texture"": ""#0"", ""uv"": [ 8.0, 11.0, 11.0, 12.0 ] },
+                ""west"": { ""texture"": ""#0"", ""uv"": [ 1.0, 11.0, 9.0, 12.0 ] },
+                ""up"": { ""texture"": ""#0"", ""uv"": [ 10.0, 9.0, 2.0, 12.0 ], ""rotation"": 90 },
+                ""down"": { ""texture"": ""#0"", ""uv"": [ 0.0, 13.0, 7.500000007450581, 16.0 ] }
+            }
+        }
+    ]
+}"
+ioniclub-master/node_modules/bower/node_modules/request/node_modules/tough-cookie/node_modules/punycode/package.json,"{
+  ""name"": ""punycode"",
+  ""version"": ""1.3.2"",
+  ""description"": ""A robust Punycode converter that fully complies to RFC 3492 and RFC 5891, and works on nearly all JavaScript platforms."",
+  ""homepage"": ""https://mths.be/punycode"",
+  ""main"": ""punycode.js"",
+  ""keywords"": [
+    ""punycode"",
+    ""unicode"",
+    ""idn"",
+    ""idna"",
+    ""dns"",
+    ""url"",
+    ""domain""
+  ],
+  ""license"": ""MIT"",
+  ""author"": {
+    ""name"": ""Mathias Bynens"",
+    ""url"": ""https://mathiasbynens.be/""
+  },
+  ""contributors"": [
+    {
+      ""name"": ""Mathias Bynens"",
+      ""url"": ""https://mathiasbynens.be/""
+    },
+    {
+      ""name"": ""John-David Dalton"",
+      ""url"": ""http://allyoucanleet.com/""
+    }
+  ],
+  ""repository"": {
+    ""type"": ""git"",
+    ""url"": ""https://github.com/bestiejs/punycode.js.git""
+  },
+  ""bugs"": {
+    ""url"": ""https://github.com/bestiejs/punycode.js/issues""
+  },
+  ""files"": [
+    ""LICENSE-MIT.txt"",
+    ""punycode.js""
+  ],
+  ""scripts"": {
+    ""test"": ""node tests/tests.js""
+  },
+  ""devDependencies"": {
+    ""coveralls"": ""^2.10.1"",
+    ""grunt"": ""^0.4.5"",
+    ""grunt-contrib-uglify"": ""^0.5.0"",
+    ""grunt-shell"": ""^0.7.0"",
+    ""istanbul"": ""^0.2.13"",
+    ""qunit-extras"": ""^1.2.0"",
+    ""qunitjs"": ""~1.11.0"",
+    ""requirejs"": ""^2.1.14""
+  },
+  ""readme"": ""# Punycode.js [![Build status](https://travis-ci.org/bestiejs/punycode.js.svg?branch=master)](https://travis-ci.org/bestiejs/punycode.js) [![Code coverage status](http://img.shields.io/coveralls/bestiejs/punycode.js/master.svg)](https://coveralls.io/r/bestiejs/punycode.js) [![Dependency status](https://gemnasium.com/b
+
+2025-01-20 12:06:17 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:17 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:17 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:18 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:18 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:06:56 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-20 12:06:56 - root - INFO - The error you're encountering:
+
+```
+000904 (42000): 01b9d656-0004-7b17-0001-11c300f0974e: SQL compilation error: error line 1 at position 7
+invalid identifier 'F."value"'
+```
+
+indicates that the identifier `f."value"` in your `SELECT` clause is invalid. This is likely due to the case sensitivity of column names in Snowflake when using double quotes.
+
+In Snowflake, unquoted identifiers are automatically converted to uppercase, whereas quoted identifiers are case-sensitive and preserve the case as written. The columns produced by `LATERAL FLATTEN` are unquoted and therefore in uppercase by default.
+
+The `LATERAL FLATTEN` function generates the following columns:
+
+- **SEQ**: A sequence number.
+- **KEY**: The key or property name (if the input is an object).
+- **PATH**: The path to the element within the JSON hierarchy.
+- **INDEX**: The index of the element (if the input is an array).
+- **VALUE**: The contents of the element, of type `VARIANT`.
+
+Given this, the column you're trying to select is `VALUE`, not `value`. To fix the error, you should reference the `VALUE` column without quotes or with uppercase quotes.
+
+Here's the corrected SQL query:
+
+```sql
+SELECT f.VALUE
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content"):"require") f
+LIMIT 1000;
+```
+
+**Explanation:**
+
+- **Change `f."value"` to `f.VALUE`**: Since `VALUE` is uppercase and unquoted, referencing it as `f.VALUE` ensures Snowflake recognizes the column.
+- **Accessing the "require" section**: The expression `TRY_PARSE_JSON(t."content"):"require"` extracts the `require` field from the JSON content.
+
+**Additional Considerations:**
+
+If the `require` field is nested within another object or you need to ensure that the JSON parsing and extraction are handled correctly, you might want to adjust the query to check for NULL values or handle cases where the `require` field doesn't exist.
+
+For example, you can modify the query to only include rows where the `require` field exists:
+
+```sql
+SELECT f.VALUE
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => (TRY_PARSE_JSON(t."content"):"require")) f
+WHERE f.VALUE IS NOT NULL
+LIMIT 1000;
+```
+
+**Alternative Approach:**
+
+If you're still encountering issues, another approach is to first parse the entire JSON content and then filter for the `require` key using the `KEY` column:
+
+```sql
+SELECT f.VALUE AS package_requirements
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+WHERE f.KEY = 'require'
+LIMIT 1000;
+```
+
+**Summary:**
+
+- **Use Correct Column Names**: Ensure the column names from `LATERAL FLATTEN` are referenced correctly, considering case sensitivity.
+- **Verify JSON Paths**: Make sure the JSON path expressions accurately reflect the structure of your JSON data.
+- **Handle Nulls**: Include checks or conditions to handle cases where the expected JSON fields might be missing.
+
+By making these adjustments, your query should execute without errors and return the desired data.
+2025-01-20 12:06:56 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:06:56 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:06:56 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:06:57 - snowflake.connector.cursor - INFO - Number of results in first chunk: 12
+2025-01-20 12:06:57 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:06:57 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:43 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-20 12:07:43 - root - INFO - SQL:
+SELECT f.VALUE AS package_requirements
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+WHERE f.KEY = 'require'
+LIMIT 1000;
+Results:
+PACKAGE_REQUIREMENTS
+"{
+  ""php"": "">=5.3.10""
+}"
+"{
+  ""php"": "">=5.3.9"",
+  ""symfony/framework-bundle"": "">=2.3""
+}"
+"{
+  ""asgard/entity"": ""~0.3.0"",
+  ""asgard/form"": ""~0.3.0"",
+  ""php"": "">=5.5.9""
+}"
+"{
+  ""illuminate/support"": ""^5.1"",
+  ""league/fractal"": ""^0.13.0"",
+  ""php"": "">=5.5.0""
+}"
+"{
+  ""php"": "">=5.0.0""
+}"
+"{
+  ""yiisoft/yii2"": ""*""
+}"
+"{
+  ""php"": "">=5.3.0""
+}"
+"{
+  ""php"": "">=5.4.0""
+}"
+"{
+  ""doctrine/collections"": ""~1.3"",
+  ""doctrine/common"": ""~2.5"",
+  ""hautelook/phpass"": ""~0.3"",
+  ""php"": "">=5.3.9"",
+  ""psr/log"": ""~1.0"",
+  ""symfony/symfony"": ""~2.8|~3.0""
+}"
+"{
+  ""php"": "">=5.4.0"",
+  ""squizlabs/php_codesniffer"": ""2.1.0""
+}"
+"{
+  ""doctrine/doctrine-bundle"": ""*"",
+  ""doctrine/orm"": ""*"",
+  ""gointegro/hateoas"": ""*"",
+  ""php"": "">=5.4.0"",
+  ""symfony/doctrine-bridge"": ""*"",
+  ""symfony/framework-bundle"": ""*"",
+  ""symfony/monolog-bundle"": ""*""
+}"
+"{
+  ""beberlei/assert"": ""~2.3"",
+  ""doctrine/doctrine-bundle"": ""~1.2"",
+  ""doctrine/orm"": ""~2.2,>=2.2.3"",
+  ""incenteev/composer-parameter-handler"": ""~2.0"",
+  ""j7mbo/twitter-api-php"": ""dev-master"",
+  ""knplabs/github-api"": ""~1.4"",
+  ""php"": "">=5.5"",
+  ""sensio/distribution-bundle"": ""~3.0.12"",
+  ""sensio/framework-extra-bundle"": ""~3.0"",
+  ""sensio/generator-bundle"": ""~2.3"",
+  ""symfony/assetic-bundle"": ""~2.3"",
+  ""symfony/monolog-bundle"": ""~2.4"",
+  ""symfony/swiftmailer-bundle"": ""~2.3"",
+  ""symfony/symfony"": ""~2.6"",
+  ""twig/extensions"": ""~1.0""
+}"
+
+2025-01-20 12:07:43 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:43 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:43 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:44 - snowflake.connector.cursor - INFO - Number of results in first chunk: 12
+2025-01-20 12:07:44 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:44 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:45 - root - INFO - SQL:
+-- Corrected SQL 1
+SELECT t."sample_repo_name", t."sample_path", f.KEY, f.VALUE
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+WHERE f.KEY = 'require'
+LIMIT 1000
+Results:
+sample_repo_name,sample_path,KEY,VALUE
+ScullWM/MailHookBundle,composer.json,require,"{
+  ""php"": "">=5.3.9"",
+  ""symfony/framework-bundle"": "">=2.3""
+}"
+asgardphp/asgard,Entityform/composer.json,require,"{
+  ""asgard/entity"": ""~0.3.0"",
+  ""asgard/form"": ""~0.3.0"",
+  ""php"": "">=5.5.9""
+}"
+ventoviro/windwalker,src/IO/composer.json,require,"{
+  ""php"": "">=5.3.10""
+}"
+NavJobs/laravel-api,composer.json,require,"{
+  ""illuminate/support"": ""^5.1"",
+  ""league/fractal"": ""^0.13.0"",
+  ""php"": "">=5.5.0""
+}"
+zurmo/Zurmo,app/protected/extensions/userinterface/lib/composer.json,require,"{
+  ""php"": "">=5.0.0""
+}"
+marcmascarell/arrayer,composer.json,require,"{
+  ""php"": "">=5.4.0""
+}"
+Ma27/Ma27ApiKeyAuthenticationBundle,composer.json,require,"{
+  ""doctrine/collections"": ""~1.3"",
+  ""doctrine/common"": ""~2.5"",
+  ""hautelook/phpass"": ""~0.3"",
+  ""php"": "">=5.3.9"",
+  ""psr/log"": ""~1.0"",
+  ""symfony/symfony"": ""~2.8|~3.0""
+}"
+AOEpeople/magento-coding-standard,composer.json,require,"{
+  ""php"": "">=5.4.0"",
+  ""squizlabs/php_codesniffer"": ""2.1.0""
+}"
+GoIntegro/hateoas-bundle,composer.json,require,"{
+  ""doctrine/doctrine-bundle"": ""*"",
+  ""doctrine/orm"": ""*"",
+  ""gointegro/hateoas"": ""*"",
+  ""php"": "">=5.4.0"",
+  ""symfony/doctrine-bridge"": ""*"",
+  ""symfony/framework-bundle"": ""*"",
+  ""symfony/monolog-bundle"": ""*""
+}"
+LonelyPullRequestsHQ/lonelypullrequests.com,composer.json,require,"{
+  ""beberlei/assert"": ""~2.3"",
+  ""doctrine/doctrine-bundle"": ""~1.2"",
+  ""doctrine/orm"": ""~2.2,>=2.2.3"",
+  ""incenteev/composer-parameter-handler"": ""~2.0"",
+  ""j7mbo/twitter-api-php"": ""dev-master"",
+  ""knplabs/github-api"": ""~1.4"",
+  ""php"": "">=5.5"",
+  ""sensio/distribution-bundle"": ""~3.0.12"",
+  ""sensio/framework-extra-bundle"": ""~3.0"",
+  ""sensio/generator-bundle"": ""~2.3"",
+  ""symfony/assetic-bundle"": ""~2.3"",
+  ""symfony/monolog-bundle"": ""~2.4"",
+  ""symfony/swiftmailer-bundle"": ""~2.3"",
+  ""symfony/symfony"": ""~2.6"",
+  ""twig/extensions"": ""~1.0""
+}"
+machour/yii2-easy-elasticsearch,composer.json,require,"{
+  ""yiisoft/yii2"": ""*""
+}"
+ddeboer/vatin,composer.json,require,"{
+  ""php"": "">=5.3.0""
+}"
+
+2025-01-20 12:07:45 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:45 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:45 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:46 - snowflake.connector.cursor - INFO - Number of results in first chunk: 15
+2025-01-20 12:07:46 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:46 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:47 - root - INFO - SQL:
+-- SQL 2 (No correction needed)
+SELECT DISTINCT "license"
+FROM GITHUB_REPOS.GITHUB_REPOS.LICENSES
+LIMIT 1000
+Results:
+license
+apache-2.0
+epl-1.0
+lgpl-2.1
+mit
+lgpl-3.0
+artistic-2.0
+isc
+cc0-1.0
+agpl-3.0
+bsd-2-clause
+gpl-2.0
+gpl-3.0
+mpl-2.0
+unlicense
+bsd-3-clause
+
+2025-01-20 12:07:47 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:47 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:47 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:48 - snowflake.connector.cursor - INFO - Number of results in first chunk: 1000
+2025-01-20 12:07:48 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:48 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:49 - root - INFO - SQL:
+-- SQL 3 (No correction needed)
+SELECT "repo_name", "language"
+FROM GITHUB_REPOS.GITHUB_REPOS.LANGUAGES
+LIMIT 1000
+Results:
+Too long, hard cut:
+repo_name,language
+konrad/READemption,[]
+Duobe/TheFirstOne,[]
+andyyardley/SecureO,[]
+PGower/Timetabler2SQL,[]
+brykmoore/SeniorProject,[]
+mpusz/SimpleWorkarounds,[]
+lily06280425/lian-,[]
+seanarooni/gitignore,[]
+mashurex/arduino-tuts,[]
+Natashka89/ironpython_training2,[]
+Chookahead/Locally-Created-Repo,[]
+twiess/hello-world,[]
+jasonzissman/Algorithms,[]
+pl85s/programming-for_testers,[]
+maicki/GDUpload,[]
+cyclejs/base,[]
+renwei360/-,[]
+pedazo/ogo,[]
+jsheng258/helloworld,[]
+web1o1/pixi.js,[]
+birthcat/HelloWorld,[]
+webner/nginx-proxy,[]
+s3r4ph/PySplice,[]
+makerspacelt/car-usb-charger,[]
+hioxxo/radiojavandownloader,[]
+alanmcna/heat_templates,[]
+dbhys/com.dbhys,[]
+Ivshti/awesome-hacking-spots,[]
+du5t/char-custom,[]
+slimchrisp/bootstrap_cms,[]
+skeeet/iOSAppReverseEngineering,[]
+ajsondev/fullcalendar,[]
+zen-np/np-log,[]
+kragen/zxing,[]
+Davidmeng78/PPRE,[]
+SebastienGaspar/Gecko,[]
+maquanyi/crew,[]
+marcelobarretto/docker-tomcat-mysql,[]
+delgadom/lptutorial,[]
+zcrutherford/zhangchao,[]
+sampanelaid/panelteam,[]
+NodeTutorials/express.js-intro,[]
+hubertod/MarketWatcher,[]
+GameDevBlizzardThread/game,[]
+RagnarDanneskjold/bitbot,[]
+deependragit/testing,[]
+kennethormandy/default,[]
+renqiaoyang/www,[]
+pjcnunes/ADS2017,[]
+drewhammond/idea-gulp,[]
+basilajith/python,[]
+pedro/active_merchant,[]
+baiyanghese/angular.js,[]
+kemalacar/mediaplayer_plugin,[]
+ridesoftech/videoconf,[]
+airate/docker-base,[]
+Galves96/CP,[]
+ibanezz/GitDemo,[]
+vpayno/md-api-perl,[]
+AnujaK/chrome-dropbox-oauth,[]
+tcalmant/nao-iotdays-2015,[]
+adyates/steamalytics,[]
+Remnaut/DungeonCrawler,[]
+FireFlyDreamWorks/aladino,[]
+active-interest/reverse-proxy-comment-ip-fix,[]
+pataquets/docker-supervisor,[]
+Sameer-Shukla/FirstRepo,[]
+gloryministry/.com,[]
+iicray/Rails-102,[]
+mrblabs/vitwitter.net,[]
+mardann/randomNumGeneratorNonReacuring,[]
+PaperHat/programmer-training,[]
+eahrold/Chainables,[]
+substruct/mohawk,[]
+Chromatophore/MDS,[]
+dazzyd/firefox-searchplugins,[]
+lutaf/auto-complete,[]
+dayler/nuevatel.common,[]
+nwgat/nodejs-rtorrent-installer,[]
+collabx/LegalComponents,[]
+4everdunn/phonefix,[]
+eos-org/autoload,[]
+devendradhanal/T,[]
+metavida/Multi-Firefox-Launcher,[]
+yjchou/polar,[]
+andreaslindeboom/padlock,[]
+mewiteor/algorithm,[]
+refactorthis/acute.js,[]
+inshideru/datasciencecoursera,[]
+sysb-io/sysbio-gallery,[]
+manutddidaka/Moments-in-Space,[]
+mako-taco/react-components,[]
+ajaycode/docker-cheat-sheet,[]
+icyflame/install-from-source-tmux-2-0,[]
+hcp4715/AnalyzingExpData,[]
+nishant-jain-94/QuizRT,[]
+therebelrobot/hublog,[]
+cheaboar/my,[]
+zarathustra1/Tom-Shelling,[]
+bobalazek/open-model,[]
+virati/LinuxScripts,[]
+thefairystamp/companions,[]
+DevAplus/Development,[]
+weixue-group/flaming-meme,[]
+taibin/AndroidEasy,[]
+fychao/DimensionalOpinion,[]
+khmarbaise/progressive-organization-pom,[]
+irshadpc/GKCustomAddressBook,[]
+acsalu/umsi-courses,[]
+markronquillo/Coil,[]
+BFFTD/Test,[]
+stephanmg/usb-backup,[]
+mjb2010/FixRIFF,[]
+zlsun/avit-mod,[]
+Arif12/referenes,[]
+Agustify/Sfotipy,[]
+TyphooN-/staticifcfg,[]
+lapogo18/Spies,[]
+notbsd/eggsploits,[]
+bhargav175/react-material-boilerplate,[]
+zokeber/docker-centos,[]
+viktorbc/HOMEWORK,[]
+NENightElves/FIR,[]
+garyjyao1/mac-devops-playbook,[]
+Chingzilla/Robotc-Extra-Libraries,[]
+naveen9755/scribe-java,[]
+ThomasLeg/Formation,[]
+jon-d/ansible-role-openntpd,[]
+mvhenten/slack-dict,[]
+02N/kaffe,[]
+holtkamp/cdnjs,[]
+OpenGov/docker-pyspark,[]
+sp02/my_first_repo,[]
+MarceloM33/BITCOINMTFKR,[]
+stmueller/PEBL_BST,[]
+zed-throben/csharp-bertpc-server,[]
+bugen/tsv,[]
+mxabierto/capa,[]
+fish-bones/surface,[]
+ColemanTO/Weather-Forecast,[]
+apiaryio/jsondiff-js,[]
+liboysoft/blueberry,[]
+Wirachmat/https-github.com-cloudflare-cfapp-sample,[]
+mandrean/blogg.se2wordress,[]
+dbergan/AutobahnPython,[]
+theatrekid09/Front-end-Developer-Interview-Questions,[]
+Un1matr1x/phpBB3-MOD-ErrorLogging,[]
+kaija/dns_alg,[]
+RedClayInteractive/rci-csv-export,[]
+isis-software/Programy-zabezpieczajace,[]
+urtdevs/pugbot-salt,[]
+wolfy12/wargreymon,[]
+ivarsolution/lesson1,[]
+aburan28/scrapy,[]
+nerones/docker-laravel-dev,[]
+Bradass/Tests,[]
+waterdance/pet_event,[]
+vladimir-vilinski/mqfte-manager,[]
+stringsonfire/django-just-friends,[]
+bronson/setenvy,[]
+Sgoettschkes/ansible-role-mysql,[]
+PureChat/PureChat,[]
+cbutcosk/rdfgen-ci,[]
+svoflee/svoflee-spartacus-tools,[]
+hilbert-space/mc,[]
+elyase/algorithms,[]
+vauxoo-dev/runbot_branch_remote_name_grp_feature,[]
+erceller/SDL-practices,[]
+othermusketeer/ServerStarter,[]
+RichardLitt/How-to-pronounce,[]
+filipveschool/overzicht-laravel-packages,[]
+garrettpross/git-test,[]
+base0225/ZJAVPlayer,[]
+wavelets/math-as-code,[]
+felicitychou/blog,[]
+knaka/markdown-link,[]
+MatrixAI/Chronograph,[]
+digitalw00t/prismaRedux,[]
+petemcw/ansible-role-redis,[]
+VincenzoAliberti/MTD-LPDDR2-NVM,[]
+pnsantos/pnsantos.github.io,[]
+est61/hello-world,[]
+MrZhouYY/PRML,[]
+LiskCommunityTools/lisk-tools,[]
+wechatpy/wechatpy.github.io,[]
+javidanser/scrum-poker-cards-android,[]
+boriszweimueller/boris-blog,[]
+qyou/QRTParser,[]
+eel3/lua_nmake_template,[]
+simar0at/composer-repos,[]
+Tu
+
+2025-01-20 12:07:49 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:49 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:49 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:50 - snowflake.connector.cursor - INFO - Number of results in first chunk: 1000
+2025-01-20 12:07:50 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:50 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:51 - root - INFO - SQL:
+-- SQL 4 (No correction needed)
+SELECT "id", "size", "binary"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = TRUE
+LIMIT 1000
+Results:
+Too long, hard cut:
+id,size,binary
+5cb570289796c79bb404453029ff2b8f54431cd5,170242,True
+237f3657a01ee1e48aa0146d9eb2f022815414cf,3922814,True
+90a3607edd46243b457d334a7f705a559707c1af,64955,True
+c62915c510205c9f914776b4da51dc15f19a87e4,9052,True
+e222e4594f8e05a43066fd061a3d93f8ead9c8e0,13616,True
+d941da334e454a1c826f39f3dbac497cc3c3db16,246,True
+41aa5b3afb75dd574eb3b31a5d75f4a60e8f93d4,360,True
+8bdc1f0589e524c133e224dda8720f5ec4d14a29,18039,True
+8f22c2697f0ddabae0eceaac76f5c599b42446de,13462,True
+d8dd553288fddcea188595e107e9caf047cb95dc,470,True
+2d2e351c81001824eb5a63d84e0b2a85c4262f31,2748,True
+0dd1b1cfc86c568ad386204ede526d8ccb95d218,3612,True
+a422b9a5f0012a490f70f0d186f8dceab44f2c6c,4943,True
+0eab18811d746b51f6813df413598078b76d65d4,487424,True
+3b541a997cba2dd5313dc43059839e2668be8bcf,2280,True
+e4d9f88a4b5ed047dc988056805d82c42be0b9bb,16964,True
+07d9923bbfa7ef30c6c0e40d62524f879e9cdc3e,1458,True
+6cfea948c7f2712af90a88cc75f7f649d83145a3,364155,True
+d70ea212f364055bef1ee484f2039ea5a80b3d99,639,True
+6d5df3081daec0ea6b4021d97866b38c716da88c,23084,True
+d1305e5f0c9bc64326e68503d2abce5886ab5dd4,281155,True
+6d04e4e2ed4e8397e83400b3c9e08d9d74dc698a,34977,True
+45b4710b2dd06b871d84a12771f66b60f692241c,59,True
+2f3c885aedc4938036b6e3adf137366472326c42,1040888,True
+9c36e07c7454aeaf059d5b07e62d4268ea6c7617,1614276,True
+32f3632d167318083947e3a968c96054f0ab2e70,14391,True
+cb107df384a6ff637074175229ba4c455a7a29ca,17577,True
+67e196faf1fa281aec64572e0b3c90b744b73e38,654,True
+0e23c4205d3922b4b4aded8cc04b3c152c1d0c87,81438,True
+2897f4521ac6aab70e2d8f69469e8a825b7d6783,512,True
+33718db98c07a3cd59e92fad17384427d5a7874b,248,True
+9f2477b423b5b8d24f8a06d89ad1db78b372ee52,3314,True
+b0bdd87563dae1eacb727138166f6ac286b3f366,774,True
+590040d8591d23262c708c146328bffc1c019d63,282,True
+7fa3c19247c0808d01a15e9f1e80de155fc6b91f,8994860,True
+24a69b986f7b3a9f7e47cd1cb2637b01d8c59811,5563,True
+e8f69f6e3fcc4a7f342284e284c3ddac527cb2d2,4506,True
+9a9d54916909608d1037e93f587dc18462382f34,3297,True
+124e0699331b9af3b37f365c35bc454a5fd2762d,229,True
+736e57c095683a38d443f153acc5cb6314767301,251,True
+433a8c14bda3fcf8663835f9ea4bc2445562ad03,1086,True
+d20a393c70709746829b1f1ad1fbe558efc116e0,1458,True
+43bf7633fa0e5422a1652f3a95de6c3a25811e55,82920,True
+d42f74535db83cdd45b01f3c1ff8df28b975b307,12814,True
+ba1e315905266ba4e0a944f233b2b95e7e060036,280,True
+e527ea532895e5abb03ffbd7af1acbd410cac20a,1254,True
+38497e198ba7b5e962e161a6746725c0d1fa9616,1458,True
+26c3877bdc7690a11c85148263fa5402c4d66fbe,8028,True
+746d017c1ef1fb2b5cad1293b7640766eb944d75,401066,True
+692a414328e913c883a4148ca7cca9ef8382728b,2472,True
+2dcb67b08e0581f767ac79e386305cd44aa735a2,688,True
+18df12eeaec707126739cfb3216e5dc928636aef,105429,True
+54cf2b9f20255ac3aaa0f0b1fd0a93ea30ad05da,205,True
+dcc0884652ca6a0e1d407fcb90c087ad8bb20340,4300,True
+8f9985d3f3299a8063622247d8ca3c8920e343f8,1458,True
+74f65dc1fe5e85317d70c3194dedeedef66c1dd0,4701,True
+a1375708947bff27c702c083b1ecb3b7f7a6668e,182972,True
+b813f5fa1d6fe5bb8416eac58afd3be526531b74,100230,True
+b6337bc9a28180d042950c9f3c21d08406fbb254,229,True
+47b46a9cf60549b4e5a2c8d88874aff541502e88,505441,True
+21d3c19424185a6d0478e81e93cde9904d45d5ad,109468,True
+873454cee5ce32013c3ad1a1d1e4a6ca0be1f4b6,19540,True
+816ac8354e79af895935b107a5e550c94123cb02,1994,True
+37ed073b556f4ce3463ded4b2e9887c023931a66,8425,True
+962d5b6139754b6789490870ccaf58672473b93a,47660,True
+5637785cf05a96729a266ff6809fe06e4376a553,229,True
+1f319b56fce631ceae678d3555c986a795a8930a,1754,True
+b389a63119c75e5ace27c50da55d85bef983f14c,2034,True
+c0f0188d07d6a4c12e725aa3724497cf4c40ed1c,28661,True
+155fa7a03a5d8d599666be87dbbd6d3905e8279f,4484,True
+f34b5576495326ba0662a86fa591cd1c2bea6da8,260,True
+b007a07c0ce8000a734e2a9c1143bbdc6c2587a5,1645,True
+050f0b7e569a2561019526e63c419be819a3d901,107,True
+e744dcd4b37cc6ae52553918d005b8320271a777,199570,True
+7cab5e1069744a27ca575cfb096853028a0c4808,187018,True
+dbd1ee7abb246b97492d173060948598895cd2a0,645,True
+174fab5528a1e5c69f1fae5c6f4fa76e63345d02,1458,True
+2bec2bab3de8caffe3cf67ab364be020234feabd,5480,True
+14ced6b07fa902f3fbfe3a52ab8ad26d147ef8c0,937,True
+ebca5c70f03b68270d1e8203390754ca02ef3334,1664,True
+3b6bef080c14961fb0abc04a3c84d20d1cdd9a52,592,True
+082761f49c334ff7c26099d519a22b964037a754,180,True
+68f229b9e54132e58be6701f2fa5fd74f6a5427e,284,True
+64fbaaacc36b659e51db803446c382d32f58aec5,2228,True
+73d904444c82460ed11297869f950fe6943f0764,545793,True
+0c3ae33c3821373b3c3e024bad3cb2292bd559be,18090,True
+2f884bbb5ffe56a3dab735bea4542dccd7af8b53,24122,True
+39c3ad72fb3c22475db3434f6acf90515519dd94,3967,True
+67545c695a2e0b12b89bf422ae8b381a1d09e1cf,213,True
+8601a3745e717a5b7d66c075bca73c0a489cd1e4,7994,True
+a59a869fc392ff310a06829c95bdd4cc51bcdc9b,7316,True
+d27ee0b5f644d1782f892bd9694268bad929a526,43312,True
+f97fca0bbcfc1d98140d6000a22776a3f8f4b193,284,True
+da0434c11a3509c49049af3e7969b3109344c806,7184,True
+9a98dfab76f27b01ebbb2e7c91940018b28dabcc,3412,True
+54ec7a8d6fb0f67e9b0bfa14a598c1056c3f2e2b,8678,True
+d681e8589fdfc7d364cc83c72ef43340328d7e7b,328,True
+5a6c275eec
+
+2025-01-20 12:07:51 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:51 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:51 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:52 - snowflake.connector.cursor - INFO - Number of results in first chunk: 104
+2025-01-20 12:07:54 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:54 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:54 - root - INFO - SQL:
+-- SQL 5 (No correction needed)
+SELECT "commit", "message"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_COMMITS
+WHERE "message" ILIKE '%fix%'
+LIMIT 1000
+Results:
+Too long, hard cut:
+commit,message
+01ffe339e3a0ba5ecbeb2b3b5abac7b3ef90f374,"Make alloc_page_buffers() initialise buffer_heads using init_buffer(),
+like other routines here, to ensure buffers are correctly initialised
+with respect to b_private/b_end_io.  Fixes an odd interaction between
+XFS and reiserfs.
+
+Signed-off-by: Nathan Scott <e2e3f1f24cbc439f8c1ba9b08f9954237d64be64@sgi.com>
+"
+7a1d7e6dd76a2070e2d86826391468edc33bb6d6,"tpm: TPM 2.0 baseline support
+
+TPM 2.0 devices are separated by adding a field 'flags' to struct
+tpm_chip and defining a flag TPM_CHIP_FLAG_TPM2 for tagging them.
+
+This patch adds the following internal functions:
+
+- tpm2_get_random()
+- tpm2_get_tpm_pt()
+- tpm2_pcr_extend()
+- tpm2_pcr_read()
+- tpm2_startup()
+
+Additionally, the following exported functions are implemented for
+implementing TPM 2.0 device drivers:
+
+- tpm2_do_selftest()
+- tpm2_calc_ordinal_durations()
+- tpm2_gen_interrupt()
+
+The existing functions that are exported for the use for existing
+subsystems have been changed to check the flags field in struct
+tpm_chip and use appropriate TPM 2.0 counterpart if
+TPM_CHIP_FLAG_TPM2 is est.
+
+The code for tpm2_calc_ordinal_duration() and tpm2_startup() were
+originally written by Will Arthur.
+
+Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+Signed-off-by: Will Arthur <will.c.arthur@intel.com>
+Reviewed-by: Jasob Gunthorpe <jason.gunthorpe@obsidianresearch.com>
+Reviewed-by: Stefan Berger <stefanb@linux.vnet.ibm.com>
+Reviewed-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+Tested-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+
+[phuewe: Fixed copy paste error * 2]
+Signed-off-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+"
+60ecd86c4d985750efa0ea3d8610972b09951715,"vTPM: fix memory allocation flag for rtce buffer at kernel boot
+
+At ibm vtpm initialzation, tpm_ibmvtpm_probe() registers its interrupt
+handler, ibmvtpm_interrupt, which calls ibmvtpm_crq_process to allocate
+memory for rtce buffer.  The current code uses 'GFP_KERNEL' as the
+type of kernel memory allocation, which resulted a warning at
+kernel/lockdep.c.  This patch uses 'GFP_ATOMIC' instead so that the
+allocation is high-priority and does not sleep.
+
+Cc: 4fbacc2fa0ffdbb11bf1ad6925b886ebd08dd15f@kernel.org
+Signed-off-by: Hon Ching(Vicky) Lo <586dce2b5b41882e50b9a0eefaf3387b8b8c8cc6@linux.vnet.ibm.com>
+Signed-off-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+"
+fe617082d9da0e162e1e79b58617b6326da3d03e,"[website] Fix jump on the header
+
+Algolia adds two inline styles
+
+```css
+  position: relative;
+  vertical-align: top;
+```
+
+to the element once the script inserted at the end of the page runs which super slightly moves the header. The fix is to always apply those two rules this way it doesn't jump. I did not notice it on my machine because it doesn't move when custom fonts are not being used.
+
+Test Plan:
+- Open two tabs: reactjs.com and localhost:4000/react
+- Click around on reactjs.com to prime the cache with the fonts
+- Switch tabs and click around on localhost (but do not force refresh!)
+- Now you get custom fonts loaded locally and it doesn't jump when you change tabs
+"
+62b19a127ce68c01c894ed46c2fcd42f70106d85,"Fix typo
+
+'wit' -> 'with'"
+b1269263905e491477dc54186a6f486748b6e62c,"Ensure IE8 style expansion list is up to date
+
+In conjunction with #1953, fixes #2407. This seems to be all of the shorthand style properties that IE8 supports, excluding a few nonstandard ones.
+"
+74cdaf24004aea8de350f58979548b3eddc11e9a,"UBI: Fastmap: Fix memory leaks while closing the WL sub-system
+
+Add a ubi_fastmap_close() to free all resources used by fastmap
+at WL shutdown.
+
+Signed-off-by: Richard Weinberger <320bca71fc381a4a025636043ca86e734e31cf8b@nod.at>
+Tested-by: Guido Martínez <adfc8f0aec273eace2629141317c1eac53923f28@vanguardiasur.com.ar>
+Reviewed-by: Guido Martínez <adfc8f0aec273eace2629141317c1eac53923f28@vanguardiasur.com.ar>
+"
+7d25b361a2d3e8a9dcaf463d92285d58dedc74ab,"UBIFS: fix a typo in comment of ubifs_budget_req
+
+s/now/how
+
+Signed-off-by: Dongsheng Yang <1b957dfff8d0f16ed124fab3c79d8c1232c34692@cn.fujitsu.com>
+Reviewed-by: Richard Weinberger <320bca71fc381a4a025636043ca86e734e31cf8b@nod.at>
+Signed-off-by: Artem Bityutskiy <2f96f8cd3e2780a209d0ab27d1b44624d0019d3f@linux.intel.com>
+"
+9e8cd24d26047a4d86a0045d3c800449ff9b0dc6,"Update fully_connected_feed.py
+
+""os.path"" and ""numpy"" were unused, so I removed them.
+The tfevents-output-file was not completely written in IPython, so I added ""summary_writer.flush()"" to fix it."
+910cd32e552ea09caa89cdbe328e468979b030dd,"parisc: Fix and enable seccomp filter support
+
+The seccomp filter support requires careful handling of task registers.  This
+includes reloading of the return value (%r28) and proper syscall exit if
+secure_computing() returned -1.
+
+Additionally we need to sign-extend the syscall number from signed 32bit to
+signed 64bit in do_syscall_trace_enter() since the ptrace interface only allows
+storing 32bit values 
+
+2025-01-20 12:07:54 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:54 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:54 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:56 - snowflake.connector.cursor - INFO - Number of results in first chunk: 4
+2025-01-20 12:07:56 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:56 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:56 - root - INFO - SQL:
+-- SQL 6 (No correction needed)
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" ILIKE '%requirements.txt%'
+LIMIT 1000
+Results:
+sample_path,content
+requirements.txt,"# The order of packages is significant, because pip processes them in the order
+# of appearance. Changing the order has an impact on the overall integration
+# process, which may cause wedges in the gate later.
+pbr>=1.6 # Apache-2.0
+python-heatclient>=0.8.0
+# REVISIT: After mitaka release add dependency on released version of python-neutronclient
+"
+requirements.txt,"# The order of packages is significant, because pip processes them in the order
+# of appearance. Changing the order has an impact on the overall integration
+# process, which may cause wedges in the gate later.
+
+pbr>=0.6,!=0.7,<1.0
+
+Babel>=1.3
+oslo.config>=1.4.0
+oslo.i18n>=1.0.0
+oslo.serialization>=1.0.0
+oslo.utils>=1.0.0
+requests>=2.2.0,!=2.4.0
+six>=1.7.0
+stevedore>=1.1.0
+"
+requirements.txt,SQLAlchemy==0.9.3
+docs/requirements.txt,"# Sphinx
+#   https://github.com/sphinx-doc/sphinx/blob/master/CHANGES
+sphinx>=1.4 # rq.filter: >=1.3, <1.5"
+
+2025-01-20 12:07:56 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:56 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:56 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:07:57 - snowflake.connector.cursor - INFO - Number of results in first chunk: 14
+2025-01-20 12:07:57 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:07:57 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:07:58 - root - INFO - SQL:
+-- SQL 7 (No correction needed)
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" ILIKE '%Gemfile%'
+LIMIT 1000
+Results:
+sample_path,content
+gemfiles/activerecord-4.2/Gemfile.base,"eval File.read File.expand_path('../../Gemfile.base', __FILE__)
+
+gem ""activerecord"", ""~> 4.2.6""
+"
+spec/dummy/Gemfile,"source 'http://rubygems.org'
+
+gem 'rails', '~> 4.1.0'
+gem 'mailboxer', :path => '../../'
+gem 'factory_girl'
+
+# Bundle edge Rails instead:
+# gem 'rails', :git => 'git://github.com/rails/rails.git'
+
+gem ""sqlite3"", :platform => [:ruby, :mswin, :mingw]
+gem ""jdbc-sqlite3"", :platform => :jruby
+"
+Gemfile,"source ""http://rubygems.org""
+
+group :development do
+  gem 'yard'
+  gem ""rspec"", ""~> 3.4.0""
+  gem ""rdoc"", ""~> 3.12""
+  gem ""bundler"", ""~> 1.0""
+  gem ""jeweler"", ""~> 2.0.1""
+end
+"
+Gemfile.lock,"PATH
+  remote: .
+  specs:
+    dry-transaction (0.5.0)
+      kleisli
+      wisper (>= 1.6.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    diff-lcs (1.2.5)
+    docile (1.1.5)
+    json (1.8.3)
+    kleisli (0.2.7)
+    rake (10.4.2)
+    rspec (3.3.0)
+      rspec-core (~> 3.3.0)
+      rspec-expectations (~> 3.3.0)
+      rspec-mocks (~> 3.3.0)
+    rspec-core (3.3.2)
+      rspec-support (~> 3.3.0)
+    rspec-expectations (3.3.1)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.3.0)
+    rspec-mocks (3.3.2)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.3.0)
+    rspec-support (3.3.0)
+    simplecov (0.10.0)
+      docile (~> 1.1.0)
+      json (~> 1.8)
+      simplecov-html (~> 0.10.0)
+    simplecov-html (0.10.0)
+    wisper (1.6.1)
+    yard (0.8.7.6)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  bundler (~> 1.10)
+  dry-transaction!
+  rake (~> 10.4.2)
+  rspec (~> 3.3.0)
+  simplecov (~> 0.10.0)
+  yard
+
+BUNDLED WITH
+   1.11.2
+"
+Gemfile.lock,"GEM
+  remote: http://rubygems.org/
+  specs:
+    bcrypt-ruby (3.1.2)
+    diff-lcs (1.2.4)
+    facter (1.6.0)
+    mkfifo (0.0.1)
+    rake (10.1.0)
+    rspec (2.13.0)
+      rspec-core (~> 2.13.0)
+      rspec-expectations (~> 2.13.0)
+      rspec-mocks (~> 2.13.0)
+    rspec-core (2.13.1)
+    rspec-expectations (2.13.0)
+      diff-lcs (>= 1.1.3, < 2.0)
+    rspec-mocks (2.13.1)
+    sqlite3 (1.3.8)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  bcrypt-ruby
+  facter (= 1.6)
+  mkfifo
+  rake
+  rspec
+  sqlite3
+"
+Gemfile,"source 'https://rubygems.org'
+
+gem 'mediawiki_selenium', '~> 1.7', '>= 1.7.1'
+gem 'rubocop', '~> 0.34.2', require: false
+"
+gemfiles/activerecord_4.1.gemfile,"# This file was generated by Appraisal
+
+source ""https://rubygems.org""
+
+gem ""activerecord"", ""4.1.0""
+
+group :test do
+  gem ""pg"", "">= 0.14.1""
+end
+
+gemspec :path => ""../""
+"
+gemfiles/3.2.gemfile,"source 'https://rubygems.org'
+
+gem 'rails', '~> 3.2.3'
+gem 'rspec', '~> 2.14.0'
+
+gemspec path: '../'
+"
+Gemfile,"source 'https://rubygems.org'
+
+# Specify your gem's dependencies in zimbra_proxy_spy.gemspec
+
+group :test do
+  gem 'minitest-reporters'
+  gem 'rack-test'
+end
+
+gem 'rake'
+gem 'sinatra'
+gem 'uuid'
+gem 'httpclient'
+gem 'sinatra-contrib'
+gem 'pry'
+"
+Gemfile.lock,"GEM
+  remote: https://rubygems.org/
+  specs:
+    slop (3.6.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  slop (~> 3.6.0)
+"
+gemfiles/rails32_ember_latest.gemfile,"source 'https://rubygems.org'
+
+gem 'rails', '~> 3.2'
+gem 'ember-source', '~> 2.2.0'
+
+gemspec path: '../'
+"
+Gemfile,"source 'https://rubygems.org'
+
+# Specify your gem's dependencies in rundeck.gemspec
+gemspec
+"
+Gemfile,"source 'https://rubygems.org'
+
+require 'json'
+require 'open-uri'
+versions = JSON.parse(open('https://pages.github.com/versions.json').read)
+
+gem 'github-pages', versions['github-pages']
+gem 'wdm', '~> 0.1.0' if Gem.win_platform?
+"
+demo/Gemfile,"source 'https://rubygems.org'
+
+gem 'rails', '~> 3.2.1'
+gem 'socialization', :path => '../'
+# Bundle edge Rails instead:
+# gem 'rails', :git => 'git://github.com/rails/rails.git'
+
+gem 'sqlite3'
+
+
+# Gems used only for assets and not required
+# in production environments by default.
+group :assets do
+  gem 'sass-rails',   '~> 3.2.3'
+  gem 'coffee-rails', '~> 3.2.0'
+
+  gem 'uglifier', '>= 1.0.3'
+end
+
+gem 'jquery-rails'
+
+# To use ActiveModel has_secure_password
+# gem 'bcrypt-ruby', '~> 3.0.0'
+
+# To use Jbuilder templates for JSON
+# gem 'jbuilder'
+
+# Use unicorn as the web server
+# gem 'unicorn'
+
+# Deploy with Capistrano
+# gem 'capistrano'
+
+# To use debugger
+# gem 'ruby-debug19', :require => 'ruby-debug'
+"
+
+2025-01-20 12:07:58 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:07:58 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:07:58 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:08:00 - snowflake.connector.cursor - INFO - Number of results in first chunk: 98
+2025-01-20 12:08:01 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:08:01 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:08:01 - root - INFO - SQL:
+-- Corrected SQL 8
+SELECT f.VALUE
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+LIMIT 1000
+Results:
+Too long, hard cut:
+VALUE
+"[
+  [
+    ""-webkit-flex-align"",
+    ""-moz-flex-align"",
+    ""-ms-flex-align"",
+    ""-o-flex-align"",
+    ""flex-align"",
+    ""overflow"",
+    ""-ms-overflow-x"",
+    ""-ms-overflow-y"",
+    ""overflow-x"",
+    ""overflow-y"",
+    ""clip"",
+    ""-webkit-box-sizing"",
+    ""-moz-box-sizing"",
+    ""box-sizing"",
+    ""display"",
+    ""width"",
+    ""height"",
+    ""top"",
+    ""right"",
+    ""bottom"",
+    ""left"",
+    ""z-index"",
+    ""visibility"",
+    ""-webkit-flex-direction"",
+    ""-moz-flex-direction"",
+    ""-ms-flex-direction"",
+    ""-o-flex-direction"",
+    ""flex-direction"",
+    ""-webkit-flex-order"",
+    ""-moz-flex-order"",
+    ""-ms-flex-order"",
+    ""-o-flex-order"",
+    ""flex-order"",
+    ""-webkit-flex-pack"",
+    ""-moz-flex-pack"",
+    ""-ms-flex-pack"",
+    ""-o-flex-pack"",
+    ""flex-pack"",
+    ""float"",
+    ""clear"",
+    ""outline"",
+    ""outline-width"",
+    ""outline-style"",
+    ""outline-color"",
+    ""outline-offset"",
+    ""border"",
+    ""border-spacing"",
+    ""border-collapse"",
+    ""border-width"",
+    ""border-style"",
+    ""border-color"",
+    ""border-top"",
+    ""border-top-width"",
+    ""border-top-style"",
+    ""border-top-color"",
+    ""border-right"",
+    ""border-right-width"",
+    ""border-right-style"",
+    ""border-right-color"",
+    ""border-bottom"",
+    ""border-bottom-width"",
+    ""border-bottom-style"",
+    ""border-bottom-color"",
+    ""border-left"",
+    ""border-left-width"",
+    ""border-left-style"",
+    ""border-left-color"",
+    ""margin"",
+    ""margin-top"",
+    ""margin-right"",
+    ""margin-bottom"",
+    ""margin-left"",
+    ""padding"",
+    ""padding-top"",
+    ""padding-right"",
+    ""padding-bottom"",
+    ""padding-left"",
+    ""min-width"",
+    ""min-height"",
+    ""max-width"",
+    ""max-height"",
+    ""-webkit-border-radius"",
+    ""-moz-border-radius"",
+    ""border-radius"",
+    ""-webkit-border-top-left-radius"",
+    ""-moz-border-radius-topleft"",
+    ""border-top-left-radius"",
+    ""-webkit-border-top-right-radius"",
+    ""-moz-border-radius-topright"",
+    ""border-top-right-radius"",
+    ""-webkit-border-bottom-right-radius"",
+    ""-moz-border-radius-bottomright"",
+    ""border-bottom-right-radius"",
+    ""-webkit-border-bottom-left-radius"",
+    ""-moz-border-radius-bottomleft"",
+    ""border-bottom-left-radius"",
+    ""-webkit-border-image"",
+    ""-moz-border-image"",
+    ""-o-border-image"",
+    ""border-image"",
+    ""-webkit-border-image-source"",
+    ""-moz-border-image-source"",
+    ""-o-border-image-source"",
+    ""border-image-source"",
+    ""-webkit-border-image-slice"",
+    ""-moz-border-image-slice"",
+    ""-o-border-image-slice"",
+    ""border-image-slice"",
+    ""-webkit-border-image-width"",
+    ""-moz-border-image-width"",
+    ""-o-border-image-width"",
+    ""border-image-width"",
+    ""-webkit-border-image-outset"",
+    ""-moz-border-image-outset"",
+    ""-o-border-image-outset"",
+    ""border-image-outset"",
+    ""-webkit-border-image-repeat"",
+    ""-moz-border-image-repeat"",
+    ""-o-border-image-repeat"",
+    ""border-image-repeat"",
+    ""-webkit-border-top-image"",
+    ""-moz-border-top-image"",
+    ""-o-border-top-image"",
+    ""border-top-image"",
+    ""-webkit-border-right-image"",
+    ""-moz-border-right-image"",
+    ""-o-border-right-image"",
+    ""border-right-image"",
+    ""-webkit-border-bottom-image"",
+    ""-moz-border-bottom-image"",
+    ""-o-border-bottom-image"",
+    ""border-bottom-image"",
+    ""-webkit-border-left-image"",
+    ""-moz-border-left-image"",
+    ""-o-border-left-image"",
+    ""border-left-image"",
+    ""-webkit-border-corner-image"",
+    ""-moz-border-corner-image"",
+    ""-o-border-corner-image"",
+    ""border-corner-image"",
+    ""-webkit-border-top-left-image"",
+    ""-moz-border-top-left-image"",
+    ""-o-border-top-left-image"",
+    ""border-top-left-image"",
+    ""-webkit-border-top-right-image"",
+    ""-moz-border-top-right-image"",
+    ""-o-border-top-right-image"",
+    ""border-top-right-image"",
+    ""-webkit-border-bottom-right-image"",
+    ""-moz-border-bottom-right-image"",
+    ""-o-border-bottom-right-image"",
+    ""border-bottom-right-image"",
+    ""-webkit-border-bottom-left-image"",
+    ""-moz-border-bottom-left-image"",
+    ""-o-border-bottom-left-image"",
+    ""border-bottom-left-image"",
+    ""background"",
+    ""filter:progid:DXImageTransform.Microsoft.AlphaImageLoader"",
+    ""background-color"",
+    ""background-image"",
+    ""background-attachment"",
+    ""background-position"",
+    ""-ms-background-position-x"",
+    ""-ms-background-position-y"",
+    ""background-position-x"",
+    ""background-position-y"",
+    ""background-clip"",
+    ""background-origin"",
+    ""-webkit-background-size"",
+    ""-moz-background-size"",
+    ""-o-background-size"",
+    ""background-size"",
+    ""background-repeat"",
+    ""box-decoration-break"",
+    ""-webkit-box-shadow"",
+    ""-moz-box-shadow"",
+    ""box-shadow"",
+    ""color"",
+    ""table-layo
+
+2025-01-20 12:08:01 - root - INFO - itercount: 0
+2025-01-20 12:08:01 - root - INFO - Database Name: GITHUB_REPOS
+Schema Name: GITHUB_REPOS
+DDL describes table information.
+,0
+table_name,SAMPLE_FILES
+description,
+DDL,"create or replace TABLE SAMPLE_FILES (
+	""repo_name"" VARCHAR(16777216),
+	""ref"" VARCHAR(16777216),
+	""path"" VARCHAR(16777216),
+	""mode"" NUMBER(38,0),
+	""id"" VARCHAR(16777216),
+	""symlink_target"" VARCHAR(16777216)
+);"
+
+,1
+table_name,LANGUAGES
+description,
+DDL,"create or replace TABLE LANGUAGES (
+	""repo_name"" VARCHAR(16777216),
+	""language"" VARIANT
+);"
+
+,2
+table_name,LICENSES
+description,
+DDL,"create or replace TABLE LICENSES (
+	""repo_name"" VARCHAR(16777216),
+	""license"" VARCHAR(16777216)
+);"
+
+,3
+table_name,SAMPLE_COMMITS
+description,
+DDL,"create or replace TABLE SAMPLE_COMMITS (
+	""commit"" VARCHAR(16777216),
+	""tree"" VARCHAR(16777216),
+	""parent"" VARIANT,
+	""author"" VARIANT,
+	""committer"" VARIANT,
+	""subject"" VARCHAR(16777216),
+	""message"" VARCHAR(16777216),
+	""trailer"" VARIANT,
+	""difference"" VARIANT,
+	""difference_truncated"" BOOLEAN,
+	""repo_name"" VARCHAR(16777216),
+	""encoding"" VARCHAR(16777216)
+);"
+
+,4
+table_name,SAMPLE_CONTENTS
+description,
+DDL,"create or replace TABLE SAMPLE_CONTENTS (
+	""id"" VARCHAR(16777216),
+	""size"" NUMBER(38,0),
+	""content"" VARCHAR(16777216),
+	""binary"" BOOLEAN,
+	""copies"" NUMBER(38,0),
+	""sample_repo_name"" VARCHAR(16777216),
+	""sample_ref"" VARCHAR(16777216),
+	""sample_path"" VARCHAR(16777216),
+	""sample_mode"" NUMBER(38,0),
+	""sample_symlink_target"" VARCHAR(16777216)
+);"
+
+,5
+table_name,SAMPLE_REPOS
+description,
+DDL,"create or replace TABLE SAMPLE_REPOS (
+	""repo_name"" VARCHAR(16777216),
+	""watch_count"" NUMBER(38,0)
+);"
+
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: {table name}}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_FILES', 'SAMPLE_REPOS']}}
+Begin Exploring Related Columns
+**Relevant tables and columns:**
+
+- **Table:** `GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS`
+  - **"content"**: Contains JSON-formatted content where the "require" section with package names may be located.
+  - **"sample_path"**: Used to identify files that typically contain package requirements (e.g., `composer.json`, `package.json`).
+  - **"sample_repo_name"**: The repository name; may be useful for grouping or joining.
+
+**Possible conditions:**
+
+- Filter `"sample_path"` to specific filenames known to contain package requirements (e.g., `"sample_path" ILIKE '%composer.json%'`).
+- Filter `"content"` to entries containing the `"require"` section (e.g., `"content" ILIKE '%"require"%:%'`).
+- Use `TRY_PARSE_JSON("content") IS NOT NULL` to ensure the content can be parsed as JSON.
+
+---
+
+**SQL Queries:**
+
+1. Retrieve content from the `SAMPLE_CONTENTS` table:
+   ```sql
+   SELECT "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   LIMIT 1000;
+   ```
+
+2. Get distinct file paths from the `SAMPLE_CONTENTS` table:
+   ```sql
+   SELECT DISTINCT "sample_path"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   LIMIT 1000;
+   ```
+
+3. Fetch content of files named `composer.json`:
+   ```sql
+   SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "sample_path" ILIKE '%composer.json%'
+   LIMIT 1000;
+   ```
+
+4. Fetch content of files named `package.json`:
+   ```sql
+   SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "sample_path" ILIKE '%package.json%'
+   LIMIT 1000;
+   ```
+
+5. Retrieve files that mention the `"require"` section in their content:
+   ```sql
+   SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "content" ILIKE '%"require"%:%'
+   LIMIT 1000;
+   ```
+
+6. Select content that can be parsed as JSON:
+   ```sql
+   SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE TRY_PARSE_JSON("content") IS NOT NULL
+   LIMIT 1000;
+   ```
+
+7. Explore the `"require"` section within JSON-parsed content:
+   ```sql
+   SELECT f."value"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+        LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content"):"require") f
+   LIMIT 1000;
+   ```
+
+8. Extract key-value pairs where the key is `"require"`:
+   ```sql
+   SELECT t."sample_repo_name", t."sample_path", f."key", f."value"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+        LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+   WHERE f."key" = 'require'
+   LIMIT 1000;
+   ```
+
+9. Get distinct licenses from the `LICENSES` table:
+   ```sql
+   SELECT DISTINCT "license"
+   FROM GITHUB_REPOS.GITHUB_REPOS.LICENSES
+   LIMIT 1000;
+   ```
+
+10. Retrieve repository names and their associated languages:
+    ```sql
+    SELECT "repo_name", "language"
+    FROM GITHUB_REPOS.GITHUB_REPOS.LANGUAGES
+    LIMIT 1000;
+    ```
+
+11. Select binary files from the `SAMPLE_CONTENTS` table:
+    ```sql
+    SELECT "id", "size", "binary"
+    FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+    WHERE "binary" = TRUE
+    LIMIT 1000;
+    ```
+
+12. Fetch commits with messages containing the word "fix":
+    ```sql
+    SELECT "commit", "message"
+    FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_COMMITS
+    WHERE "message" ILIKE '%fix%'
+    LIMIT 1000;
+    ```
+
+13. Retrieve content of files named `requirements.txt`:
+    ```sql
+    SELECT "sample_path", "content"
+    FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+    WHERE "sample_path" ILIKE '%requirements.txt%'
+    LIMIT 1000;
+    ```
+
+14. Fetch content of files named `Gemfile`:
+    ```sql
+    SELECT "sample_path", "content"
+    FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+    WHERE "sample_path" ILIKE '%Gemfile%'
+    LIMIT 1000;
+    ```
+
+15. Flatten and explore JSON content:
+    ```sql
+    SELECT f."value"
+    FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+         LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+    LIMIT 1000;
+    ```
+
+---
+
+These queries help in understanding the structure and content of the relevant columns, aiding in the task of extracting and counting package names from the `"require"` section.Query:
+SELECT "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   LIMIT 1000;
+Answer:
+Too long, hard cut:
+content
+"/*
+ * rtc-ds1305.c -- driver for DS1305 and DS1306 SPI RTC chips
+ *
+ * Copyright (C) 2008 David Brownell
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ */
+#include <linux/kernel.h>
+#include <linux/init.h>
+#include <linux/bcd.h>
+#include <linux/slab.h>
+#include <linux/rtc.h>
+#include <linux/workqueue.h>
+
+#include <linux/spi/spi.h>
+#include <linux/spi/ds1305.h>
+#include <linux/module.h>
+
+
+/*
+ * Registers ... mask DS1305_WRITE into register address to write,
+ * otherwise you're reading it.  All non-bitmask values are BCD.
+ */
+#define DS1305_WRITE		0x80
+
+
+/* RTC date/time ... the main special cases are that we:
+ *  - Need fancy ""hours"" encoding in 12hour mode
+ *  - Don't rely on the ""day-of-week"" field (or tm_wday)
+ *  - Are a 21st-century clock (2000 <= year < 2100)
+ */
+#define DS1305_RTC_LEN		7		/* bytes for RTC regs */
+
+#define DS1305_SEC		0x00		/* register addresses */
+#define DS1305_MIN		0x01
+#define DS1305_HOUR		0x02
+#	define DS1305_HR_12		0x40	/* set == 12 hr mode */
+#	define DS1305_HR_PM		0x20	/* set == PM (12hr mode) */
+#define DS1305_WDAY		0x03
+#define DS1305_MDAY		0x04
+#define DS1305_MON		0x05
+#define DS1305_YEAR		0x06
+
+
+/* The two alarms have only sec/min/hour/wday fields (ALM_LEN).
+ * DS1305_ALM_DISABLE disables a match field (some combos are bad).
+ *
+ * NOTE that since we don't use WDAY, we limit ourselves to alarms
+ * only one day into the future (vs potentially up to a week).
+ *
+ * NOTE ALSO that while we could generate once-a-second IRQs (UIE), we
+ * don't currently support them.  We'd either need to do it only when
+ * no alarm is pending (not the standard model), or to use the second
+ * alarm (implying that this is a DS1305 not DS1306, *and* that either
+ * it's wired up a second IRQ we know, or that INTCN is set)
+ */
+#define DS1305_ALM_LEN		4		/* bytes for ALM regs */
+#define DS1305_ALM_DISABLE	0x80
+
+#define DS1305_ALM0(r)		(0x07 + (r))	/* register addresses */
+#define DS1305_ALM1(r)		(0x0b + (r))
+
+
+/* three control registers */
+#define DS1305_CONTROL_LEN	3		/* bytes of control regs */
+
+#define DS1305_CONTROL		0x0f		/* register addresses */
+#	define DS1305_nEOSC		0x80	/* low enables oscillator */
+#	define DS1305_WP		0x40	/* write protect */
+#	define DS1305_INTCN		0x04	/* clear == only int0 used */
+#	define DS1306_1HZ		0x04	/* enable 1Hz output */
+#	define DS1305_AEI1		0x02	/* enable ALM1 IRQ */
+#	define DS1305_AEI0		0x01	/* enable ALM0 IRQ */
+#define DS1305_STATUS		0x10
+/* status has just AEIx bits, mirrored as IRQFx */
+#define DS1305_TRICKLE		0x11
+/* trickle bits are defined in <linux/spi/ds1305.h> */
+
+/* a bunch of NVRAM */
+#define DS1305_NVRAM_LEN	96		/* bytes of NVRAM */
+
+#define DS1305_NVRAM		0x20		/* register addresses */
+
+
+struct ds1305 {
+	struct spi_device	*spi;
+	struct rtc_device	*rtc;
+
+	struct work_struct	work;
+
+	unsigned long		flags;
+#define FLAG_EXITING	0
+
+	bool			hr12;
+	u8			ctrl[DS1305_CONTROL_LEN];
+};
+
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Utilities ...  tolerate 12-hour AM/PM notation in case of non-Linux
+ * software (like a bootloader) which may require it.
+ */
+
+static unsigned bcd2hour(u8 bcd)
+{
+	if (bcd & DS1305_HR_12) {
+		unsigned	hour = 0;
+
+		bcd &= ~DS1305_HR_12;
+		if (bcd & DS1305_HR_PM) {
+			hour = 12;
+			bcd &= ~DS1305_HR_PM;
+		}
+		hour += bcd2bin(bcd);
+		return hour - 1;
+	}
+	return bcd2bin(bcd);
+}
+
+static u8 hour2bcd(bool hr12, int hour)
+{
+	if (hr12) {
+		hour++;
+		if (hour <= 12)
+			return DS1305_HR_12 | bin2bcd(hour);
+		hour -= 12;
+		return DS1305_HR_12 | DS1305_HR_PM | bin2bcd(hour);
+	}
+	return bin2bcd(hour);
+}
+
+/*----------------------------------------------------------------------*/
+
+/*
+ * Interface to RTC framework
+ */
+
+static int ds1305_alarm_irq_enable(struct device *dev, unsigned int enabled)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		buf[2];
+	long		err = -EINVAL;
+
+	buf[0] = DS1305_WRITE | DS1305_CONTROL;
+	buf[1] = ds1305->ctrl[0];
+
+	if (enabled) {
+		if (ds1305->ctrl[0] & DS1305_AEI0)
+			goto done;
+		buf[1] |= DS1305_AEI0;
+	} else {
+		if (!(buf[1] & DS1305_AEI0))
+			goto done;
+		buf[1] &= ~DS1305_AEI0;
+	}
+	err = spi_write_then_read(ds1305->spi, buf, sizeof(buf), NULL, 0);
+	if (err >= 0)
+		ds1305->ctrl[0] = buf[1];
+done:
+	return err;
+
+}
+
+
+/*
+ * Get/set of date and time is pretty normal.
+ */
+
+static int ds1305_get_time(struct device *dev, struct rtc_time *time)
+{
+	struct ds1305	*ds1305 = dev_get_drvdata(dev);
+	u8		addr = DS1305_SEC;
+	u8		buf[DS1305_RTC_LEN];
+	int		status;
+
+	/* Use write-then-read to get all the date/time registers
+	 * since dma from stack is nonportable
+	 */
+	status = spi_write_then_read(ds1305->spi, &addr, sizeof(addr),
+			buf, sizeof(buf));
+	if (status < 0)
+		return status;
+
+	dev_vdbg(dev, ""%s: %02x %02x %02x, %02x %02x %02x %02x\n"",
+		""read"", buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5], buf[6]);
+
+	/* Decode the registers
+Query:
+SELECT DISTINCT "sample_path"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   LIMIT 1000;
+Answer:
+Too long, hard cut:
+sample_path
+common/thrift/CatalogService.thrift
+socketcan_interface/CMakeLists.txt
+bin/php7_linux1/bin/mbedtls_dh_client
+src/pocketmine/block/Sugarcane.php
+Install/Help/commands/3dmaths/SCALE VECTOR2.htm
+src/cinder/app/linux/WindowImplLinuxEgl.cpp
+libjava/javax/naming/spi/NamingManager.java
+lionengine-network/src/main/java/com/b3dgs/lionengine/network/Networker.java
+top_down_classifier/src/top_down_classifier/volume_visualizer.h
+networking_cisco/neutronclient/policyprofile.py
+third-party/org.svnkit/org/tmatesoft/svn/core/internal/wc2/ng/SvnNgRepositoryAccess.class
+share/gamedir/levels/ctf_duel2/sprites/flag_y.bmp
+aws-cpp-sdk-route53/include/aws/route53/model/CreateTrafficPolicyInstanceRequest.h
+backend/colorAdmin/form_editable.html
+src/BCR/BCRexternalBWT.cpp
+util/robodoc/Source/robodoc.c
+myblockchain-test/suite/rpl/r/rpl_loaddata_s.result
+myblockchain-test/suite/ndb_rpl/r/ndb_rpl_mixed_tables.result
+resources/assets/storagedrawers/textures/blocks/indicator/void_icon.png
+GPy/testing/state_space_main_tests.py
+tooling/support/provisioning-model/pom.xml
+src/java/org/apache/cassandra/db/commitlog/ReplayPosition.java
+chrome/browser/signin/about_signin_internals.cc
+core/sis-metadata/src/test/java/org/apache/sis/metadata/iso/DefaultMetadataTest.java
+src/include/platform.h
+lib/padding/pad_variable.m
+clients/java/src/main/java/com/senseidb/search/client/req/SenseiClientRequest.java
+sal/qa/rtl/strings/test_oustring_compare.cxx
+source/stylesheets/modules/_sortable.scss
+bin/Skylark.dll.config
+pos_position/cv483_16378.txt
+src/main/webapp/fonts/DigitalDream/DIGITALDREAMNARROW-webfont.ttf
+checks/decru_fans
+grails-app/controllers/TagController.groovy
+src/libc/stdio/FreeBSD/clrerr.c
+CommonProjects/AMDTBaseTools/Include/gtStringTokenizer.h
+libs/SDL2_ttf-2.0.14/debian/copyright
+lionengine-core/src/main/java/com/b3dgs/lionengine/drawable/Image.java
+src/main/resources/templates/layout/app.jade
+spec/models/i18n_spec.rb
+dbaccess/source/ui/misc/datasourceconnector.cxx
+SystemEx/Windows/Forms/IpcHelper.cs
+Assets/Scripts/HarryPotterUnity/Cards/Quidditch/Spells/QuickThinking.cs
+authmodules/TYPO3/privacyidea/Resources/Private/Language/locallang.xlf
+assets/src/scss/components/_logo.scss
+chef-repo/site-cookbooks/cloud-benchmarking-server/berks-cookbooks/databox/recipes/mysql.rb
+css/datachange-tracker.css
+public/javascripts/SVLabel/doc/svl.StatusMessage.html
+bootloader/swd-adapter/swduino/swd.h
+marathon/demo.yml
+tests/realapplications/vim/src/vim63/src/arabic.h
+mods/fft/fftw-3.3.4/rdft/scalar/r2cb/hb_8.lo
+src/Webiny/Component/Security/User/Providers/Memory/MemoryException.php
+db/migrate/20120727115954_add_category_to_document.rb
+framework/integrationtests/resources/mapreduce/hadoop-streaming.jar
+micro-infra-spring-base/src/test/groovy/com/ofg/infrastructure/base/MvcCorrelationIdSettingIntegrationSpec.groovy
+Muhelp/string_ext.hh
+build_dir/host/flex-2.5.35/tools/Makefile
+getopt.sml/getopt-test.smi
+crt_hash/e509500c8632b247ad4a45b3a301d58935430bf360c3d01d1458b1f5850c40ca.pem
+ckanext/pdfview/theme/templates/pdf.html
+lib/to_markdown.js
+mcscf/test/test_c2h4.py
+client/js/components/assessments/check_understanding.spec.js
+Assets/Graphics/Big.psd
+Product/Production/Services/PatientDiscoveryCore/src/main/java/gov/hhs/fha/nhinc/patientdiscovery/model/builder/impl/PatientSearchResultsModelBuilderImpl.java
+third_party/skia/src/gpu/effects/GrConfigConversionEffect.cpp
+deps/icu4c/source/i18n/hebrwcal.cpp
+mapfishapp/src/main/java/org/georchestra/mapfishapp/ws/upload/FeatureGeoFileReader.java
+uimaj-core/src/main/java/org/apache/uima/collection/CasConsumerDescription.java
+whois-endtoend/src/test/java/net/ripe/db/whois/changedphase3/util/Scenario.java
+JGTL/JGTL_API/latex/class_j_g_t_l_1_1_hex_tree_branch.tex
+resources/CAVP/Vectors/OpenSSL/testvectors.SuSE/testvectors/sha/req/SHA256Monte.req
+test/ddiff.052.clit
+common/java/core/net/i2p/client/naming/ExecNamingService.java
+third_party/skia/src/gpu/gl/GrGLProgram.cpp
+pack.cmd
+spec/test_app/spec-opal/active_record/update_associations_spec.rb
+classes/time_series/@ts/acosh.m
+html/partials/compare/os_table.html.haml
+app/src/main/res/drawable-xxxhdpi/ic_headphones_grey600_48dp.png
+app/src/main/res/drawable/key8.png
+src/libs/css/daterangepicker-bs3.css
+util/misc/cdna_fasta_file_to_transcript_gtf.pl
+docs/html/T_AForge_Video_Ximea_XimeaCamera.htm
+chromium/src/third_party/WebKit/Source/modules/webaudio/OfflineAudioDestinationNode.h
+Helpers/INRIAEval/data-USA/annotations/set06/V017.vbb
+include/bot-logic/behaviour_drive_neuralnet.h
+src/Scriban.Tests/TestFiles/100-expressions/150-range-expression.txt
+application/var/generation/Magento/AdminNotification/Controller/Adminhtml/Notification/Remove/Interceptor.php
+password_policies/tests/__init__.py
+templates/includes/htmlhead.jade
+tests/fixtures/ecma-version/6/arrowFunctions/error-strict-param-no-paren-eval.result.js
+pixmaps/feta26-scripts-reverseturn.xbm
+src_numeric/src_iterative/pgmresDR.m
+lib/spimasterdma.cpp
+2013-11-15 - High Performance Core Data by Matthew Morey.pdf
+js/sr
+Query:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "sample_path" ILIKE '%composer.json%'
+   LIMIT 1000;
+Answer:
+Too long, hard cut:
+sample_path,content
+app/protected/extensions/userinterface/lib/composer.json,"{
+    ""name"": ""mobiledetect/mobiledetectlib"",
+    ""type"": ""library"",
+    ""description"": ""Mobile_Detect is a lightweight PHP class for detecting mobile devices. It uses the User-Agent string combined with specific HTTP headers to detect the mobile environment."",
+    ""keywords"": [""mobile"", ""mobile detect"", ""mobile detector"", ""php mobile detect"", ""detect mobile devices""],
+    ""homepage"": ""https://github.com/serbanghita/Mobile-Detect"",
+    ""license"": ""MIT"",
+    ""authors"": [
+        {
+            ""name"": ""Serban Ghita"",
+            ""email"": ""serbanghita@gmail.com"",
+            ""homepage"": ""http://mobiledetect.net"",
+            ""role"": ""Developer""
+        }
+    ],
+    ""require"": {
+        ""php"": "">=5.0.0""
+    },
+    ""autoload"": {
+            ""classmap"": [""Mobile_Detect.php""]
+        }
+}"
+composer.json,"{
+    ""name"": ""scullwm/mailhookbundle"",
+    ""type"": ""library"",
+    ""description"": ""A bundle to catch API webhook from differents mail service"",
+    ""keywords"": [""symfony"", ""bundle"", ""mail"", ""api"", ""webhook"", ""hook"", ""mandrill"", ""mailjet""],
+    ""homepage"": ""http://github.com/ScullWM/MailHookBundle"",
+    ""license"": ""MIT"",
+    ""authors"": [
+        {
+            ""name"": ""Thomas Perez"",
+            ""email"": ""thomas@scullwm.com""
+        }
+    ],
+    ""require"": {
+        ""php"": "">=5.3.9"",
+        ""symfony/framework-bundle"": "">=2.3""
+    },
+    ""require-dev"": {
+        ""atoum/atoum"": ""dev-master""
+    },
+    ""config"": {
+        ""bin-dir"": ""bin""
+    },
+    ""autoload"": {
+        ""psr-4"": { ""Swm\\Bundle\\MailHookBundle\\"": """" }
+    }
+}"
+Entityform/composer.json,"{
+    ""name"": ""asgard/entityform"",
+    ""license"": ""MIT"",
+    ""authors"": [{
+        ""name"": ""Michel Hognerud"",
+        ""email"": ""michel@hognerud.net""
+    }],
+    ""autoload"": {
+        ""psr-4"": {""Asgard\\Entityform\\"": "".""}
+    },
+    ""require"": {
+        ""php"": "">=5.5.9"",
+        ""asgard/form"": ""~0.3.0"",
+        ""asgard/entity"": ""~0.3.0""
+    },
+    ""extra"": {
+        ""branch-alias"": {
+            ""dev-master"": ""0.3-dev""
+        }
+    },
+    ""minimum-stability"": ""dev""
+}"
+composer.json,"{
+    ""name"": ""navjobs/transmit"",
+    ""description"": ""A collection of Laravel api base classes and helpers."",
+    ""keywords"": [
+        ""laravel"",
+        ""fractal"",
+        ""api"",
+        ""transform"",
+        ""microservices""
+    ],
+    ""homepage"": ""https://kimmel.com"",
+    ""license"": ""MIT"",
+    ""require"": {
+        ""php"" : "">=5.5.0"",
+        ""league/fractal"": ""^0.13.0"",
+        ""illuminate/support"": ""^5.1""
+    },
+    ""require-dev"": {
+        ""phpunit/phpunit"" : ""^4.0"",
+        ""scrutinizer/ocular"": ""^1.1"",
+        ""orchestra/testbench"": ""^3.0"",
+        ""mockery/mockery"": ""^0.9.4"",
+        ""satooshi/php-coveralls"": ""1.*""
+    },
+    ""autoload"": {
+        ""psr-4"": {
+            ""NavJobs\\Transmit\\"": ""src""
+        }
+    },
+    ""autoload-dev"": {
+        ""psr-4"": {
+            ""NavJobs\\Transmit\\Test\\"": ""tests""
+        }
+    },
+    ""scripts"": {
+        ""test"": ""phpunit""
+    }
+}
+"
+src/IO/composer.json,"{
+    ""name"": ""windwalker/io"",
+    ""type"": ""windwalker-package"",
+    ""description"": ""Windwalker IO package"",
+    ""keywords"": [""windwalker"", ""framework"", ""io""],
+    ""homepage"": ""https://github.com/ventoviro/windwalker-io"",
+    ""license"": ""LGPL-2.0+"",
+    ""require"": {
+        ""php"": "">=5.3.10""
+    },
+    ""require-dev"": {
+        ""windwalker/test"": ""~2.0"",
+        ""windwalker/filter"": ""~2.0""
+    },
+    ""suggest"": {
+        ""windwalker/filter"": ""Install 2.* if you require filter support.""
+    },
+    ""minimum-stability"": ""beta"",
+    ""autoload"": {
+        ""psr-4"": {
+            ""Windwalker\\IO\\"": """"
+        }
+    },
+    ""extra"": {
+        ""branch-alias"": {
+            ""dev-master"": ""2.2-dev""
+        }
+    }
+}
+"
+composer.json,"{    ""name"": ""gointegro/hateoas-bundle"",    ""type"": ""symfony-bundle"",    ""description"": ""GOintegro HATEOAS Bundle"",    ""keywords"": [""Doctrine"", ""HATEOAS"", ""REST"", ""API"", ""JSON-API""],    ""homepage"": ""http://www.gointegro.com"",    ""license"": ""MIT"",    ""authors"": [        {            ""name"": ""Javier Lorenzana"",            ""email"": ""javier.lorenzana@gointegro.com""        },        {            ""name"": ""Adolfo Castro Menna"",            ""email"": ""adolfo.casto@gointegro.com""        },        {            ""name"": ""GOintegro Devs"",            ""homepage"": ""http://www.gointegro.com""        }    ],    ""require"": {        ""php"": "">=5.4.0"",        ""gointegro/hateoas"": ""*"",        ""symfony/framework-bundle"": ""*"",        ""symfony/doctrine-bridge"": ""*"",        ""doctrine/doctr
+Query:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "sample_path" ILIKE '%package.json%'
+   LIMIT 1000;
+Answer:
+Too long, hard cut:
+sample_path,content
+ioniclub-master/node_modules/bower/node_modules/request/node_modules/tough-cookie/node_modules/punycode/package.json,"{
+  ""name"": ""punycode"",
+  ""version"": ""1.3.2"",
+  ""description"": ""A robust Punycode converter that fully complies to RFC 3492 and RFC 5891, and works on nearly all JavaScript platforms."",
+  ""homepage"": ""https://mths.be/punycode"",
+  ""main"": ""punycode.js"",
+  ""keywords"": [
+    ""punycode"",
+    ""unicode"",
+    ""idn"",
+    ""idna"",
+    ""dns"",
+    ""url"",
+    ""domain""
+  ],
+  ""license"": ""MIT"",
+  ""author"": {
+    ""name"": ""Mathias Bynens"",
+    ""url"": ""https://mathiasbynens.be/""
+  },
+  ""contributors"": [
+    {
+      ""name"": ""Mathias Bynens"",
+      ""url"": ""https://mathiasbynens.be/""
+    },
+    {
+      ""name"": ""John-David Dalton"",
+      ""url"": ""http://allyoucanleet.com/""
+    }
+  ],
+  ""repository"": {
+    ""type"": ""git"",
+    ""url"": ""https://github.com/bestiejs/punycode.js.git""
+  },
+  ""bugs"": {
+    ""url"": ""https://github.com/bestiejs/punycode.js/issues""
+  },
+  ""files"": [
+    ""LICENSE-MIT.txt"",
+    ""punycode.js""
+  ],
+  ""scripts"": {
+    ""test"": ""node tests/tests.js""
+  },
+  ""devDependencies"": {
+    ""coveralls"": ""^2.10.1"",
+    ""grunt"": ""^0.4.5"",
+    ""grunt-contrib-uglify"": ""^0.5.0"",
+    ""grunt-shell"": ""^0.7.0"",
+    ""istanbul"": ""^0.2.13"",
+    ""qunit-extras"": ""^1.2.0"",
+    ""qunitjs"": ""~1.11.0"",
+    ""requirejs"": ""^2.1.14""
+  },
+  ""readme"": ""# Punycode.js [![Build status](https://travis-ci.org/bestiejs/punycode.js.svg?branch=master)](https://travis-ci.org/bestiejs/punycode.js) [![Code coverage status](http://img.shields.io/coveralls/bestiejs/punycode.js/master.svg)](https://coveralls.io/r/bestiejs/punycode.js) [![Dependency status](https://gemnasium.com/bestiejs/punycode.js.svg)](https://gemnasium.com/bestiejs/punycode.js)\n\nA robust Punycode converter that fully complies to [RFC 3492](http://tools.ietf.org/html/rfc3492) and [RFC 5891](http://tools.ietf.org/html/rfc5891), and works on nearly all JavaScript platforms.\n\nThis JavaScript library is the result of comparing, optimizing and documenting different open-source implementations of the Punycode algorithm:\n\n* [The C example code from RFC 3492](http://tools.ietf.org/html/rfc3492#appendix-C)\n* [`punycode.c` by _Markus W. Scherer_ (IBM)](http://opensource.apple.com/source/ICU/ICU-400.42/icuSources/common/punycode.c)\n* [`punycode.c` by _Ben Noordhuis_](https://github.com/bnoordhuis/punycode/blob/master/punycode.c)\n* [JavaScript implementation by _some_](http://stackoverflow.com/questions/183485/can-anyone-recommend-a-good-free-javascript-for-punycode-to-unicode-conversion/301287#301287)\n* [`punycode.js` by _Ben Noordhuis_](https://github.com/joyent/node/blob/426298c8c1c0d5b5224ac3658c41e7c2a3fe9377/lib/punycode.js) (note: [not fully compliant](https://github.com/joyent/node/issues/2072))\n\nThis project is [bundled](https://github.com/joyent/node/blob/master/lib/punycode.js) with [Node.js v0.6.2+](https://github.com/joyent/node/compare/975f1930b1...61e796decc).\n\n## Installation\n\nVia [npm](http://npmjs.org/) (only required for Node.js releases older than v0.6.2):\n\n```bash\nnpm install punycode\n```\n\nVia [Bower](http://bower.io/):\n\n```bash\nbower install punycode\n```\n\nVia [Component](https://github.com/component/component):\n\n```bash\ncomponent install bestiejs/punycode.js\n```\n\nIn a browser:\n\n```html\n<script src=\""punycode.js\""></script>\n```\n\nIn [Narwhal](http://narwhaljs.org/), [Node.js](http://nodejs.org/), and [RingoJS](http://ringojs.org/):\n\n```js\nvar punycode = require('punycode');\n```\n\nIn [Rhino](http://www.mozilla.org/rhino/):\n\n```js\nload('punycode.js');\n```\n\nUsing an AMD loader like [RequireJS](http://requirejs.org/):\n\n```js\nrequire(\n  {\n    'paths': {\n      'punycode': 'path/to/punycode'\n    }\n  },\n  ['punycode'],\n  function(punycode) {\n    console.log(punycode);\n  }\n);\n```\n\n## API\n\n### `punycode.decode(string)`\n\nConverts a Punycode string of ASCII symbols to a string of Unicode symbols.\n\n```js\n// decode domain name parts\npunycode.decode('maana-pta'); // 'mañana'\npunycode.decode('--dqo34k'); // '☃-⌘'\n```\n\n### `punycode.encode(string)`\n\nConverts a string of Unicode symbols to a Punycode string of ASCII symbols.\n\n```js\n// encode domain name parts\npunycode.encode('mañana'); // 'maana-pta'\npunycode.encode('☃-⌘'); // '--dqo34k'\n```\n\n### `punycode.toUnicode(input)`\n\nConverts a Punycode string representing a domain name or an email address to Unicode. Only the Punycoded parts of the input will be converted, i.e. it doesn’t matter if you call it on a string that has already been converted to Unicode.\n\n```js\n// decode domain names\npunycode.toUnicode('xn--maana-pta.com');\n// → 'mañana.com'\npunycode.toUnicode('xn----dqo34k.com');\n// → '☃-⌘.com'\n\n// decode email addresses\npunycode.toUnicode('джумла@xn--p-8sbkgc5ag7bhce.xn--ba-lmcq');\n/
+Query:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE "content" ILIKE '%"require"%:%'
+   LIMIT 1000;
+Answer:
+Too long, hard cut:
+sample_path,content
+desktop/core/src/desktop/static/desktop/js/ace/mode-pgsql.js,"ace.define(""ace/mode/doc_comment_highlight_rules"",[""require"",""exports"",""module"",""ace/lib/oop"",""ace/mode/text_highlight_rules""],function(e,t,n){""use strict"";var r=e(""../lib/oop""),i=e(""./text_highlight_rules"").TextHighlightRules,s=function(){this.$rules={start:[{token:""comment.doc.tag"",regex:""@[\\w\\d_]+""},s.getTagRule(),{defaultToken:""comment.doc"",caseInsensitive:!0}]}};r.inherits(s,i),s.getTagRule=function(e){return{token:""comment.doc.tag.storage.type"",regex:""\\b(?:TODO|FIXME|XXX|HACK)\\b""}},s.getStartRule=function(e){return{token:""comment.doc"",regex:""\\/\\*(?=\\*)"",next:e}},s.getEndRule=function(e){return{token:""comment.doc"",regex:""\\*\\/"",next:e}},t.DocCommentHighlightRules=s}),ace.define(""ace/mode/perl_highlight_rules"",[""require"",""exports"",""module"",""ace/lib/oop"",""ace/mode/text_highlight_rules""],function(e,t,n){""use strict"";var r=e(""../lib/oop""),i=e(""./text_highlight_rules"").TextHighlightRules,s=function(){var e=""base|constant|continue|else|elsif|for|foreach|format|goto|if|last|local|my|next|no|package|parent|redo|require|scalar|sub|unless|until|while|use|vars"",t=""ARGV|ENV|INC|SIG"",n=""getprotobynumber|getprotobyname|getservbyname|gethostbyaddr|gethostbyname|getservbyport|getnetbyaddr|getnetbyname|getsockname|getpeername|setpriority|getprotoent|setprotoent|getpriority|endprotoent|getservent|setservent|endservent|sethostent|socketpair|getsockopt|gethostent|endhostent|setsockopt|setnetent|quotemeta|localtime|prototype|getnetent|endnetent|rewinddir|wantarray|getpwuid|closedir|getlogin|readlink|endgrent|getgrgid|getgrnam|shmwrite|shutdown|readline|endpwent|setgrent|readpipe|formline|truncate|dbmclose|syswrite|setpwent|getpwnam|getgrent|getpwent|ucfirst|sysread|setpgrp|shmread|sysseek|sysopen|telldir|defined|opendir|connect|lcfirst|getppid|binmode|syscall|sprintf|getpgrp|readdir|seekdir|waitpid|reverse|unshift|symlink|dbmopen|semget|msgrcv|rename|listen|chroot|msgsnd|shmctl|accept|unpack|exists|fileno|shmget|system|unlink|printf|gmtime|msgctl|semctl|values|rindex|substr|splice|length|msgget|select|socket|return|caller|delete|alarm|ioctl|index|undef|lstat|times|srand|chown|fcntl|close|write|umask|rmdir|study|sleep|chomp|untie|print|utime|mkdir|atan2|split|crypt|flock|chmod|BEGIN|bless|chdir|semop|shift|reset|link|stat|chop|grep|fork|dump|join|open|tell|pipe|exit|glob|warn|each|bind|sort|pack|eval|push|keys|getc|kill|seek|sqrt|send|wait|rand|tied|read|time|exec|recv|eof|chr|int|ord|exp|pos|pop|sin|log|abs|oct|hex|tie|cos|vec|END|ref|map|die|uc|lc|do"",r=this.createKeywordMapper({keyword:e,""constant.language"":t,""support.function"":n},""identifier"");this.$rules={start:[{token:""comment.doc"",regex:""^=(?:begin|item)\\b"",next:""block_comment""},{token:""string.regexp"",regex:""[/](?:(?:\\[(?:\\\\]|[^\\]])+\\])|(?:\\\\/|[^\\]/]))*[/]\\w*\\s*(?=[).,;]|$)""},{token:""string"",regex:'[""](?:(?:\\\\.)|(?:[^""\\\\]))*?[""]'},{token:""string"",regex:'[""].*\\\\$',next:""qqstring""},{token:""string"",regex:""['](?:(?:\\\\.)|(?:[^'\\\\]))*?[']""},{token:""string"",regex:""['].*\\\\$"",next:""qstring""},{token:""constant.numeric"",regex:""0x[0-9a-fA-F]+\\b""},{token:""constant.numeric"",regex:""[+-]?\\d+(?:(?:\\.\\d*)?(?:[eE][+-]?\\d+)?)?\\b""},{token:r,regex:""[a-zA-Z_$][a-zA-Z0-9_$]*\\b""},{token:""keyword.operator"",regex:""%#|\\$#|\\.\\.\\.|\\|\\|=|>>=|<<=|<=>|&&=|=>|!~|\\^=|&=|\\|=|\\.=|x=|%=|\\/=|\\*=|\\-=|\\+=|=~|\\*\\*|\\-\\-|\\.\\.|\\|\\||&&|\\+\\+|\\->|!=|==|>=|<=|>>|<<|,|=|\\?\\:|\\^|\\||x|%|\\/|\\*|<|&|\\\\|~|!|>|\\.|\\-|\\+|\\-C|\\-b|\\-S|\\-u|\\-t|\\-p|\\-l|\\-d|\\-f|\\-g|\\-s|\\-z|\\-k|\\-e|\\-O|\\-T|\\-B|\\-M|\\-A|\\-X|\\-W|\\-c|\\-R|\\-o|\\-x|\\-w|\\-r|\\b(?:and|cmp|eq|ge|gt|le|lt|ne|not|or|xor)""},{token:""comment"",regex:""#.*$""},{token:""lparen"",regex:""[[({]""},{token:""rparen"",regex:""[\\])}]""},{token:""text"",regex:""\\s+""}],qqstring:[{token:""string"",regex:'(?:(?:\\\\.)|(?:[^""\\\\]))*?""',next:""start""},{token:""string"",regex:"".+""}],qstring:[{token:""string"",regex:""(?:(?:\\\\.)|(?:[^'\\\\]))*?'"",next:""start""},{token:""string"",regex:"".+""}],block_comment:[{token:""comment.doc"",regex:""^=cut\\b"",next:""start""},{defaultToken:""comment.doc""}]}};r.inherits(s,i),t.PerlHighlightRules=s}),ace.define(""ace/mode/python_highlight_rules"",[""require"",""exports"",""module"",""ace/lib/oop"",""ace/mode/text_highlight_rules""],function(e,t,n){""use strict"";var r=e(""../lib/oop""),i=e(""./text_highlight_rules"").TextHighlightRules,s=function(){var e=""and|as|assert|break|class|continue|def|del|elif|else|except|exec|finally|for|from|global|if|import|in|is|lambda|not|or|pass|print|raise|return|try|while|with|yield"",t=""True|False|None|NotImplemented|Ellipsis|__debug__"",n=""abs|divmod|input|open|staticmethod|all|enumerate|int|ord|str|any|eval|isinstance|pow|sum|basestring|execfile|issubclass|print|super|binfile|iter|property|tuple|bool|filter|len|range|
+Query:
+SELECT "sample_path", "content"
+   FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+   WHERE TRY_PARSE_JSON("content") IS NOT NULL
+   LIMIT 1000;
+Answer:
+Too long, hard cut:
+sample_path,content
+src/main/resources/assets/ironbackpacks/models/item/backpackBasic.json,"{
+    ""__comment"": ""Model generated using MrCrayfish's Model Creator (http://mrcrayfish.com/modelcreator/)"",
+    ""textures"": {
+        ""0"": ""ironbackpacks:models/packBasicMain"",
+        ""1"": ""ironbackpacks:models/packBasicPouch""
+    },
+    ""elements"": [
+        {
+            ""name"": ""Main"",
+            ""from"": [ 7.0, 1.0, 5.0 ], 
+            ""to"": [ 9.0, 7.0, 11.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#0"", ""uv"": [ 16.0, 0.0, 12.0, 12.0 ] },
+                ""east"": { ""texture"": ""#0"", ""uv"": [ 12.0, 0.0, 0.0, 12.0 ] },
+                ""south"": { ""texture"": ""#0"", ""uv"": [ 12.0, 0.0, 16.0, 12.0 ] },
+                ""west"": { ""texture"": ""#0"", ""uv"": [ 0.0, 0.0, 12.0, 12.0 ] },
+                ""up"": { ""texture"": ""#0"", ""uv"": [ 0.0, 7.0, 12.0, 3.0 ], ""rotation"": 90 },
+                ""down"": { ""texture"": ""#0"", ""uv"": [ 0.0, 12.0, 12.0, 16.0 ], ""rotation"": 270 }
+            }
+        },
+        {
+            ""name"": ""pouch"",
+            ""from"": [ 6.0, 1.0, 6.0 ], 
+            ""to"": [ 7.0, 5.0, 10.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] },
+                ""east"": { ""texture"": ""#1"", ""uv"": [ 2.0, 2.0, 6.0, 6.0 ] },
+                ""south"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] },
+                ""west"": { ""texture"": ""#1"", ""uv"": [ 0.0, 0.0, 8.0, 8.0 ] },
+                ""up"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] },
+                ""down"": { ""texture"": ""#1"", ""uv"": [ 9.0, 0.0, 11.0, 8.0 ] }
+            }
+        },
+        {
+            ""name"": ""Cube"",
+            ""from"": [ 7.0, 0.0, 6.0 ], 
+            ""to"": [ 9.0, 1.0, 10.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#0"", ""uv"": [ 10.0, 10.0, 6.0, 12.0 ] },
+                ""east"": { ""texture"": ""#0"", ""uv"": [ 2.0, 10.0, 10.0, 12.0 ] },
+                ""south"": { ""texture"": ""#0"", ""uv"": [ 6.0, 10.0, 10.0, 12.0 ] },
+                ""west"": { ""texture"": ""#0"", ""uv"": [ 2.0, 10.0, 10.0, 12.0 ] },
+                ""up"": { ""texture"": ""#0"", ""uv"": [ 0.0, 0.0, 2.0, 4.0 ] },
+                ""down"": { ""texture"": ""#0"", ""uv"": [ 0.0, 12.0, 8.0, 16.0 ] }
+            }
+        },
+        {
+            ""name"": ""Cube"",
+            ""from"": [ 7.499999992549419, 7.0, 6.0 ], 
+            ""to"": [ 9.0, 7.499999992549419, 10.0 ], 
+            ""faces"": {
+                ""north"": { ""texture"": ""#0"", ""uv"": [ 11.0, 12.0, 8.0, 11.0 ] },
+                ""east"": { ""texture"": ""#0"", ""uv"": [ 1.0, 11.0, 9.0, 12.0 ] },
+                ""south"": { ""texture"": ""#0"", ""uv"": [ 8.0, 11.0, 11.0, 12.0 ] },
+                ""west"": { ""texture"": ""#0"", ""uv"": [ 1.0, 11.0, 9.0, 12.0 ] },
+                ""up"": { ""texture"": ""#0"", ""uv"": [ 10.0, 9.0, 2.0, 12.0 ], ""rotation"": 90 },
+                ""down"": { ""texture"": ""#0"", ""uv"": [ 0.0, 13.0, 7.500000007450581, 16.0 ] }
+            }
+        }
+    ]
+}"
+ioniclub-master/node_modules/bower/node_modules/request/node_modules/tough-cookie/node_modules/punycode/package.json,"{
+  ""name"": ""punycode"",
+  ""version"": ""1.3.2"",
+  ""description"": ""A robust Punycode converter that fully complies to RFC 3492 and RFC 5891, and works on nearly all JavaScript platforms."",
+  ""homepage"": ""https://mths.be/punycode"",
+  ""main"": ""punycode.js"",
+  ""keywords"": [
+    ""punycode"",
+    ""unicode"",
+    ""idn"",
+    ""idna"",
+    ""dns"",
+    ""url"",
+    ""domain""
+  ],
+  ""license"": ""MIT"",
+  ""author"": {
+    ""name"": ""Mathias Bynens"",
+    ""url"": ""https://mathiasbynens.be/""
+  },
+  ""contributors"": [
+    {
+      ""name"": ""Mathias Bynens"",
+      ""url"": ""https://mathiasbynens.be/""
+    },
+    {
+      ""name"": ""John-David Dalton"",
+      ""url"": ""http://allyoucanleet.com/""
+    }
+  ],
+  ""repository"": {
+    ""type"": ""git"",
+    ""url"": ""https://github.com/bestiejs/punycode.js.git""
+  },
+  ""bugs"": {
+    ""url"": ""https://github.com/bestiejs/punycode.js/issues""
+  },
+  ""files"": [
+    ""LICENSE-MIT.txt"",
+    ""punycode.js""
+  ],
+  ""scripts"": {
+    ""test"": ""node tests/tests.js""
+  },
+  ""devDependencies"": {
+    ""coveralls"": ""^2.10.1"",
+    ""grunt"": ""^0.4.5"",
+    ""grunt-contrib-uglify"": ""^0.5.0"",
+    ""grunt-shell"": ""^0.7.0"",
+    ""istanbul"": ""^0.2.13"",
+    ""qunit-extras"": ""^1.2.0"",
+    ""qunitjs"": ""~1.11.0"",
+    ""requirejs"": ""^2.1.14""
+  },
+  ""readme"": ""# Punycode.js [![Build status](https://travis-ci.org/bestiejs/punycode.js.svg?branch=master)](https://travis-ci.org/bestiejs/punycode.js) [![Code coverage status](http://img.shields.io/coveralls/bestiejs/punycode.js/master.svg)](https://coveralls.io/r/bestiejs/punycode.js) [![Dependency status](https://gemnasium.com/b
+Query:
+SELECT f.VALUE AS package_requirements
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+WHERE f.KEY = 'require'
+LIMIT 1000;
+Answer:
+PACKAGE_REQUIREMENTS
+"{
+  ""php"": "">=5.3.10""
+}"
+"{
+  ""php"": "">=5.3.9"",
+  ""symfony/framework-bundle"": "">=2.3""
+}"
+"{
+  ""asgard/entity"": ""~0.3.0"",
+  ""asgard/form"": ""~0.3.0"",
+  ""php"": "">=5.5.9""
+}"
+"{
+  ""illuminate/support"": ""^5.1"",
+  ""league/fractal"": ""^0.13.0"",
+  ""php"": "">=5.5.0""
+}"
+"{
+  ""php"": "">=5.0.0""
+}"
+"{
+  ""yiisoft/yii2"": ""*""
+}"
+"{
+  ""php"": "">=5.3.0""
+}"
+"{
+  ""php"": "">=5.4.0""
+}"
+"{
+  ""doctrine/collections"": ""~1.3"",
+  ""doctrine/common"": ""~2.5"",
+  ""hautelook/phpass"": ""~0.3"",
+  ""php"": "">=5.3.9"",
+  ""psr/log"": ""~1.0"",
+  ""symfony/symfony"": ""~2.8|~3.0""
+}"
+"{
+  ""php"": "">=5.4.0"",
+  ""squizlabs/php_codesniffer"": ""2.1.0""
+}"
+"{
+  ""doctrine/doctrine-bundle"": ""*"",
+  ""doctrine/orm"": ""*"",
+  ""gointegro/hateoas"": ""*"",
+  ""php"": "">=5.4.0"",
+  ""symfony/doctrine-bridge"": ""*"",
+  ""symfony/framework-bundle"": ""*"",
+  ""symfony/monolog-bundle"": ""*""
+}"
+"{
+  ""beberlei/assert"": ""~2.3"",
+  ""doctrine/doctrine-bundle"": ""~1.2"",
+  ""doctrine/orm"": ""~2.2,>=2.2.3"",
+  ""incenteev/composer-parameter-handler"": ""~2.0"",
+  ""j7mbo/twitter-api-php"": ""dev-master"",
+  ""knplabs/github-api"": ""~1.4"",
+  ""php"": "">=5.5"",
+  ""sensio/distribution-bundle"": ""~3.0.12"",
+  ""sensio/framework-extra-bundle"": ""~3.0"",
+  ""sensio/generator-bundle"": ""~2.3"",
+  ""symfony/assetic-bundle"": ""~2.3"",
+  ""symfony/monolog-bundle"": ""~2.4"",
+  ""symfony/swiftmailer-bundle"": ""~2.3"",
+  ""symfony/symfony"": ""~2.6"",
+  ""twig/extensions"": ""~1.0""
+}"
+Query:
+-- Corrected SQL 1
+SELECT t."sample_repo_name", t."sample_path", f.KEY, f.VALUE
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+WHERE f.KEY = 'require'
+LIMIT 1000
+Answer:
+sample_repo_name,sample_path,KEY,VALUE
+ScullWM/MailHookBundle,composer.json,require,"{
+  ""php"": "">=5.3.9"",
+  ""symfony/framework-bundle"": "">=2.3""
+}"
+asgardphp/asgard,Entityform/composer.json,require,"{
+  ""asgard/entity"": ""~0.3.0"",
+  ""asgard/form"": ""~0.3.0"",
+  ""php"": "">=5.5.9""
+}"
+ventoviro/windwalker,src/IO/composer.json,require,"{
+  ""php"": "">=5.3.10""
+}"
+NavJobs/laravel-api,composer.json,require,"{
+  ""illuminate/support"": ""^5.1"",
+  ""league/fractal"": ""^0.13.0"",
+  ""php"": "">=5.5.0""
+}"
+zurmo/Zurmo,app/protected/extensions/userinterface/lib/composer.json,require,"{
+  ""php"": "">=5.0.0""
+}"
+marcmascarell/arrayer,composer.json,require,"{
+  ""php"": "">=5.4.0""
+}"
+Ma27/Ma27ApiKeyAuthenticationBundle,composer.json,require,"{
+  ""doctrine/collections"": ""~1.3"",
+  ""doctrine/common"": ""~2.5"",
+  ""hautelook/phpass"": ""~0.3"",
+  ""php"": "">=5.3.9"",
+  ""psr/log"": ""~1.0"",
+  ""symfony/symfony"": ""~2.8|~3.0""
+}"
+AOEpeople/magento-coding-standard,composer.json,require,"{
+  ""php"": "">=5.4.0"",
+  ""squizlabs/php_codesniffer"": ""2.1.0""
+}"
+GoIntegro/hateoas-bundle,composer.json,require,"{
+  ""doctrine/doctrine-bundle"": ""*"",
+  ""doctrine/orm"": ""*"",
+  ""gointegro/hateoas"": ""*"",
+  ""php"": "">=5.4.0"",
+  ""symfony/doctrine-bridge"": ""*"",
+  ""symfony/framework-bundle"": ""*"",
+  ""symfony/monolog-bundle"": ""*""
+}"
+LonelyPullRequestsHQ/lonelypullrequests.com,composer.json,require,"{
+  ""beberlei/assert"": ""~2.3"",
+  ""doctrine/doctrine-bundle"": ""~1.2"",
+  ""doctrine/orm"": ""~2.2,>=2.2.3"",
+  ""incenteev/composer-parameter-handler"": ""~2.0"",
+  ""j7mbo/twitter-api-php"": ""dev-master"",
+  ""knplabs/github-api"": ""~1.4"",
+  ""php"": "">=5.5"",
+  ""sensio/distribution-bundle"": ""~3.0.12"",
+  ""sensio/framework-extra-bundle"": ""~3.0"",
+  ""sensio/generator-bundle"": ""~2.3"",
+  ""symfony/assetic-bundle"": ""~2.3"",
+  ""symfony/monolog-bundle"": ""~2.4"",
+  ""symfony/swiftmailer-bundle"": ""~2.3"",
+  ""symfony/symfony"": ""~2.6"",
+  ""twig/extensions"": ""~1.0""
+}"
+machour/yii2-easy-elasticsearch,composer.json,require,"{
+  ""yiisoft/yii2"": ""*""
+}"
+ddeboer/vatin,composer.json,require,"{
+  ""php"": "">=5.3.0""
+}"
+Query:
+-- SQL 2 (No correction needed)
+SELECT DISTINCT "license"
+FROM GITHUB_REPOS.GITHUB_REPOS.LICENSES
+LIMIT 1000
+Answer:
+license
+apache-2.0
+epl-1.0
+lgpl-2.1
+mit
+lgpl-3.0
+artistic-2.0
+isc
+cc0-1.0
+agpl-3.0
+bsd-2-clause
+gpl-2.0
+gpl-3.0
+mpl-2.0
+unlicense
+bsd-3-clause
+Query:
+-- SQL 3 (No correction needed)
+SELECT "repo_name", "language"
+FROM GITHUB_REPOS.GITHUB_REPOS.LANGUAGES
+LIMIT 1000
+Answer:
+Too long, hard cut:
+repo_name,language
+konrad/READemption,[]
+Duobe/TheFirstOne,[]
+andyyardley/SecureO,[]
+PGower/Timetabler2SQL,[]
+brykmoore/SeniorProject,[]
+mpusz/SimpleWorkarounds,[]
+lily06280425/lian-,[]
+seanarooni/gitignore,[]
+mashurex/arduino-tuts,[]
+Natashka89/ironpython_training2,[]
+Chookahead/Locally-Created-Repo,[]
+twiess/hello-world,[]
+jasonzissman/Algorithms,[]
+pl85s/programming-for_testers,[]
+maicki/GDUpload,[]
+cyclejs/base,[]
+renwei360/-,[]
+pedazo/ogo,[]
+jsheng258/helloworld,[]
+web1o1/pixi.js,[]
+birthcat/HelloWorld,[]
+webner/nginx-proxy,[]
+s3r4ph/PySplice,[]
+makerspacelt/car-usb-charger,[]
+hioxxo/radiojavandownloader,[]
+alanmcna/heat_templates,[]
+dbhys/com.dbhys,[]
+Ivshti/awesome-hacking-spots,[]
+du5t/char-custom,[]
+slimchrisp/bootstrap_cms,[]
+skeeet/iOSAppReverseEngineering,[]
+ajsondev/fullcalendar,[]
+zen-np/np-log,[]
+kragen/zxing,[]
+Davidmeng78/PPRE,[]
+SebastienGaspar/Gecko,[]
+maquanyi/crew,[]
+marcelobarretto/docker-tomcat-mysql,[]
+delgadom/lptutorial,[]
+zcrutherford/zhangchao,[]
+sampanelaid/panelteam,[]
+NodeTutorials/express.js-intro,[]
+hubertod/MarketWatcher,[]
+GameDevBlizzardThread/game,[]
+RagnarDanneskjold/bitbot,[]
+deependragit/testing,[]
+kennethormandy/default,[]
+renqiaoyang/www,[]
+pjcnunes/ADS2017,[]
+drewhammond/idea-gulp,[]
+basilajith/python,[]
+pedro/active_merchant,[]
+baiyanghese/angular.js,[]
+kemalacar/mediaplayer_plugin,[]
+ridesoftech/videoconf,[]
+airate/docker-base,[]
+Galves96/CP,[]
+ibanezz/GitDemo,[]
+vpayno/md-api-perl,[]
+AnujaK/chrome-dropbox-oauth,[]
+tcalmant/nao-iotdays-2015,[]
+adyates/steamalytics,[]
+Remnaut/DungeonCrawler,[]
+FireFlyDreamWorks/aladino,[]
+active-interest/reverse-proxy-comment-ip-fix,[]
+pataquets/docker-supervisor,[]
+Sameer-Shukla/FirstRepo,[]
+gloryministry/.com,[]
+iicray/Rails-102,[]
+mrblabs/vitwitter.net,[]
+mardann/randomNumGeneratorNonReacuring,[]
+PaperHat/programmer-training,[]
+eahrold/Chainables,[]
+substruct/mohawk,[]
+Chromatophore/MDS,[]
+dazzyd/firefox-searchplugins,[]
+lutaf/auto-complete,[]
+dayler/nuevatel.common,[]
+nwgat/nodejs-rtorrent-installer,[]
+collabx/LegalComponents,[]
+4everdunn/phonefix,[]
+eos-org/autoload,[]
+devendradhanal/T,[]
+metavida/Multi-Firefox-Launcher,[]
+yjchou/polar,[]
+andreaslindeboom/padlock,[]
+mewiteor/algorithm,[]
+refactorthis/acute.js,[]
+inshideru/datasciencecoursera,[]
+sysb-io/sysbio-gallery,[]
+manutddidaka/Moments-in-Space,[]
+mako-taco/react-components,[]
+ajaycode/docker-cheat-sheet,[]
+icyflame/install-from-source-tmux-2-0,[]
+hcp4715/AnalyzingExpData,[]
+nishant-jain-94/QuizRT,[]
+therebelrobot/hublog,[]
+cheaboar/my,[]
+zarathustra1/Tom-Shelling,[]
+bobalazek/open-model,[]
+virati/LinuxScripts,[]
+thefairystamp/companions,[]
+DevAplus/Development,[]
+weixue-group/flaming-meme,[]
+taibin/AndroidEasy,[]
+fychao/DimensionalOpinion,[]
+khmarbaise/progressive-organization-pom,[]
+irshadpc/GKCustomAddressBook,[]
+acsalu/umsi-courses,[]
+markronquillo/Coil,[]
+BFFTD/Test,[]
+stephanmg/usb-backup,[]
+mjb2010/FixRIFF,[]
+zlsun/avit-mod,[]
+Arif12/referenes,[]
+Agustify/Sfotipy,[]
+TyphooN-/staticifcfg,[]
+lapogo18/Spies,[]
+notbsd/eggsploits,[]
+bhargav175/react-material-boilerplate,[]
+zokeber/docker-centos,[]
+viktorbc/HOMEWORK,[]
+NENightElves/FIR,[]
+garyjyao1/mac-devops-playbook,[]
+Chingzilla/Robotc-Extra-Libraries,[]
+naveen9755/scribe-java,[]
+ThomasLeg/Formation,[]
+jon-d/ansible-role-openntpd,[]
+mvhenten/slack-dict,[]
+02N/kaffe,[]
+holtkamp/cdnjs,[]
+OpenGov/docker-pyspark,[]
+sp02/my_first_repo,[]
+MarceloM33/BITCOINMTFKR,[]
+stmueller/PEBL_BST,[]
+zed-throben/csharp-bertpc-server,[]
+bugen/tsv,[]
+mxabierto/capa,[]
+fish-bones/surface,[]
+ColemanTO/Weather-Forecast,[]
+apiaryio/jsondiff-js,[]
+liboysoft/blueberry,[]
+Wirachmat/https-github.com-cloudflare-cfapp-sample,[]
+mandrean/blogg.se2wordress,[]
+dbergan/AutobahnPython,[]
+theatrekid09/Front-end-Developer-Interview-Questions,[]
+Un1matr1x/phpBB3-MOD-ErrorLogging,[]
+kaija/dns_alg,[]
+RedClayInteractive/rci-csv-export,[]
+isis-software/Programy-zabezpieczajace,[]
+urtdevs/pugbot-salt,[]
+wolfy12/wargreymon,[]
+ivarsolution/lesson1,[]
+aburan28/scrapy,[]
+nerones/docker-laravel-dev,[]
+Bradass/Tests,[]
+waterdance/pet_event,[]
+vladimir-vilinski/mqfte-manager,[]
+stringsonfire/django-just-friends,[]
+bronson/setenvy,[]
+Sgoettschkes/ansible-role-mysql,[]
+PureChat/PureChat,[]
+cbutcosk/rdfgen-ci,[]
+svoflee/svoflee-spartacus-tools,[]
+hilbert-space/mc,[]
+elyase/algorithms,[]
+vauxoo-dev/runbot_branch_remote_name_grp_feature,[]
+erceller/SDL-practices,[]
+othermusketeer/ServerStarter,[]
+RichardLitt/How-to-pronounce,[]
+filipveschool/overzicht-laravel-packages,[]
+garrettpross/git-test,[]
+base0225/ZJAVPlayer,[]
+wavelets/math-as-code,[]
+felicitychou/blog,[]
+knaka/markdown-link,[]
+MatrixAI/Chronograph,[]
+digitalw00t/prismaRedux,[]
+petemcw/ansible-role-redis,[]
+VincenzoAliberti/MTD-LPDDR2-NVM,[]
+pnsantos/pnsantos.github.io,[]
+est61/hello-world,[]
+MrZhouYY/PRML,[]
+LiskCommunityTools/lisk-tools,[]
+wechatpy/wechatpy.github.io,[]
+javidanser/scrum-poker-cards-android,[]
+boriszweimueller/boris-blog,[]
+qyou/QRTParser,[]
+eel3/lua_nmake_template,[]
+simar0at/composer-repos,[]
+Tu
+Query:
+-- SQL 4 (No correction needed)
+SELECT "id", "size", "binary"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "binary" = TRUE
+LIMIT 1000
+Answer:
+Too long, hard cut:
+id,size,binary
+5cb570289796c79bb404453029ff2b8f54431cd5,170242,True
+237f3657a01ee1e48aa0146d9eb2f022815414cf,3922814,True
+90a3607edd46243b457d334a7f705a559707c1af,64955,True
+c62915c510205c9f914776b4da51dc15f19a87e4,9052,True
+e222e4594f8e05a43066fd061a3d93f8ead9c8e0,13616,True
+d941da334e454a1c826f39f3dbac497cc3c3db16,246,True
+41aa5b3afb75dd574eb3b31a5d75f4a60e8f93d4,360,True
+8bdc1f0589e524c133e224dda8720f5ec4d14a29,18039,True
+8f22c2697f0ddabae0eceaac76f5c599b42446de,13462,True
+d8dd553288fddcea188595e107e9caf047cb95dc,470,True
+2d2e351c81001824eb5a63d84e0b2a85c4262f31,2748,True
+0dd1b1cfc86c568ad386204ede526d8ccb95d218,3612,True
+a422b9a5f0012a490f70f0d186f8dceab44f2c6c,4943,True
+0eab18811d746b51f6813df413598078b76d65d4,487424,True
+3b541a997cba2dd5313dc43059839e2668be8bcf,2280,True
+e4d9f88a4b5ed047dc988056805d82c42be0b9bb,16964,True
+07d9923bbfa7ef30c6c0e40d62524f879e9cdc3e,1458,True
+6cfea948c7f2712af90a88cc75f7f649d83145a3,364155,True
+d70ea212f364055bef1ee484f2039ea5a80b3d99,639,True
+6d5df3081daec0ea6b4021d97866b38c716da88c,23084,True
+d1305e5f0c9bc64326e68503d2abce5886ab5dd4,281155,True
+6d04e4e2ed4e8397e83400b3c9e08d9d74dc698a,34977,True
+45b4710b2dd06b871d84a12771f66b60f692241c,59,True
+2f3c885aedc4938036b6e3adf137366472326c42,1040888,True
+9c36e07c7454aeaf059d5b07e62d4268ea6c7617,1614276,True
+32f3632d167318083947e3a968c96054f0ab2e70,14391,True
+cb107df384a6ff637074175229ba4c455a7a29ca,17577,True
+67e196faf1fa281aec64572e0b3c90b744b73e38,654,True
+0e23c4205d3922b4b4aded8cc04b3c152c1d0c87,81438,True
+2897f4521ac6aab70e2d8f69469e8a825b7d6783,512,True
+33718db98c07a3cd59e92fad17384427d5a7874b,248,True
+9f2477b423b5b8d24f8a06d89ad1db78b372ee52,3314,True
+b0bdd87563dae1eacb727138166f6ac286b3f366,774,True
+590040d8591d23262c708c146328bffc1c019d63,282,True
+7fa3c19247c0808d01a15e9f1e80de155fc6b91f,8994860,True
+24a69b986f7b3a9f7e47cd1cb2637b01d8c59811,5563,True
+e8f69f6e3fcc4a7f342284e284c3ddac527cb2d2,4506,True
+9a9d54916909608d1037e93f587dc18462382f34,3297,True
+124e0699331b9af3b37f365c35bc454a5fd2762d,229,True
+736e57c095683a38d443f153acc5cb6314767301,251,True
+433a8c14bda3fcf8663835f9ea4bc2445562ad03,1086,True
+d20a393c70709746829b1f1ad1fbe558efc116e0,1458,True
+43bf7633fa0e5422a1652f3a95de6c3a25811e55,82920,True
+d42f74535db83cdd45b01f3c1ff8df28b975b307,12814,True
+ba1e315905266ba4e0a944f233b2b95e7e060036,280,True
+e527ea532895e5abb03ffbd7af1acbd410cac20a,1254,True
+38497e198ba7b5e962e161a6746725c0d1fa9616,1458,True
+26c3877bdc7690a11c85148263fa5402c4d66fbe,8028,True
+746d017c1ef1fb2b5cad1293b7640766eb944d75,401066,True
+692a414328e913c883a4148ca7cca9ef8382728b,2472,True
+2dcb67b08e0581f767ac79e386305cd44aa735a2,688,True
+18df12eeaec707126739cfb3216e5dc928636aef,105429,True
+54cf2b9f20255ac3aaa0f0b1fd0a93ea30ad05da,205,True
+dcc0884652ca6a0e1d407fcb90c087ad8bb20340,4300,True
+8f9985d3f3299a8063622247d8ca3c8920e343f8,1458,True
+74f65dc1fe5e85317d70c3194dedeedef66c1dd0,4701,True
+a1375708947bff27c702c083b1ecb3b7f7a6668e,182972,True
+b813f5fa1d6fe5bb8416eac58afd3be526531b74,100230,True
+b6337bc9a28180d042950c9f3c21d08406fbb254,229,True
+47b46a9cf60549b4e5a2c8d88874aff541502e88,505441,True
+21d3c19424185a6d0478e81e93cde9904d45d5ad,109468,True
+873454cee5ce32013c3ad1a1d1e4a6ca0be1f4b6,19540,True
+816ac8354e79af895935b107a5e550c94123cb02,1994,True
+37ed073b556f4ce3463ded4b2e9887c023931a66,8425,True
+962d5b6139754b6789490870ccaf58672473b93a,47660,True
+5637785cf05a96729a266ff6809fe06e4376a553,229,True
+1f319b56fce631ceae678d3555c986a795a8930a,1754,True
+b389a63119c75e5ace27c50da55d85bef983f14c,2034,True
+c0f0188d07d6a4c12e725aa3724497cf4c40ed1c,28661,True
+155fa7a03a5d8d599666be87dbbd6d3905e8279f,4484,True
+f34b5576495326ba0662a86fa591cd1c2bea6da8,260,True
+b007a07c0ce8000a734e2a9c1143bbdc6c2587a5,1645,True
+050f0b7e569a2561019526e63c419be819a3d901,107,True
+e744dcd4b37cc6ae52553918d005b8320271a777,199570,True
+7cab5e1069744a27ca575cfb096853028a0c4808,187018,True
+dbd1ee7abb246b97492d173060948598895cd2a0,645,True
+174fab5528a1e5c69f1fae5c6f4fa76e63345d02,1458,True
+2bec2bab3de8caffe3cf67ab364be020234feabd,5480,True
+14ced6b07fa902f3fbfe3a52ab8ad26d147ef8c0,937,True
+ebca5c70f03b68270d1e8203390754ca02ef3334,1664,True
+3b6bef080c14961fb0abc04a3c84d20d1cdd9a52,592,True
+082761f49c334ff7c26099d519a22b964037a754,180,True
+68f229b9e54132e58be6701f2fa5fd74f6a5427e,284,True
+64fbaaacc36b659e51db803446c382d32f58aec5,2228,True
+73d904444c82460ed11297869f950fe6943f0764,545793,True
+0c3ae33c3821373b3c3e024bad3cb2292bd559be,18090,True
+2f884bbb5ffe56a3dab735bea4542dccd7af8b53,24122,True
+39c3ad72fb3c22475db3434f6acf90515519dd94,3967,True
+67545c695a2e0b12b89bf422ae8b381a1d09e1cf,213,True
+8601a3745e717a5b7d66c075bca73c0a489cd1e4,7994,True
+a59a869fc392ff310a06829c95bdd4cc51bcdc9b,7316,True
+d27ee0b5f644d1782f892bd9694268bad929a526,43312,True
+f97fca0bbcfc1d98140d6000a22776a3f8f4b193,284,True
+da0434c11a3509c49049af3e7969b3109344c806,7184,True
+9a98dfab76f27b01ebbb2e7c91940018b28dabcc,3412,True
+54ec7a8d6fb0f67e9b0bfa14a598c1056c3f2e2b,8678,True
+d681e8589fdfc7d364cc83c72ef43340328d7e7b,328,True
+5a6c275eec
+Query:
+-- SQL 5 (No correction needed)
+SELECT "commit", "message"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_COMMITS
+WHERE "message" ILIKE '%fix%'
+LIMIT 1000
+Answer:
+Too long, hard cut:
+commit,message
+01ffe339e3a0ba5ecbeb2b3b5abac7b3ef90f374,"Make alloc_page_buffers() initialise buffer_heads using init_buffer(),
+like other routines here, to ensure buffers are correctly initialised
+with respect to b_private/b_end_io.  Fixes an odd interaction between
+XFS and reiserfs.
+
+Signed-off-by: Nathan Scott <e2e3f1f24cbc439f8c1ba9b08f9954237d64be64@sgi.com>
+"
+7a1d7e6dd76a2070e2d86826391468edc33bb6d6,"tpm: TPM 2.0 baseline support
+
+TPM 2.0 devices are separated by adding a field 'flags' to struct
+tpm_chip and defining a flag TPM_CHIP_FLAG_TPM2 for tagging them.
+
+This patch adds the following internal functions:
+
+- tpm2_get_random()
+- tpm2_get_tpm_pt()
+- tpm2_pcr_extend()
+- tpm2_pcr_read()
+- tpm2_startup()
+
+Additionally, the following exported functions are implemented for
+implementing TPM 2.0 device drivers:
+
+- tpm2_do_selftest()
+- tpm2_calc_ordinal_durations()
+- tpm2_gen_interrupt()
+
+The existing functions that are exported for the use for existing
+subsystems have been changed to check the flags field in struct
+tpm_chip and use appropriate TPM 2.0 counterpart if
+TPM_CHIP_FLAG_TPM2 is est.
+
+The code for tpm2_calc_ordinal_duration() and tpm2_startup() were
+originally written by Will Arthur.
+
+Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+Signed-off-by: Will Arthur <will.c.arthur@intel.com>
+Reviewed-by: Jasob Gunthorpe <jason.gunthorpe@obsidianresearch.com>
+Reviewed-by: Stefan Berger <stefanb@linux.vnet.ibm.com>
+Reviewed-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+Tested-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+
+[phuewe: Fixed copy paste error * 2]
+Signed-off-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+"
+60ecd86c4d985750efa0ea3d8610972b09951715,"vTPM: fix memory allocation flag for rtce buffer at kernel boot
+
+At ibm vtpm initialzation, tpm_ibmvtpm_probe() registers its interrupt
+handler, ibmvtpm_interrupt, which calls ibmvtpm_crq_process to allocate
+memory for rtce buffer.  The current code uses 'GFP_KERNEL' as the
+type of kernel memory allocation, which resulted a warning at
+kernel/lockdep.c.  This patch uses 'GFP_ATOMIC' instead so that the
+allocation is high-priority and does not sleep.
+
+Cc: 4fbacc2fa0ffdbb11bf1ad6925b886ebd08dd15f@kernel.org
+Signed-off-by: Hon Ching(Vicky) Lo <586dce2b5b41882e50b9a0eefaf3387b8b8c8cc6@linux.vnet.ibm.com>
+Signed-off-by: Peter Huewe <014f16385c5a8ff1646b588a3d5169b595c0f10e@gmx.de>
+"
+fe617082d9da0e162e1e79b58617b6326da3d03e,"[website] Fix jump on the header
+
+Algolia adds two inline styles
+
+```css
+  position: relative;
+  vertical-align: top;
+```
+
+to the element once the script inserted at the end of the page runs which super slightly moves the header. The fix is to always apply those two rules this way it doesn't jump. I did not notice it on my machine because it doesn't move when custom fonts are not being used.
+
+Test Plan:
+- Open two tabs: reactjs.com and localhost:4000/react
+- Click around on reactjs.com to prime the cache with the fonts
+- Switch tabs and click around on localhost (but do not force refresh!)
+- Now you get custom fonts loaded locally and it doesn't jump when you change tabs
+"
+62b19a127ce68c01c894ed46c2fcd42f70106d85,"Fix typo
+
+'wit' -> 'with'"
+b1269263905e491477dc54186a6f486748b6e62c,"Ensure IE8 style expansion list is up to date
+
+In conjunction with #1953, fixes #2407. This seems to be all of the shorthand style properties that IE8 supports, excluding a few nonstandard ones.
+"
+74cdaf24004aea8de350f58979548b3eddc11e9a,"UBI: Fastmap: Fix memory leaks while closing the WL sub-system
+
+Add a ubi_fastmap_close() to free all resources used by fastmap
+at WL shutdown.
+
+Signed-off-by: Richard Weinberger <320bca71fc381a4a025636043ca86e734e31cf8b@nod.at>
+Tested-by: Guido Martínez <adfc8f0aec273eace2629141317c1eac53923f28@vanguardiasur.com.ar>
+Reviewed-by: Guido Martínez <adfc8f0aec273eace2629141317c1eac53923f28@vanguardiasur.com.ar>
+"
+7d25b361a2d3e8a9dcaf463d92285d58dedc74ab,"UBIFS: fix a typo in comment of ubifs_budget_req
+
+s/now/how
+
+Signed-off-by: Dongsheng Yang <1b957dfff8d0f16ed124fab3c79d8c1232c34692@cn.fujitsu.com>
+Reviewed-by: Richard Weinberger <320bca71fc381a4a025636043ca86e734e31cf8b@nod.at>
+Signed-off-by: Artem Bityutskiy <2f96f8cd3e2780a209d0ab27d1b44624d0019d3f@linux.intel.com>
+"
+9e8cd24d26047a4d86a0045d3c800449ff9b0dc6,"Update fully_connected_feed.py
+
+""os.path"" and ""numpy"" were unused, so I removed them.
+The tfevents-output-file was not completely written in IPython, so I added ""summary_writer.flush()"" to fix it."
+910cd32e552ea09caa89cdbe328e468979b030dd,"parisc: Fix and enable seccomp filter support
+
+The seccomp filter support requires careful handling of task registers.  This
+includes reloading of the return value (%r28) and proper syscall exit if
+secure_computing() returned -1.
+
+Additionally we need to sign-extend the syscall number from signed 32bit to
+signed 64bit in do_syscall_trace_enter() since the ptrace interface only allows
+storing 32bit values 
+Query:
+-- SQL 6 (No correction needed)
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" ILIKE '%requirements.txt%'
+LIMIT 1000
+Answer:
+sample_path,content
+requirements.txt,"# The order of packages is significant, because pip processes them in the order
+# of appearance. Changing the order has an impact on the overall integration
+# process, which may cause wedges in the gate later.
+pbr>=1.6 # Apache-2.0
+python-heatclient>=0.8.0
+# REVISIT: After mitaka release add dependency on released version of python-neutronclient
+"
+requirements.txt,"# The order of packages is significant, because pip processes them in the order
+# of appearance. Changing the order has an impact on the overall integration
+# process, which may cause wedges in the gate later.
+
+pbr>=0.6,!=0.7,<1.0
+
+Babel>=1.3
+oslo.config>=1.4.0
+oslo.i18n>=1.0.0
+oslo.serialization>=1.0.0
+oslo.utils>=1.0.0
+requests>=2.2.0,!=2.4.0
+six>=1.7.0
+stevedore>=1.1.0
+"
+requirements.txt,SQLAlchemy==0.9.3
+docs/requirements.txt,"# Sphinx
+#   https://github.com/sphinx-doc/sphinx/blob/master/CHANGES
+sphinx>=1.4 # rq.filter: >=1.3, <1.5"
+Query:
+-- SQL 7 (No correction needed)
+SELECT "sample_path", "content"
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS
+WHERE "sample_path" ILIKE '%Gemfile%'
+LIMIT 1000
+Answer:
+sample_path,content
+gemfiles/activerecord-4.2/Gemfile.base,"eval File.read File.expand_path('../../Gemfile.base', __FILE__)
+
+gem ""activerecord"", ""~> 4.2.6""
+"
+spec/dummy/Gemfile,"source 'http://rubygems.org'
+
+gem 'rails', '~> 4.1.0'
+gem 'mailboxer', :path => '../../'
+gem 'factory_girl'
+
+# Bundle edge Rails instead:
+# gem 'rails', :git => 'git://github.com/rails/rails.git'
+
+gem ""sqlite3"", :platform => [:ruby, :mswin, :mingw]
+gem ""jdbc-sqlite3"", :platform => :jruby
+"
+Gemfile,"source ""http://rubygems.org""
+
+group :development do
+  gem 'yard'
+  gem ""rspec"", ""~> 3.4.0""
+  gem ""rdoc"", ""~> 3.12""
+  gem ""bundler"", ""~> 1.0""
+  gem ""jeweler"", ""~> 2.0.1""
+end
+"
+Gemfile.lock,"PATH
+  remote: .
+  specs:
+    dry-transaction (0.5.0)
+      kleisli
+      wisper (>= 1.6.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    diff-lcs (1.2.5)
+    docile (1.1.5)
+    json (1.8.3)
+    kleisli (0.2.7)
+    rake (10.4.2)
+    rspec (3.3.0)
+      rspec-core (~> 3.3.0)
+      rspec-expectations (~> 3.3.0)
+      rspec-mocks (~> 3.3.0)
+    rspec-core (3.3.2)
+      rspec-support (~> 3.3.0)
+    rspec-expectations (3.3.1)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.3.0)
+    rspec-mocks (3.3.2)
+      diff-lcs (>= 1.2.0, < 2.0)
+      rspec-support (~> 3.3.0)
+    rspec-support (3.3.0)
+    simplecov (0.10.0)
+      docile (~> 1.1.0)
+      json (~> 1.8)
+      simplecov-html (~> 0.10.0)
+    simplecov-html (0.10.0)
+    wisper (1.6.1)
+    yard (0.8.7.6)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  bundler (~> 1.10)
+  dry-transaction!
+  rake (~> 10.4.2)
+  rspec (~> 3.3.0)
+  simplecov (~> 0.10.0)
+  yard
+
+BUNDLED WITH
+   1.11.2
+"
+Gemfile.lock,"GEM
+  remote: http://rubygems.org/
+  specs:
+    bcrypt-ruby (3.1.2)
+    diff-lcs (1.2.4)
+    facter (1.6.0)
+    mkfifo (0.0.1)
+    rake (10.1.0)
+    rspec (2.13.0)
+      rspec-core (~> 2.13.0)
+      rspec-expectations (~> 2.13.0)
+      rspec-mocks (~> 2.13.0)
+    rspec-core (2.13.1)
+    rspec-expectations (2.13.0)
+      diff-lcs (>= 1.1.3, < 2.0)
+    rspec-mocks (2.13.1)
+    sqlite3 (1.3.8)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  bcrypt-ruby
+  facter (= 1.6)
+  mkfifo
+  rake
+  rspec
+  sqlite3
+"
+Gemfile,"source 'https://rubygems.org'
+
+gem 'mediawiki_selenium', '~> 1.7', '>= 1.7.1'
+gem 'rubocop', '~> 0.34.2', require: false
+"
+gemfiles/activerecord_4.1.gemfile,"# This file was generated by Appraisal
+
+source ""https://rubygems.org""
+
+gem ""activerecord"", ""4.1.0""
+
+group :test do
+  gem ""pg"", "">= 0.14.1""
+end
+
+gemspec :path => ""../""
+"
+gemfiles/3.2.gemfile,"source 'https://rubygems.org'
+
+gem 'rails', '~> 3.2.3'
+gem 'rspec', '~> 2.14.0'
+
+gemspec path: '../'
+"
+Gemfile,"source 'https://rubygems.org'
+
+# Specify your gem's dependencies in zimbra_proxy_spy.gemspec
+
+group :test do
+  gem 'minitest-reporters'
+  gem 'rack-test'
+end
+
+gem 'rake'
+gem 'sinatra'
+gem 'uuid'
+gem 'httpclient'
+gem 'sinatra-contrib'
+gem 'pry'
+"
+Gemfile.lock,"GEM
+  remote: https://rubygems.org/
+  specs:
+    slop (3.6.0)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  slop (~> 3.6.0)
+"
+gemfiles/rails32_ember_latest.gemfile,"source 'https://rubygems.org'
+
+gem 'rails', '~> 3.2'
+gem 'ember-source', '~> 2.2.0'
+
+gemspec path: '../'
+"
+Gemfile,"source 'https://rubygems.org'
+
+# Specify your gem's dependencies in rundeck.gemspec
+gemspec
+"
+Gemfile,"source 'https://rubygems.org'
+
+require 'json'
+require 'open-uri'
+versions = JSON.parse(open('https://pages.github.com/versions.json').read)
+
+gem 'github-pages', versions['github-pages']
+gem 'wdm', '~> 0.1.0' if Gem.win_platform?
+"
+demo/Gemfile,"source 'https://rubygems.org'
+
+gem 'rails', '~> 3.2.1'
+gem 'socialization', :path => '../'
+# Bundle edge Rails instead:
+# gem 'rails', :git => 'git://github.com/rails/rails.git'
+
+gem 'sqlite3'
+
+
+# Gems used only for assets and not required
+# in production environments by default.
+group :assets do
+  gem 'sass-rails',   '~> 3.2.3'
+  gem 'coffee-rails', '~> 3.2.0'
+
+  gem 'uglifier', '>= 1.0.3'
+end
+
+gem 'jquery-rails'
+
+# To use ActiveModel has_secure_password
+# gem 'bcrypt-ruby', '~> 3.0.0'
+
+# To use Jbuilder templates for JSON
+# gem 'jbuilder'
+
+# Use unicorn as the web server
+# gem 'unicorn'
+
+# Deploy with Capistrano
+# gem 'capistrano'
+
+# To use debugger
+# gem 'ruby-debug19', :require => 'ruby-debug'
+"
+Query:
+-- Corrected SQL 8
+SELECT f.VALUE
+FROM GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+     LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f
+LIMIT 1000
+Answer:
+Too long, hard cut:
+VALUE
+"[
+  [
+    ""-webkit-flex-align"",
+    ""-moz-flex-align"",
+    ""-ms-flex-align"",
+    ""-o-flex-align"",
+    ""flex-align"",
+    ""overflow"",
+    ""-ms-overflow-x"",
+    ""-ms-overflow-y"",
+    ""overflow-x"",
+    ""overflow-y"",
+    ""clip"",
+    ""-webkit-box-sizing"",
+    ""-moz-box-sizing"",
+    ""box-sizing"",
+    ""display"",
+    ""width"",
+    ""height"",
+    ""top"",
+    ""right"",
+    ""bottom"",
+    ""left"",
+    ""z-index"",
+    ""visibility"",
+    ""-webkit-flex-direction"",
+    ""-moz-flex-direction"",
+    ""-ms-flex-direction"",
+    ""-o-flex-direction"",
+    ""flex-direction"",
+    ""-webkit-flex-order"",
+    ""-moz-flex-order"",
+    ""-ms-flex-order"",
+    ""-o-flex-order"",
+    ""flex-order"",
+    ""-webkit-flex-pack"",
+    ""-moz-flex-pack"",
+    ""-ms-flex-pack"",
+    ""-o-flex-pack"",
+    ""flex-pack"",
+    ""float"",
+    ""clear"",
+    ""outline"",
+    ""outline-width"",
+    ""outline-style"",
+    ""outline-color"",
+    ""outline-offset"",
+    ""border"",
+    ""border-spacing"",
+    ""border-collapse"",
+    ""border-width"",
+    ""border-style"",
+    ""border-color"",
+    ""border-top"",
+    ""border-top-width"",
+    ""border-top-style"",
+    ""border-top-color"",
+    ""border-right"",
+    ""border-right-width"",
+    ""border-right-style"",
+    ""border-right-color"",
+    ""border-bottom"",
+    ""border-bottom-width"",
+    ""border-bottom-style"",
+    ""border-bottom-color"",
+    ""border-left"",
+    ""border-left-width"",
+    ""border-left-style"",
+    ""border-left-color"",
+    ""margin"",
+    ""margin-top"",
+    ""margin-right"",
+    ""margin-bottom"",
+    ""margin-left"",
+    ""padding"",
+    ""padding-top"",
+    ""padding-right"",
+    ""padding-bottom"",
+    ""padding-left"",
+    ""min-width"",
+    ""min-height"",
+    ""max-width"",
+    ""max-height"",
+    ""-webkit-border-radius"",
+    ""-moz-border-radius"",
+    ""border-radius"",
+    ""-webkit-border-top-left-radius"",
+    ""-moz-border-radius-topleft"",
+    ""border-top-left-radius"",
+    ""-webkit-border-top-right-radius"",
+    ""-moz-border-radius-topright"",
+    ""border-top-right-radius"",
+    ""-webkit-border-bottom-right-radius"",
+    ""-moz-border-radius-bottomright"",
+    ""border-bottom-right-radius"",
+    ""-webkit-border-bottom-left-radius"",
+    ""-moz-border-radius-bottomleft"",
+    ""border-bottom-left-radius"",
+    ""-webkit-border-image"",
+    ""-moz-border-image"",
+    ""-o-border-image"",
+    ""border-image"",
+    ""-webkit-border-image-source"",
+    ""-moz-border-image-source"",
+    ""-o-border-image-source"",
+    ""border-image-source"",
+    ""-webkit-border-image-slice"",
+    ""-moz-border-image-slice"",
+    ""-o-border-image-slice"",
+    ""border-image-slice"",
+    ""-webkit-border-image-width"",
+    ""-moz-border-image-width"",
+    ""-o-border-image-width"",
+    ""border-image-width"",
+    ""-webkit-border-image-outset"",
+    ""-moz-border-image-outset"",
+    ""-o-border-image-outset"",
+    ""border-image-outset"",
+    ""-webkit-border-image-repeat"",
+    ""-moz-border-image-repeat"",
+    ""-o-border-image-repeat"",
+    ""border-image-repeat"",
+    ""-webkit-border-top-image"",
+    ""-moz-border-top-image"",
+    ""-o-border-top-image"",
+    ""border-top-image"",
+    ""-webkit-border-right-image"",
+    ""-moz-border-right-image"",
+    ""-o-border-right-image"",
+    ""border-right-image"",
+    ""-webkit-border-bottom-image"",
+    ""-moz-border-bottom-image"",
+    ""-o-border-bottom-image"",
+    ""border-bottom-image"",
+    ""-webkit-border-left-image"",
+    ""-moz-border-left-image"",
+    ""-o-border-left-image"",
+    ""border-left-image"",
+    ""-webkit-border-corner-image"",
+    ""-moz-border-corner-image"",
+    ""-o-border-corner-image"",
+    ""border-corner-image"",
+    ""-webkit-border-top-left-image"",
+    ""-moz-border-top-left-image"",
+    ""-o-border-top-left-image"",
+    ""border-top-left-image"",
+    ""-webkit-border-top-right-image"",
+    ""-moz-border-top-right-image"",
+    ""-o-border-top-right-image"",
+    ""border-top-right-image"",
+    ""-webkit-border-bottom-right-image"",
+    ""-moz-border-bottom-right-image"",
+    ""-o-border-bottom-right-image"",
+    ""border-bottom-right-image"",
+    ""-webkit-border-bottom-left-image"",
+    ""-moz-border-bottom-left-image"",
+    ""-o-border-bottom-left-image"",
+    ""border-bottom-left-image"",
+    ""background"",
+    ""filter:progid:DXImageTransform.Microsoft.AlphaImageLoader"",
+    ""background-color"",
+    ""background-image"",
+    ""background-attachment"",
+    ""background-position"",
+    ""-ms-background-position-x"",
+    ""-ms-background-position-y"",
+    ""background-position-x"",
+    ""background-position-y"",
+    ""background-clip"",
+    ""background-origin"",
+    ""-webkit-background-size"",
+    ""-moz-background-size"",
+    ""-o-background-size"",
+    ""background-size"",
+    ""background-repeat"",
+    ""box-decoration-break"",
+    ""-webkit-box-shadow"",
+    ""-moz-box-shadow"",
+    ""box-shadow"",
+    ""color"",
+    ""table-layo
+End Exploring Related Columns
+Task: Extract and count the frequency of all package names listed in the require section of JSON-formatted content
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+package_name,frequency
+package_name1:str,count1:int
+package_name2:str,count2:int
+...
+```
+
+This table lists all the package names found in the `require` section of the JSON-formatted `content` in the `SAMPLE_CONTENTS` table, along with the count of how often each package appears..
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: ({database name: {schema name: {table name}}}): 
+{'GITHUB_REPOS': {'GITHUB_REPOS': ['LANGUAGES', 'LICENSES', 'SAMPLE_COMMITS', 'SAMPLE_CONTENTS', 'SAMPLE_FILES', 'SAMPLE_REPOS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.Keep all decimals to four decimal places.
+
+2025-01-20 12:08:34 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-20 12:08:34 - root - INFO - ```sql
+SELECT "package_name", COUNT(*) AS "frequency"
+FROM (
+  SELECT
+    f1."KEY" AS "package_name"
+  FROM
+    GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+    LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f,
+    LATERAL FLATTEN(input => f."VALUE") f1
+  WHERE
+    f."KEY" = 'require'
+)
+GROUP BY "package_name"
+ORDER BY "frequency" DESC NULLS LAST;
+```
+2025-01-20 12:08:34 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:08:34 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:08:34 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:08:36 - snowflake.connector.cursor - INFO - Number of results in first chunk: 28
+2025-01-20 12:08:36 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:08:36 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:08:36 - root - INFO - itercount: 1
+2025-01-20 12:08:36 - root - INFO - 0
+2025-01-20 12:08:36 - root - INFO - results: 
+package_name,frequency
+php,11
+doctrine/orm,2
+doctrine/doctrine-bundle,2
+symfony/framework-bundle,2
+symfony/symfony,2
+symfony/monolog-bundle,2
+symfony/swiftmailer-bundle,1
+league/fractal,1
+symfony/doctrine-bridge,1
+sensio/distribution-bundle,1
+sensio/generator-bundle,1
+asgard/form,1
+yiisoft/yii2,1
+beberlei/assert,1
+doctrine/common,1
+gointegro/hateoas,1
+hautelook/phpass,1
+illuminate/support,1
+twig/extensions,1
+symfony/assetic-bundle,1
+incenteev/composer-parameter-handler,1
+asgard/entity,1
+knplabs/github-api,1
+doctrine/collections,1
+sensio/framework-extra-bundle,1
+j7mbo/twitter-api-php,1
+squizlabs/php_codesniffer,1
+psr/log,1
+
+
+2025-01-20 12:08:36 - root - INFO - Please check the answer again by reviewing Extract and count the frequency of all package names listed in the require section of JSON-formatted content, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+Keep all decimals to four decimal places.
+The answer format should be like: ```csv
+package_name,frequency
+package_name1:str,count1:int
+package_name2:str,count2:int
+...
+```
+
+This table lists all the package names found in the `require` section of the JSON-formatted `content` in the `SAMPLE_CONTENTS` table, along with the count of how often each package appears. The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+package_name,frequency
+php,11
+doctrine/orm,2
+doctrine/doctrine-bundle,2
+symfony/framework-bundle,2
+symfony/symfony,2
+symfony/monolog-bundle,2
+symfony/swiftmailer-bundle,1
+league/fractal,1
+symfony/doctrine-bridge,1
+sensio/distribution-bundle,1
+sensio/generator-bundle,1
+asgard/form,1
+yiisoft/yii2,1
+beberlei/assert,1
+doctrine/common,1
+gointegro/hateoas,1
+hautelook/phpass,1
+illuminate/support,1
+twig/extensions,1
+symfony/assetic-bundle,1
+incenteev/composer-parameter-handler,1
+asgard/entity,1
+knplabs/github-api,1
+doctrine/collections,1
+sensio/framework-extra-bundle,1
+j7mbo/twitter-api-php,1
+squizlabs/php_codesniffer,1
+psr/log,1
+Current sql:
+SELECT "package_name", COUNT(*) AS "frequency"
+FROM (
+  SELECT
+    f1."KEY" AS "package_name"
+  FROM
+    GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+    LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f,
+    LATERAL FLATTEN(input => f."VALUE") f1
+  WHERE
+    f."KEY" = 'require'
+)
+GROUP BY "package_name"
+ORDER BY "frequency" DESC NULLS LAST;
+2025-01-20 12:09:07 - httpx - INFO - HTTP Request: POST https://sfc-ml-sweden.openai.azure.com/openai/deployments/o1-preview/chat/completions?api-version=2024-02-15-preview "HTTP/1.1 200 OK"
+2025-01-20 12:09:07 - root - INFO - ```sql
+SELECT "package_name", COUNT(*) AS "frequency"
+FROM (
+  SELECT
+    f1."KEY" AS "package_name"
+  FROM
+    GITHUB_REPOS.GITHUB_REPOS.SAMPLE_CONTENTS t,
+    LATERAL FLATTEN(input => TRY_PARSE_JSON(t."content")) f,
+    LATERAL FLATTEN(input => f."VALUE") f1
+  WHERE
+    f."KEY" = 'require'
+)
+GROUP BY "package_name"
+ORDER BY "frequency" DESC NULLS LAST;
+```
+2025-01-20 12:09:07 - snowflake.connector.connection - INFO - Snowflake Connector for Python Version: 3.12.4, Python Version: 3.11.11, Platform: Linux-6.1.38-x86_64-with-glibc2.31
+2025-01-20 12:09:07 - snowflake.connector.connection - INFO - Connecting to GLOBAL Snowflake domain
+2025-01-20 12:09:07 - snowflake.connector.connection - INFO - This connection is in OCSP Fail Open Mode. TLS Certificates would be checked for validity and revocation status. Any other Certificate Revocation related exceptions or OCSP Responder failures would be disregarded in favor of connectivity.
+2025-01-20 12:09:08 - snowflake.connector.cursor - INFO - Number of results in first chunk: 28
+2025-01-20 12:09:08 - snowflake.connector.connection - INFO - closed
+2025-01-20 12:09:09 - snowflake.connector.connection - INFO - No async queries seem to be running, deleting session
+2025-01-20 12:09:09 - root - INFO - itercount: 2
+2025-01-20 12:09:09 - root - INFO - 0
+2025-01-20 12:09:09 - root - INFO - Total iteration counts: 2

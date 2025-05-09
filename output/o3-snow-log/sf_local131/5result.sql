@@ -1,0 +1,14 @@
+SELECT
+    MS."StyleName",
+    COALESCE(SUM(CASE WHEN MP."PreferenceSeq" = 1 THEN 1 ELSE 0 END), 0) AS "FirstPreferenceCount",
+    COALESCE(SUM(CASE WHEN MP."PreferenceSeq" = 2 THEN 1 ELSE 0 END), 0) AS "SecondPreferenceCount",
+    COALESCE(SUM(CASE WHEN MP."PreferenceSeq" = 3 THEN 1 ELSE 0 END), 0) AS "ThirdPreferenceCount"
+FROM
+    ENTERTAINMENTAGENCY.ENTERTAINMENTAGENCY."MUSICAL_STYLES"   MS
+LEFT JOIN
+    ENTERTAINMENTAGENCY.ENTERTAINMENTAGENCY."MUSICAL_PREFERENCES" MP
+        ON MS."StyleID" = MP."StyleID"
+GROUP BY
+    MS."StyleName"
+ORDER BY
+    MS."StyleName";

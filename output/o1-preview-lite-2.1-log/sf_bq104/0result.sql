@@ -1,0 +1,6 @@
+SELECT "dma_name", SUM("score") AS "total_search_score"
+FROM "GOOGLE_TRENDS"."GOOGLE_TRENDS"."TOP_RISING_TERMS"
+WHERE "week" BETWEEN DATEADD('year', -1, CURRENT_DATE() - INTERVAL '7 DAY') AND DATEADD('year', -1, CURRENT_DATE() + INTERVAL '7 DAY')
+GROUP BY "dma_name"
+ORDER BY "total_search_score" DESC NULLS LAST
+LIMIT 1;

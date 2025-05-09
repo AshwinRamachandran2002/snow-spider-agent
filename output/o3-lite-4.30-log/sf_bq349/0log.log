@@ -1,0 +1,2359 @@
+2025-05-01 01:16:19 - Thread-268 (execute) - INFO - [Answer format]
+```csv
+osm_id
+```
+[Answer format]
+2025-05-01 01:18:13 - Thread-268 (execute) - INFO - [Exploration]
+Relevant columns and their potential usage  
+
+• GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES  
+  – "feature_type": filter to only the administrative boundaries drawn as multipolygons.  
+  – "all_tags"     : JSON array to locate tags where key = 'boundary' and value = 'administrative'.  
+  – "geometry"     : WKB geometry ‒ convert with TO_GEOGRAPHY() to test spatial relations.  
+  – "osm_id" / "osm_way_id": returned OpenStreetMap identifier of each boundary.  
+
+• GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_NODES  
+  – "all_tags"     : JSON array to locate tags where key = 'amenity'.  
+  – "latitude","longitude": build GEOGRAPHY points with ST_MAKEPOINT() if "geometry" is NULL.  
+  – "geometry"     : WKB point ‒ preferred when present.  
+  – "id"           : node id, used only for reference / counting.  
+
+Typical conditions  
+1. "feature_type" = 'multipolygons'  
+2. "boundary"‑tag exists with value 'administrative'  
+3. in nodes: an entry with key = 'amenity' (value can be anything)  
+4. Spatial test: ST_CONTAINS( TO_GEOGRAPHY(boundary.geometry) , node_point ) = TRUE  
+
+Below are 10 exploratory Snowflake SQL queries (all capped with LIMIT 20) that step from inspection to the final answer search.
+
+```sql
+-- 1. View a few multipolygon rows and their tags
+SELECT 
+  "osm_id",
+  "osm_way_id",
+  "feature_type",
+  "all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"
+WHERE "feature_type" = 'multipolygons'
+LIMIT 20;
+```
+
+```sql
+-- 2. Confirm which of those multipolygons are administrative boundaries
+SELECT DISTINCT
+  pf."osm_id",
+  f.value:"key"::STRING   AS tag_key,
+  f.value:"value"::STRING AS tag_val
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+     LATERAL FLATTEN ( INPUT => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING = 'boundary'
+LIMIT 20;
+```
+
+```sql
+-- 3. Pull a sample of nodes that carry an 'amenity' tag
+SELECT 
+  pn."id",
+  pn."latitude",
+  pn."longitude",
+  pn."all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+```
+
+```sql
+-- 4. Produce a point GEOGRAPHY for each amenity node
+SELECT 
+  pn."id",
+  COALESCE(
+     TO_GEOGRAPHY(pn."geometry"),
+     ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+  ) AS node_geo
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+```
+
+```sql
+-- 5. Single‑boundary test: how many amenity nodes fall inside one boundary
+WITH one_boundary AS (
+  SELECT 
+    pf."osm_id",
+    TO_GEOGRAPHY(pf."geometry") AS bnd_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  LIMIT 1            -- pick one boundary for demo
+)
+SELECT 
+  ob."osm_id"          AS boundary_id,
+  COUNT(*)             AS amenity_cnt
+FROM one_boundary ob
+JOIN (
+    SELECT 
+      pn."id",
+      COALESCE(
+         TO_GEOGRAPHY(pn."geometry"),
+         ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+      ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN( INPUT => pn."all_tags") t
+    WHERE t.value:"key"::STRING = 'amenity'
+) amen
+  ON ST_CONTAINS(ob.bnd_geo , amen.node_geo)
+LIMIT 20;
+```
+
+```sql
+-- 6. Count amenity‑tagged POIs for every administrative boundary (limited sample)
+WITH admin_bounds AS (
+  SELECT 
+    COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+    TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  LIMIT 200      -- sample for speed
+),
+amen_nodes AS (
+  SELECT 
+    pn."id",
+    COALESCE(
+       TO_GEOGRAPHY(pn."geometry"),
+       ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+    ) AS node_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+       LATERAL FLATTEN( INPUT => pn."all_tags") t
+  WHERE t.value:"key"::STRING = 'amenity'
+)
+SELECT 
+  ab.boundary_id,
+  COUNT(amen.id) AS amenity_cnt
+FROM admin_bounds ab
+LEFT JOIN amen_nodes amen
+  ON ST_CONTAINS(ab.bnd_geo , amen.node_geo)
+GROUP BY ab.boundary_id
+LIMIT 20;
+```
+
+```sql
+-- 7. Derive the median of those amenity counts
+WITH amen_ct AS (
+  SELECT 
+    COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+    COUNT(*) AS amenity_cnt
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"   pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f,
+       LATERAL (
+         SELECT pn.*
+         FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+              LATERAL FLATTEN( INPUT => pn."all_tags") t
+         WHERE t.value:"key"::STRING = 'amenity'
+           AND ST_CONTAINS( TO_GEOGRAPHY(pf."geometry"),
+                             COALESCE( TO_GEOGRAPHY(pn."geometry"),
+                                       ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)))
+       ) node_match
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  GROUP BY boundary_id
+)
+SELECT MEDIAN(amenity_cnt) AS median_cnt
+FROM amen_ct
+LIMIT 20;
+```
+
+```sql
+-- 8. Compute each boundary’s deviation from the median
+WITH amen_ct AS (
+  SELECT 
+    COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+    COUNT(*) AS amenity_cnt
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"   pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f,
+       LATERAL (
+         SELECT pn.*
+         FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+              LATERAL FLATTEN( INPUT => pn."all_tags") t
+         WHERE t.value:"key"::STRING = 'amenity'
+           AND ST_CONTAINS( TO_GEOGRAPHY(pf."geometry"),
+                             COALESCE( TO_GEOGRAPHY(pn."geometry"),
+                                       ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)))
+       ) node_match
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  GROUP BY boundary_id
+),
+m AS ( SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct )
+SELECT 
+  a.boundary_id,
+  a.amenity_cnt,
+  ABS(a.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct a, m
+LIMIT 20;
+```
+
+```sql
+-- 9. Order boundaries by closeness to the median
+WITH amen_ct AS ( /* same CTE as previous */ ),
+m AS ( SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct )
+SELECT 
+  a.boundary_id,
+  a.amenity_cnt,
+  ABS(a.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct a, m
+ORDER BY diff_from_median ASC, a.boundary_id
+LIMIT 20;
+```
+
+```sql
+-- 10. Boundary (OpenStreetMap ID) whose amenity count is closest to the median
+WITH amen_ct AS ( /* same CTE build as before */ ),
+m AS ( SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct ),
+ranked AS (
+  SELECT 
+    a.boundary_id,
+    a.amenity_cnt,
+    ABS(a.amenity_cnt - m.median_cnt) AS diff_from_median,
+    ROW_NUMBER() OVER (ORDER BY ABS(a.amenity_cnt - m.median_cnt)) AS rn
+  FROM amen_ct a, m
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 20;
+```
+
+Each query builds on the previous ones, moving from simple inspection (Queries 1–4) through spatial joins and aggregation (Queries 5–8) to finally isolate the administrative boundary whose amenity‑POI total is nearest to the overall median (Queries 9–10).
+[Exploration]
+2025-05-01 01:18:13 - Thread-268 (execute) - INFO - [Try to execute]
+-- 1. View a few multipolygon rows and their tags
+SELECT 
+  "osm_id",
+  "osm_way_id",
+  "feature_type",
+  "all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"
+WHERE "feature_type" = 'multipolygons'
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:18:22 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1. View a few multipolygon rows and their tags
+SELECT 
+  "osm_id",
+  "osm_way_id",
+  "feature_type",
+  "all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"
+WHERE "feature_type" = 'multipolygons'
+LIMIT 20;
+Results:
+osm_id,osm_way_id,feature_type,all_tags
+,757363719,multipolygons,"[
+  {
+    ""key"": ""landuse"",
+    ""value"": ""residential""
+  },
+  {
+    ""key"": ""place"",
+    ""value"": ""plot""
+  }
+]"
+,745417460,multipolygons,"[
+  {
+    ""key"": ""landuse"",
+    ""value"": ""residential""
+  },
+  {
+    ""key"": ""place"",
+    ""value"": ""plot""
+  }
+]"
+,754398980,multipolygons,"[
+  {
+    ""key"": ""landuse"",
+    ""value"": ""residential""
+  },
+  {
+    ""key"": ""place"",
+    ""value"": ""plot""
+  }
+]
+
+[Successfully executed]
+2025-05-01 01:18:22 - Thread-268 (execute) - INFO - [Try to execute]
+-- 2. Confirm which of those multipolygons are administrative boundaries
+SELECT DISTINCT
+  pf."osm_id",
+  f.value:"key"::STRING   AS tag_key,
+  f.value:"value"::STRING AS tag_val
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+     LATERAL FLATTEN ( INPUT => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING = 'boundary'
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:18:25 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2. Confirm which of those multipolygons are administrative boundaries
+SELECT DISTINCT
+  pf."osm_id",
+  f.value:"key"::STRING   AS tag_key,
+  f.value:"value"::STRING AS tag_val
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+     LATERAL FLATTEN ( INPUT => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING = 'boundary'
+LIMIT 20;
+Results:
+osm_id,TAG_KEY,TAG_VAL
+5721501,boundary,administrative
+11801609,boundary,national_park
+4273830,boundary,protected_area
+10571631,boundary,postal_code
+7035994,boundary,administrative
+6923010,boundary,administrative
+11156538,boundary,administrative
+10564738,boundary,postal_code
+5721503,boundary,administrative
+12667366,boundary,protected_area
+11736449,boundary,postal_code
+12572441,boundary,place
+10571630,boundary,postal_code
+6853206,boundary,administrative
+
+[Successfully executed]
+2025-05-01 01:18:25 - Thread-268 (execute) - INFO - [Try to execute]
+-- 3. Pull a sample of nodes that carry an 'amenity' tag
+SELECT 
+  pn."id",
+  pn."latitude",
+  pn."longitude",
+  pn."all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:18:26 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3. Pull a sample of nodes that carry an 'amenity' tag
+SELECT 
+  pn."id",
+  pn."latitude",
+  pn."longitude",
+  pn."all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+Results:
+id,latitude,longitude,all_tags
+5153788346,46.764770500,23.575598700,"[
+  {
+    ""key"": ""amenity"",
+    ""value"": ""nightclub""
+  },
+  {
+    ""key"": ""name"",
+    ""value"": ""Club-Come""
+  },
+  {
+    ""key"": ""opening_hours"",
+    ""value"": ""Mo-Fr 11:00-24:00; Sa,Su 12:00-24:00; PH off""
+  }
+]"
+8526165505,43.855187000,19.840372800,"[
+  {
+    ""key"": ""amenity"",
+    ""value"": ""bench""
+  }
+]"
+8909701159,43.853064100,19.831971500,"[
+  {
+    ""key"": ""amenity"",
+    ""value"": ""bench
+
+[Successfully executed]
+2025-05-01 01:18:26 - Thread-268 (execute) - INFO - [Try to execute]
+-- 4. Produce a point GEOGRAPHY for each amenity node
+SELECT 
+  pn."id",
+  COALESCE(
+     TO_GEOGRAPHY(pn."geometry"),
+     ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+  ) AS node_geo
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:18:27 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4. Produce a point GEOGRAPHY for each amenity node
+SELECT 
+  pn."id",
+  COALESCE(
+     TO_GEOGRAPHY(pn."geometry"),
+     ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+  ) AS node_geo
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+Results:
+id,NODE_GEO
+8639920472,"{
+  ""coordinates"": [
+    1.984577080000000e+01,
+    4.384944350000000e+01
+  ],
+  ""type"": ""Point""
+}"
+3073957534,"{
+  ""coordinates"": [
+    1.859092190000000e+01,
+    4.634670230000000e+01
+  ],
+  ""type"": ""Point""
+}"
+8892342895,"{
+  ""coordinates"": [
+    2.057953160000000e+01,
+    4.442529950000000e+01
+  ],
+  ""type"": ""Point""
+}"
+8151100720,"{
+  ""coordinates"": [
+    1.984136760000000e+01,
+    4.385702590000000e+01
+  ],
+  ""type"": ""Point""
+}"
+8300980287,
+
+[Successfully executed]
+2025-05-01 01:18:27 - Thread-268 (execute) - INFO - [Try to execute]
+-- 5. Single‑boundary test: how many amenity nodes fall inside one boundary
+WITH one_boundary AS (
+  SELECT 
+    pf."osm_id",
+    TO_GEOGRAPHY(pf."geometry") AS bnd_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  LIMIT 1            -- pick one boundary for demo
+)
+SELECT 
+  ob."osm_id"          AS boundary_id,
+  COUNT(*)             AS amenity_cnt
+FROM one_boundary ob
+JOIN (
+    SELECT 
+      pn."id",
+      COALESCE(
+         TO_GEOGRAPHY(pn."geometry"),
+         ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+      ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN( INPUT => pn."all_tags") t
+    WHERE t.value:"key"::STRING = 'amenity'
+) amen
+  ON ST_CONTAINS(ob.bnd_geo , amen.node_geo)
+LIMIT 20;
+[Try to execute]
+2025-05-01 01:18:27 - Thread-268 (execute) - INFO - [Error occurred]
+000979 (42601): SQL compilation error:
+[SYS_VW."osm_id_0"] is not a valid group by expression
+[Error occurred]
+2025-05-01 01:20:29 - Thread-268 (execute) - INFO - [Corrected SQL]
+```sql
+/* ----------------------------------------------------------------------
+   Goal: return the OpenStreetMap ID of an administrative boundary
+         (multipolygon) whose number of amenity‑tagged POIs is closest
+         to the median among all such boundaries.
+
+   Thinking process encoded as comments inside one statement:
+
+   1) admin_bounds  – collect every feature that is a multipolygon with
+      boundary = administrative, casting its WKB to GEOGRAPHY.
+
+   2) amen_nodes    – turn each node that contains an “amenity” tag into
+      a GEOGRAPHY point (use stored geometry when present, otherwise
+      build from lon/lat).
+
+   3) amen_ct       – for every boundary, count amenity points that fall
+      inside it via ST_CONTAINS.
+
+   4) median_val    – compute the median of those counts.
+
+   5) ranked        – compute absolute difference from the median and
+      rank boundaries by that difference (then by id to break ties).
+
+   6) final select  – output the single boundary_id with rank = 1.
+------------------------------------------------------------------------ */
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS boundary_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"          = 'multipolygons'
+      AND tag.value:"key"::STRING    = 'boundary'
+      AND tag.value:"value"::STRING  = 'administrative'
+),
+amen_nodes AS (
+    SELECT
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an.node_geo) AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.boundary_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+median_val AS (
+    SELECT MEDIAN(amenity_cnt) AS med_cnt FROM amen_ct
+),
+ranked AS (
+    SELECT
+        ac.boundary_id,
+        ac.amenity_cnt,
+        ABS(ac.amenity_cnt - mv.med_cnt) AS diff_from_median,
+        ROW_NUMBER() OVER (ORDER BY ABS(ac.amenity_cnt - mv.med_cnt), ac.boundary_id) AS rn
+    FROM amen_ct ac, median_val mv
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 1;
+```
+[Corrected SQL]
+2025-05-01 01:21:59 - Thread-268 (execute) - INFO - [Results for corrected sql]
+BOUNDARY_ID
+28958
+
+[Results for corrected sql]
+2025-05-01 01:23:21 - Thread-268 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Count amenity‑tagged POIs for every administrative boundary (sample of 200 boundaries) and return counts.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200        -- keep a small sample for quick look
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+)
+SELECT
+    ab.boundary_id,
+    COUNT(an."id") AS amenity_cnt
+FROM admin_bounds ab
+LEFT JOIN amen_nodes an
+  ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+GROUP BY ab.boundary_id
+LIMIT 20;
+```
+
+```sql
+--Description: Compute the median number of amenity POIs per administrative boundary (using the same 200‑boundary sample).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+)
+SELECT MEDIAN(amenity_cnt) AS median_cnt
+FROM amen_ct
+LIMIT 20;
+```
+
+```sql
+--Description: For each administrative boundary (sample), compute deviation of its amenity count from the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+LIMIT 20;
+```
+
+```sql
+--Description: Order boundaries (sample) by how close their amenity count is to the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+ORDER BY diff_from_median ASC, ac.boundary_id
+LIMIT 20;
+```
+
+```sql
+--Description: Return the boundary whose amenity count is closest to the median (ties broken by smaller ID).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+median_val AS (
+    SELECT MEDIAN(amenity_cnt) AS med_cnt FROM amen_ct
+),
+ranked AS (
+    SELECT
+        ac.boundary_id,
+        ac.amenity_cnt,
+        ABS(ac.amenity_cnt - mv.med_cnt) AS diff_from_median,
+        ROW_NUMBER() OVER (ORDER BY ABS(ac.amenity_cnt - mv.med_cnt), ac.boundary_id) AS rn
+    FROM amen_ct ac, median_val mv
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 1;
+```
+
+[Corrected other sqls]
+2025-05-01 01:23:21 - Thread-268 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+/* ----------------------------------------------------------------------
+   Goal: return the OpenStreetMap ID of an administrative boundary
+         (multipolygon) whose number of amenity‑tagged POIs is closest
+         to the median among all such boundaries.
+
+   Thinking process encoded as comments inside one statement:
+
+   1) admin_bounds  – collect every feature that is a multipolygon with
+      boundary = administrative, casting its WKB to GEOGRAPHY.
+
+   2) amen_nodes    – turn each node that contains an “amenity” tag into
+      a GEOGRAPHY point (use stored geometry when present, otherwise
+      build from lon/lat).
+
+   3) amen_ct       – for every boundary, count amenity points that fall
+      inside it via ST_CONTAINS.
+
+   4) median_val    – compute the median of those counts.
+
+   5) ranked        – compute absolute difference from the median and
+      rank boundaries by that difference (then by id to break ties).
+
+   6) final select  – output the single boundary_id with rank = 1.
+------------------------------------------------------------------------ */
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS boundary_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"          = 'multipolygons'
+      AND tag.value:"key"::STRING    = 'boundary'
+      AND tag.value:"value"::STRING  = 'administrative'
+),
+amen_nodes AS (
+    SELECT
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an.node_geo) AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.boundary_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+median_val AS (
+    SELECT MEDIAN(amenity_cnt) AS med_cnt FROM amen_ct
+),
+ranked AS (
+    SELECT
+        ac.boundary_id,
+        ac.amenity_cnt,
+        ABS(ac.amenity_cnt - mv.med_cnt) AS diff_from_median,
+        ROW_NUMBER() OVER (ORDER BY ABS(ac.amenity_cnt - mv.med_cnt), ac.boundary_id) AS rn
+    FROM amen_ct ac, median_val mv
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 1;
+Results:
+BOUNDARY_ID
+28958
+
+[Successfully corrected]
+2025-05-01 01:23:21 - Thread-268 (execute) - INFO - [Try to execute]
+--Description: Count amenity‑tagged POIs for every administrative boundary (sample of 200 boundaries) and return counts.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200        -- keep a small sample for quick look
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+)
+SELECT
+    ab.boundary_id,
+    COUNT(an."id") AS amenity_cnt
+FROM admin_bounds ab
+LEFT JOIN amen_nodes an
+  ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+GROUP BY ab.boundary_id
+LIMIT 20
+[Try to execute]
+2025-05-01 01:23:51 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Count amenity‑tagged POIs for every administrative boundary (sample of 200 boundaries) and return counts.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200        -- keep a small sample for quick look
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+)
+SELECT
+    ab.boundary_id,
+    COUNT(an."id") AS amenity_cnt
+FROM admin_bounds ab
+LEFT JOIN amen_nodes an
+  ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+GROUP BY ab.boundary_id
+LIMIT 20
+Results:
+BOUNDARY_ID,AMENITY_CNT
+6923782,0
+11998952,0
+8505224,0
+38852980,0
+11168646,0
+12229038,0
+7070142,0
+6921421,0
+7093973,0
+354079,0
+12724062,0
+13015735,0
+7025123,0
+12860333,0
+38854045,0
+7070013,0
+7091489,0
+6778256,0
+7066218,0
+5216199,0
+
+[Successfully executed]
+2025-05-01 01:23:51 - Thread-268 (execute) - INFO - [Try to execute]
+--Description: Compute the median number of amenity POIs per administrative boundary (using the same 200‑boundary sample).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+)
+SELECT MEDIAN(amenity_cnt) AS median_cnt
+FROM amen_ct
+LIMIT 20
+[Try to execute]
+2025-05-01 01:24:57 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Compute the median number of amenity POIs per administrative boundary (using the same 200‑boundary sample).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+)
+SELECT MEDIAN(amenity_cnt) AS median_cnt
+FROM amen_ct
+LIMIT 20
+Results:
+MEDIAN_CNT
+0.000
+
+[Successfully executed]
+2025-05-01 01:24:57 - Thread-268 (execute) - INFO - [Try to execute]
+--Description: For each administrative boundary (sample), compute deviation of its amenity count from the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+LIMIT 20
+[Try to execute]
+2025-05-01 01:25:14 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: For each administrative boundary (sample), compute deviation of its amenity count from the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+LIMIT 20
+Results:
+BOUNDARY_ID,AMENITY_CNT,DIFF_FROM_MEDIAN
+7095383,0,0.000
+6900545,0,0.000
+7024944,0,0.000
+7105160,0,0.000
+11143560,0,0.000
+7066677,0,0.000
+7100763,0,0.000
+11998969,0,0.000
+13406472,0,0.000
+3429037,0,0.000
+6900745,0,0.000
+7086981,0,0.000
+12691845,0,0.000
+7024449,0,0.000
+5349631,0,0.000
+13015698,0,0.000
+7091378,0,0.000
+
+[Successfully executed]
+2025-05-01 01:25:14 - Thread-268 (execute) - INFO - [Try to execute]
+--Description: Order boundaries (sample) by how close their amenity count is to the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+ORDER BY diff_from_median ASC, ac.boundary_id
+LIMIT 20
+[Try to execute]
+2025-05-01 01:25:19 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Order boundaries (sample) by how close their amenity count is to the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+ORDER BY diff_from_median ASC, ac.boundary_id
+LIMIT 20
+Results:
+BOUNDARY_ID,AMENITY_CNT,DIFF_FROM_MEDIAN
+351755,0,0.000
+353064,0,0.000
+354051,0,0.000
+355050,0,0.000
+355073,0,0.000
+355521,0,0.000
+1645389,0,0.000
+5216123,0,0.000
+5349566,0,0.000
+5349631,0,0.000
+5349655,0,0.000
+5349732,0,0.000
+5721501,0,0.000
+5721503,0,0.000
+5996601,0,0.000
+6251544,0,0.000
+6853206,0,0.000
+
+[Successfully executed]
+2025-05-01 01:25:19 - Thread-268 (execute) - INFO - [Try to execute]
+--Description: Return the boundary whose amenity count is closest to the median (ties broken by smaller ID).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+median_val AS (
+    SELECT MEDIAN(amenity_cnt) AS med_cnt FROM amen_ct
+),
+ranked AS (
+    SELECT
+        ac.boundary_id,
+        ac.amenity_cnt,
+        ABS(ac.amenity_cnt - mv.med_cnt) AS diff_from_median,
+        ROW_NUMBER() OVER (ORDER BY ABS(ac.amenity_cnt - mv.med_cnt), ac.boundary_id) AS rn
+    FROM amen_ct ac, median_val mv
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 1
+[Try to execute]
+2025-05-01 01:25:23 - Thread-268 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Return the boundary whose amenity count is closest to the median (ties broken by smaller ID).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+median_val AS (
+    SELECT MEDIAN(amenity_cnt) AS med_cnt FROM amen_ct
+),
+ranked AS (
+    SELECT
+        ac.boundary_id,
+        ac.amenity_cnt,
+        ABS(ac.amenity_cnt - mv.med_cnt) AS diff_from_median,
+        ROW_NUMBER() OVER (ORDER BY ABS(ac.amenity_cnt - mv.med_cnt), ac.boundary_id) AS rn
+    FROM amen_ct ac, median_val mv
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 1
+Results:
+BOUNDARY_ID
+28958
+
+[Successfully executed]
+2025-05-01 01:25:23 - Thread-268 (execute) - INFO - itercount: 0
+2025-05-01 01:25:23 - Thread-268 (execute) - INFO - [Self-refine]
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.HISTORY_RELATIONS
+Column name: username Type: TEXT Description: None
+Column name: members Type: VARIANT Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: visible Type: BOOLEAN Description: None
+Column name: version Type: NUMBER Description: None
+Column name: geometry Type: BINARY Description: None
+Column name: all_tags Type: VARIANT Description: None
+Column name: changeset Type: NUMBER Description: None
+Sample rows:
+[{'id': 5426265, 'version': 11, 'username': 'Stylez995', 'changeset': 93021604, 'visible': True, 'osm_timestamp': 1603643356000000, 'geometry': 'bytearray(b\'\\x01\\x05\\x00\\x00\\x00\\x05\\x00\\x00\\x00\\x01\\x02\\x00\\x00\\x00\\x05\\x00\\x00\\x00\\xcd\\xde\\x08A\\xfd\\x91%@\\x8d5\\xb7\\x9d\\x11\\xf9M@\\xe0"\\x9c\\xbb\\x02\\x92%@\\xb7\\xee\\xe6\\xa9\\x0e\\xf9M@g\\xb6\\xf2\\x92\\xff\\x91%@R\\xb3\\xac\\xa0\\x0e\\xf9M@\\xa3\\xb3\\x82\\x95\\xf9\\x91%@\\x96?\\x95\\x89\\x11\\xf9M@\\xcd\\xde\\x08A\\xfd\\x91%@\\x8d5\\xb7\\x9d\\x11\\xf9M@\\x01\\x02\\x00\\x00\\x00\\x05\\x00\\x00\\x00\\\'\\xc2\\x86\\xa7W\\x8e%@\\xcd\\x12S\\xd8\\xfb\\xf8M@\\x16X\\x11\\x7f^\\x8e%@\\x02&\\x152\\xfc\\xf8M@\\xbbd\\xc1if\\x8e%@79\\xd7\\x8b\\xfc\\xf8M@\\x83LT\\xca\\xc6\\x8e%@=\\x04Dw\\xff\\xf8M@\\xbdO\\xfa\\xe7\\x0e\\x8f%@\\x1dA\\x85~\\x01\\xf9M@\\x01\\x02\\x00\\x00\\x00\\x05\\x00\\x00\\x00\\xce@\\x1bo\\xe1\\x8f%@\\xfb\\xcdz\\xe7\\x06\\xf9M@\\xdb\\xf9E\\t\\xfa\\x8f%@\\xf4\\x80\\xd4\\x81\\x07\\xf9M@\\xb6-Y\\x9a\\x06\\x9
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.HISTORY_CHANGESETS
+Column name: osm_timestamp_min Type: NUMBER Description: Minimum timestamp of objects contained in this changeset.
+Column name: ways Type: VARIANT Description: Ways that are part of this way
+Column name: id Type: NUMBER Description: Changeset ID.
+Column name: osm_timestamp_max Type: NUMBER Description: Maximum timestamp of objects contained in this changeset.
+Column name: relations Type: VARIANT Description: Relations that are part of this way
+Column name: nodes Type: VARIANT Description: Nodes that are part of this way
+Sample rows:
+[{'id': 30256461, 'osm_timestamp_min': 1429167998, 'osm_timestamp_max': 1429167998, 'relations': '[\n  2787405\n]', 'ways': '[]', 'nodes': '[]'}, {'id': 8254690, 'osm_timestamp_min': 1306424582, 'osm_timestamp_max': 1306424582, 'relations': '[\n  1573819\n]', 'ways': '[]', 'nodes': '[]'}, {'id': 12871634, 'osm_timestamp_min': 1346011892, 'osm_timestamp_max': 1346011894, 'relations': '[\n  186430\n]', 'ways': '[]', 'nodes': '[\n  171513871\n]'}, {'id': 33171592, 'osm_timestamp_min': 1438929466, 'osm_timestamp_max': 1438929466, 'relations': '[\n  5419230,\n  5419225\n]', 'ways': '[]', 'nodes': '[]'}, {'id': 65078513, 'osm_timestamp_min': 1543686864, 'osm_timestamp_max': 1543686864, 'relations': '[\n  9068338\n]', 'ways': '[]', 'nodes': '[]'}]
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES
+Column name: geometry Type: BINARY Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: all_tags Type: VARIANT Description: None
+Column name: feature_type Type: TEXT Description: None
+Column name: osm_version Type: NUMBER Description: None
+Column name: osm_id Type: NUMBER Description: None
+Column name: osm_way_id Type: NUMBER Description: None
+Sample rows:
+[{'feature_type': 'multipolygons', 'osm_id': None, 'osm_way_id': 839339694, 'osm_version': 1, 'osm_timestamp': 1598016026000000, 'all_tags': '[\n  {\n    "key": "landuse",\n    "value": "residential"\n  },\n  {\n    "key": "name",\n    "value": "شهرک امام زمان"\n  }\n]', 'geometry': "bytearray(b'\\x01\\x03\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x17\\x00\\x00\\x00\\\\2}e\\x94\\xdeI@\\xd1\\xb4\\xc4\\xcahX@@\\x12/O\\xe7\\x8a\\xdeI@\\xff\\t\\x89\\x0fGX@@\\x04JT\\xb9\\x9a\\xdeI@\\xb5\\x83\\x11\\xfb\\x04X@@\\x8c\\x8c\\xc4\\xba\\xa7\\xdeI@\\xe1\\xdbO!\\xb2W@@\\xc9\\xee\\xb8\\x97\\xea\\xdeI@\\xbc\\x9c\\x12\\x10\\x93W@@\\x1c\\x04\\xc2\\xf3\\xf7\\xdeI@i|\\x15\\xcf\\x8fW@@\\xab\\x1e\\xd5U&\\xdfI@\\xd8u\\xb9\\xd2|W@@\\xd4\\xf3n,(\\xdfI@\\x1f\\xf4lV}W@@+hZbe\\xdfI@\\x9b\\xf8\\xb4\\xd4\\x8bW@@:\\xe9}\\xe3k\\xdfI@\\x88\\x06\\x18L\\xb2W@@\\x82j(Z^\\xdfI@\\xc6\\x8a\\x1aL\\xc3W@@\\xb1\\xe1DO%\\xdfI@\\xbf\\xa5R\\xa2\\xdbW@@>\\xc3\\x8a\\t \\xdfI@\\x9a\\xb5\\x14\\x90\\xf6W@@L\\x05p\\x0e2\\xdfI@\\xf5td\\x9b\\n
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES_POINTS
+Column name: geometry Type: BINARY Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: osm_way_id Type: NUMBER Description: None
+Column name: osm_id Type: NUMBER Description: None
+Column name: osm_version Type: NUMBER Description: None
+Column name: all_tags Type: VARIANT Description: None
+Sample rows:
+[{'osm_id': 8242788622, 'osm_version': 1, 'osm_way_id': None, 'osm_timestamp': 1608386913000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00\\xef\\xa6\\xa5\\x03\\xa3\\x9a4@\\xfc\\xb4@q\\xb6^C@')", 'all_tags': '[\n  {\n    "key": "id",\n    "value": "1"\n  }\n]'}, {'osm_id': 8242788645, 'osm_version': 1, 'osm_way_id': None, 'osm_timestamp': 1608386913000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00\\xb6\\xb5\\x85\\xe7\\xa5\\x9a4@\\\\23\\xd8y^C@')", 'all_tags': '[\n  {\n    "key": "id",\n    "value": "1"\n  }\n]'}, {'osm_id': 8242788728, 'osm_version': 1, 'osm_way_id': None, 'osm_timestamp': 1608386913000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00S\\x1a\\xd6\\xf9\\\\\\x9a4@e&\\x07\\xa2\\xdd]C@')", 'all_tags': '[\n  {\n    "key": "id",\n    "value": "1"\n  }\n]'}, {'osm_id': 5336182396, 'osm_version': 1, 'osm_way_id': None, 'osm_timestamp': 1515821683000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00\\xc4\\xa4S\\xb2\\xf7\\xd3<@P\\n\\xa9\\x91L\\x9dD@')"
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.HISTORY_LAYERS
+Column name: osm_id Type: NUMBER Description: None
+Column name: layer_name Type: TEXT Description: None
+Column name: all_tags Type: VARIANT Description: None
+Column name: osm_way_id Type: NUMBER Description: None
+Column name: geometry Type: BINARY Description: None
+Column name: gdal_type Type: TEXT Description: None
+Column name: layer_code Type: NUMBER Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: osm_version Type: NUMBER Description: None
+Column name: layer_class Type: TEXT Description: None
+Sample rows:
+[{'layer_code': 1500, 'layer_class': 'building', 'layer_name': 'building', 'osm_id': 295106180, 'osm_way_id': 295106180, 'osm_timestamp': 1492347889000000, 'osm_version': 2, 'all_tags': '[\n  {\n    "key": "building",\n    "value": "house"\n  },\n  {\n    "key": "addr:city",\n    "value": "Rawa Mazowiecka"\n  },\n  {\n    "key": "addr:street",\n    "value": "Aleksandrówka"\n  },\n  {\n    "key": "source:addr",\n    "value": "mrawamazowiecka.e-mapa.net"\n  },\n  {\n    "key": "addr:postcode",\n    "value": "96-200"\n  },\n  {\n    "key": "addr:city:simc",\n    "value": "0977077"\n  },\n  {\n    "key": "addr:housenumber",\n    "value": "11"\n  },\n  {\n    "key": "addr:street:sym_ul",\n    "value": "00228"\n  }\n]', 'geometry': "bytearray(b'\\x01\\x03\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x05\\x00\\x00\\x00S\\x94K\\xe3\\x17F4@U\\x84\\xe5\\x19E\\xe2I@i\\xa7\\x8b\\xb9\\x10F4@\\xa7\\xd0/\\x00C\\xe2I@\\xacO\\xdel\\x18F4@\\xba\\xd1\\xc7|@\\xe2I@\\x97<\\x9e\\x96\\x1fF4@\\xfbDT\\x97B\\xe2I@S\\x94
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_WAYS
+Column name: geometry Type: BINARY Description: None
+Column name: version Type: NUMBER Description: None
+Column name: visible Type: BOOLEAN Description: None
+Column name: username Type: TEXT Description: None
+Column name: all_tags Type: VARIANT Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: nodes Type: VARIANT Description: None
+Column name: id Type: NUMBER Description: None
+Column name: changeset Type: NUMBER Description: None
+Sample rows:
+[{'id': 73165139, 'version': 2, 'username': 'jumbanho', 'changeset': 10475054, 'visible': True, 'osm_timestamp': 1327342614000000, 'geometry': 'bytearray(b"\\x01\\x02\\x00\\x00\\x00\\x0b\\x00\\x00\\x00o\\xdc\\x18\\xf1\\xd3 ^\\xc0\\xedf\\xa1\\xf8\\x8c\\xb6A@\\xfaA]\\xa4\\xd0 ^\\xc0~\\xee\\xbam\\x95\\xb6A@\\\'\\x07\\xfd\\x96\\xca ^\\xc07y\\x80\\xdd\\x9f\\xb6A@8$Z\\x97\\xbf ^\\xc0\\x17N-\\xb6\\xa4\\xb6A@qC\\x8c\\xd7\\xbc ^\\xc0c}\\xa8\\xd9\\xa8\\xb6A@/Ie\\x8a\\xb9 ^\\xc0\\xff\\xb2{\\xf2\\xb0\\xb6A@\\xcex[\\xe9\\xb5 ^\\xc0\\\\g\\x8d\\x8b\\xb4\\xb6A@d\\xbakd\\xb2 ^\\xc0\\xbb\\xf9\\xfc\\xe6\\xb4\\xb6A@U0t6\\xae ^\\xc0\\x7f\\xf5\\xb8o\\xb5\\xb6A@cL\\xfa{\\xa9 ^\\xc0\\x1f\\xe7G\\r\\xb7\\xb6A@\\x9a\\xab\\xe69\\xa2 ^\\xc0\\xd74J\\xf2\\xb7\\xb6A@")', 'all_tags': '[\n  {\n    "key": "gnis:fcode",\n    "value": "46003"\n  },\n  {\n    "key": "gnis:ftype",\n    "value": "StreamRiver"\n  },\n  {\n    "key": "intermittent",\n    "value": "yes"\n  },\n  {\n    "key": "nhd:com_id",\n    "value": "373468
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.HISTORY_NODES
+Column name: all_tags Type: VARIANT Description: None
+Column name: changeset Type: NUMBER Description: None
+Column name: longitude Type: NUMBER Description: None
+Column name: username Type: TEXT Description: None
+Column name: latitude Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: geometry Type: BINARY Description: None
+Column name: visible Type: BOOLEAN Description: None
+Column name: version Type: NUMBER Description: None
+Sample rows:
+[{'id': 2719410933, 'version': 1, 'username': 'lodde1949', 'changeset': 21119993, 'visible': True, 'osm_timestamp': 1394901096000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00\\xd4\\xe8\\xc4\\xd4L\\xbd\\n@\\xb8vGk\\xb1_I@')", 'all_tags': '[]', 'latitude': '50.747601900', 'longitude': '3.342431700'}, {'id': 2024704316, 'version': 1, 'username': 'lodde1949', 'changeset': 13957937, 'visible': True, 'osm_timestamp': 1353500660000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00A$C\\x8e\\xad\\x87\\x0c@GrT\\xc9[gI@')", 'all_tags': '[]', 'latitude': '50.807488600', 'longitude': '3.566249000'}, {'id': 1923480350, 'version': 1, 'username': 'lodde1949', 'changeset': 13181552, 'visible': True, 'osm_timestamp': 1348134836000000, 'geometry': "bytearray(b'\\x01\\x01\\x00\\x00\\x00\\x01F\\xe1\\xc4\\xa1\\xc8\\x0b@s}\\xc4T\\x9fwI@')", 'all_tags': '[]', 'latitude': '50.934549900', 'longitude': '3.472964800'}, {'id': 2688228888, 'version': 1, 'username': 'lodde1949', 'changeset': 20748310,
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_NODES
+Column name: all_tags Type: VARIANT Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: changeset Type: NUMBER Description: None
+Column name: visible Type: BOOLEAN Description: None
+Column name: latitude Type: NUMBER Description: None
+Column name: geometry Type: BINARY Description: None
+Column name: username Type: TEXT Description: None
+Column name: version Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: longitude Type: NUMBER Description: None
+Sample rows:
+[{'id': 8809595840, 'version': 1, 'username': 'tschettervictor', 'changeset': 105929128, 'visible': True, 'osm_timestamp': 1623005376000000, 'geometry': None, 'all_tags': '[]', 'latitude': '49.438724700', 'longitude': '-113.443301100'}, {'id': 4811433843, 'version': 1, 'username': 'twesigyegabriel', 'changeset': 48059152, 'visible': True, 'osm_timestamp': 1492951085000000, 'geometry': None, 'all_tags': '[]', 'latitude': '-20.688499500', 'longitude': '28.986649100'}, {'id': 4926349833, 'version': 1, 'username': 'twesigyegabriel', 'changeset': 49688586, 'visible': True, 'osm_timestamp': 1497952209000000, 'geometry': None, 'all_tags': '[]', 'latitude': '3.376556000', 'longitude': '31.774604500'}, {'id': 7825875320, 'version': 1, 'username': 'twesigyegabriel', 'changeset': 89630746, 'visible': True, 'osm_timestamp': 1597836475000000, 'geometry': None, 'all_tags': '[]', 'latitude': '1.249124300', 'longitude': '34.772905300'}, {'id': 2164077960, 'version': 1, 'username': 'umrudasl-import', '
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_RELATIONS
+Column name: visible Type: BOOLEAN Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: id Type: NUMBER Description: None
+Column name: username Type: TEXT Description: None
+Column name: all_tags Type: VARIANT Description: None
+Column name: geometry Type: BINARY Description: None
+Column name: members Type: VARIANT Description: None
+Column name: version Type: NUMBER Description: None
+Column name: changeset Type: NUMBER Description: None
+Sample rows:
+[{'id': 7463946, 'version': 1, 'username': 'Aurimas Fišeras', 'changeset': 51041273, 'visible': True, 'osm_timestamp': 1502475117000000, 'geometry': 'bytearray(b\'\\x01\\x03\\x00\\x00\\x00\\x01\\x00\\x00\\x00>\\x00\\x00\\x00W$&\\xa8\\xe1\\xd58@[~;\\xe4\\xc1&L@\\xe9\\xdcH4\\xdc\\xd58@\\xb59\\xcem\\xc2&L@l\\xc6X\\\\\\xd2\\xd58@\\xde\\xe6\\x8d\\x93\\xc2&L@\\\'\\xf9\\x11\\xbfb\\xd58@4\\xc4\\x0c\\xe8\\xe0&L@b\\xe3\\xb0\\xeab\\xd58@\\xce\\xb0\\xac\\x8f\\xe2&L@\\xea\\x0b|\\xa0p\\xd58@\\xd3b\\xf00\\xed&L@Ec\\xed\\xefl\\xd58@r\\\\|\\xc0\\xf2&L@\\x07\\x8c?\\x9bf\\xd58@N\\xaes\\x1d\\xf4&L@\\xc7L\\xfd\\x17c\\xd58@\\x12\\xdey=\\xf3&L@\\x93S\\xe0\\tb\\xd58@\\xa3\\x90dV\\xef&L@]&ydb\\xd58@\\xb5IEc\\xed&L@\\xf2/892\\xd58@\\xbb<Br\\xd7&L@\\xa9\\x12eo)\\xd58@1\\x9a:4\\xd1&L@\\t\\xbfy\\x16)\\xd58@\\xd3\\xa3\\xa9\\x9e\\xcc&L@R\\x10\\x97w0\\xd58@\\x9b\\xf9\\xc4\\xf0\\xc7&L@\\xcbWn\\x0e|\\xd58@\\xd2\\xe4b\\x0c\\xac&L@P\\xe1c\\x0b\\x9c\\xd58@\\x8e.\\xdb\\xf3\\xa1&L@\\tz^\\xe0\\xa8\\xd58@\\xd2\\xf5\\x8ed\\xa0
+
+
+--------------------------------------------------
+Table full name: GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_LAYERS
+Column name: layer_code Type: NUMBER Description: None
+Column name: osm_id Type: NUMBER Description: None
+Column name: osm_timestamp Type: NUMBER Description: None
+Column name: osm_way_id Type: NUMBER Description: None
+Column name: layer_class Type: TEXT Description: None
+Column name: all_tags Type: VARIANT Description: None
+Column name: layer_name Type: TEXT Description: None
+Column name: geometry Type: BINARY Description: None
+Column name: gdal_type Type: TEXT Description: None
+Column name: osm_version Type: NUMBER Description: None
+Sample rows:
+[{'layer_code': 1500, 'layer_class': 'building', 'layer_name': 'building', 'gdal_type': 'multipolygons', 'osm_id': None, 'osm_way_id': 80820903, 'osm_timestamp': 1286621389000000, 'osm_version': 1, 'all_tags': '[\n  {\n    "key": "building",\n    "value": "yes"\n  },\n  {\n    "key": "source",\n    "value": "extraction vectorielle v1 cadastre-dgi-fr source : Direction Générale des Impôts - Cadas. Mise à jour : 2010"\n  },\n  {\n    "key": "wall",\n    "value": "no"\n  }\n]', 'geometry': "bytearray(b'\\x01\\x03\\x00\\x00\\x00\\x01\\x00\\x00\\x00\\x06\\x00\\x00\\x00\\xa5\\xa8\\x8e\\xb0\\x03\\xb2\\x03@\\xae\\xdf\\x02\\xbf\\xfceH@<\\x1e\\xe9\\xc2\\xfe\\xb1\\x03@\\rrr\\x1a\\xfdeH@\\xf7\\xe7\\xa2!\\xe3\\xb1\\x03@\\xfc|J\\x84\\xfceH@Z\\xb5\\x10\\x89\\xe7\\xb1\\x03@H\\xec\\x7f%\\xfceH@\\x80\\xdd\\x9fA\\xf9\\xb1\\x03@%\\xfc\\xf7\\x85\\xfceH@\\xa5\\xa8\\x8e\\xb0\\x03\\xb2\\x03@\\xae\\xdf\\x02\\xbf\\xfceH@')"}, {'layer_code': 1500, 'layer_class': 'building', 'layer_name': 'building', 'gdal_type':
+
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+Categories: Geospatial functions
+
+
+## ST_DWITHIN
+
+Returns TRUE if the minimum geodesic distance between two points (two GEOGRAPHY objects) is within the specified distance. Otherwise, returns FALSE.
+If the parameters are GEOGRAPHY values that are not points (e.g. lines or polygons), this returns TRUE or FALSE based on the minimum geodesic distance between the two closest points of the two values.
+
+Tip You can use the search optimization service to improve the performance of queries that call this function.
+For details, see Search Optimization Service.
+
+## Syntax
+
+ST_DWITHIN( <geography_expression_1> , <geography_expression_2> , <distance_in_meters> )
+
+
+## Arguments
+
+
+geography_expression_1The argument must be an expression of type GEOGRAPHY.
+
+geography_expression_2The argument must be an expression of type GEOGRAPHY.
+
+distance_in_metersThe argument must be an expression of type REAL. The distance is in meters.
+
+
+## Returns
+
+Returns a BOOLEAN.
+
+## Usage notes
+
+
+Returns NULL if any input is NULL.
+
+
+## Examples
+
+This returns TRUE because the distance in meters between two points 1 degree apart along the equator is less than 150,000 meters:
+
+SELECT ST_DWITHIN (ST_MAKEPOINT(0, 0), ST_MAKEPOINT(1, 0), 150000);
++-------------------------------------------------------------+
+| ST_DWITHIN (ST_MAKEPOINT(0, 0), ST_MAKEPOINT(1, 0), 150000) |
+|-------------------------------------------------------------|
+| True                                                        |
++-------------------------------------------------------------+
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'GEO_OPENSTREETMAP': {'GEO_OPENSTREETMAP': ['HISTORY_RELATIONS', 'HISTORY_CHANGESETS', 'PLANET_FEATURES', 'PLANET_FEATURES_POINTS', 'HISTORY_LAYERS', 'PLANET_WAYS', 'HISTORY_NODES', 'PLANET_NODES', 'PLANET_RELATIONS', 'PLANET_LAYERS']}}
+Begin Exploring Related Columns
+Relevant columns and their potential usage  
+
+• GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_FEATURES  
+  – "feature_type": filter to only the administrative boundaries drawn as multipolygons.  
+  – "all_tags"     : JSON array to locate tags where key = 'boundary' and value = 'administrative'.  
+  – "geometry"     : WKB geometry ‒ convert with TO_GEOGRAPHY() to test spatial relations.  
+  – "osm_id" / "osm_way_id": returned OpenStreetMap identifier of each boundary.  
+
+• GEO_OPENSTREETMAP.GEO_OPENSTREETMAP.PLANET_NODES  
+  – "all_tags"     : JSON array to locate tags where key = 'amenity'.  
+  – "latitude","longitude": build GEOGRAPHY points with ST_MAKEPOINT() if "geometry" is NULL.  
+  – "geometry"     : WKB point ‒ preferred when present.  
+  – "id"           : node id, used only for reference / counting.  
+
+Typical conditions  
+1. "feature_type" = 'multipolygons'  
+2. "boundary"‑tag exists with value 'administrative'  
+3. in nodes: an entry with key = 'amenity' (value can be anything)  
+4. Spatial test: ST_CONTAINS( TO_GEOGRAPHY(boundary.geometry) , node_point ) = TRUE  
+
+Below are 10 exploratory Snowflake SQL queries (all capped with LIMIT 20) that step from inspection to the final answer search.
+
+```sql
+-- 1. View a few multipolygon rows and their tags
+SELECT 
+  "osm_id",
+  "osm_way_id",
+  "feature_type",
+  "all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"
+WHERE "feature_type" = 'multipolygons'
+LIMIT 20;
+```
+
+```sql
+-- 2. Confirm which of those multipolygons are administrative boundaries
+SELECT DISTINCT
+  pf."osm_id",
+  f.value:"key"::STRING   AS tag_key,
+  f.value:"value"::STRING AS tag_val
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+     LATERAL FLATTEN ( INPUT => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING = 'boundary'
+LIMIT 20;
+```
+
+```sql
+-- 3. Pull a sample of nodes that carry an 'amenity' tag
+SELECT 
+  pn."id",
+  pn."latitude",
+  pn."longitude",
+  pn."all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+```
+
+```sql
+-- 4. Produce a point GEOGRAPHY for each amenity node
+SELECT 
+  pn."id",
+  COALESCE(
+     TO_GEOGRAPHY(pn."geometry"),
+     ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+  ) AS node_geo
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+```
+
+```sql
+-- 5. Single‑boundary test: how many amenity nodes fall inside one boundary
+WITH one_boundary AS (
+  SELECT 
+    pf."osm_id",
+    TO_GEOGRAPHY(pf."geometry") AS bnd_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  LIMIT 1            -- pick one boundary for demo
+)
+SELECT 
+  ob."osm_id"          AS boundary_id,
+  COUNT(*)             AS amenity_cnt
+FROM one_boundary ob
+JOIN (
+    SELECT 
+      pn."id",
+      COALESCE(
+         TO_GEOGRAPHY(pn."geometry"),
+         ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+      ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN( INPUT => pn."all_tags") t
+    WHERE t.value:"key"::STRING = 'amenity'
+) amen
+  ON ST_CONTAINS(ob.bnd_geo , amen.node_geo)
+LIMIT 20;
+```
+
+```sql
+-- 6. Count amenity‑tagged POIs for every administrative boundary (limited sample)
+WITH admin_bounds AS (
+  SELECT 
+    COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+    TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  LIMIT 200      -- sample for speed
+),
+amen_nodes AS (
+  SELECT 
+    pn."id",
+    COALESCE(
+       TO_GEOGRAPHY(pn."geometry"),
+       ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+    ) AS node_geo
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+       LATERAL FLATTEN( INPUT => pn."all_tags") t
+  WHERE t.value:"key"::STRING = 'amenity'
+)
+SELECT 
+  ab.boundary_id,
+  COUNT(amen.id) AS amenity_cnt
+FROM admin_bounds ab
+LEFT JOIN amen_nodes amen
+  ON ST_CONTAINS(ab.bnd_geo , amen.node_geo)
+GROUP BY ab.boundary_id
+LIMIT 20;
+```
+
+```sql
+-- 7. Derive the median of those amenity counts
+WITH amen_ct AS (
+  SELECT 
+    COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+    COUNT(*) AS amenity_cnt
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"   pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f,
+       LATERAL (
+         SELECT pn.*
+         FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+              LATERAL FLATTEN( INPUT => pn."all_tags") t
+         WHERE t.value:"key"::STRING = 'amenity'
+           AND ST_CONTAINS( TO_GEOGRAPHY(pf."geometry"),
+                             COALESCE( TO_GEOGRAPHY(pn."geometry"),
+                                       ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)))
+       ) node_match
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  GROUP BY boundary_id
+)
+SELECT MEDIAN(amenity_cnt) AS median_cnt
+FROM amen_ct
+LIMIT 20;
+```
+
+```sql
+-- 8. Compute each boundary’s deviation from the median
+WITH amen_ct AS (
+  SELECT 
+    COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+    COUNT(*) AS amenity_cnt
+  FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"   pf,
+       LATERAL FLATTEN( INPUT => pf."all_tags") f,
+       LATERAL (
+         SELECT pn.*
+         FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+              LATERAL FLATTEN( INPUT => pn."all_tags") t
+         WHERE t.value:"key"::STRING = 'amenity'
+           AND ST_CONTAINS( TO_GEOGRAPHY(pf."geometry"),
+                             COALESCE( TO_GEOGRAPHY(pn."geometry"),
+                                       ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)))
+       ) node_match
+  WHERE pf."feature_type" = 'multipolygons'
+    AND f.value:"key"::STRING = 'boundary'
+    AND f.value:"value"::STRING = 'administrative'
+  GROUP BY boundary_id
+),
+m AS ( SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct )
+SELECT 
+  a.boundary_id,
+  a.amenity_cnt,
+  ABS(a.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct a, m
+LIMIT 20;
+```
+
+```sql
+-- 9. Order boundaries by closeness to the median
+WITH amen_ct AS ( /* same CTE as previous */ ),
+m AS ( SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct )
+SELECT 
+  a.boundary_id,
+  a.amenity_cnt,
+  ABS(a.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct a, m
+ORDER BY diff_from_median ASC, a.boundary_id
+LIMIT 20;
+```
+
+```sql
+-- 10. Boundary (OpenStreetMap ID) whose amenity count is closest to the median
+WITH amen_ct AS ( /* same CTE build as before */ ),
+m AS ( SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct ),
+ranked AS (
+  SELECT 
+    a.boundary_id,
+    a.amenity_cnt,
+    ABS(a.amenity_cnt - m.median_cnt) AS diff_from_median,
+    ROW_NUMBER() OVER (ORDER BY ABS(a.amenity_cnt - m.median_cnt)) AS rn
+  FROM amen_ct a, m
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 20;
+```
+
+Each query builds on the previous ones, moving from simple inspection (Queries 1–4) through spatial joins and aggregation (Queries 5–8) to finally isolate the administrative boundary whose amenity‑POI total is nearest to the overall median (Queries 9–10).
+Refined SQLs and results:
+Query:
+-- 1. View a few multipolygon rows and their tags
+SELECT 
+  "osm_id",
+  "osm_way_id",
+  "feature_type",
+  "all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES"
+WHERE "feature_type" = 'multipolygons'
+LIMIT 20;
+Answer:
+osm_id,osm_way_id,feature_type,all_tags
+,757363719,multipolygons,"[
+  {
+    ""key"": ""landuse"",
+    ""value"": ""residential""
+  },
+  {
+    ""key"": ""place"",
+    ""value"": ""plot""
+  }
+]"
+,745417460,multipolygons,"[
+  {
+    ""key"": ""landuse"",
+    ""value"": ""residential""
+  },
+  {
+    ""key"": ""place"",
+    ""value"": ""plot""
+  }
+]"
+,754398980,multipolygons,"[
+  {
+    ""key"": ""landuse"",
+    ""value"": ""residential""
+  },
+  {
+    ""key"": ""place"",
+    ""value"": ""plot""
+  }
+]
+Query:
+-- 2. Confirm which of those multipolygons are administrative boundaries
+SELECT DISTINCT
+  pf."osm_id",
+  f.value:"key"::STRING   AS tag_key,
+  f.value:"value"::STRING AS tag_val
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+     LATERAL FLATTEN ( INPUT => pf."all_tags") f
+WHERE  pf."feature_type" = 'multipolygons'
+  AND  f.value:"key"::STRING = 'boundary'
+LIMIT 20;
+Answer:
+osm_id,TAG_KEY,TAG_VAL
+5721501,boundary,administrative
+11801609,boundary,national_park
+4273830,boundary,protected_area
+10571631,boundary,postal_code
+7035994,boundary,administrative
+6923010,boundary,administrative
+11156538,boundary,administrative
+10564738,boundary,postal_code
+5721503,boundary,administrative
+12667366,boundary,protected_area
+11736449,boundary,postal_code
+12572441,boundary,place
+10571630,boundary,postal_code
+6853206,boundary,administrative
+Query:
+-- 3. Pull a sample of nodes that carry an 'amenity' tag
+SELECT 
+  pn."id",
+  pn."latitude",
+  pn."longitude",
+  pn."all_tags"
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+Answer:
+id,latitude,longitude,all_tags
+5153788346,46.764770500,23.575598700,"[
+  {
+    ""key"": ""amenity"",
+    ""value"": ""nightclub""
+  },
+  {
+    ""key"": ""name"",
+    ""value"": ""Club-Come""
+  },
+  {
+    ""key"": ""opening_hours"",
+    ""value"": ""Mo-Fr 11:00-24:00; Sa,Su 12:00-24:00; PH off""
+  }
+]"
+8526165505,43.855187000,19.840372800,"[
+  {
+    ""key"": ""amenity"",
+    ""value"": ""bench""
+  }
+]"
+8909701159,43.853064100,19.831971500,"[
+  {
+    ""key"": ""amenity"",
+    ""value"": ""bench
+Query:
+-- 4. Produce a point GEOGRAPHY for each amenity node
+SELECT 
+  pn."id",
+  COALESCE(
+     TO_GEOGRAPHY(pn."geometry"),
+     ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+  ) AS node_geo
+FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+     LATERAL FLATTEN( INPUT => pn."all_tags") t
+WHERE t.value:"key"::STRING = 'amenity'
+LIMIT 20;
+Answer:
+id,NODE_GEO
+8639920472,"{
+  ""coordinates"": [
+    1.984577080000000e+01,
+    4.384944350000000e+01
+  ],
+  ""type"": ""Point""
+}"
+3073957534,"{
+  ""coordinates"": [
+    1.859092190000000e+01,
+    4.634670230000000e+01
+  ],
+  ""type"": ""Point""
+}"
+8892342895,"{
+  ""coordinates"": [
+    2.057953160000000e+01,
+    4.442529950000000e+01
+  ],
+  ""type"": ""Point""
+}"
+8151100720,"{
+  ""coordinates"": [
+    1.984136760000000e+01,
+    4.385702590000000e+01
+  ],
+  ""type"": ""Point""
+}"
+8300980287,
+Query:
+--Description: Count amenity‑tagged POIs for every administrative boundary (sample of 200 boundaries) and return counts.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200        -- keep a small sample for quick look
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+)
+SELECT
+    ab.boundary_id,
+    COUNT(an."id") AS amenity_cnt
+FROM admin_bounds ab
+LEFT JOIN amen_nodes an
+  ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+GROUP BY ab.boundary_id
+LIMIT 20
+Answer:
+BOUNDARY_ID,AMENITY_CNT
+6923782,0
+11998952,0
+8505224,0
+38852980,0
+11168646,0
+12229038,0
+7070142,0
+6921421,0
+7093973,0
+354079,0
+12724062,0
+13015735,0
+7025123,0
+12860333,0
+38854045,0
+7070013,0
+7091489,0
+6778256,0
+7066218,0
+5216199,0
+Query:
+--Description: Compute the median number of amenity POIs per administrative boundary (using the same 200‑boundary sample).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+)
+SELECT MEDIAN(amenity_cnt) AS median_cnt
+FROM amen_ct
+LIMIT 20
+Answer:
+MEDIAN_CNT
+0.000
+Query:
+--Description: For each administrative boundary (sample), compute deviation of its amenity count from the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+LIMIT 20
+Answer:
+BOUNDARY_ID,AMENITY_CNT,DIFF_FROM_MEDIAN
+7095383,0,0.000
+6900545,0,0.000
+7024944,0,0.000
+7105160,0,0.000
+11143560,0,0.000
+7066677,0,0.000
+7100763,0,0.000
+11998969,0,0.000
+13406472,0,0.000
+3429037,0,0.000
+6900745,0,0.000
+7086981,0,0.000
+12691845,0,0.000
+7024449,0,0.000
+5349631,0,0.000
+13015698,0,0.000
+7091378,0,0.000
+Query:
+--Description: Order boundaries (sample) by how close their amenity count is to the median.
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+    LIMIT 200
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+m AS (SELECT MEDIAN(amenity_cnt) AS median_cnt FROM amen_ct)
+SELECT
+    ac.boundary_id,
+    ac.amenity_cnt,
+    ABS(ac.amenity_cnt - m.median_cnt) AS diff_from_median
+FROM amen_ct ac, m
+ORDER BY diff_from_median ASC, ac.boundary_id
+LIMIT 20
+Answer:
+BOUNDARY_ID,AMENITY_CNT,DIFF_FROM_MEDIAN
+351755,0,0.000
+353064,0,0.000
+354051,0,0.000
+355050,0,0.000
+355073,0,0.000
+355521,0,0.000
+1645389,0,0.000
+5216123,0,0.000
+5349566,0,0.000
+5349631,0,0.000
+5349655,0,0.000
+5349732,0,0.000
+5721501,0,0.000
+5721503,0,0.000
+5996601,0,0.000
+6251544,0,0.000
+6853206,0,0.000
+Query:
+--Description: Return the boundary whose amenity count is closest to the median (ties broken by smaller ID).
+WITH admin_bounds AS (
+    SELECT
+        COALESCE(pf."osm_id", pf."osm_way_id") AS boundary_id,
+        TO_GEOGRAPHY(pf."geometry")            AS bnd_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES" pf,
+         LATERAL FLATTEN(INPUT => pf."all_tags") tag
+    WHERE pf."feature_type"       = 'multipolygons'
+      AND tag.value:"key"::STRING = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amen_nodes AS (
+    SELECT
+        pn."id",
+        COALESCE(
+            TO_GEOGRAPHY(pn."geometry"),
+            ST_MAKEPOINT(pn."longitude"::DOUBLE, pn."latitude"::DOUBLE)
+        ) AS node_geo
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES" pn,
+         LATERAL FLATTEN(INPUT => pn."all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amen_ct AS (
+    SELECT
+        ab.boundary_id,
+        COUNT(an."id") AS amenity_cnt
+    FROM admin_bounds ab
+    LEFT JOIN amen_nodes an
+      ON ST_CONTAINS(ab.bnd_geo, an.node_geo)
+    GROUP BY ab.boundary_id
+),
+median_val AS (
+    SELECT MEDIAN(amenity_cnt) AS med_cnt FROM amen_ct
+),
+ranked AS (
+    SELECT
+        ac.boundary_id,
+        ac.amenity_cnt,
+        ABS(ac.amenity_cnt - mv.med_cnt) AS diff_from_median,
+        ROW_NUMBER() OVER (ORDER BY ABS(ac.amenity_cnt - mv.med_cnt), ac.boundary_id) AS rn
+    FROM amen_ct ac, median_val mv
+)
+SELECT boundary_id
+FROM ranked
+WHERE rn = 1
+LIMIT 1
+Answer:
+BOUNDARY_ID
+28958
+End Exploring Related Columns
+Task: Which OpenStreetMap ID from the planet features table corresponds to an administrative boundary, represented as multipolygons, whose total number of 'amenity'-tagged Points of Interest (POIs), as derived from the planet nodes table, is closest to the median count among all such boundaries?
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+Usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Follow the answer format like: ```csv
+osm_id
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'GEO_OPENSTREETMAP': {'GEO_OPENSTREETMAP': ['HISTORY_RELATIONS', 'HISTORY_CHANGESETS', 'PLANET_FEATURES', 'PLANET_FEATURES_POINTS', 'HISTORY_LAYERS', 'PLANET_WAYS', 'HISTORY_NODES', 'PLANET_NODES', 'PLANET_RELATIONS', 'PLANET_LAYERS']}}
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 01:26:34 - Thread-268 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH admin_bounds AS (
+    /* all administrative boundaries stored as multipolygons */
+    SELECT
+        COALESCE("osm_id", "osm_way_id")                      AS "osm_id",
+        TO_GEOGRAPHY("geometry")                              AS "geom"
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES",
+         LATERAL FLATTEN(INPUT => "all_tags") AS tag
+    WHERE "feature_type" = 'multipolygons'
+      AND tag.value:"key"::STRING   = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amenity_nodes AS (
+    /* every node that carries an `amenity` tag, expressed as GEOGRAPHY point  */
+    SELECT
+        COALESCE(
+            TO_GEOGRAPHY("geometry"),
+            ST_MAKEPOINT("longitude"::DOUBLE, "latitude"::DOUBLE)
+        ) AS "geom"
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES",
+         LATERAL FLATTEN(INPUT => "all_tags") AS tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amenity_count_per_boundary AS (
+    /* how many amenity nodes fall inside each administrative boundary */
+    SELECT
+        ab."osm_id",
+        COUNT(an."geom") AS "amenity_cnt"
+    FROM admin_bounds  ab
+    LEFT JOIN amenity_nodes an
+      ON ST_CONTAINS(ab."geom", an."geom")
+    GROUP BY ab."osm_id"
+),
+median_val AS (
+    /* overall median of amenity counts */
+    SELECT MEDIAN("amenity_cnt") AS "med_cnt"
+    FROM amenity_count_per_boundary
+),
+ranked AS (
+    /* rank boundaries by closeness to the median (ties → smaller osm_id) */
+    SELECT
+        ac."osm_id",
+        ROW_NUMBER() OVER (
+            ORDER BY ABS(ac."amenity_cnt" - mv."med_cnt"), ac."osm_id"
+        ) AS "rn"
+    FROM amenity_count_per_boundary ac
+    CROSS JOIN median_val mv
+)
+SELECT "osm_id"
+FROM ranked
+WHERE "rn" = 1;
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:26:41 - Thread-268 (execute) - INFO - [Executed results in self-refine]
+osm_id
+28958
+
+[Executed results in self-refine]
+2025-05-01 01:26:41 - Thread-268 (execute) - INFO - itercount: 1
+2025-05-01 01:26:41 - Thread-268 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Which OpenStreetMap ID from the planet features table corresponds to an administrative boundary, represented as multipolygons, whose total number of 'amenity'-tagged Points of Interest (POIs), as derived from the planet nodes table, is closest to the median count among all such boundaries?, reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+osm_id
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+osm_id
+28958
+Current sql:
+WITH admin_bounds AS (
+    /* all administrative boundaries stored as multipolygons */
+    SELECT
+        COALESCE("osm_id", "osm_way_id")                      AS "osm_id",
+        TO_GEOGRAPHY("geometry")                              AS "geom"
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES",
+         LATERAL FLATTEN(INPUT => "all_tags") AS tag
+    WHERE "feature_type" = 'multipolygons'
+      AND tag.value:"key"::STRING   = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amenity_nodes AS (
+    /* every node that carries an `amenity` tag, expressed as GEOGRAPHY point  */
+    SELECT
+        COALESCE(
+            TO_GEOGRAPHY("geometry"),
+            ST_MAKEPOINT("longitude"::DOUBLE, "latitude"::DOUBLE)
+        ) AS "geom"
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES",
+         LATERAL FLATTEN(INPUT => "all_tags") AS tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amenity_count_per_boundary AS (
+    /* how many amenity nodes fall inside each administrative boundary */
+    SELECT
+        ab."osm_id",
+        COUNT(an."geom") AS "amenity_cnt"
+    FROM admin_bounds  ab
+    LEFT JOIN amenity_nodes an
+      ON ST_CONTAINS(ab."geom", an."geom")
+    GROUP BY ab."osm_id"
+),
+median_val AS (
+    /* overall median of amenity counts */
+    SELECT MEDIAN("amenity_cnt") AS "med_cnt"
+    FROM amenity_count_per_boundary
+),
+ranked AS (
+    /* rank boundaries by closeness to the median (ties → smaller osm_id) */
+    SELECT
+        ac."osm_id",
+        ROW_NUMBER() OVER (
+            ORDER BY ABS(ac."amenity_cnt" - mv."med_cnt"), ac."osm_id"
+        ) AS "rn"
+    FROM amenity_count_per_boundary ac
+    CROSS JOIN median_val mv
+)
+SELECT "osm_id"
+FROM ranked
+WHERE "rn" = 1;
+[Self-refine]
+2025-05-01 01:27:26 - Thread-268 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH admin_bounds AS (
+    SELECT
+        COALESCE("osm_id", "osm_way_id") AS "osm_id",
+        TO_GEOGRAPHY("geometry")         AS "geom"
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_FEATURES",
+         LATERAL FLATTEN(INPUT => "all_tags") tag
+    WHERE "feature_type" = 'multipolygons'
+      AND tag.value:"key"::STRING   = 'boundary'
+      AND tag.value:"value"::STRING = 'administrative'
+),
+amenity_nodes AS (
+    SELECT
+        COALESCE(
+            TO_GEOGRAPHY("geometry"),
+            ST_MAKEPOINT("longitude"::DOUBLE, "latitude"::DOUBLE)
+        ) AS "geom"
+    FROM "GEO_OPENSTREETMAP"."GEO_OPENSTREETMAP"."PLANET_NODES",
+         LATERAL FLATTEN(INPUT => "all_tags") tag
+    WHERE tag.value:"key"::STRING = 'amenity'
+),
+amenity_count_per_boundary AS (
+    SELECT
+        ab."osm_id",
+        COUNT(an."geom") AS "amenity_cnt"
+    FROM admin_bounds ab
+    LEFT JOIN amenity_nodes an
+      ON ST_CONTAINS(ab."geom", an."geom")
+    GROUP BY ab."osm_id"
+),
+median_val AS (
+    SELECT MEDIAN("amenity_cnt") AS "med_cnt"
+    FROM amenity_count_per_boundary
+),
+ranked AS (
+    SELECT
+        ac."osm_id",
+        ROW_NUMBER() OVER (
+            ORDER BY ABS(ac."amenity_cnt" - mv."med_cnt"), ac."osm_id"
+        ) AS "rn"
+    FROM amenity_count_per_boundary ac
+    CROSS JOIN median_val mv
+)
+SELECT "osm_id"
+FROM ranked
+WHERE "rn" = 1;
+```
+[Try to run SQL in self-refine]
+2025-05-01 01:27:35 - Thread-268 (execute) - INFO - [Executed results in self-refine]
+osm_id
+28958
+
+[Executed results in self-refine]
+2025-05-01 01:27:35 - Thread-268 (execute) - INFO - [Consistent results]
+osm_id
+28958
+
+[Consistent results]
+2025-05-01 01:27:35 - Thread-268 (execute) - INFO - Total iteration counts: 1

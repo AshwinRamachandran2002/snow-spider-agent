@@ -1,0 +1,10 @@
+SELECT
+    EXTRACT(YEAR FROM "DATE_OF_LOSS")                          AS "year_of_loss",
+    SUM("BUILDING_DAMAGE_AMOUNT") :: NUMBER(38,4)  AS "total_building_damage",
+    SUM("CONTENTS_DAMAGE_AMOUNT") :: NUMBER(38,4)  AS "total_contents_damage"
+FROM "WEATHER__ENVIRONMENT"."CYBERSYN"."FEMA_NATIONAL_FLOOD_INSURANCE_PROGRAM_CLAIM_INDEX"
+WHERE "NFIP_COMMUNITY_NAME" = 'City Of New York'
+  AND "DATE_OF_LOSS" >= '2010-01-01'
+  AND "DATE_OF_LOSS" <  '2020-01-01'
+GROUP BY "year_of_loss"
+ORDER BY "year_of_loss";

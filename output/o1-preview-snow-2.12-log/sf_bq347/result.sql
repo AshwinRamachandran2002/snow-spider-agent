@@ -1,0 +1,11 @@
+SELECT da."Modality", COUNT(*) AS "SOPInstanceCount"
+FROM "IDC"."IDC_V17"."DICOM_ALL" da
+WHERE da."SeriesInstanceUID" = '1.3.6.1.4.1.14519.5.2.1.3671.4754.105976129314091491952445656147'
+   OR da."SeriesInstanceUID" IN (
+       SELECT s."SeriesInstanceUID"
+       FROM "IDC"."IDC_V17"."SEGMENTATIONS" s
+       WHERE s."segmented_SeriesInstanceUID" = '1.3.6.1.4.1.14519.5.2.1.3671.4754.105976129314091491952445656147'
+   )
+GROUP BY da."Modality"
+ORDER BY "SOPInstanceCount" DESC NULLS LAST
+LIMIT 1;

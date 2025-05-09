@@ -1,0 +1,1827 @@
+2025-05-01 03:17:28 - Thread-1319 (execute) - INFO - [Answer format]
+```csv
+ingredient,total_quantity
+```
+[Answer format]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Exploration]
+Relevant columns and possible use  
+• pizza_clean_runner_orders.order_id – identify orders that were really delivered  
+  – condition: cancellation IS NULL (i.e., not cancelled)  
+• pizza_clean_customer_orders.order_id / pizza_clean_customer_orders.pizza_id – link each delivered order to its pizza recipe  
+• pizza_recipes.pizza_id / pizza_recipes.toppings – list of default topping‑IDs for every pizza  
+• pizza_toppings.topping_id / pizza_toppings.topping_name – turn every topping‑ID into a human readable ingredient name  
+• pizza_get_extras.order_id / pizza_get_extras.extras / pizza_get_extras.extras_count – extra toppings a customer requested; add these quantities  
+• pizza_get_exclusions.order_id / pizza_get_exclusions.exclusions / pizza_get_exclusions.total_exclusions – toppings a customer removed; subtract these quantities  
+
+The core logic will therefore be:  
+1. keep only the orders that were picked up (not cancelled)  
+2. explode the comma‑separated toppings field so we get one row per (order, topping_id) coming from the pizza recipe  
+3. add extra toppings rows (respecting extras_count)  
+4. subtract the excluded toppings rows (respecting total_exclusions)  
+5. aggregate everything by topping_id and convert to topping_name  
+
+Below are ten exploratory SQL queries, from very simple inspections to the final all‑in‑one answer.  
+(The queries use SQLite syntax; LIMIT 20 is added where the result could be long.)
+
+```sql
+-- 1.  Show a sample of runner records to check the cancellation flag
+SELECT *
+FROM pizza_clean_runner_orders
+LIMIT 20;
+```
+
+```sql
+-- 2.  List the distinct orders that were actually delivered
+SELECT DISTINCT order_id
+FROM pizza_clean_runner_orders
+WHERE cancellation IS NULL
+LIMIT 20;
+```
+
+```sql
+-- 3.  See which pizzas were in those delivered orders
+SELECT c.order_id,
+       c.pizza_id
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r
+       ON r.order_id = c.order_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+```
+
+```sql
+-- 4.  Look at the raw recipe‑topping strings for the pizzas we delivered
+SELECT DISTINCT c.pizza_id,
+       pr.toppings
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r  ON r.order_id = c.order_id
+JOIN   pizza_recipes             AS pr ON pr.pizza_id = c.pizza_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+```
+
+```sql
+-- 5.  Inspect how extras are stored for delivered orders
+SELECT *
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+```
+
+```sql
+-- 6.  Inspect how exclusions are stored for delivered orders
+SELECT *
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+```
+
+```sql
+-- 7.  Count how many times each topping appears in the recipes
+--     (ignoring extras / exclusions for the moment)
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+raw_pairs AS (
+    -- split the comma list into rows; the replace/remove trick gets rid of the blanks
+    SELECT c.order_id,
+           CAST(trim(substr(
+                pr.toppings,
+                instr(pr.toppings || ',', ',') * (n-1) + 1,
+                instr(substr(pr.toppings || ',', instr(pr.toppings || ',', ',')*(n-1)+1), ',')-1
+           )) AS INTEGER) AS topping_id
+    FROM  pizza_clean_customer_orders AS c
+    JOIN  delivered_orders           AS d ON d.order_id = c.order_id
+    JOIN  pizza_recipes              AS pr ON pr.pizza_id = c.pizza_id,
+          generate_series(1, 20) AS n   -- 20 is wider than any pizza topping list length
+    WHERE  n <= (length(pr.toppings) - length(replace(pr.toppings, ',', '')) + 1)
+)
+SELECT topping_id,
+       COUNT(*) AS recipe_qty
+FROM   raw_pairs
+GROUP  BY topping_id
+ORDER  BY recipe_qty DESC
+LIMIT 20;
+```
+
+```sql
+-- 8.  Count total extras for delivered orders
+SELECT extras AS topping_id,
+       SUM(extras_count) AS extras_qty
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+GROUP BY extras
+ORDER BY extras_qty DESC
+LIMIT 20;
+```
+
+```sql
+-- 9.  Count total exclusions for delivered orders
+SELECT exclusions AS topping_id,
+       SUM(total_exclusions) AS exclusion_qty
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+GROUP BY exclusions
+ORDER BY exclusion_qty DESC
+LIMIT 20;
+```
+
+```sql
+-- 10. FINAL ANSWER –
+--     Total quantity of each ingredient actually used after
+--     adding extras and subtracting exclusions
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+
+-- split the recipe topping list into rows
+recipe_pairs AS (
+    SELECT c.order_id,
+           CAST(trim(substr(
+                pr.toppings,
+                instr(pr.toppings || ',', ',') * (n-1) + 1,
+                instr(substr(pr.toppings || ',', instr(pr.toppings || ',', ',')*(n-1)+1), ',')-1
+           )) AS INTEGER) AS topping_id,
+           1 AS qty
+    FROM  pizza_clean_customer_orders AS c
+    JOIN  delivered_orders           AS d ON d.order_id = c.order_id
+    JOIN  pizza_recipes              AS pr ON pr.pizza_id = c.pizza_id,
+          generate_series(1, 20) AS n
+    WHERE  n <= (length(pr.toppings) - length(replace(pr.toppings, ',', '')) + 1)
+),
+
+-- extras rows – positive quantities
+extra_pairs AS (
+    SELECT order_id,
+           extras  AS topping_id,
+           extras_count AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+),
+
+-- exclusion rows – negative quantities
+exclusion_pairs AS (
+    SELECT order_id,
+           exclusions        AS topping_id,
+          -total_exclusions  AS qty          -- minus sign!
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+),
+
+-- union everything together
+all_movements AS (
+    SELECT topping_id, qty FROM recipe_pairs
+    UNION ALL
+    SELECT topping_id, qty FROM extra_pairs
+    UNION ALL
+    SELECT topping_id, qty FROM exclusion_pairs
+)
+
+SELECT  pt.topping_name      AS ingredient,
+        SUM(a.qty)           AS total_quantity
+FROM    all_movements AS a
+JOIN    pizza_toppings AS pt ON pt.topping_id = a.topping_id
+GROUP   BY pt.topping_name
+ORDER   BY total_quantity DESC;
+```
+
+The last query returns exactly the requested summary: one row per ingredient (topping_name) and the total number of units actually used in all pizzas we delivered, after applying customer‑specific extras and exclusions.
+[Exploration]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 1.  Show a sample of runner records to check the cancellation flag
+SELECT *
+FROM pizza_clean_runner_orders
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1.  Show a sample of runner records to check the cancellation flag
+SELECT *
+FROM pizza_clean_runner_orders
+LIMIT 20;
+Results:
+order_id,runner_id,pickup_time,distance,duration,cancellation
+1,1,2021-01-01 18:15:34,20.0,32.0,
+2,1,2021-01-01 19:10:54,20.0,27.0,
+3,1,2021-01-03 00:12:37,13.4,20.0,
+4,2,2021-01-04 13:53:03,23.4,40.0,
+5,3,2021-01-08 21:10:57,10.0,15.0,
+6,3,,0.0,0.0,Restaurant Cancellation
+7,2,2021-01-08 21:30:45,25.0,25.0,
+8,2,2021-01-10 00:15:02,23.4,15.0,
+9,2,,0.0,0.0,Customer Cancellation
+10,1,2021-01-11 18:50:20,10.0,10.0,
+
+[Successfully executed]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 2.  List the distinct orders that were actually delivered
+SELECT DISTINCT order_id
+FROM pizza_clean_runner_orders
+WHERE cancellation IS NULL
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2.  List the distinct orders that were actually delivered
+SELECT DISTINCT order_id
+FROM pizza_clean_runner_orders
+WHERE cancellation IS NULL
+LIMIT 20;
+Results:
+order_id
+1
+2
+3
+4
+5
+7
+8
+10
+
+[Successfully executed]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 3.  See which pizzas were in those delivered orders
+SELECT c.order_id,
+       c.pizza_id
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r
+       ON r.order_id = c.order_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3.  See which pizzas were in those delivered orders
+SELECT c.order_id,
+       c.pizza_id
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r
+       ON r.order_id = c.order_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+Results:
+order_id,pizza_id
+1,1
+2,1
+3,1
+3,2
+4,1
+4,1
+4,2
+5,1
+7,2
+8,1
+10,1
+10,1
+
+[Successfully executed]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 4.  Look at the raw recipe‑topping strings for the pizzas we delivered
+SELECT DISTINCT c.pizza_id,
+       pr.toppings
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r  ON r.order_id = c.order_id
+JOIN   pizza_recipes             AS pr ON pr.pizza_id = c.pizza_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4.  Look at the raw recipe‑topping strings for the pizzas we delivered
+SELECT DISTINCT c.pizza_id,
+       pr.toppings
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r  ON r.order_id = c.order_id
+JOIN   pizza_recipes             AS pr ON pr.pizza_id = c.pizza_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+Results:
+pizza_id,toppings
+1,"1, 2, 3, 4, 5, 6, 8, 10"
+2,"4, 6, 7, 9, 11, 12"
+
+[Successfully executed]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 5.  Inspect how extras are stored for delivered orders
+SELECT *
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5.  Inspect how extras are stored for delivered orders
+SELECT *
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+Results:
+row_id,order_id,extras,extras_count
+1,5,1,1
+1,7,1,1
+1,10,1,2
+2,10,4,2
+
+[Successfully executed]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 6.  Inspect how exclusions are stored for delivered orders
+SELECT *
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6.  Inspect how exclusions are stored for delivered orders
+SELECT *
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+Results:
+row_id,order_id,exclusions,total_exclusions
+1,4,4,3
+1,10,2,2
+2,10,6,2
+
+[Successfully executed]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Try to execute]
+-- 7.  Count how many times each topping appears in the recipes
+--     (ignoring extras / exclusions for the moment)
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+raw_pairs AS (
+    -- split the comma list into rows; the replace/remove trick gets rid of the blanks
+    SELECT c.order_id,
+           CAST(trim(substr(
+                pr.toppings,
+                instr(pr.toppings || ',', ',') * (n-1) + 1,
+                instr(substr(pr.toppings || ',', instr(pr.toppings || ',', ',')*(n-1)+1), ',')-1
+           )) AS INTEGER) AS topping_id
+    FROM  pizza_clean_customer_orders AS c
+    JOIN  delivered_orders           AS d ON d.order_id = c.order_id
+    JOIN  pizza_recipes              AS pr ON pr.pizza_id = c.pizza_id,
+          generate_series(1, 20) AS n   -- 20 is wider than any pizza topping list length
+    WHERE  n <= (length(pr.toppings) - length(replace(pr.toppings, ',', '')) + 1)
+)
+SELECT topping_id,
+       COUNT(*) AS recipe_qty
+FROM   raw_pairs
+GROUP  BY topping_id
+ORDER  BY recipe_qty DESC
+LIMIT 20;
+[Try to execute]
+2025-05-01 03:18:12 - Thread-1319 (execute) - INFO - [Error occurred]
+no such table: generate_series
+[Error occurred]
+2025-05-01 03:20:15 - Thread-1319 (execute) - INFO - [Corrected SQL]
+```sql
+--Description / thinking process: 
+--Goal: total quantity of each topping actually used in pizzas that were delivered.
+--Plan, each step as a CTE:
+--1) delivered_orders   – keep only orders whose runner record shows no cancellation.
+--2) order_recipes      – attach every delivered order to its pizza’s recipe (comma list of topping IDs).
+--3) split              – recursively de‑nest the comma list so we have one row per (order_id, topping_id); each counts +1.
+--4) extras_qty         – extras table: sum extra toppings per topping_id (positive qty).
+--5) exclusions_qty     – exclusions table: sum excluded toppings per topping_id (negative qty).
+--6) movements          – union recipe rows, extras, exclusions → net movements.
+--7) final_totals       – aggregate by topping_id, convert to topping_name, order by most used.
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders           d USING(order_id)
+    JOIN   pizza_recipes              pr USING(pizza_id)
+),
+--recursive splitter: turns "1, 2, 3" → separate rows
+split(order_id, topping_id, rest) AS (
+    SELECT order_id,
+           CAST(trim(substr(toppings || ',', 1,
+                   instr(toppings || ',', ',') - 1)) AS INTEGER)  AS topping_id,
+           substr(toppings || ',', instr(toppings || ',', ',')+1) AS rest
+    FROM   order_recipes
+    UNION ALL
+    SELECT order_id,
+           CAST(trim(substr(rest, 1,
+                   instr(rest, ',') - 1)) AS INTEGER)             AS topping_id,
+           substr(rest, instr(rest, ',') + 1)                    AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (         -- +1 per default recipe topping
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (         -- +extras_count
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (     -- -total_exclusions
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+final_totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       ft.total_quantity
+FROM   final_totals ft
+JOIN   pizza_toppings pt USING(topping_id)
+ORDER  BY ft.total_quantity DESC;
+```
+[Corrected SQL]
+2025-05-01 03:20:15 - Thread-1319 (execute) - INFO - [Results for corrected sql]
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+
+[Results for corrected sql]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: Count total extras added (positive quantities) for each topping_id in delivered orders.
+SELECT extras AS topping_id,
+       SUM(extras_count) AS extras_qty
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY extras
+ORDER BY extras_qty DESC
+LIMIT 20;
+```
+
+```sql
+--Description: Count total exclusions (negative quantities) for each topping_id in delivered orders.
+SELECT exclusions AS topping_id,
+       SUM(total_exclusions) AS exclusion_qty
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY exclusions
+ORDER BY exclusion_qty DESC
+LIMIT 20;
+```
+
+```sql
+--Description: FINAL answer – net quantity of every ingredient actually used in delivered pizzas.
+--Re‑implemented without generate_series by using a recursive splitter.
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders d USING(order_id)
+    JOIN   pizza_recipes    pr USING(pizza_id)
+),
+-- Recursive CTE to split comma‑separated topping list into rows
+split(order_id, topping_id, rest) AS (
+    -- anchor: first token
+    SELECT order_id,
+           CAST(trim(substr(toppings || ',', 1,
+                            instr(toppings || ',', ',') - 1)) AS INTEGER) AS topping_id,
+           substr(toppings || ',', instr(toppings || ',', ',') + 1)        AS rest
+    FROM   order_recipes
+    UNION ALL
+    -- recursive: peel the next token
+    SELECT order_id,
+           CAST(trim(substr(rest, 1,
+                            instr(rest, ',') - 1)) AS INTEGER)             AS topping_id,
+           substr(rest, instr(rest, ',') + 1)                              AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (           -- +1 for each default recipe topping
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (           -- +extras_count for extras
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (       -- –total_exclusions for exclusions
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+final_totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       ft.total_quantity
+FROM   final_totals ft
+JOIN   pizza_toppings pt USING(topping_id)
+ORDER  BY ft.total_quantity DESC;
+```
+[Corrected other sqls]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description / thinking process: 
+--Goal: total quantity of each topping actually used in pizzas that were delivered.
+--Plan, each step as a CTE:
+--1) delivered_orders   – keep only orders whose runner record shows no cancellation.
+--2) order_recipes      – attach every delivered order to its pizza’s recipe (comma list of topping IDs).
+--3) split              – recursively de‑nest the comma list so we have one row per (order_id, topping_id); each counts +1.
+--4) extras_qty         – extras table: sum extra toppings per topping_id (positive qty).
+--5) exclusions_qty     – exclusions table: sum excluded toppings per topping_id (negative qty).
+--6) movements          – union recipe rows, extras, exclusions → net movements.
+--7) final_totals       – aggregate by topping_id, convert to topping_name, order by most used.
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders           d USING(order_id)
+    JOIN   pizza_recipes              pr USING(pizza_id)
+),
+--recursive splitter: turns "1, 2, 3" → separate rows
+split(order_id, topping_id, rest) AS (
+    SELECT order_id,
+           CAST(trim(substr(toppings || ',', 1,
+                   instr(toppings || ',', ',') - 1)) AS INTEGER)  AS topping_id,
+           substr(toppings || ',', instr(toppings || ',', ',')+1) AS rest
+    FROM   order_recipes
+    UNION ALL
+    SELECT order_id,
+           CAST(trim(substr(rest, 1,
+                   instr(rest, ',') - 1)) AS INTEGER)             AS topping_id,
+           substr(rest, instr(rest, ',') + 1)                    AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (         -- +1 per default recipe topping
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (         -- +extras_count
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (     -- -total_exclusions
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+final_totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       ft.total_quantity
+FROM   final_totals ft
+JOIN   pizza_toppings pt USING(topping_id)
+ORDER  BY ft.total_quantity DESC;
+Results:
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+
+[Successfully corrected]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Try to execute]
+--Description: Count total extras added (positive quantities) for each topping_id in delivered orders.
+SELECT extras AS topping_id,
+       SUM(extras_count) AS extras_qty
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY extras
+ORDER BY extras_qty DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Count total extras added (positive quantities) for each topping_id in delivered orders.
+SELECT extras AS topping_id,
+       SUM(extras_count) AS extras_qty
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY extras
+ORDER BY extras_qty DESC
+LIMIT 20
+Results:
+topping_id,extras_qty
+1,4
+4,2
+
+[Successfully executed]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Try to execute]
+--Description: Count total exclusions (negative quantities) for each topping_id in delivered orders.
+SELECT exclusions AS topping_id,
+       SUM(total_exclusions) AS exclusion_qty
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY exclusions
+ORDER BY exclusion_qty DESC
+LIMIT 20
+[Try to execute]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: Count total exclusions (negative quantities) for each topping_id in delivered orders.
+SELECT exclusions AS topping_id,
+       SUM(total_exclusions) AS exclusion_qty
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY exclusions
+ORDER BY exclusion_qty DESC
+LIMIT 20
+Results:
+topping_id,exclusion_qty
+4,3
+6,2
+2,2
+
+[Successfully executed]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Try to execute]
+--Description: FINAL answer – net quantity of every ingredient actually used in delivered pizzas.
+--Re‑implemented without generate_series by using a recursive splitter.
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders d USING(order_id)
+    JOIN   pizza_recipes    pr USING(pizza_id)
+),
+-- Recursive CTE to split comma‑separated topping list into rows
+split(order_id, topping_id, rest) AS (
+    -- anchor: first token
+    SELECT order_id,
+           CAST(trim(substr(toppings || ',', 1,
+                            instr(toppings || ',', ',') - 1)) AS INTEGER) AS topping_id,
+           substr(toppings || ',', instr(toppings || ',', ',') + 1)        AS rest
+    FROM   order_recipes
+    UNION ALL
+    -- recursive: peel the next token
+    SELECT order_id,
+           CAST(trim(substr(rest, 1,
+                            instr(rest, ',') - 1)) AS INTEGER)             AS topping_id,
+           substr(rest, instr(rest, ',') + 1)                              AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (           -- +1 for each default recipe topping
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (           -- +extras_count for extras
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (       -- –total_exclusions for exclusions
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+final_totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       ft.total_quantity
+FROM   final_totals ft
+JOIN   pizza_toppings pt USING(topping_id)
+ORDER  BY ft.total_quantity DESC
+[Try to execute]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: FINAL answer – net quantity of every ingredient actually used in delivered pizzas.
+--Re‑implemented without generate_series by using a recursive splitter.
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders d USING(order_id)
+    JOIN   pizza_recipes    pr USING(pizza_id)
+),
+-- Recursive CTE to split comma‑separated topping list into rows
+split(order_id, topping_id, rest) AS (
+    -- anchor: first token
+    SELECT order_id,
+           CAST(trim(substr(toppings || ',', 1,
+                            instr(toppings || ',', ',') - 1)) AS INTEGER) AS topping_id,
+           substr(toppings || ',', instr(toppings || ',', ',') + 1)        AS rest
+    FROM   order_recipes
+    UNION ALL
+    -- recursive: peel the next token
+    SELECT order_id,
+           CAST(trim(substr(rest, 1,
+                            instr(rest, ',') - 1)) AS INTEGER)             AS topping_id,
+           substr(rest, instr(rest, ',') + 1)                              AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (           -- +1 for each default recipe topping
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (           -- +extras_count for extras
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (       -- –total_exclusions for exclusions
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+final_totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       ft.total_quantity
+FROM   final_totals ft
+JOIN   pizza_toppings pt USING(topping_id)
+ORDER  BY ft.total_quantity DESC
+Results:
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+
+[Successfully executed]
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - itercount: 0
+2025-05-01 03:20:34 - Thread-1319 (execute) - INFO - [Self-refine]
+
+--------------------------------------------------
+Table full name: pizza_names
+Column name: pizza_id Type: INTEGER Description: 
+Column name: pizza_name Type: TEXT Description: 
+Sample rows:
+[(1, 'Meatlovers'), (2, 'Vegetarian')]
+
+--------------------------------------------------
+Table full name: companies_funding
+Column name: company_id Type: INTEGER Description: 
+Column name: valuation Type: INTEGER Description: 
+Column name: funding Type: INTEGER Description: 
+Column name: select_investors Type: TEXT Description: 
+Sample rows:
+[(548, 2000000000, 449000000, '"Accel Partners, Index Ventures, Insight Venture Partners"'), (645, 1000000000, 188000000, '"Sequoia Capital China, China Life Investment Holding Company, Qiming Venture Partners"'), (615, 1000000000, 2000000000, '"CreditEase Fintech Investment Fund, BMW i Ventures, SoftBank Group"')]
+
+--------------------------------------------------
+Table full name: pizza_customer_orders
+Column name: order_id Type: INTEGER Description: 
+Column name: customer_id Type: INTEGER Description: 
+Column name: pizza_id Type: INTEGER Description: 
+Column name: exclusions Type: TEXT Description: 
+Column name: extras Type: TEXT Description: 
+Column name: order_time Type: TEXT Description: 
+Sample rows:
+[(1, 101, 1, None, None, '2021-01-01 18:05:02'), (2, 101, 1, None, None, '2021-01-01 19:00:52'), (3, 102, 1, None, None, '2021-01-02 23:51:23')]
+
+--------------------------------------------------
+Table full name: pizza_toppings
+Column name: topping_id Type: INTEGER Description: 
+Column name: topping_name Type: TEXT Description: 
+Sample rows:
+[(1, 'Bacon'), (2, 'BBQ Sauce'), (3, 'Beef')]
+
+--------------------------------------------------
+Table full name: trees
+Column name: idx Type: INTEGER Description: 
+Column name: tree_id Type: INTEGER Description: 
+Column name: tree_dbh Type: INTEGER Description: 
+Column name: stump_diam Type: INTEGER Description: 
+Column name: status Type: TEXT Description: 
+Column name: health Type: TEXT Description: 
+Column name: spc_latin Type: TEXT Description: 
+Column name: spc_common Type: TEXT Description: 
+Column name: address Type: TEXT Description: 
+Column name: zipcode Type: INTEGER Description: 
+Column name: borocode Type: INTEGER Description: 
+Column name: boroname Type: TEXT Description: 
+Column name: nta_name Type: TEXT Description: 
+Column name: state Type: TEXT Description: 
+Column name: latitude Type: REAL Description: 
+Column name: longitude Type: REAL Description: 
+Sample rows:
+[(199121, 414328, 4, 0, 'Alive', 'Good', 'Ulmus americana', 'American elm', '1301 RYAWA AVENUE', 10474, 2, 'Bronx', 'Hunts Point', 'New York', 40.80504923, -73.88385512), (32277, 155915, 2, 0, 'Alive', 'Good', 'Eucommia ulmoides', 'hardy rubber tree', '506 BEACH 69 STREET', 11692, 4, 'Queens', 'Hammels-Arverne-Edgemere', 'New York', 40.5949501, -73.79834048), (164564, 362104, 23, 0, 'Alive', 'Fair', 'Tilia cordata', 'littleleaf linden', '2312 WESTERVELT AVENUE', 10469, 2, 'Bronx', 'Allerton-Pelham Gardens', 'New York', 40.85977962, -73.8399055)]
+
+--------------------------------------------------
+Table full name: pizza_recipes
+Column name: pizza_id Type: INTEGER Description: 
+Column name: toppings Type: TEXT Description: 
+Sample rows:
+[(1, '1, 2, 3, 4, 5, 6, 8, 10'), (2, '4, 6, 7, 9, 11, 12')]
+
+--------------------------------------------------
+Table full name: statistics
+Column name: date Type: TEXT Description: 
+Column name: state Type: TEXT Description: 
+Column name: total_cases Type: INTEGER Description: 
+Column name: total_deaths Type: INTEGER Description: 
+Sample rows:
+[('2020-05-27 00:00:00', 'NC', 24628, 794), ('2020-06-26 00:00:00', 'NC', 58818, 1303), ('2020-09-05 00:00:00', 'CO', 58989, 1971)]
+
+--------------------------------------------------
+Table full name: income_trees
+Column name: zipcode Type: INTEGER Description: 
+Column name: Estimate_Total Type: INTEGER Description: 
+Column name: Margin_of_Error_Total Type: INTEGER Description: 
+Column name: Estimate_Median_income Type: INTEGER Description: 
+Column name: Margin_of_Error_Median_income Type: INTEGER Description: 
+Column name: Estimate_Mean_income Type: INTEGER Description: 
+Column name: Margin_of_Error_Mean_income Type: INTEGER Description: 
+Sample rows:
+[(11205, 15198, 353, 47575, 3834, 73353, 3929), (11218, 24909, 371, 56120, 3925, 78208, 3788), (10451, 18140, 405, 26048, 2140, 40836, 3424)]
+
+--------------------------------------------------
+Table full name: pizza_clean_runner_orders
+Column name: order_id Type: INTEGER Description: 
+Column name: runner_id Type: INTEGER Description: 
+Column name: pickup_time Type: TEXT Description: 
+Column name: distance Type: REAL Description: 
+Column name: duration Type: REAL Description: 
+Column name: cancellation Type: TEXT Description: 
+Sample rows:
+[(1, 1, '2021-01-01 18:15:34', 20.0, 32.0, None), (2, 1, '2021-01-01 19:10:54', 20.0, 27.0, None), (3, 1, '2021-01-03 00:12:37', 13.4, 20.0, None)]
+
+--------------------------------------------------
+Table full name: pizza_runner_orders
+Column name: order_id Type: INTEGER Description: 
+Column name: runner_id Type: INTEGER Description: 
+Column name: pickup_time Type: TEXT Description: 
+Column name: distance Type: TEXT Description: 
+Column name: duration Type: TEXT Description: 
+Column name: cancellation Type: TEXT Description: 
+Sample rows:
+[(1, 1, '2021-01-01 18:15:34', '20km', '32 minutes', None), (2, 1, '2021-01-01 19:10:54', '20km', '27 minutes', None), (3, 1, '2021-01-03 00:12:37', '13.4km', '20 mins', None)]
+
+--------------------------------------------------
+Table full name: word_list
+Column name: words Type: TEXT Description: 
+Sample rows:
+[('cannach',), ('ouistitis',), ('revacate',)]
+
+--------------------------------------------------
+Table full name: companies_dates
+Column name: company_id Type: INTEGER Description: 
+Column name: date_joined Type: TEXT Description: 
+Column name: year_founded Type: INTEGER Description: 
+Sample rows:
+[(109, '2020-09-08T00:00:00.000', 2004), (821, '2019-05-16T00:00:00.000', 2009), (153, '2019-07-11T00:00:00.000', 2016)]
+
+--------------------------------------------------
+Table full name: pizza_get_extras
+Column name: row_id Type: INTEGER Description: 
+Column name: order_id Type: INTEGER Description: 
+Column name: extras Type: INTEGER Description: 
+Column name: extras_count Type: INTEGER Description: 
+Sample rows:
+[(1, 5, 1, 1), (1, 7, 1, 1), (1, 9, 1, 2)]
+
+--------------------------------------------------
+Table full name: pizza_get_exclusions
+Column name: row_id Type: INTEGER Description: 
+Column name: order_id Type: INTEGER Description: 
+Column name: exclusions Type: INTEGER Description: 
+Column name: total_exclusions Type: INTEGER Description: 
+Sample rows:
+[(1, 4, 4, 3), (1, 9, 4, 1), (1, 10, 2, 2)]
+
+--------------------------------------------------
+Table full name: pizza_clean_customer_orders
+Column name: order_id Type: INTEGER Description: 
+Column name: customer_id Type: INTEGER Description: 
+Column name: pizza_id Type: INTEGER Description: 
+Column name: exclusions Type: TEXT Description: 
+Column name: extras Type: TEXT Description: 
+Column name: order_time Type: TEXT Description: 
+Sample rows:
+[(1, 101, 1, None, None, '2021-01-01 18:05:02'), (2, 101, 1, None, None, '2021-01-01 19:00:52'), (3, 102, 1, None, None, '2021-01-02 23:51:23')]
+
+--------------------------------------------------
+Table full name: companies_industries
+Column name: company_id Type: INTEGER Description: 
+Column name: industry Type: TEXT Description: 
+Sample rows:
+[(316, 'Fintech'), (162, 'Fintech'), (803, 'Fintech')]
+
+--------------------------------------------------
+Table full name: pizza_runners
+Column name: runner_id Type: INTEGER Description: 
+Column name: registration_date Type: TEXT Description: 
+Sample rows:
+[(1, '2021-01-01'), (2, '2021-01-03'), (3, '2021-01-08')]
+External knowledge that might be helpful: 
+None
+The table structure information is (table names): 
+['pizza_names', 'companies_funding', 'pizza_customer_orders', 'pizza_toppings', 'trees', 'pizza_recipes', 'statistics', 'income_trees', 'pizza_clean_runner_orders', 'pizza_runner_orders', 'word_list', 'companies_dates', 'pizza_get_extras', 'pizza_get_exclusions', 'pizza_clean_customer_orders', 'companies_industries', 'pizza_runners']
+Begin Exploring Related Columns
+Relevant columns and possible use  
+• pizza_clean_runner_orders.order_id – identify orders that were really delivered  
+  – condition: cancellation IS NULL (i.e., not cancelled)  
+• pizza_clean_customer_orders.order_id / pizza_clean_customer_orders.pizza_id – link each delivered order to its pizza recipe  
+• pizza_recipes.pizza_id / pizza_recipes.toppings – list of default topping‑IDs for every pizza  
+• pizza_toppings.topping_id / pizza_toppings.topping_name – turn every topping‑ID into a human readable ingredient name  
+• pizza_get_extras.order_id / pizza_get_extras.extras / pizza_get_extras.extras_count – extra toppings a customer requested; add these quantities  
+• pizza_get_exclusions.order_id / pizza_get_exclusions.exclusions / pizza_get_exclusions.total_exclusions – toppings a customer removed; subtract these quantities  
+
+The core logic will therefore be:  
+1. keep only the orders that were picked up (not cancelled)  
+2. explode the comma‑separated toppings field so we get one row per (order, topping_id) coming from the pizza recipe  
+3. add extra toppings rows (respecting extras_count)  
+4. subtract the excluded toppings rows (respecting total_exclusions)  
+5. aggregate everything by topping_id and convert to topping_name  
+
+Below are ten exploratory SQL queries, from very simple inspections to the final all‑in‑one answer.  
+(The queries use SQLite syntax; LIMIT 20 is added where the result could be long.)
+
+```sql
+-- 1.  Show a sample of runner records to check the cancellation flag
+SELECT *
+FROM pizza_clean_runner_orders
+LIMIT 20;
+```
+
+```sql
+-- 2.  List the distinct orders that were actually delivered
+SELECT DISTINCT order_id
+FROM pizza_clean_runner_orders
+WHERE cancellation IS NULL
+LIMIT 20;
+```
+
+```sql
+-- 3.  See which pizzas were in those delivered orders
+SELECT c.order_id,
+       c.pizza_id
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r
+       ON r.order_id = c.order_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+```
+
+```sql
+-- 4.  Look at the raw recipe‑topping strings for the pizzas we delivered
+SELECT DISTINCT c.pizza_id,
+       pr.toppings
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r  ON r.order_id = c.order_id
+JOIN   pizza_recipes             AS pr ON pr.pizza_id = c.pizza_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+```
+
+```sql
+-- 5.  Inspect how extras are stored for delivered orders
+SELECT *
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+```
+
+```sql
+-- 6.  Inspect how exclusions are stored for delivered orders
+SELECT *
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+```
+
+```sql
+-- 7.  Count how many times each topping appears in the recipes
+--     (ignoring extras / exclusions for the moment)
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+raw_pairs AS (
+    -- split the comma list into rows; the replace/remove trick gets rid of the blanks
+    SELECT c.order_id,
+           CAST(trim(substr(
+                pr.toppings,
+                instr(pr.toppings || ',', ',') * (n-1) + 1,
+                instr(substr(pr.toppings || ',', instr(pr.toppings || ',', ',')*(n-1)+1), ',')-1
+           )) AS INTEGER) AS topping_id
+    FROM  pizza_clean_customer_orders AS c
+    JOIN  delivered_orders           AS d ON d.order_id = c.order_id
+    JOIN  pizza_recipes              AS pr ON pr.pizza_id = c.pizza_id,
+          generate_series(1, 20) AS n   -- 20 is wider than any pizza topping list length
+    WHERE  n <= (length(pr.toppings) - length(replace(pr.toppings, ',', '')) + 1)
+)
+SELECT topping_id,
+       COUNT(*) AS recipe_qty
+FROM   raw_pairs
+GROUP  BY topping_id
+ORDER  BY recipe_qty DESC
+LIMIT 20;
+```
+
+```sql
+-- 8.  Count total extras for delivered orders
+SELECT extras AS topping_id,
+       SUM(extras_count) AS extras_qty
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+GROUP BY extras
+ORDER BY extras_qty DESC
+LIMIT 20;
+```
+
+```sql
+-- 9.  Count total exclusions for delivered orders
+SELECT exclusions AS topping_id,
+       SUM(total_exclusions) AS exclusion_qty
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+GROUP BY exclusions
+ORDER BY exclusion_qty DESC
+LIMIT 20;
+```
+
+```sql
+-- 10. FINAL ANSWER –
+--     Total quantity of each ingredient actually used after
+--     adding extras and subtracting exclusions
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+
+-- split the recipe topping list into rows
+recipe_pairs AS (
+    SELECT c.order_id,
+           CAST(trim(substr(
+                pr.toppings,
+                instr(pr.toppings || ',', ',') * (n-1) + 1,
+                instr(substr(pr.toppings || ',', instr(pr.toppings || ',', ',')*(n-1)+1), ',')-1
+           )) AS INTEGER) AS topping_id,
+           1 AS qty
+    FROM  pizza_clean_customer_orders AS c
+    JOIN  delivered_orders           AS d ON d.order_id = c.order_id
+    JOIN  pizza_recipes              AS pr ON pr.pizza_id = c.pizza_id,
+          generate_series(1, 20) AS n
+    WHERE  n <= (length(pr.toppings) - length(replace(pr.toppings, ',', '')) + 1)
+),
+
+-- extras rows – positive quantities
+extra_pairs AS (
+    SELECT order_id,
+           extras  AS topping_id,
+           extras_count AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+),
+
+-- exclusion rows – negative quantities
+exclusion_pairs AS (
+    SELECT order_id,
+           exclusions        AS topping_id,
+          -total_exclusions  AS qty          -- minus sign!
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+),
+
+-- union everything together
+all_movements AS (
+    SELECT topping_id, qty FROM recipe_pairs
+    UNION ALL
+    SELECT topping_id, qty FROM extra_pairs
+    UNION ALL
+    SELECT topping_id, qty FROM exclusion_pairs
+)
+
+SELECT  pt.topping_name      AS ingredient,
+        SUM(a.qty)           AS total_quantity
+FROM    all_movements AS a
+JOIN    pizza_toppings AS pt ON pt.topping_id = a.topping_id
+GROUP   BY pt.topping_name
+ORDER   BY total_quantity DESC;
+```
+
+The last query returns exactly the requested summary: one row per ingredient (topping_name) and the total number of units actually used in all pizzas we delivered, after applying customer‑specific extras and exclusions.
+Refined SQLs and results:
+Query:
+-- 1.  Show a sample of runner records to check the cancellation flag
+SELECT *
+FROM pizza_clean_runner_orders
+LIMIT 20;
+Answer:
+order_id,runner_id,pickup_time,distance,duration,cancellation
+1,1,2021-01-01 18:15:34,20.0,32.0,
+2,1,2021-01-01 19:10:54,20.0,27.0,
+3,1,2021-01-03 00:12:37,13.4,20.0,
+4,2,2021-01-04 13:53:03,23.4,40.0,
+5,3,2021-01-08 21:10:57,10.0,15.0,
+6,3,,0.0,0.0,Restaurant Cancellation
+7,2,2021-01-08 21:30:45,25.0,25.0,
+8,2,2021-01-10 00:15:02,23.4,15.0,
+9,2,,0.0,0.0,Customer Cancellation
+10,1,2021-01-11 18:50:20,10.0,10.0,
+Query:
+-- 2.  List the distinct orders that were actually delivered
+SELECT DISTINCT order_id
+FROM pizza_clean_runner_orders
+WHERE cancellation IS NULL
+LIMIT 20;
+Answer:
+order_id
+1
+2
+3
+4
+5
+7
+8
+10
+Query:
+-- 3.  See which pizzas were in those delivered orders
+SELECT c.order_id,
+       c.pizza_id
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r
+       ON r.order_id = c.order_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+Answer:
+order_id,pizza_id
+1,1
+2,1
+3,1
+3,2
+4,1
+4,1
+4,2
+5,1
+7,2
+8,1
+10,1
+10,1
+Query:
+-- 4.  Look at the raw recipe‑topping strings for the pizzas we delivered
+SELECT DISTINCT c.pizza_id,
+       pr.toppings
+FROM   pizza_clean_customer_orders AS c
+JOIN   pizza_clean_runner_orders  AS r  ON r.order_id = c.order_id
+JOIN   pizza_recipes             AS pr ON pr.pizza_id = c.pizza_id
+WHERE  r.cancellation IS NULL
+LIMIT 20;
+Answer:
+pizza_id,toppings
+1,"1, 2, 3, 4, 5, 6, 8, 10"
+2,"4, 6, 7, 9, 11, 12"
+Query:
+-- 5.  Inspect how extras are stored for delivered orders
+SELECT *
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+Answer:
+row_id,order_id,extras,extras_count
+1,5,1,1
+1,7,1,1
+1,10,1,2
+2,10,4,2
+Query:
+-- 6.  Inspect how exclusions are stored for delivered orders
+SELECT *
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL
+       )
+LIMIT 20;
+Answer:
+row_id,order_id,exclusions,total_exclusions
+1,4,4,3
+1,10,2,2
+2,10,6,2
+Query:
+--Description: Count total extras added (positive quantities) for each topping_id in delivered orders.
+SELECT extras AS topping_id,
+       SUM(extras_count) AS extras_qty
+FROM   pizza_get_extras
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY extras
+ORDER BY extras_qty DESC
+LIMIT 20
+Answer:
+topping_id,extras_qty
+1,4
+4,2
+Query:
+--Description: Count total exclusions (negative quantities) for each topping_id in delivered orders.
+SELECT exclusions AS topping_id,
+       SUM(total_exclusions) AS exclusion_qty
+FROM   pizza_get_exclusions
+WHERE  order_id IN (
+          SELECT order_id
+          FROM   pizza_clean_runner_orders
+          WHERE  cancellation IS NULL            -- delivered only
+       )
+GROUP BY exclusions
+ORDER BY exclusion_qty DESC
+LIMIT 20
+Answer:
+topping_id,exclusion_qty
+4,3
+6,2
+2,2
+Query:
+--Description: FINAL answer – net quantity of every ingredient actually used in delivered pizzas.
+--Re‑implemented without generate_series by using a recursive splitter.
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders d USING(order_id)
+    JOIN   pizza_recipes    pr USING(pizza_id)
+),
+-- Recursive CTE to split comma‑separated topping list into rows
+split(order_id, topping_id, rest) AS (
+    -- anchor: first token
+    SELECT order_id,
+           CAST(trim(substr(toppings || ',', 1,
+                            instr(toppings || ',', ',') - 1)) AS INTEGER) AS topping_id,
+           substr(toppings || ',', instr(toppings || ',', ',') + 1)        AS rest
+    FROM   order_recipes
+    UNION ALL
+    -- recursive: peel the next token
+    SELECT order_id,
+           CAST(trim(substr(rest, 1,
+                            instr(rest, ',') - 1)) AS INTEGER)             AS topping_id,
+           substr(rest, instr(rest, ',') + 1)                              AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (           -- +1 for each default recipe topping
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (           -- +extras_count for extras
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (       -- –total_exclusions for exclusions
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+final_totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       ft.total_quantity
+FROM   final_totals ft
+JOIN   pizza_toppings pt USING(topping_id)
+ORDER  BY ft.total_quantity DESC
+Answer:
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+End Exploring Related Columns
+Task: Based on our customer pizza order information, summarize the total quantity of each ingredient used in the pizzas we delivered. Output the name and quantity for each ingredient.
+
+Please answer only one complete SQL in sqlite dialect in ```sql``` format.
+Usage example: ```sql
+SELECT DISTINCT "column_name" FROM "table_name" WHERE ... ``` (Replace "table_name" with the actual table name. Enclose table and column names with double quotations if they contain special characters or match reserved keywords.)
+Follow the answer format like: ```csv
+ingredient,total_quantity
+```.
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is (table names): 
+['pizza_names', 'companies_funding', 'pizza_customer_orders', 'pizza_toppings', 'trees', 'pizza_recipes', 'statistics', 'income_trees', 'pizza_clean_runner_orders', 'pizza_runner_orders', 'word_list', 'companies_dates', 'pizza_get_extras', 'pizza_get_exclusions', 'pizza_clean_customer_orders', 'companies_industries', 'pizza_runners']
+
+For string-matching scenarios, if the string is decided, don't use fuzzy query, and avoid using REGEXP. e.g. Get the object's title contains the word "book"
+However, if the string is not decided, you may use fuzzy query and ignore upper or lower case. e.g. Get articles that mention "education".
+When using ORDER BY, if there are duplicate values in the primary sort column, sort by an additional column as a secondary criterion.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-01 03:21:09 - Thread-1319 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders            USING (order_id)
+    JOIN   pizza_recipes      AS pr    USING (pizza_id)
+),
+/* split comma‑separated topping list into rows */
+split(order_id, topping_id, rest) AS (
+    /* anchor row: first token */
+    SELECT order_id,
+           CAST(TRIM(SUBSTR(toppings || ',', 1,
+                            INSTR(toppings || ',', ',') - 1)) AS INTEGER)     AS topping_id,
+           TRIM(SUBSTR(toppings || ',', INSTR(toppings || ',', ',') + 1))     AS rest
+    FROM   order_recipes
+    UNION ALL
+    /* recursive part: peel next token until string is empty */
+    SELECT order_id,
+           CAST(TRIM(CASE WHEN INSTR(rest, ',') = 0
+                          THEN rest
+                          ELSE SUBSTR(rest, 1, INSTR(rest, ',') - 1)
+                     END) AS INTEGER)                                         AS topping_id,
+           TRIM(CASE WHEN INSTR(rest, ',') = 0
+                     THEN ''
+                     ELSE SUBSTR(rest, INSTR(rest, ',') + 1)
+                END)                                                          AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (              /* +1 for every default recipe topping */
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (              /* +extras_count for requested extras */
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (          /* –total_exclusions for removed toppings */
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       totals.total_quantity
+FROM   totals
+JOIN   pizza_toppings AS pt ON pt.topping_id = totals.topping_id
+ORDER  BY totals.total_quantity DESC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:21:09 - Thread-1319 (execute) - INFO - [Executed results in self-refine]
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+
+[Executed results in self-refine]
+2025-05-01 03:21:09 - Thread-1319 (execute) - INFO - itercount: 1
+2025-05-01 03:21:09 - Thread-1319 (execute) - INFO - [Self-refine]
+Please check the answer again by reviewing Based on our customer pizza order information, summarize the total quantity of each ingredient used in the pizzas we delivered. Output the name and quantity for each ingredient., reviewing Relevant Tables and Columns and Possible Conditions and then give the final SQL query. Don't output other queries. If you think the answer is right, just output the current SQL.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+The answer format should be like: ```csv
+ingredient,total_quantity
+``` The answer should match the number of rows, the column name of the format and the filled values in the format (e.g. filled year or month). Don't output extra rows or nested rows!
+Current snswer: 
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+Current sql:
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders            USING (order_id)
+    JOIN   pizza_recipes      AS pr    USING (pizza_id)
+),
+/* split comma‑separated topping list into rows */
+split(order_id, topping_id, rest) AS (
+    /* anchor row: first token */
+    SELECT order_id,
+           CAST(TRIM(SUBSTR(toppings || ',', 1,
+                            INSTR(toppings || ',', ',') - 1)) AS INTEGER)     AS topping_id,
+           TRIM(SUBSTR(toppings || ',', INSTR(toppings || ',', ',') + 1))     AS rest
+    FROM   order_recipes
+    UNION ALL
+    /* recursive part: peel next token until string is empty */
+    SELECT order_id,
+           CAST(TRIM(CASE WHEN INSTR(rest, ',') = 0
+                          THEN rest
+                          ELSE SUBSTR(rest, 1, INSTR(rest, ',') - 1)
+                     END) AS INTEGER)                                         AS topping_id,
+           TRIM(CASE WHEN INSTR(rest, ',') = 0
+                     THEN ''
+                     ELSE SUBSTR(rest, INSTR(rest, ',') + 1)
+                END)                                                          AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (              /* +1 for every default recipe topping */
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (              /* +extras_count for requested extras */
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (          /* –total_exclusions for removed toppings */
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       totals.total_quantity
+FROM   totals
+JOIN   pizza_toppings AS pt ON pt.topping_id = totals.topping_id
+ORDER  BY totals.total_quantity DESC;
+[Self-refine]
+2025-05-01 03:21:25 - Thread-1319 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH delivered_orders AS (
+    SELECT order_id
+    FROM   pizza_clean_runner_orders
+    WHERE  cancellation IS NULL
+),
+order_recipes AS (
+    SELECT c.order_id,
+           pr.toppings
+    FROM   pizza_clean_customer_orders AS c
+    JOIN   delivered_orders USING (order_id)
+    JOIN   pizza_recipes    AS pr USING (pizza_id)
+),
+split(order_id, topping_id, rest) AS (
+    SELECT order_id,
+           CAST(TRIM(SUBSTR(toppings || ',', 1,
+                            INSTR(toppings || ',', ',') - 1)) AS INTEGER)     AS topping_id,
+           TRIM(SUBSTR(toppings || ',', INSTR(toppings || ',', ',') + 1))     AS rest
+    FROM   order_recipes
+    UNION ALL
+    SELECT order_id,
+           CAST(TRIM(CASE WHEN INSTR(rest, ',') = 0
+                          THEN rest
+                          ELSE SUBSTR(rest, 1, INSTR(rest, ',') - 1)
+                     END) AS INTEGER)                                         AS topping_id,
+           TRIM(CASE WHEN INSTR(rest, ',') = 0
+                     THEN ''
+                     ELSE SUBSTR(rest, INSTR(rest, ',') + 1)
+                END)                                                          AS rest
+    FROM   split
+    WHERE  rest <> ''
+),
+recipe_qty AS (
+    SELECT topping_id, COUNT(*) AS qty
+    FROM   split
+    GROUP  BY topping_id
+),
+extras_qty AS (
+    SELECT extras AS topping_id,
+           SUM(extras_count) AS qty
+    FROM   pizza_get_extras
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY extras
+),
+exclusions_qty AS (
+    SELECT exclusions AS topping_id,
+          -SUM(total_exclusions) AS qty
+    FROM   pizza_get_exclusions
+    WHERE  order_id IN (SELECT order_id FROM delivered_orders)
+    GROUP  BY exclusions
+),
+all_movements AS (
+    SELECT * FROM recipe_qty
+    UNION ALL
+    SELECT * FROM extras_qty
+    UNION ALL
+    SELECT * FROM exclusions_qty
+),
+totals AS (
+    SELECT topping_id,
+           SUM(qty) AS total_quantity
+    FROM   all_movements
+    GROUP  BY topping_id
+)
+SELECT pt.topping_name AS ingredient,
+       totals.total_quantity
+FROM   totals
+JOIN   pizza_toppings AS pt ON pt.topping_id = totals.topping_id
+WHERE  totals.total_quantity > 0
+ORDER  BY totals.total_quantity DESC;
+```
+[Try to run SQL in self-refine]
+2025-05-01 03:21:25 - Thread-1319 (execute) - INFO - [Executed results in self-refine]
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+
+[Executed results in self-refine]
+2025-05-01 03:21:25 - Thread-1319 (execute) - INFO - [Consistent results]
+ingredient,total_quantity
+Bacon,13
+Cheese,11
+Mushrooms,10
+Beef,9
+Chicken,9
+Pepperoni,9
+Salami,9
+BBQ Sauce,7
+Onions,3
+Peppers,3
+Tomatoes,3
+Tomato Sauce,3
+
+[Consistent results]
+2025-05-01 03:21:25 - Thread-1319 (execute) - INFO - Total iteration counts: 1

@@ -1,0 +1,28 @@
+WITH selected AS (
+    SELECT
+        "TICKER",
+        "DATE",
+        "VALUE"
+    FROM FINANCE__ECONOMICS.CYBERSYN.STOCK_PRICE_TIMESERIES
+    WHERE "VARIABLE" = 'post-market_close'
+      AND "TICKER" IN ('AAPL','MSFT','AMZN','GOOGL','META','NVDA','TSLA')
+      AND "DATE" BETWEEN '2024-01-01' AND '2024-06-30'
+), start_prices AS (
+    SELECT
+        "TICKER",
+        "VALUE" AS "START_VALUE"
+    FROM selected
+    QUALIFY "DATE" = MIN("DATE") OVER (PARTITION BY "TICKER")
+), end_prices AS (
+    SELECT
+        "TICKER",
+        "VALUE" AS "END_VALUE"
+    FROM selected
+    QUALIFY "DATE" = MAX("DATE") OVER (PARTITION BY "TICKER")
+)
+SELECT
+    s."TICKER",
+    ROUND((e."END_VALUE" - s."START_VALUE") / s."START_VALUE" * 100, 4) AS "PERCENT_CHANGE_2024_H1"
+FROM start_prices s
+JOIN end_prices  e USING ("TICKER")
+ORDER BY "PERCENT_CHANGE_2024_H1" DESC NULLS LAST, s."TICKER";

@@ -1,0 +1,28 @@
+WITH brca_clinical AS (
+    SELECT
+        "bcr_patient_barcode"          AS patient_id,
+        "histological_type"
+    FROM PANCANCER_ATLAS_1.PANCANCER_ATLAS_FILTERED."CLINICAL_PANCAN_PATIENT_WITH_FOLLOWUP_FILTERED"
+    WHERE "acronym" = 'BRCA'
+      AND "histological_type" IS NOT NULL
+),
+cdh1_mutated_patients AS (
+    SELECT DISTINCT
+        "ParticipantBarcode" AS patient_id
+    FROM PANCANCER_ATLAS_1.PANCANCER_ATLAS_FILTERED."MC3_MAF_V5_ONE_PER_TUMOR_SAMPLE"
+    WHERE "Study" = 'BRCA'
+      AND "Hugo_Symbol" = 'CDH1'
+)
+SELECT
+    bc."histological_type",
+    COUNT(DISTINCT bc.patient_id)                                          AS total_patients,
+    COUNT(DISTINCT cmp.patient_id)                                         AS patients_with_cdh1_mutation,
+    ROUND(COUNT(DISTINCT cmp.patient_id) * 100.0
+          / NULLIF(COUNT(DISTINCT bc.patient_id),0), 4)                    AS mutation_percentage
+FROM brca_clinical bc
+LEFT JOIN cdh1_mutated_patients cmp
+       ON bc.patient_id = cmp.patient_id
+GROUP BY bc."histological_type"
+ORDER BY mutation_percentage DESC NULLS LAST,
+         bc."histological_type"
+LIMIT 5;

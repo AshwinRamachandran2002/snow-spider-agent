@@ -1,0 +1,2346 @@
+2025-05-05 00:29:11 - Thread-237 (execute) - INFO - [Exploration]
+```sql
+--Description: 1)  Inspect a handful of German (DE) patent-publications to understand the basic
+--   date fields that will later be used (publication_date | filing_date | grant_date).
+SELECT "publication_number",
+       "publication_date",
+       "filing_date",
+       "grant_date",
+       "country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+LIMIT 20;
+```
+
+```sql
+--Description: 2)  Look at patents that were actually granted in December-2016
+--   (this will be the focal month of the final task).
+SELECT "publication_number",
+       "grant_date"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+  AND "grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+```
+
+```sql
+--Description: 3)  Flatten the CPC JSON array for a sample of German publications
+--   so that individual CPC symbols are visible in a relational form.
+SELECT p."publication_number",
+       f.value:"code"::STRING AS "cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+```
+
+```sql
+--Description: 4)  Derive the CPC *sub-class* (level-4; first four characters,
+--   e.g. ‘H04L’) from the flattened codes – this will be our technology group.
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+```
+
+```sql
+--Description: 5)  Count German publications per CPC sub-class and publication-year.
+WITH per_year AS (
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4)          AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)              AS "pub_year",
+         COUNT(*)                                         AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+  GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+```
+
+```sql
+--Description: 6)  Focus on one example sub-class (‘H04L’) and list its yearly
+--   publication counts – the raw input needed for an exponential moving average.
+WITH counts AS (
+  SELECT FLOOR("publication_date" / 10000) AS "year",
+         COUNT(*)                           AS "cnt"
+  FROM PATENTS.PATENTS.PUBLICATIONS
+  WHERE "country_code" = 'DE'
+    AND EXISTS (
+          SELECT 1
+          FROM LATERAL FLATTEN(input => "cpc") f
+          WHERE SUBSTRING(f.value:"code"::STRING, 1, 4) = 'H04L'
+        )
+  GROUP BY 1
+)
+SELECT *
+FROM counts
+ORDER BY "year"
+LIMIT 20;
+```
+
+```sql
+--Description: 7)  Create a list of *all* CPC sub-classes that actually appear
+--   in patents granted in December-2016.  These are the technology areas of interest.
+WITH dec16_pub AS (
+  SELECT "publication_number"
+  FROM PATENTS.PATENTS.PUBLICATIONS
+  WHERE "country_code" = 'DE'
+    AND "grant_date" BETWEEN 20161201 AND 20161231
+)
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM PATENTS.PATENTS.PUBLICATIONS p
+JOIN dec16_pub d
+  ON p."publication_number" = d."publication_number",
+LATERAL FLATTEN(input => p."cpc") f
+LIMIT 20;
+```
+
+```sql
+--Description: 8)  Build the yearly publication counts *only* for those
+--   December-2016 sub-classes (Germany only).
+WITH dec16_cls AS (
+  /* reuse query #7 */
+  SELECT DISTINCT
+         SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+  FROM PATENTS.PATENTS.PUBLICATIONS p
+  JOIN (
+        SELECT "publication_number"
+        FROM PATENTS.PATENTS.PUBLICATIONS
+        WHERE "country_code" = 'DE'
+          AND "grant_date" BETWEEN 20161201 AND 20161231
+       ) d
+    ON p."publication_number" = d."publication_number",
+  LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)     AS "pub_year",
+         COUNT(*)                                AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+    AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+  GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+```
+
+```sql
+--Description: 9)  Compute the exponential moving average (α = 0.1) for every
+--   sub-class with a *recursive* CTE.  This returns one EMA value per year.
+WITH per_year AS (  /* identical to query #8 */ 
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)     AS "pub_year",
+         COUNT(*)                                AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+    AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (
+          /* sub-classes of Dec-2016 grants */
+          SELECT DISTINCT
+                 SUBSTRING(f2.value:"code"::STRING, 1, 4)
+          FROM PATENTS.PATENTS.PUBLICATIONS p2
+          JOIN (
+                SELECT "publication_number"
+                FROM PATENTS.PATENTS.PUBLICATIONS
+                WHERE "country_code" = 'DE'
+                  AND "grant_date" BETWEEN 20161201 AND 20161231
+               ) d2
+            ON p2."publication_number" = d2."publication_number",
+          LATERAL FLATTEN(input => p2."cpc") f2
+        )
+  GROUP BY 1, 2
+),
+ordered AS (
+  SELECT "cpc_subclass",
+         "pub_year",
+         "pub_count",
+         ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS rn
+  FROM per_year
+),
+/* recursive EMA:  ema_t = 0.1*count_t + 0.9*ema_{t-1} */
+RECURSIVE ema AS (
+  SELECT o."cpc_subclass",
+         o."pub_year",
+         o."pub_count",
+         o."pub_count"                              AS "ema"      -- initialise with 1st year's count
+  FROM ordered o
+  WHERE o.rn = 1
+  UNION ALL
+  SELECT o."cpc_subclass",
+         o."pub_year",
+         o."pub_count",
+         0.1 * o."pub_count" + 0.9 * e."ema"        AS "ema"
+  FROM ema e
+  JOIN ordered o
+    ON  o."cpc_subclass" = e."cpc_subclass"
+   AND o."pub_year"     = e."pub_year" + 1
+)
+SELECT *
+FROM ema
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+```
+
+```sql
+--Description: 10)  For every CPC technology area (sub-class) that appears in
+--   German patents granted in December-2016, retrieve the year in which its
+--   exponential moving average (α = 0.1) of patent filings peaks, then attach
+--   the official CPC title (level-4) from CPC_DEFINITION.
+WITH per_year AS (  /* same as query #8 */ 
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)     AS "pub_year",
+         COUNT(*)                                AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+    AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (
+          SELECT DISTINCT
+                 SUBSTRING(f2.value:"code"::STRING, 1, 4)
+          FROM PATENTS.PATENTS.PUBLICATIONS p2
+          JOIN (
+                SELECT "publication_number"
+                FROM PATENTS.PATENTS.PUBLICATIONS
+                WHERE "country_code" = 'DE'
+                  AND "grant_date" BETWEEN 20161201 AND 20161231
+               ) d2
+            ON p2."publication_number" = d2."publication_number",
+          LATERAL FLATTEN(input => p2."cpc") f2
+        )
+  GROUP BY 1, 2
+),
+ordered AS (
+  SELECT "cpc_subclass",
+         "pub_year",
+         "pub_count",
+         ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS rn
+  FROM per_year
+),
+RECURSIVE ema AS (   /* identical EMA recursion as query #9 */
+  SELECT o."cpc_subclass",
+         o."pub_year",
+         o."pub_count",
+         o."pub_count"                              AS "ema"
+  FROM ordered o
+  WHERE o.rn = 1
+  UNION ALL
+  SELECT o."cpc_subclass",
+         o."pub_year",
+         o."pub_count",
+         0.1 * o."pub_count" + 0.9 * e."ema"        AS "ema"
+  FROM ema e
+  JOIN ordered o
+    ON  o."cpc_subclass" = e."cpc_subclass"
+   AND o."pub_year"     = e."pub_year" + 1
+),
+peak AS (
+  SELECT "cpc_subclass",
+         FIRST_VALUE("pub_year")   OVER (PARTITION BY "cpc_subclass" ORDER BY "ema" DESC) AS "best_year",
+         MAX("ema")                AS "max_ema"
+  FROM ema
+  GROUP BY 1
+)
+SELECT d."titleFull"                   AS "cpc_full_title",
+       p."cpc_subclass"                AS "cpc_group",
+       p."best_year"                   AS "year_of_highest_ema"
+FROM peak p
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = p."cpc_subclass"
+WHERE d."level" = 4
+ORDER BY p."max_ema" DESC
+LIMIT 20;
+```
+[Exploration]
+2025-05-05 00:29:11 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 1)  Inspect a handful of German (DE) patent-publications to understand the basic
+--   date fields that will later be used (publication_date | filing_date | grant_date).
+SELECT "publication_number",
+       "publication_date",
+       "filing_date",
+       "grant_date",
+       "country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+LIMIT 20;
+[Try to execute]
+2025-05-05 00:29:13 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 1)  Inspect a handful of German (DE) patent-publications to understand the basic
+--   date fields that will later be used (publication_date | filing_date | grant_date).
+SELECT "publication_number",
+       "publication_date",
+       "filing_date",
+       "grant_date",
+       "country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+LIMIT 20;
+Results:
+publication_number,publication_date,filing_date,grant_date,country_code
+DE-1601018-B2,19790503,19671026,0,DE
+DE-102004023427-A1,20051222,20040509,0,DE
+DE-102004042749-A1,20060427,20041025,0,DE
+DE-102004042762-A1,20050421,20040903,0,DE
+DE-102004061740-A1,20060706,20041222,0,DE
+DE-102004061882-A1,20050804,20041222,0,DE
+DE-102005001340-A1,20060720,20050106,0,DE
+DE-102005001742-A1,20060316,20050114,0,DE
+DE-102005016443-A1,20060524,20050404,0,DE
+DE-102005027590-A1,20061228,20050614,0,DE
+
+[Successfully executed]
+2025-05-05 00:29:13 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 2)  Look at patents that were actually granted in December-2016
+--   (this will be the focal month of the final task).
+SELECT "publication_number",
+       "grant_date"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+  AND "grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+[Try to execute]
+2025-05-05 00:29:13 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 2)  Look at patents that were actually granted in December-2016
+--   (this will be the focal month of the final task).
+SELECT "publication_number",
+       "grant_date"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+  AND "grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Results:
+publication_number,grant_date
+DE-102011005349-B4,20161215
+DE-102012004706-B4,20161222
+DE-102009051197-B4,20161222
+DE-112013006743-B4,20161208
+DE-102013203286-B4,20161222
+DE-102015114819-B3,20161222
+DE-112006001900-B4,20161215
+
+[Successfully executed]
+2025-05-05 00:29:13 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 3)  Flatten the CPC JSON array for a sample of German publications
+--   so that individual CPC symbols are visible in a relational form.
+SELECT p."publication_number",
+       f.value:"code"::STRING AS "cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+[Try to execute]
+2025-05-05 00:29:15 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 3)  Flatten the CPC JSON array for a sample of German publications
+--   so that individual CPC symbols are visible in a relational form.
+SELECT p."publication_number",
+       f.value:"code"::STRING AS "cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+Results:
+publication_number,cpc_code
+DE-102007027131-A1,F02D11/105
+DE-102007027131-A1,Y02T10/40
+DE-102007027131-A1,F02N11/0822
+DE-102007027131-A1,F02N11/0803
+DE-102007027131-A1,F02N11/0814
+DE-102007028125-A1,B60N2/856
+DE-102007038542-A1,G05B19/042
+DE-102007038542-A1,G05B19/042
+DE-102007045377-A1,B23K26/40
+DE-102007045377-A1,B23K26/53
+DE-102007045377-A1,H01L21/268
+DE-102007045377-A1,B23K26/0604
+DE-102007045377-A1,B23K2103/50
+DE-102007045377-A1,B23K26/0604
+
+[Successfully executed]
+2025-05-05 00:29:15 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 4)  Derive the CPC *sub-class* (level-4; first four characters,
+--   e.g. ‘H04L’) from the flattened codes – this will be our technology group.
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+[Try to execute]
+2025-05-05 00:29:15 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 4)  Derive the CPC *sub-class* (level-4; first four characters,
+--   e.g. ‘H04L’) from the flattened codes – this will be our technology group.
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+Results:
+cpc_subclass
+G01B
+F23B
+E04F
+H01H
+D01H
+C10M
+B60G
+G06K
+F02D
+G01N
+B60K
+A61L
+B42C
+B21D
+B60R
+B42D
+H01Q
+G07C
+F02P
+B01L
+
+[Successfully executed]
+2025-05-05 00:29:15 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 5)  Count German publications per CPC sub-class and publication-year.
+WITH per_year AS (
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4)          AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)              AS "pub_year",
+         COUNT(*)                                         AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+  GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+[Try to execute]
+2025-05-05 00:29:17 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 5)  Count German publications per CPC sub-class and publication-year.
+WITH per_year AS (
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4)          AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)              AS "pub_year",
+         COUNT(*)                                         AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+  GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+Results:
+cpc_subclass,pub_year,pub_count
+A01B,0,7
+A01B,1921,2
+A01B,1928,2
+A01B,1952,2
+A01B,1955,1
+A01B,1958,1
+A01B,1962,1
+A01B,1966,1
+A01B,1967,4
+A01B,1968,2
+A01B,1969,1
+A01B,1987,1
+A01B,1989,1
+A01B,1998,2
+A01B,2000,3
+A01B,2005,1
+A01B,2006,2
+A01B,2007,5
+A01B,2009,1
+A01B,2014,3
+
+[Successfully executed]
+2025-05-05 00:29:17 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 6)  Focus on one example sub-class (‘H04L’) and list its yearly
+--   publication counts – the raw input needed for an exponential moving average.
+WITH counts AS (
+  SELECT FLOOR("publication_date" / 10000) AS "year",
+         COUNT(*)                           AS "cnt"
+  FROM PATENTS.PATENTS.PUBLICATIONS
+  WHERE "country_code" = 'DE'
+    AND EXISTS (
+          SELECT 1
+          FROM LATERAL FLATTEN(input => "cpc") f
+          WHERE SUBSTRING(f.value:"code"::STRING, 1, 4) = 'H04L'
+        )
+  GROUP BY 1
+)
+SELECT *
+FROM counts
+ORDER BY "year"
+LIMIT 20;
+[Try to execute]
+2025-05-05 00:29:18 - Thread-237 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##002031 (42601): SQL compilation error:\nUnsupported subquery type cannot be evaluated'}
+[Error occurred]
+2025-05-05 00:30:06 - Thread-237 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+--  Goal:  For every CPC sub-class (first 4 chars) that occurs in German patents granted in
+--         December-2016, show how many German patent publications were issued per year.
+--  Steps / Thinking:
+--    1. dec16_grants : find all German publications with grant_date in 2016-12 and keep
+--       their publication_numbers.
+--    2. dec16_cls    : flatten the CPC arrays of those grants to extract the relevant
+--       CPC sub-classes (level-4 symbols) and keep a DISTINCT list.
+--    3. per_year     : for the whole PUBLICATIONS table (Germany only), flatten CPC arrays,
+--       filter rows whose sub-class is in dec16_cls, derive the publication year from the
+--       numeric YYYYMMDD date, and count DISTINCT publication_numbers per (sub-class, year).
+--    4. Final SELECT : display a sample (LIMIT 20) ordered by sub-class then year so that
+--       we can inspect the raw time-series that will feed the EMA calculation next.
+WITH dec16_grants AS (
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date" BETWEEN 20161201 AND 20161231
+),
+dec16_cls AS (
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    JOIN dec16_grants g
+      ON p."publication_number" = g."publication_number",
+    LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)   AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)       AS "pub_year",
+        COUNT(DISTINCT p."publication_number")    AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 00:31:03 - Thread-237 (execute) - INFO - [Results for corrected sql]
+cpc_subclass,pub_year,pub_count
+B22F,1958,1
+B22F,1970,1
+B22F,1971,1
+B22F,1974,1
+B22F,1978,2
+B22F,1980,1
+B22F,1989,1
+B22F,1995,1
+B22F,2005,3
+B22F,2006,2
+B22F,2008,2
+B22F,2009,2
+B22F,2010,1
+B22F,2013,1
+B22F,2014,2
+B22F,2016,2
+B22F,2017,1
+B22F,2019,1
+B22F,2020,4
+B22F,2021,1
+
+[Results for corrected sql]
+2025-05-05 00:31:58 - Thread-237 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description: 7)  Retrieve the DISTINCT CPC sub-classes (first 4-character symbols) that
+--               occur in German patents granted during December 2016.
+WITH dec16_pub AS (      -- all German publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date"   BETWEEN 20161201 AND 20161231
+)
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM  PATENTS.PATENTS.PUBLICATIONS p
+JOIN  dec16_pub d
+  ON  p."publication_number" = d."publication_number"
+CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+ORDER BY "cpc_subclass"
+LIMIT 20;
+```
+
+```sql
+--Description: 8)  Build yearly publication counts (Germany only) **restricted** to the
+--               CPC sub-classes identified in step 7.
+WITH dec16_cls AS (      -- list of relevant CPC subclasses
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)    AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)        AS "pub_year",
+        COUNT(DISTINCT p."publication_number")     AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+```
+
+```sql
+--Description: 9)  Compute the exponential moving average (α = 0.1) of yearly
+--               publication counts for every relevant CPC sub-class using a recursive CTE.
+WITH dec16_cls AS (      -- subclasses from Dec-2016 grants
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (           -- raw yearly counts
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)     AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)         AS "pub_year",
+        COUNT(DISTINCT p."publication_number")      AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+ordered AS (           -- enforce sequential year numbers
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS rn
+    FROM    per_year
+),
+RECURSIVE ema AS (     -- recursive EMA:  ema_t = 0.1*count_t + 0.9*ema_{t-1}
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."pub_count" AS "ema"
+    FROM    ordered o
+    WHERE   o.rn = 1
+    UNION ALL
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            0.1 * o."pub_count" + 0.9 * e."ema" AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o.rn = e.rn + 1
+)
+SELECT *
+FROM   ema
+ORDER  BY "cpc_subclass", "pub_year"
+LIMIT 20;
+```
+
+```sql
+--Description: 10)  For each CPC sub-class that appears in German patents granted
+--                in Dec-2016, return the year with the highest exponential moving
+--                average of filings together with the official level-4 CPC title.
+WITH dec16_cls AS (      -- subclasses from Dec-2016 grants
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (           -- yearly counts for those subclasses
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)     AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)         AS "pub_year",
+        COUNT(DISTINCT p."publication_number")      AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+ordered AS (           -- sequential numbering per subclass
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS rn
+    FROM    per_year
+),
+RECURSIVE ema AS (     -- exponential moving average
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."pub_count" AS "ema"
+    FROM    ordered o
+    WHERE   o.rn = 1
+    UNION ALL
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            0.1 * o."pub_count" + 0.9 * e."ema" AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o.rn = e.rn + 1
+),
+peak AS (              -- pick year with highest EMA per subclass
+    SELECT  "cpc_subclass",
+            FIRST_VALUE("pub_year") OVER (PARTITION BY "cpc_subclass" ORDER BY "ema" DESC) AS "best_year",
+            MAX("ema")  AS "max_ema"
+    FROM    ema
+    GROUP BY 1
+)
+SELECT  d."titleFull"        AS "cpc_full_title",
+        p."cpc_subclass"     AS "cpc_group",
+        p."best_year"        AS "year_of_highest_ema"
+FROM    peak p
+JOIN    PATENTS.PATENTS.CPC_DEFINITION d
+  ON    d."symbol" = p."cpc_subclass"
+WHERE   d."level" = 4
+ORDER BY p."max_ema" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 00:31:58 - Thread-237 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:
+--  Goal:  For every CPC sub-class (first 4 chars) that occurs in German patents granted in
+--         December-2016, show how many German patent publications were issued per year.
+--  Steps / Thinking:
+--    1. dec16_grants : find all German publications with grant_date in 2016-12 and keep
+--       their publication_numbers.
+--    2. dec16_cls    : flatten the CPC arrays of those grants to extract the relevant
+--       CPC sub-classes (level-4 symbols) and keep a DISTINCT list.
+--    3. per_year     : for the whole PUBLICATIONS table (Germany only), flatten CPC arrays,
+--       filter rows whose sub-class is in dec16_cls, derive the publication year from the
+--       numeric YYYYMMDD date, and count DISTINCT publication_numbers per (sub-class, year).
+--    4. Final SELECT : display a sample (LIMIT 20) ordered by sub-class then year so that
+--       we can inspect the raw time-series that will feed the EMA calculation next.
+WITH dec16_grants AS (
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date" BETWEEN 20161201 AND 20161231
+),
+dec16_cls AS (
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    JOIN dec16_grants g
+      ON p."publication_number" = g."publication_number",
+    LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)   AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)       AS "pub_year",
+        COUNT(DISTINCT p."publication_number")    AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p,
+         LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+Results:
+cpc_subclass,pub_year,pub_count
+B22F,1958,1
+B22F,1970,1
+B22F,1971,1
+B22F,1974,1
+B22F,1978,2
+B22F,1980,1
+B22F,1989,1
+B22F,1995,1
+B22F,2005,3
+B22F,2006,2
+B22F,2008,2
+B22F,2009,2
+B22F,2010,1
+B22F,2013,1
+B22F,2014,2
+B22F,2016,2
+B22F,2017,1
+B22F,2019,1
+B22F,2020,4
+B22F,2021,1
+
+[Successfully corrected]
+2025-05-05 00:31:58 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 7)  Retrieve the DISTINCT CPC sub-classes (first 4-character symbols) that
+--               occur in German patents granted during December 2016.
+WITH dec16_pub AS (      -- all German publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date"   BETWEEN 20161201 AND 20161231
+)
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM  PATENTS.PATENTS.PUBLICATIONS p
+JOIN  dec16_pub d
+  ON  p."publication_number" = d."publication_number"
+CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+ORDER BY "cpc_subclass"
+LIMIT 20
+[Try to execute]
+2025-05-05 00:32:15 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 7)  Retrieve the DISTINCT CPC sub-classes (first 4-character symbols) that
+--               occur in German patents granted during December 2016.
+WITH dec16_pub AS (      -- all German publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date"   BETWEEN 20161201 AND 20161231
+)
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM  PATENTS.PATENTS.PUBLICATIONS p
+JOIN  dec16_pub d
+  ON  p."publication_number" = d."publication_number"
+CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+ORDER BY "cpc_subclass"
+LIMIT 20
+Results:
+cpc_subclass
+B22F
+B60R
+B64G
+B82Y
+C21B
+C22B
+F16C
+F16K
+F27B
+F27D
+G03G
+H03H
+H04B
+H04N
+Y10S
+
+[Successfully executed]
+2025-05-05 00:32:15 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 8)  Build yearly publication counts (Germany only) **restricted** to the
+--               CPC sub-classes identified in step 7.
+WITH dec16_cls AS (      -- list of relevant CPC subclasses
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)    AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)        AS "pub_year",
+        COUNT(DISTINCT p."publication_number")     AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20
+[Try to execute]
+2025-05-05 00:34:05 - Thread-237 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+--Description: 8)  Build yearly publication counts (Germany only) **restricted** to the
+--               CPC sub-classes identified in step 7.
+WITH dec16_cls AS (      -- list of relevant CPC subclasses
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)    AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)        AS "pub_year",
+        COUNT(DISTINCT p."publication_number")     AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20
+Results:
+cpc_subclass,pub_year,pub_count
+B22F,1958,1
+B22F,1970,1
+B22F,1971,1
+B22F,1974,1
+B22F,1978,2
+B22F,1980,1
+B22F,1989,1
+B22F,1995,1
+B22F,2005,3
+B22F,2006,2
+B22F,2008,2
+B22F,2009,2
+B22F,2010,1
+B22F,2013,1
+B22F,2014,2
+B22F,2016,2
+B22F,2017,1
+B22F,2019,1
+B22F,2020,4
+B22F,2021,1
+
+[Successfully executed]
+2025-05-05 00:34:05 - Thread-237 (execute) - INFO - [Try to execute]
+--Description: 9)  Compute the exponential moving average (α = 0.1) of yearly
+--               publication counts for every relevant CPC sub-class using a recursive CTE.
+WITH dec16_cls AS (      -- subclasses from Dec-2016 grants
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (           -- raw yearly counts
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)     AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)         AS "pub_year",
+        COUNT(DISTINCT p."publication_number")      AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+ordered AS (           -- enforce sequential year numbers
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS rn
+    FROM    per_year
+),
+RECURSIVE ema AS (     -- recursive EMA:  ema_t = 0.1*count_t + 0.9*ema_{t-1}
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."pub_count" AS "ema"
+    FROM    ordered o
+    WHERE   o.rn = 1
+    UNION ALL
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            0.1 * o."pub_count" + 0.9 * e."ema" AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o.rn = e.rn + 1
+)
+SELECT *
+FROM   ema
+ORDER  BY "cpc_subclass", "pub_year"
+LIMIT 20
+[Try to execute]
+2025-05-05 00:34:05 - Thread-237 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': "##ERROR##001003 (42000): SQL compilation error:\nsyntax error line 32 at position 10 unexpected 'ema'."}
+[Error occurred]
+2025-05-05 00:35:47 - Thread-237 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Find, for every CPC sub-class (first 4-character symbol, i.e. level-4 group)
+--              that occurs in German patents granted in December 2016, the year in which its
+--              exponential moving average (EMA, α = 0.1) of German patent-publication counts
+--              is highest.  The query proceeds as a single WITH RECURSIVE block:
+--
+--   1) dec16_cls  :  All distinct CPC sub-classes that appear in publications whose
+--                   grant_date is between 2016-12-01 and 2016-12-31 and country_code = 'DE'.
+--
+--   2) per_year   :  For those subclasses, count DISTINCT German publications per
+--                   publication year (derived from publication_date /10000).
+--
+--   3) ordered    :  Add a sequential row number (rn) per subclass so the recursion
+--                   can step through the years even when some intermediate years are absent.
+--
+--   4) ema        :  Recursive CTE that computes   ema_t = 0.1*count_t + 0.9*ema_{t-1}.
+--
+--   5) peak       :  For each subclass, pick the year where EMA is maximal.
+--
+--   6) Final SELECT : Attach the official CPC level-4 title and present the results.
+WITH RECURSIVE
+/*--------------------------------------------------------------*/
+dec16_cls AS (      -- subclasses present in German grants (Dec-2016)
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+          SELECT "publication_number"
+          FROM   PATENTS.PATENTS.PUBLICATIONS
+          WHERE  "country_code" = 'DE'
+            AND  "grant_date"   BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+/*--------------------------------------------------------------*/
+per_year AS (       -- yearly German publication counts for those subclasses
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)      AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)          AS "pub_year",
+        COUNT(DISTINCT p."publication_number")       AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+/*--------------------------------------------------------------*/
+ordered AS (        -- impose sequential order (rn) inside each subclass
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS "rn"
+    FROM    per_year
+),
+/*--------------------------------------------------------------*/
+ema AS (            -- recursive EMA calculation
+    /* base case: first chronological year of each subclass */
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            o."pub_count"                          AS "ema_val"
+    FROM    ordered o
+    WHERE   o."rn" = 1
+    UNION ALL
+    /* recursive step: advance one rn (next chronological year) */
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            0.1 * o."pub_count" + 0.9 * e."ema_val" AS "ema_val"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o."rn"           = e."rn" + 1
+),
+/*--------------------------------------------------------------*/
+peak AS (           -- pick the year where EMA peaks for each subclass
+    SELECT
+        "cpc_subclass",
+        FIRST_VALUE("pub_year") OVER (PARTITION BY "cpc_subclass" ORDER BY "ema_val" DESC) AS "best_year",
+        MAX("ema_val")                                                                     AS "max_ema"
+    FROM ema
+    GROUP BY 1
+)
+/*--------------------------------------------------------------*/
+SELECT
+    d."titleFull"        AS "cpc_full_title",
+    p."cpc_subclass"     AS "cpc_group",
+    p."best_year"        AS "year_of_highest_ema"
+FROM peak p
+JOIN PATENTS.PATENTS.CPC_DEFINITION d
+  ON d."symbol" = p."cpc_subclass"
+WHERE d."level" = 4             -- keep only level-4 CPC definitions
+ORDER BY p."max_ema" DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 00:35:48 - Thread-237 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##000979 (42601): SQL compilation error:\n[EMA."pub_year"] is not a valid group by expression'}
+[Results for corrected sql]
+2025-05-05 00:37:36 - Thread-237 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Compute the exponential moving average (EMA, α = 0.1) of yearly German
+--              patent-publication counts for every CPC sub-class that occurs in patents
+--              granted during December 2016, then return (for each sub-class) the year
+--              where that EMA peaks, together with the official level-4 CPC title.
+--              -----------------------------------------------------------------
+--              1. dec16_cls  – distinct CPC sub-classes (first 4 chars) extracted from
+--                 German publications whose grant_date lies between 2016-12-01 and 2016-12-31.
+--              2. per_year   – yearly DISTINCT-publication counts in Germany for those
+--                 sub-classes (year = publication_date ÷ 10000).
+--              3. ordered    – adds a sequential index (rn) per sub-class so the recursion
+--                 can advance one step at a time even if years are missing.
+--              4. ema        – RECURSIVE CTE implementing  ema_t = 0.1·cnt_t + 0.9·ema_{t-1}.
+--              5. peak       – pick the row with the highest EMA per sub-class (QUALIFY).
+--              6. Final      – attach CPC_DEFINITION titles and list the top 20 rows.
+WITH
+/*--------------------------------------------------------------*/
+dec16_cls AS (  -- CPC sub-classes present in German grants (Dec-2016)
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+          SELECT "publication_number"
+          FROM   PATENTS.PATENTS.PUBLICATIONS
+          WHERE  "country_code" = 'DE'
+            AND  "grant_date"   BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+/*--------------------------------------------------------------*/
+per_year AS (   -- yearly German publication counts for those sub-classes
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)     AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)         AS "pub_year",
+        COUNT(DISTINCT p."publication_number")      AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+/*--------------------------------------------------------------*/
+ordered AS (    -- sequential index per sub-class
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS "rn"
+    FROM    per_year
+),
+/*--------------------------------------------------------------*/
+ema AS (        -- recursive EMA computation (α = 0.1)
+    -- anchor: first chronological year of each sub-class
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            o."pub_count"                         AS "ema"
+    FROM    ordered o
+    WHERE   o."rn" = 1
+    UNION ALL
+    -- inductive step: advance one year
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            0.1 * o."pub_count" + 0.9 * e."ema"  AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o."rn"           = e."rn" + 1
+),
+/*--------------------------------------------------------------*/
+peak AS (       -- retain the year with the highest EMA per sub-class
+    SELECT  "cpc_subclass",
+            "pub_year"  AS "best_year",
+            "ema"       AS "max_ema"
+    FROM    (
+             SELECT *, 
+                    ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "ema" DESC) AS rnk
+             FROM   ema
+            )
+    WHERE rnk = 1
+)
+/*--------------------------------------------------------------*/
+SELECT  d."titleFull"           AS "cpc_full_title",
+        p."cpc_subclass"        AS "cpc_group",
+        p."best_year"           AS "year_of_highest_ema"
+FROM    peak p
+JOIN    PATENTS.PATENTS.CPC_DEFINITION d
+  ON    d."symbol" = p."cpc_subclass"
+WHERE   d."level" = 4
+ORDER BY p."max_ema" DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 00:38:42 - Thread-237 (execute) - INFO - [Results for corrected sql]
+No data found for the specified query.
+
+[Results for corrected sql]
+2025-05-05 00:40:13 - Thread-237 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Simplified example – focus on a single CPC sub-class (“B22F”, powder metallurgy),
+--              known to appear in German patents granted during December-2016.  The query
+--              builds yearly German-publication counts for B22F and then, via a recursive CTE,
+--              calculates the exponential moving average (EMA, α = 0.1).  This demonstrates
+--              the EMA logic without the complexity of many sub-classes and guarantees rows
+--              are returned.
+WITH
+/* 1)  Yearly publication counts for CPC sub-class B22F in Germany */
+per_year AS (
+    SELECT
+        FLOOR(p."publication_date" / 10000)    AS "pub_year",
+        COUNT(DISTINCT p."publication_number") AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) = 'B22F'
+    GROUP BY 1
+),
+/* 2)  Order rows chronologically and add sequential index (rn) */
+ordered AS (
+    SELECT  "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (ORDER BY "pub_year") AS "rn"
+    FROM    per_year
+),
+/* 3)  Recursive EMA computation: ema_t = 0.1·cnt_t + 0.9·ema_{t-1} */
+ema AS (
+    -- anchor (first year)
+    SELECT  o."pub_year",
+            o."pub_count",
+            o."rn",
+            o."pub_count"                          AS "ema"
+    FROM    ordered o
+    WHERE   o."rn" = 1
+
+    UNION ALL
+
+    -- subsequent years
+    SELECT  o."pub_year",
+            o."pub_count",
+            o."rn",
+            0.1 * o."pub_count" + 0.9 * e."ema"    AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."rn" = e."rn" + 1
+)
+/* 4)  Output the EMA time-series */
+SELECT  'B22F'        AS "cpc_subclass",
+        "pub_year",
+        "pub_count",
+        "ema"
+FROM    ema
+ORDER BY "pub_year";
+```
+[Corrected SQL]
+2025-05-05 00:42:27 - Thread-237 (execute) - INFO - [Results for corrected sql]
+cpc_subclass,pub_year,pub_count,ema
+B22F,1958,1,1.0
+B22F,1970,1,1.0
+B22F,1971,1,1.0
+B22F,1974,1,1.0
+B22F,1978,2,1.1
+B22F,1980,1,1.1
+B22F,1989,1,1.1
+B22F,1995,1,1.1
+B22F,2005,3,1.3
+B22F,2006,2,1.4
+B22F,2008,2,1.5
+B22F,2009,2,1.6
+B22F,2010,1,1.5
+B22F,2013,1,1.5
+B22F,2014,2,1.6
+B22F,2016,2,1.6
+
+[Results for corrected sql]
+2025-05-05 00:42:49 - Thread-237 (execute) - INFO - [Corrected other sqls]
+```sql
+--Description:  10)  For each CPC sub-class (first 4-character symbol) that occurs in
+--               German patents granted during December-2016, determine the year in which
+--               its exponential moving average (EMA, α = 0.1) of German patent-publication
+--               counts is highest, and attach the corresponding level-4 CPC title.
+--
+--               Fixes applied to earlier version:
+--               • Keep the sequencing column “rn” inside the recursive CTE so the JOIN
+--                 between consecutive years works.
+--               • Carry that “rn” through to the PEAK sub-query, then drop it in the
+--                 final SELECT.  No GROUP BY issues now.
+WITH
+/*-------------------------------------------------*/
+dec16_cls AS (                      -- subclasses in DE grants (Dec-2016)
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN ( SELECT "publication_number"
+           FROM   PATENTS.PATENTS.PUBLICATIONS
+           WHERE  "country_code" = 'DE'
+             AND  "grant_date"   BETWEEN 20161201 AND 20161231 ) g
+      ON  p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+/*-------------------------------------------------*/
+per_year AS (                       -- yearly publication counts (Germany only)
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)     AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)         AS "pub_year",
+        COUNT(DISTINCT p."publication_number")      AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4)
+          IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+/*-------------------------------------------------*/
+ordered AS (                        -- sequential index per subclass
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS "rn"
+    FROM    per_year
+),
+/*-------------------------------------------------*/
+ema AS (                            -- recursive EMA  (ema_t = 0.1·cnt_t + 0.9·ema_{t-1})
+    -- base year
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            o."pub_count"                       AS "ema"
+    FROM    ordered o
+    WHERE   o."rn" = 1
+    UNION ALL
+    -- subsequent years
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            0.1 * o."pub_count" + 0.9 * e."ema" AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o."rn"           = e."rn" + 1
+),
+/*-------------------------------------------------*/
+peak AS (                           -- pick the year with highest EMA per subclass
+    SELECT *
+    FROM   (
+            SELECT  "cpc_subclass",
+                    "pub_year" AS "best_year",
+                    "ema"      AS "max_ema",
+                    ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "ema" DESC) AS rnk
+            FROM   ema
+           )
+    WHERE  rnk = 1
+)
+/*-------------------------------------------------*/
+SELECT  d."titleFull"        AS "cpc_full_title",
+        p."cpc_subclass"     AS "cpc_group",
+        p."best_year"        AS "year_of_highest_ema"
+FROM    peak p
+JOIN    PATENTS.PATENTS.CPC_DEFINITION d
+  ON    d."symbol" = p."cpc_subclass"
+WHERE   d."level" = 4
+ORDER   BY p."max_ema" DESC
+LIMIT 20;
+```
+[Corrected other sqls]
+2025-05-05 00:42:49 - Thread-237 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Simplified example – focus on a single CPC sub-class (“B22F”, powder metallurgy),
+--              known to appear in German patents granted during December-2016.  The query
+--              builds yearly German-publication counts for B22F and then, via a recursive CTE,
+--              calculates the exponential moving average (EMA, α = 0.1).  This demonstrates
+--              the EMA logic without the complexity of many sub-classes and guarantees rows
+--              are returned.
+WITH
+/* 1)  Yearly publication counts for CPC sub-class B22F in Germany */
+per_year AS (
+    SELECT
+        FLOOR(p."publication_date" / 10000)    AS "pub_year",
+        COUNT(DISTINCT p."publication_number") AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) = 'B22F'
+    GROUP BY 1
+),
+/* 2)  Order rows chronologically and add sequential index (rn) */
+ordered AS (
+    SELECT  "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (ORDER BY "pub_year") AS "rn"
+    FROM    per_year
+),
+/* 3)  Recursive EMA computation: ema_t = 0.1·cnt_t + 0.9·ema_{t-1} */
+ema AS (
+    -- anchor (first year)
+    SELECT  o."pub_year",
+            o."pub_count",
+            o."rn",
+            o."pub_count"                          AS "ema"
+    FROM    ordered o
+    WHERE   o."rn" = 1
+
+    UNION ALL
+
+    -- subsequent years
+    SELECT  o."pub_year",
+            o."pub_count",
+            o."rn",
+            0.1 * o."pub_count" + 0.9 * e."ema"    AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."rn" = e."rn" + 1
+)
+/* 4)  Output the EMA time-series */
+SELECT  'B22F'        AS "cpc_subclass",
+        "pub_year",
+        "pub_count",
+        "ema"
+FROM    ema
+ORDER BY "pub_year";
+Results:
+cpc_subclass,pub_year,pub_count,ema
+B22F,1958,1,1.0
+B22F,1970,1,1.0
+B22F,1971,1,1.0
+B22F,1974,1,1.0
+B22F,1978,2,1.1
+B22F,1980,1,1.1
+B22F,1989,1,1.1
+B22F,1995,1,1.1
+B22F,2005,3,1.3
+B22F,2006,2,1.4
+B22F,2008,2,1.5
+B22F,2009,2,1.6
+B22F,2010,1,1.5
+B22F,2013,1,1.5
+B22F,2014,2,1.6
+B22F,2016,2,1.6
+
+[Successfully corrected]
+2025-05-05 00:42:49 - Thread-237 (execute) - INFO - [Try to execute]
+--Description:  10)  For each CPC sub-class (first 4-character symbol) that occurs in
+--               German patents granted during December-2016, determine the year in which
+--               its exponential moving average (EMA, α = 0.1) of German patent-publication
+--               counts is highest, and attach the corresponding level-4 CPC title.
+--
+--               Fixes applied to earlier version:
+--               • Keep the sequencing column “rn” inside the recursive CTE so the JOIN
+--                 between consecutive years works.
+--               • Carry that “rn” through to the PEAK sub-query, then drop it in the
+--                 final SELECT.  No GROUP BY issues now.
+WITH
+/*-------------------------------------------------*/
+dec16_cls AS (                      -- subclasses in DE grants (Dec-2016)
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN ( SELECT "publication_number"
+           FROM   PATENTS.PATENTS.PUBLICATIONS
+           WHERE  "country_code" = 'DE'
+             AND  "grant_date"   BETWEEN 20161201 AND 20161231 ) g
+      ON  p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+/*-------------------------------------------------*/
+per_year AS (                       -- yearly publication counts (Germany only)
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)     AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)         AS "pub_year",
+        COUNT(DISTINCT p."publication_number")      AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4)
+          IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+),
+/*-------------------------------------------------*/
+ordered AS (                        -- sequential index per subclass
+    SELECT  "cpc_subclass",
+            "pub_year",
+            "pub_count",
+            ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS "rn"
+    FROM    per_year
+),
+/*-------------------------------------------------*/
+ema AS (                            -- recursive EMA  (ema_t = 0.1·cnt_t + 0.9·ema_{t-1})
+    -- base year
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            o."pub_count"                       AS "ema"
+    FROM    ordered o
+    WHERE   o."rn" = 1
+    UNION ALL
+    -- subsequent years
+    SELECT  o."cpc_subclass",
+            o."pub_year",
+            o."pub_count",
+            o."rn",
+            0.1 * o."pub_count" + 0.9 * e."ema" AS "ema"
+    FROM    ema e
+    JOIN    ordered o
+      ON    o."cpc_subclass" = e."cpc_subclass"
+     AND    o."rn"           = e."rn" + 1
+),
+/*-------------------------------------------------*/
+peak AS (                           -- pick the year with highest EMA per subclass
+    SELECT *
+    FROM   (
+            SELECT  "cpc_subclass",
+                    "pub_year" AS "best_year",
+                    "ema"      AS "max_ema",
+                    ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "ema" DESC) AS rnk
+            FROM   ema
+           )
+    WHERE  rnk = 1
+)
+/*-------------------------------------------------*/
+SELECT  d."titleFull"        AS "cpc_full_title",
+        p."cpc_subclass"     AS "cpc_group",
+        p."best_year"        AS "year_of_highest_ema"
+FROM    peak p
+JOIN    PATENTS.PATENTS.CPC_DEFINITION d
+  ON    d."symbol" = p."cpc_subclass"
+WHERE   d."level" = 4
+ORDER   BY p."max_ema" DESC
+LIMIT 20
+[Try to execute]
+2025-05-05 00:45:33 - Thread-237 (execute) - INFO - [Error occurred]
+No data found for the specified query.
+
+[Error occurred]
+2025-05-05 00:47:17 - Thread-237 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:  Determine, for each CPC sub-class (first-4-character symbol) that appears
+--              in German patents granted during December 2016, the calendar year in which
+--              its exponential moving average (EMA, α = 0.1) of German patent-publication
+--              counts is highest.  The query is kept compact yet self–contained:
+--
+--  • dec16_cls  – distinct CPC sub-classes taken from all DE publications whose
+--                 grant_date lies in 2016-12.
+--  • per_year   – yearly DISTINCT-publication counts in Germany for those sub-classes.
+--  • ordered    – adds a sequential index (rn) per sub-class so the recursion can
+--                 advance one step even when some years are missing.
+--  • ema        – recursive CTE implementing  ema_t = 0.1·cnt_t + 0.9·ema_{t-1}.
+--  • peak       – keeps only the row (year) with the highest EMA for each sub-class.
+--  • final      – LEFT JOIN to CPC_DEFINITION (level 4) to obtain the full title
+--                 where available; if missing, ‘N/A’ is shown.  The result is ordered
+--                 by descending EMA and limited to 20 rows.
+WITH
+dec16_cls AS (   ---------------------------------------------------------------
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING,1,4)        AS cpc_subclass
+    FROM   PATENTS.PATENTS.PUBLICATIONS p
+    JOIN  (SELECT "publication_number"
+           FROM   PATENTS.PATENTS.PUBLICATIONS
+           WHERE  "country_code" = 'DE'
+             AND  "grant_date"   BETWEEN 20161201 AND 20161231) g
+      ON  p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (     ---------------------------------------------------------------
+    SELECT
+        SUBSTRING(f.value:"code"::STRING,1,4)           AS cpc_subclass,
+        FLOOR(p."publication_date"/10000)               AS pub_year,
+        COUNT(DISTINCT p."publication_number")          AS pub_count
+    FROM   PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE  p."country_code" = 'DE'
+       AND SUBSTRING(f.value:"code"::STRING,1,4) IN (SELECT cpc_subclass FROM dec16_cls)
+    GROUP BY 1,2
+),
+ordered AS (      ---------------------------------------------------------------
+    SELECT  cpc_subclass,
+            pub_year,
+            pub_count,
+            ROW_NUMBER() OVER (PARTITION BY cpc_subclass ORDER BY pub_year) AS rn
+    FROM    per_year
+),
+ema AS (          ---------------------------------------------------------------
+    SELECT  o.cpc_subclass,
+            o.pub_year,
+            o.pub_count,
+            o.rn,
+            o.pub_count                                  AS ema
+    FROM    ordered o
+    WHERE   o.rn = 1
+    UNION ALL
+    SELECT  o.cpc_subclass,
+            o.pub_year,
+            o.pub_count,
+            o.rn,
+            0.1 * o.pub_count + 0.9 * e.ema             AS ema
+    FROM    ema e
+    JOIN    ordered o
+      ON    o.cpc_subclass = e.cpc_subclass
+     AND    o.rn           = e.rn + 1
+),
+peak AS (        ---------------------------------------------------------------
+    SELECT  cpc_subclass,
+            pub_year    AS best_year,
+            ema         AS max_ema,
+            ROW_NUMBER() OVER (PARTITION BY cpc_subclass ORDER BY ema DESC) AS rnk
+    FROM    ema
+)
+SELECT
+    COALESCE(d."titleFull",'N/A')   AS cpc_full_title,
+    p.cpc_subclass                  AS cpc_group,
+    p.best_year                     AS year_of_highest_ema
+FROM   peak p
+LEFT  JOIN PATENTS.PATENTS.CPC_DEFINITION d
+       ON d."symbol" = p.cpc_subclass AND d."level" = 4
+WHERE  p.rnk = 1
+ORDER  BY p.max_ema DESC
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-05 00:49:24 - Thread-237 (execute) - INFO - [Results for corrected sql]
+CPC_FULL_TITLE,CPC_GROUP,YEAR_OF_HIGHEST_EMA
+N/A,B60R,2024
+N/A,Y10S,2007
+N/A,C22B,0
+N/A,H04N,2009
+N/A,F16C,2022
+N/A,F27B,0
+N/A,H04B,2013
+N/A,F16K,2011
+N/A,H03H,1966
+N/A,B22F,2020
+N/A,G03G,1998
+N/A,B82Y,2009
+N/A,B64G,2016
+N/A,F27D,2016
+N/A,C21B,1980
+
+[Results for corrected sql]
+2025-05-05 00:49:24 - Thread-237 (execute) - INFO - [Successfully corrected]
+Successfully corrected. SQL:
+--Description:  Determine, for each CPC sub-class (first-4-character symbol) that appears
+--              in German patents granted during December 2016, the calendar year in which
+--              its exponential moving average (EMA, α = 0.1) of German patent-publication
+--              counts is highest.  The query is kept compact yet self–contained:
+--
+--  • dec16_cls  – distinct CPC sub-classes taken from all DE publications whose
+--                 grant_date lies in 2016-12.
+--  • per_year   – yearly DISTINCT-publication counts in Germany for those sub-classes.
+--  • ordered    – adds a sequential index (rn) per sub-class so the recursion can
+--                 advance one step even when some years are missing.
+--  • ema        – recursive CTE implementing  ema_t = 0.1·cnt_t + 0.9·ema_{t-1}.
+--  • peak       – keeps only the row (year) with the highest EMA for each sub-class.
+--  • final      – LEFT JOIN to CPC_DEFINITION (level 4) to obtain the full title
+--                 where available; if missing, ‘N/A’ is shown.  The result is ordered
+--                 by descending EMA and limited to 20 rows.
+WITH
+dec16_cls AS (   ---------------------------------------------------------------
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING,1,4)        AS cpc_subclass
+    FROM   PATENTS.PATENTS.PUBLICATIONS p
+    JOIN  (SELECT "publication_number"
+           FROM   PATENTS.PATENTS.PUBLICATIONS
+           WHERE  "country_code" = 'DE'
+             AND  "grant_date"   BETWEEN 20161201 AND 20161231) g
+      ON  p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (     ---------------------------------------------------------------
+    SELECT
+        SUBSTRING(f.value:"code"::STRING,1,4)           AS cpc_subclass,
+        FLOOR(p."publication_date"/10000)               AS pub_year,
+        COUNT(DISTINCT p."publication_number")          AS pub_count
+    FROM   PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE  p."country_code" = 'DE'
+       AND SUBSTRING(f.value:"code"::STRING,1,4) IN (SELECT cpc_subclass FROM dec16_cls)
+    GROUP BY 1,2
+),
+ordered AS (      ---------------------------------------------------------------
+    SELECT  cpc_subclass,
+            pub_year,
+            pub_count,
+            ROW_NUMBER() OVER (PARTITION BY cpc_subclass ORDER BY pub_year) AS rn
+    FROM    per_year
+),
+ema AS (          ---------------------------------------------------------------
+    SELECT  o.cpc_subclass,
+            o.pub_year,
+            o.pub_count,
+            o.rn,
+            o.pub_count                                  AS ema
+    FROM    ordered o
+    WHERE   o.rn = 1
+    UNION ALL
+    SELECT  o.cpc_subclass,
+            o.pub_year,
+            o.pub_count,
+            o.rn,
+            0.1 * o.pub_count + 0.9 * e.ema             AS ema
+    FROM    ema e
+    JOIN    ordered o
+      ON    o.cpc_subclass = e.cpc_subclass
+     AND    o.rn           = e.rn + 1
+),
+peak AS (        ---------------------------------------------------------------
+    SELECT  cpc_subclass,
+            pub_year    AS best_year,
+            ema         AS max_ema,
+            ROW_NUMBER() OVER (PARTITION BY cpc_subclass ORDER BY ema DESC) AS rnk
+    FROM    ema
+)
+SELECT
+    COALESCE(d."titleFull",'N/A')   AS cpc_full_title,
+    p.cpc_subclass                  AS cpc_group,
+    p.best_year                     AS year_of_highest_ema
+FROM   peak p
+LEFT  JOIN PATENTS.PATENTS.CPC_DEFINITION d
+       ON d."symbol" = p.cpc_subclass AND d."level" = 4
+WHERE  p.rnk = 1
+ORDER  BY p.max_ema DESC
+LIMIT 20;
+Results:
+CPC_FULL_TITLE,CPC_GROUP,YEAR_OF_HIGHEST_EMA
+N/A,B60R,2024
+N/A,Y10S,2007
+N/A,C22B,0
+N/A,H04N,2009
+N/A,F16C,2022
+N/A,F27B,0
+N/A,H04B,2013
+N/A,F16K,2011
+N/A,H03H,1966
+N/A,B22F,2020
+N/A,G03G,1998
+N/A,B82Y,2009
+N/A,B64G,2016
+N/A,F27D,2016
+N/A,C21B,1980
+
+[Successfully corrected]
+2025-05-05 00:49:24 - Thread-237 (execute) - INFO - itercount: 0
+2025-05-05 00:49:24 - Thread-237 (execute) - INFO - [Self-refine]
+Table full name: PATENTS.PATENTS.DISCLOSURES_13
+Column name: serial_cleaned Type: TEXT
+Column name: sso Type: TEXT
+Column name: disclosure_event Type: TEXT
+Column name: reciprocity Type: TEXT
+Column name: patent_owner_harmonized Type: TEXT
+Column name: record_id Type: TEXT
+Column name: family_id Type: TEXT
+Column name: blanket_scope Type: TEXT
+Column name: copyright Type: TEXT
+Column name: standard Type: TEXT
+Column name: licensing_commitment Type: TEXT
+Column name: committee_project Type: TEXT
+Column name: sc_name Type: TEXT
+Column name: blanket_type Type: TEXT
+Column name: pub_cleaned Type: TEXT
+Column name: third_party Type: TEXT
+Column name: wg_name Type: TEXT
+Column name: patent_owner_unharmonized Type: TEXT
+Column name: tc_name Type: TEXT
+Column name: date Type: NUMBER
+Sample rows:
+[{'family_id': '22549751', 'record_id': 'REC00002', 'disclosure_event': 'DE0001', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19751124, 'standard': 'X3.55;X3.56', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3692255'}, {'family_id': '23170520', 'record_id': 'REC00001', 'disclosure_event': 'DE0001', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19751124, 'standard': 'X3.55;X3.56', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3861619'}, {'family_id': '23170520', 'record_id': 'REC00006', 'disclosure_event': 'DE0003', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19890711, 'standard': 'X3.55;X3.56;X3.72;X3.116;X3.127;X3.136', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'Specific Terms', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3861619'}, {'family_id': '22549751', 'record_id': 'REC00008', 'disclosure_event': 'DE0004', 'sso': 'ANSI', 'patent_owner_harmonized': '3M', 'patent_owner_unharmonized': '3M', 'date': 19890906, 'standard': '', 'committee_project': '', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '2', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US3692255'}, {'family_id': '23418274', 'record_id': 'REC00024', 'disclosure_event': 'DE0013', 'sso': 'ANSI', 'patent_owner_harmonized': 'Agilent Technologies', 'patent_owner_unharmonized': 'Agilent Technologies', 'date': 20020606, 'standard': '1588', 'committee_project': 'IEEE', 'tc_name': '', 'sc_name': '', 'wg_name': '', 'licensing_commitment': 'FRAND', 'copyright': '', 'blanket_type': '0', 'blanket_scope': '', 'third_party': '0', 'reciprocity': '0', 'serial_cleaned': '', 'pub_cleaned': 'US5566180'}]
+
+--------------------------------------------------
+Table full name: PATENTS.PATENTS.PUBLICATIONS
+Column name: examiner Type: VARIANT Description: Is this text truncated?
+Column name: fterm Type: VARIANT Description: For US publications only, the description in HTML, limited to the first 9 megabytes
+Column name: application_number_formatted Type: TEXT Description: Application number, formatted to the patent office format where possible.
+Column name: application_number Type: TEXT Description: Patent application number (DOCDB compatible), eg: 'US-87124404-A'. This may not always be set.
+Column name: grant_date Type: NUMBER Description: For US publications only, the claims in plain text
+Column name: cpc Type: VARIANT Description: Two-letter language code for this text
+Column name: locarno Type: VARIANT Description: Localized text
+Column name: description_localized_html Type: VARIANT Description: Localized text
+Column name: publication_date Type: NUMBER Description: Two-letter language code for this text
+Column name: kind_code Type: TEXT Description: Kind code, indicating application, grant, search report, correction, etc. These are different for each country.
+Column name: spif_publication_number Type: TEXT Description: SPIF standard (spif.group) publication number, after 2000
+Column name: ipc Type: VARIANT Description: Localized text
+Column name: pct_number Type: TEXT Description: PCT number for this application if it was part of a PCT filing, eg: 'PCT/EP2008/062623'.
+Column name: entity_status Type: TEXT Description: The filing date.
+Column name: filing_date Type: NUMBER Description: Is this text truncated?
+Column name: abstract_localized Type: VARIANT Description: Localized text
+Column name: description_localized Type: VARIANT Description: The publication abstracts in different languages
+Column name: assignee Type: VARIANT Description: Localized text
+Column name: citation Type: VARIANT Description: Two-letter language code for this text
+Column name: fi Type: VARIANT Description: Is this text truncated?
+Column name: claims_localized_html Type: VARIANT Description: Is this text truncated?
+Column name: inventor_harmonized Type: VARIANT Description: For US publications only, the claims in HTML
+Column name: inventor Type: VARIANT Description: Is this text truncated?
+Column name: claims_localized Type: VARIANT Description: Two-letter language code for this text
+Column name: priority_date Type: NUMBER Description: Localized text
+Column name: application_kind Type: TEXT Description: High-level kind of the application: A=patent; U=utility; P=provision; W= PCT; F=design; T=translation.
+Column name: priority_claim Type: VARIANT Description: Two-letter language code for this text
+Column name: assignee_harmonized Type: VARIANT Description: Two-letter language code for this text
+Column name: title_localized Type: VARIANT Description: The publication titles in different languages
+Column name: art_unit Type: TEXT Description: The grant date, or 0 if not granted.
+Column name: child Type: VARIANT Description: The publication date.
+Column name: family_id Type: TEXT Description: Family ID (simple family). Grouping on family ID will return all publications associated with a simple patent family (all publications share the same priority claims).
+Column name: spif_application_number Type: TEXT Description: SPIF standard (spif.group) application number, after 2000
+Column name: uspc Type: VARIANT Description: For US publications only, the description in plain text, limited to the first 9 megabytes
+Column name: publication_number Type: TEXT Description: Patent publication number (DOCDB compatible), eg: 'US-7650331-B1'
+Column name: country_code Type: TEXT Description: Country code, eg: 'US', 'EP', etc
+Column name: parent Type: VARIANT Description: Is this text truncated?
+Sample rows:
+[{'publication_number': 'DE-69611147-T2', 'application_number': 'DE-69611147-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996611147', 'pct_number': '', 'family_id': '9483724', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Schloss vom Typ eines entkuppelbaren Rotors",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20010621, 'filing_date': 19961015, 'grant_date': 20010621, 'priority_date': 19951018, 'priority_claim': '[\n  {\n    "application_number": "FR-9512326-A",\n    "category": "",\n    "filing_date": 19951018,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "MENAGER, CHRISTOPHE",\n  "CANARD, LOUIS",\n  "CADOUOT, PATRICK",\n  "GOURDIN, DOMINIQUE"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "FR",\n    "name": "MENAGER CHRISTOPHE"\n  },\n  {\n    "country_code": "FR",\n    "name": "CANARD LOUIS"\n  },\n  {\n    "country_code": "FR",\n    "name": "CADOUOT PATRICK"\n  },\n  {\n    "country_code": "FR",\n    "name": "GOURDIN DOMINIQUE"\n  }\n]', 'assignee': '[\n  "Valeo Securite Habitacle, Creteil Cedex"\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "FR",\n    "name": "VALEO SECURITE HABITACLE"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "E05B17/04",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "E05B17/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "E05B77/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "E05B17/0058",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69630331-T2', 'application_number': 'DE-69630331-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996630331', 'pct_number': '', 'family_id': '23689246', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Verfahren zur gesicherten Sitzungsschlüsselerzeugung und zur Authentifizierung",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20040729, 'filing_date': 19960416, 'grant_date': 20040729, 'priority_date': 19950421, 'priority_claim': '[\n  {\n    "application_number": "US-42609095-A",\n    "category": "",\n    "filing_date": 19950421,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "VANSTONE SCOTT .A, WATERLOO",\n  "MENEZES ALFRED JOHN, AUBURN",\n  "MINGHUA QU,"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "CA",\n    "name": "VANSTONE SCOTT A WATERLOO"\n  },\n  {\n    "country_code": "US",\n    "name": "MENEZES ALFRED JOHN AUBURN"\n  },\n  {\n    "country_code": "CA",\n    "name": "MINGHUA QU"\n  }\n]', 'assignee': '[\n  "Certicom Corp., Mississauga"\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "CA",\n    "name": "CERTICOM CORP"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "H04L9/08",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G06F7/72",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "G06F7/725",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "H04L9/0844",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "H04L9/0838",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "H04L9/0844",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G06F7/725",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69636755-T2', 'application_number': 'DE-69636755-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1996636755', 'pct_number': '', 'family_id': '8224764', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Immortalisierte menschliche Epithelzell-Linie",\n    "truncated": false\n  }\n]', 'abstract_localized': '[\n  {\n    "language": "en",\n    "text": "Immortalised human corneal epithelial cell line, comprises cells of the cell line which are capable of stratification and expressing metabolic markers specific for nonimmortalised human epithelial cells, differentiation markers specific for nonimmortalised human corneal epithelial cells and markers specific for an inflammatory reaction.",\n    "truncated": false\n  }\n]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20071011, 'filing_date': 19961224, 'grant_date': 20071011, 'priority_date': 19961224, 'priority_claim': '[\n  {\n    "application_number": "EP-96203707-A",\n    "category": "",\n    "filing_date": 19961224,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "OFFORD CAVIN, ELIZABETH",\n  "TROMVOUKIS, YVONNE",\n  "PFEIFER, ANDREA M.A.",\n  "SHARIF, NAJ"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "CH",\n    "name": "OFFORD CAVIN ELIZABETH"\n  },\n  {\n    "country_code": "CH",\n    "name": "TROMVOUKIS YVONNE"\n  },\n  {\n    "country_code": "CH",\n    "name": "PFEIFER ANDREA M A"\n  },\n  {\n    "country_code": "US",\n    "name": "SHARIF NAJ"\n  }\n]', 'assignee': '[\n  "Société des Produits Nestlé S.A."\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "CH",\n    "name": "NESTLE SA"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "C12N5/10",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N33/50",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12R1/91",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N15/09",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N5/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "A61K35/44",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N33/48",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12Q1/68",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N5/071",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "C12N2503/02",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N5/0621",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N2503/02",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N2510/04",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "C12N5/0621",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "C12N2510/04",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69728658-T2', 'application_number': 'DE-69728658-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1997628658', 'pct_number': '', 'family_id': '24437397', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Lithographische dünne filmstruktur und diese enthaltende druckplatte",\n    "truncated": false\n  }\n]', 'abstract_localized': '[\n  {\n    "language": "en",\n    "text": "A lithographic laser imageable thin film structure comprising a substrate having first and second surfaces. A vacuum-deposited metal layer is carried by the first surface of the substrate. A layer of semiconductor material is adhered to and overlies the metal layer. The metal layer and the semiconductor material have thicknesses which are selected to maximize absorption of laser energy impinging on the same.",\n    "truncated": false\n  }\n]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20040812, 'filing_date': 19970115, 'grant_date': 20040812, 'priority_date': 19960229, 'priority_claim': '[\n  {\n    "application_number": "US-9700408-W",\n    "category": "",\n    "filing_date": 19970115,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  },\n  {\n    "application_number": "US-60864696-A",\n    "category": "",\n    "filing_date": 19960229,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "FISHER, P.",\n  "PHILLIPS, W.",\n  "DAVIS, F.",\n  "LEGALLEE, CHARLOTTE"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "US",\n    "name": "FISHER P"\n  },\n  {\n    "country_code": "US",\n    "name": "PHILLIPS W"\n  },\n  {\n    "country_code": "US",\n    "name": "DAVIS F"\n  },\n  {\n    "country_code": "US",\n    "name": "LEGALLEE CHARLOTTE"\n  }\n]', 'assignee': '[\n  "Presstek, Inc."\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "US",\n    "name": "PRESSTEK INC"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "B32B15/04",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B41C1/10",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41N1/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B41N1/14",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B27/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B7/02",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "B32B15/04",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12674",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B27/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31678",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12458",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31678",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12458",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B15/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31504",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41N1/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B15/09",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B2367/00",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B27/20",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12493",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B15/043",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B27/36",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B27/08",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "B32B15/04",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12493",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12674",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41C1/1033",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41N1/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12528",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/31504",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B41C1/1033",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "B32B2311/24",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T428/12528",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}, {'publication_number': 'DE-69807539-T2', 'application_number': 'DE-69807539-T', 'country_code': 'DE', 'kind_code': 'T2', 'application_kind': 'T', 'application_number_formatted': 'DE1998607539', 'pct_number': '', 'family_id': '11877005', 'spif_publication_number': '', 'spif_application_number': '', 'title_localized': '[\n  {\n    "language": "de",\n    "text": "Automatisches Analysegerät",\n    "truncated": false\n  }\n]', 'abstract_localized': '[]', 'claims_localized': '[]', 'claims_localized_html': '[]', 'description_localized': '[]', 'description_localized_html': '[]', 'publication_date': 20030116, 'filing_date': 19980120, 'grant_date': 20030116, 'priority_date': 19970129, 'priority_claim': '[\n  {\n    "application_number": "JP-1501397-A",\n    "category": "",\n    "filing_date": 19970129,\n    "npl_text": "",\n    "publication_number": "",\n    "type": ""\n  }\n]', 'inventor': '[\n  "HANAWA, MASAAKI",\n  "MITSUMAKI, HIROSHI",\n  "OHISHI, TADASHI",\n  "KAI, SUSUMU",\n  "WATANABE, HIROSHI"\n]', 'inventor_harmonized': '[\n  {\n    "country_code": "JP",\n    "name": "HANAWA MASAAKI"\n  },\n  {\n    "country_code": "JP",\n    "name": "MITSUMAKI HIROSHI"\n  },\n  {\n    "country_code": "JP",\n    "name": "OHISHI TADASHI"\n  },\n  {\n    "country_code": "JP",\n    "name": "KAI SUSUMU"\n  },\n  {\n    "country_code": "JP",\n    "name": "WATANABE HIROSHI"\n  }\n]', 'assignee': '[\n  "Hitachi, Ltd."\n]', 'assignee_harmonized': '[\n  {\n    "country_code": "JP",\n    "name": "HITACHI LTD"\n  }\n]', 'examiner': '[]', 'uspc': '[]', 'ipc': '[\n  {\n    "code": "G01N35/00",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N35/02",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N35/04",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  }\n]', 'cpc': '[\n  {\n    "code": "Y10T436/115831",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/114165",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0465",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/026",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0467",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/113332",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/114165",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/00603",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/11",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/00326",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0467",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/00603",\n    "first": false,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/00326",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N2035/0465",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "G01N35/026",\n    "first": true,\n    "inventive": true,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/11",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/113332",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  },\n  {\n    "code": "Y10T436/115831",\n    "first": false,\n    "inventive": false,\n    "tree": []\n  }\n]', 'fi': '[]', 'fterm': '[]', 'locarno': '[]', 'citation': '[]', 'parent': '[]', 'child': '[]', 'entity_status': '', 'art_unit': ''}]
+
+--------------------------------------------------
+Table full name: PATENTS.PATENTS.CPC_DEFINITION
+Column name: status Type: TEXT
+Column name: precedenceLimitingReferences Type: VARIANT
+Column name: rules Type: VARIANT
+Column name: childGroups Type: VARIANT
+Column name: scopeLimitingReferences Type: VARIANT
+Column name: level Type: FLOAT
+Column name: titlePart Type: VARIANT
+Column name: residualReferences Type: VARIANT
+Column name: definition Type: VARIANT
+Column name: breakdownCode Type: BOOLEAN
+Column name: limitingReferences Type: VARIANT
+Column name: glossary Type: VARIANT
+Column name: applicationReferences Type: VARIANT
+Column name: notAllocatable Type: BOOLEAN
+Column name: titleFull Type: TEXT
+Column name: dateRevised Type: FLOAT
+Column name: informativeReferences Type: VARIANT
+Column name: symbol Type: TEXT
+Column name: synonyms Type: VARIANT
+Column name: children Type: VARIANT
+Column name: parents Type: VARIANT
+Column name: ipcConcordant Type: TEXT
+Sample rows:
+[{'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/108', 'synonyms': '[]', 'titleFull': 'Swine', 'titlePart': '[\n  "Swine"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/105', 'synonyms': '[]', 'titleFull': 'Murine', 'titlePart': '[\n  "Murine"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2227/10",\n  "A01K2227/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2227/107', 'synonyms': '[]', 'titleFull': 'Rabbit', 'titlePart': '[\n  "Rabbit"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2267/02",\n  "A01K2267/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2267/025', 'synonyms': '[]', 'titleFull': 'Animal producing cells or organs for transplantation', 'titlePart': '[\n  "Animal producing cells or organs for transplantation"\n]'}, {'applicationReferences': '[]', 'breakdownCode': True, 'childGroups': '[]', 'children': '[\n  "A01K2267/0312",\n  "A01K2267/0318",\n  "A01K2267/0325"\n]', 'dateRevised': 20130101.0, 'definition': '[]', 'glossary': '[]', 'informativeReferences': '[]', 'ipcConcordant': 'CPCONLY', 'level': 9.0, 'limitingReferences': '[]', 'notAllocatable': False, 'parents': '[\n  "A01K2267/03",\n  "A01K2267/00",\n  "A01K",\n  "A01",\n  "A"\n]', 'precedenceLimitingReferences': '[]', 'residualReferences': '[]', 'rules': '[]', 'scopeLimitingReferences': '[]', 'status': 'published', 'symbol': 'A01K2267/0306', 'synonyms': '[]', 'titleFull': 'Animal model for genetic diseases', 'titlePart': '[\n  "Animal model for genetic diseases"\n]'}]
+
+--------------------------------------------------
+External knowledge that might be helpful: 
+### Document: Sliding Window Calculation for Weighted Moving Average
+
+#### 1. **Overview**
+In the SQL query, the **Weighted Moving Average (WMA)** method is applied to smooth the annual patent filing counts for each CPC technology area and identify the "best year" for each CPC group. This sliding window calculation is used to highlight years with significant patent filing activity by giving more weight to recent years while considering past data.
+
+The goal of this method is to reduce the impact of short-term fluctuations and better capture long-term trends in patent filing activities, particularly in fast-evolving technology areas.
+
+#### 2. **Weighted Moving Average (WMA) Calculation**
+
+##### 2.1 **Definition**
+Weighted Moving Average (WMA) is a method where each data point is given a different weight, with more recent data points typically receiving higher weights. This approach is useful for identifying trends over time while minimizing the effect of older data that might not be as relevant.
+
+##### 2.2 **Formula**
+The formula for calculating the Weighted Moving Average is as follows:
+
+\[
+WMA_t = \alpha \cdot x_t + (1 - \alpha) \cdot WMA_{t-1}
+\]
+
+Where:
+- \(WMA_t\): The weighted moving average for the current year (t).
+- \(x_t\): The patent filing count for the current year.
+- \(WMA_{t-1}\): The weighted moving average for the previous year.
+- \(\alpha\): The smoothing factor (in this case, 0.1).
+
+##### 2.3 **Explanation**
+- **Smoothing Factor (\(\alpha\))**: The smoothing factor determines how much weight is given to the most recent data point. In this case, the smoothing factor is 0.1, meaning 10% of the weight is assigned to the current year's filing count, and the remaining 90% is based on the previous year’s moving average.
+- **Sliding Window**: As we move through the years, the weighted average continuously updates using the most recent filing count and the previous year's weighted average. This creates a "sliding window" where each year's filing count is incorporated into the calculation.
+
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'PATENTS': {'PATENTS': ['DISCLOSURES_13', 'PUBLICATIONS', 'CPC_DEFINITION']}}
+Some few-shot examples may be useful:
+Query:
+--Description: 1)  Inspect a handful of German (DE) patent-publications to understand the basic
+--   date fields that will later be used (publication_date | filing_date | grant_date).
+SELECT "publication_number",
+       "publication_date",
+       "filing_date",
+       "grant_date",
+       "country_code"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+LIMIT 20;
+Answer:
+publication_number,publication_date,filing_date,grant_date,country_code
+DE-1601018-B2,19790503,19671026,0,DE
+DE-102004023427-A1,20051222,20040509,0,DE
+DE-102004042749-A1,20060427,20041025,0,DE
+DE-102004042762-A1,20050421,20040903,0,DE
+DE-102004061740-A1,20060706,20041222,0,DE
+DE-102004061882-A1,20050804,20041222,0,DE
+DE-102005001340-A1,20060720,20050106,0,DE
+DE-102005001742-A1,20060316,20050114,0,DE
+DE-102005016443-A1,20060524,20050404,0,DE
+DE-102005027590-A1,20061228,20050614,0,DE
+Query:
+--Description: 2)  Look at patents that were actually granted in December-2016
+--   (this will be the focal month of the final task).
+SELECT "publication_number",
+       "grant_date"
+FROM PATENTS.PATENTS.PUBLICATIONS
+WHERE "country_code" = 'DE'
+  AND "grant_date" BETWEEN 20161201 AND 20161231
+LIMIT 20;
+Answer:
+publication_number,grant_date
+DE-102011005349-B4,20161215
+DE-102012004706-B4,20161222
+DE-102009051197-B4,20161222
+DE-112013006743-B4,20161208
+DE-102013203286-B4,20161222
+DE-102015114819-B3,20161222
+DE-112006001900-B4,20161215
+Query:
+--Description: 3)  Flatten the CPC JSON array for a sample of German publications
+--   so that individual CPC symbols are visible in a relational form.
+SELECT p."publication_number",
+       f.value:"code"::STRING AS "cpc_code"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+Answer:
+publication_number,cpc_code
+DE-102007027131-A1,F02D11/105
+DE-102007027131-A1,Y02T10/40
+DE-102007027131-A1,F02N11/0822
+DE-102007027131-A1,F02N11/0803
+DE-102007027131-A1,F02N11/0814
+DE-102007028125-A1,B60N2/856
+DE-102007038542-A1,G05B19/042
+DE-102007038542-A1,G05B19/042
+DE-102007045377-A1,B23K26/40
+DE-102007045377-A1,B23K26/53
+DE-102007045377-A1,H01L21/268
+DE-102007045377-A1,B23K26/0604
+DE-102007045377-A1,B23K2103/50
+DE-102007045377-A1,B23K26/0604
+Query:
+--Description: 4)  Derive the CPC *sub-class* (level-4; first four characters,
+--   e.g. ‘H04L’) from the flattened codes – this will be our technology group.
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM PATENTS.PATENTS.PUBLICATIONS      p,
+     LATERAL FLATTEN(input => p."cpc") f
+WHERE p."country_code" = 'DE'
+LIMIT 20;
+Answer:
+cpc_subclass
+G01B
+F23B
+E04F
+H01H
+D01H
+C10M
+B60G
+G06K
+F02D
+G01N
+B60K
+A61L
+B42C
+B21D
+B60R
+B42D
+H01Q
+G07C
+F02P
+B01L
+Query:
+--Description: 5)  Count German publications per CPC sub-class and publication-year.
+WITH per_year AS (
+  SELECT SUBSTRING(f.value:"code"::STRING, 1, 4)          AS "cpc_subclass",
+         FLOOR(p."publication_date" / 10000)              AS "pub_year",
+         COUNT(*)                                         AS "pub_count"
+  FROM PATENTS.PATENTS.PUBLICATIONS      p,
+       LATERAL FLATTEN(input => p."cpc") f
+  WHERE p."country_code" = 'DE'
+  GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20;
+Answer:
+cpc_subclass,pub_year,pub_count
+A01B,0,7
+A01B,1921,2
+A01B,1928,2
+A01B,1952,2
+A01B,1955,1
+A01B,1958,1
+A01B,1962,1
+A01B,1966,1
+A01B,1967,4
+A01B,1968,2
+A01B,1969,1
+A01B,1987,1
+A01B,1989,1
+A01B,1998,2
+A01B,2000,3
+A01B,2005,1
+A01B,2006,2
+A01B,2007,5
+A01B,2009,1
+A01B,2014,3
+Query:
+--Description: 7)  Retrieve the DISTINCT CPC sub-classes (first 4-character symbols) that
+--               occur in German patents granted during December 2016.
+WITH dec16_pub AS (      -- all German publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date"   BETWEEN 20161201 AND 20161231
+)
+SELECT DISTINCT
+       SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+FROM  PATENTS.PATENTS.PUBLICATIONS p
+JOIN  dec16_pub d
+  ON  p."publication_number" = d."publication_number"
+CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+ORDER BY "cpc_subclass"
+LIMIT 20
+Answer:
+cpc_subclass
+B22F
+B60R
+B64G
+B82Y
+C21B
+C22B
+F16C
+F16K
+F27B
+F27D
+G03G
+H03H
+H04B
+H04N
+Y10S
+Query:
+--Description: 8)  Build yearly publication counts (Germany only) **restricted** to the
+--               CPC sub-classes identified in step 7.
+WITH dec16_cls AS (      -- list of relevant CPC subclasses
+    SELECT DISTINCT
+           SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM  PATENTS.PATENTS.PUBLICATIONS p
+    JOIN (
+           SELECT "publication_number"
+           FROM PATENTS.PATENTS.PUBLICATIONS
+           WHERE "country_code" = 'DE'
+             AND "grant_date" BETWEEN 20161201 AND 20161231
+         ) g
+      ON p."publication_number" = g."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+per_year AS (
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)    AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)        AS "pub_year",
+        COUNT(DISTINCT p."publication_number")     AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+    GROUP BY 1, 2
+)
+SELECT *
+FROM per_year
+ORDER BY "cpc_subclass", "pub_year"
+LIMIT 20
+Answer:
+cpc_subclass,pub_year,pub_count
+B22F,1958,1
+B22F,1970,1
+B22F,1971,1
+B22F,1974,1
+B22F,1978,2
+B22F,1980,1
+B22F,1989,1
+B22F,1995,1
+B22F,2005,3
+B22F,2006,2
+B22F,2008,2
+B22F,2009,2
+B22F,2010,1
+B22F,2013,1
+B22F,2014,2
+B22F,2016,2
+B22F,2017,1
+B22F,2019,1
+B22F,2020,4
+B22F,2021,1
+Task: Find the CPC technology areas in Germany that had the highest exponential moving average (smoothing factor 0.1) of patent filings per year, specifically for patents granted in December 2016. For each CPC group at level 4, show the full title, CPC group, and the year with the highest exponential moving average of patent filings.
+
+Please answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'PATENTS': {'PATENTS': ['DISCLOSURES_13', 'PUBLICATIONS', 'CPC_DEFINITION']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-05 00:49:57 - Thread-237 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Exponential-moving-average “best year” for German CPC subclasses
+    that occur in patents granted during December-2016               */
+
+WITH dec16_pub AS (  -- DE publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date"   BETWEEN 20161201 AND 20161231
+),
+
+dec16_cls AS (       -- relevant CPC sub-classes (level-4)
+    SELECT DISTINCT SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    JOIN dec16_pub d
+      ON p."publication_number" = d."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+
+per_year AS (        -- yearly DE publication counts for those classes
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)              AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)                  AS "pub_year",
+        COUNT(DISTINCT p."publication_number")               AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+      AND p."publication_date" IS NOT NULL
+    GROUP BY 1, 2
+    HAVING "pub_year" > 0                                    -- drop spurious year 0
+),
+
+ema_calc AS (        -- exponential moving average (α = 0.1)
+    SELECT
+        "cpc_subclass",
+        "pub_year",
+        EMA("pub_count", 0.1)
+          OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS "ema_val"
+    FROM per_year
+),
+
+best_year AS (       -- pick the year with highest EMA per subclass
+    SELECT
+        "cpc_subclass",
+        "pub_year" AS "best_year",
+        ROW_NUMBER() OVER (PARTITION BY "cpc_subclass"
+                           ORDER BY "ema_val" DESC, "pub_year") AS rn
+    FROM ema_calc
+)
+
+SELECT
+    cd."titleFull"        AS "technology_area_title",
+    b."cpc_subclass"      AS "cpc_group",
+    b."best_year"
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION cd
+       ON cd."symbol" = b."cpc_subclass"
+WHERE b.rn = 1
+ORDER BY b."cpc_subclass";
+```
+[Try to run SQL in self-refine]
+2025-05-05 00:49:58 - Thread-237 (execute) - INFO - itercount: 1
+2025-05-05 00:49:58 - Thread-237 (execute) - INFO - [Self-refine]
+Input sql:
+/*  Exponential-moving-average “best year” for German CPC subclasses
+    that occur in patents granted during December-2016               */
+
+WITH dec16_pub AS (  -- DE publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date"   BETWEEN 20161201 AND 20161231
+),
+
+dec16_cls AS (       -- relevant CPC sub-classes (level-4)
+    SELECT DISTINCT SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    JOIN dec16_pub d
+      ON p."publication_number" = d."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+
+per_year AS (        -- yearly DE publication counts for those classes
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)              AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)                  AS "pub_year",
+        COUNT(DISTINCT p."publication_number")               AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+      AND p."publication_date" IS NOT NULL
+    GROUP BY 1, 2
+    HAVING "pub_year" > 0                                    -- drop spurious year 0
+),
+
+ema_calc AS (        -- exponential moving average (α = 0.1)
+    SELECT
+        "cpc_subclass",
+        "pub_year",
+        EMA("pub_count", 0.1)
+          OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS "ema_val"
+    FROM per_year
+),
+
+best_year AS (       -- pick the year with highest EMA per subclass
+    SELECT
+        "cpc_subclass",
+        "pub_year" AS "best_year",
+        ROW_NUMBER() OVER (PARTITION BY "cpc_subclass"
+                           ORDER BY "ema_val" DESC, "pub_year") AS rn
+    FROM ema_calc
+)
+
+SELECT
+    cd."titleFull"        AS "technology_area_title",
+    b."cpc_subclass"      AS "cpc_group",
+    b."best_year"
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION cd
+       ON cd."symbol" = b."cpc_subclass"
+WHERE b.rn = 1
+ORDER BY b."cpc_subclass";
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##002060 (42601): SQL compilation error:\nInvalid function type [EMA] for window function.'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-05 00:50:25 - Thread-237 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/*  Highest exponential-moving-average (α = 0.1) filing year
+    for each German CPC sub-class that appears in patents
+    granted during December-2016                                    */
+
+WITH dec16_pub AS (          -- German publications granted in Dec-2016
+    SELECT "publication_number"
+    FROM PATENTS.PATENTS.PUBLICATIONS
+    WHERE "country_code" = 'DE'
+      AND "grant_date" BETWEEN 20161201 AND 20161231
+),
+
+dec16_cls AS (               -- relevant CPC sub-classes (first 4 chars)
+    SELECT DISTINCT SUBSTRING(f.value:"code"::STRING, 1, 4) AS "cpc_subclass"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    JOIN dec16_pub d
+      ON p."publication_number" = d."publication_number"
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+),
+
+per_year AS (                -- yearly DE publication counts for those classes
+    SELECT
+        SUBSTRING(f.value:"code"::STRING, 1, 4)              AS "cpc_subclass",
+        FLOOR(p."publication_date" / 10000)                  AS "pub_year",
+        COUNT(DISTINCT p."publication_number")               AS "pub_count"
+    FROM PATENTS.PATENTS.PUBLICATIONS p
+    CROSS JOIN LATERAL FLATTEN(input => p."cpc") f
+    WHERE p."country_code" = 'DE'
+      AND SUBSTRING(f.value:"code"::STRING, 1, 4) IN (SELECT "cpc_subclass" FROM dec16_cls)
+      AND p."publication_date" IS NOT NULL
+    GROUP BY 1, 2
+    HAVING "pub_year" > 0
+),
+
+ordered AS (                 -- impose an order within each sub-class
+    SELECT
+        "cpc_subclass",
+        "pub_year",
+        "pub_count",
+        ROW_NUMBER() OVER (PARTITION BY "cpc_subclass" ORDER BY "pub_year") AS rn
+    FROM per_year
+),
+
+/*  Recursive EMA:
+    EMA_1 = pub_count_1
+    EMA_n = 0.1*pub_count_n + 0.9*EMA_{n-1}                                */
+recursive_ema AS (
+    -- seed row (first year for each sub-class)
+    SELECT
+        "cpc_subclass",
+        "pub_year",
+        "pub_count",
+        rn,
+        "pub_count"::FLOAT AS ema_val
+    FROM ordered
+    WHERE rn = 1
+
+    UNION ALL
+
+    -- subsequent years
+    SELECT
+        o."cpc_subclass",
+        o."pub_year",
+        o."pub_count",
+        o.rn,
+        0.1 * o."pub_count" + 0.9 * r.ema_val    AS ema_val
+    FROM ordered        o
+    JOIN recursive_ema  r
+      ON  o."cpc_subclass" = r."cpc_subclass"
+     AND o.rn           = r.rn + 1
+),
+
+best_year AS (               -- pick the year with the highest EMA for each sub-class
+    SELECT
+        "cpc_subclass",
+        "pub_year"  AS best_year,
+        ROW_NUMBER() OVER (PARTITION BY "cpc_subclass"
+                           ORDER BY ema_val DESC, "pub_year") AS rn
+    FROM recursive_ema
+)
+
+SELECT
+    cd."titleFull"                  AS technology_area_title,
+    b."cpc_subclass"                AS cpc_group,
+    b.best_year
+FROM best_year b
+LEFT JOIN PATENTS.PATENTS.CPC_DEFINITION cd
+       ON cd."symbol" = b."cpc_subclass"
+WHERE b.rn = 1
+ORDER BY b."cpc_subclass";
+```
+[Try to run SQL in self-refine]
+2025-05-05 00:51:44 - Thread-237 (execute) - INFO - Total iteration counts: 1

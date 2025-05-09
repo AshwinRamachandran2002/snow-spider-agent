@@ -1,0 +1,2065 @@
+2025-05-07 05:56:20 - Thread-304 (execute) - INFO - [Exploration]
+```sql
+-- 1)  Preview a handful of available Nature articles  
+SELECT "id", "date", "title"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+```
+
+```sql
+-- 2)  See the different research “category” values that exist  
+SELECT DISTINCT "category"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+```
+
+```sql
+-- 3)  Inspect the full text (abstract + body) of one sample article  
+SELECT "id", "title", "abstract", "body"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+ORDER BY "date" DESC
+LIMIT 1;
+```
+
+```sql
+-- 4)  Tokenise the BODY of that single article into individual words  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+)
+SELECT oa."id"    AS "article_id",
+       tok.value::STRING  AS "token"
+FROM one_article oa,
+     LATERAL SPLIT_TO_TABLE(
+            REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '),  -- keep letters & blanks
+            ' '                                           -- split on blanks
+      ) tok
+WHERE tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+```
+
+```sql
+-- 5)  Same token list but drop a few common stop-words (very small example list)  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT DISTINCT "word"
+FROM tokens
+WHERE LOWER("word") NOT IN ('the','and','of','to','in','a','for','on')
+LIMIT 20;
+```
+
+```sql
+-- 6)  Attach corpus frequencies to those tokens  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT t."word",
+       wf."frequency"
+FROM tokens t
+JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+  ON wf."word" = t."word"
+LIMIT 20;
+```
+
+```sql
+-- 7)  Compute the weighting factor 1 / frequency^0.4 for every word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)   AS "weight"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+)
+SELECT *
+FROM joined
+LIMIT 20;
+```
+
+```sql
+-- 8)  Bring in the 300-dimensional GloVe vectors for each weighted word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)                    AS "weight",
+         gv."vector"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+    ON gv."word" = w."word"
+)
+SELECT "word", "weight", "vector"
+FROM joined
+LIMIT 20;
+```
+
+```sql
+-- 9)  Multiply every element in the vector by its weight (element-wise scaling)  
+WITH word_vecs AS (
+  SELECT gv."word",
+         1.0 / POWER(wf."frequency", 0.4)                               AS "weight",
+         gv."vector"                                                    AS "vec"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES"  wf
+    ON gv."word" = wf."word"
+  WHERE gv."word" IN ('cell','culture','serum')                         -- sample
+)
+SELECT "word",
+       ARRAY_TRANSFORM("vec", x -> x * "weight") AS "weighted_vector"
+FROM word_vecs
+LIMIT 20;
+```
+
+```sql
+--10)  Full pipeline (per article): sum the weighted vectors and normalise to unit length  
+WITH tokens AS (  -- explode every article into cleaned word tokens
+  SELECT n."id"           AS "article_id",
+         n."date",
+         n."title",
+         LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE tok.value IS NOT NULL
+),
+wfreq AS (  -- attach corpus frequency
+  SELECT t.*,
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)                 AS "weight"
+  FROM tokens t
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = t."word"
+),
+wvecs AS (  -- add GloVe vectors & scale them
+  SELECT w.*,
+         ARRAY_TRANSFORM(gv."vector", x -> x * w."weight") AS "scaled_vec"
+  FROM wfreq w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+    ON gv."word" = w."word"
+),
+vec_sum AS (  -- sum all scaled vectors per article
+  SELECT "article_id",
+         "date",
+         "title",
+         ARRAY_AGG("scaled_vec")                AS "vec_list"
+  FROM wvecs
+  GROUP BY "article_id", "date", "title"
+),
+summed AS (  -- flatten & accumulate by index position
+  SELECT vs."article_id",
+         vs."date",
+         vs."title",
+         ARRAY_AGG(sv.value)                    AS "raw_sum_vec"
+  FROM vec_sum vs,
+       LATERAL FLATTEN(vs."vec_list") f1,       -- list of vectors
+       LATERAL FLATTEN(input => f1.value) sv    -- individual dimensions
+  GROUP BY vs."article_id", vs."date", vs."title", sv.index
+  ORDER BY vs."article_id", sv.index
+),
+normed AS (  -- compute magnitude & divide each component
+  SELECT s."article_id",
+         s."date",
+         s."title",
+         ARRAY_AGG(s.raw_sum_vec[0])                          AS "sum_vector", -- rebuild
+         SQRT(SUM(POWER(s.raw_sum_vec[0], 2)))                AS "norm"
+  FROM summed s
+  GROUP BY s."article_id", s."date", s."title"
+)
+SELECT "article_id" AS "id",
+       "date",
+       "title",
+       ARRAY_TRANSFORM("sum_vector", x -> x / NULLIF("norm", 0)) 
+         AS "normalized_vector"
+FROM normed
+LIMIT 20;
+```
+[Exploration]
+2025-05-07 05:56:20 - Thread-304 (execute) - INFO - [Try to execute]
+-- 1)  Preview a handful of available Nature articles  
+SELECT "id", "date", "title"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+[Try to execute]
+2025-05-07 05:56:22 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 1)  Preview a handful of available Nature articles  
+SELECT "id", "date", "title"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+Results:
+id,date,title
+b8f29c08-2530-4ff1-bd49-da1f483b73ed,2018-12-31,Structural basis of Notch recognition by human γ-secretase
+ba1d19c8-e235-4bf6-95ff-f2022a69e510,2018-09-27,"You are what you eat: diet, health and the gut microbiota"
+83ee533c-7dd3-4e7f-9f30-53cddb6fa2a6,2018-10-31,The SWI/SNF complex is a mechanoregulated inhibitor of YAP and TAZ
+40f51d9b-2e38-48d5-9d4d-f6e53ce57adf,2018-06-06,Equivalent-accuracy accelerated neural-network training using analogue memory
+
+[Successfully executed]
+2025-05-07 05:56:22 - Thread-304 (execute) - INFO - [Try to execute]
+-- 2)  See the different research “category” values that exist  
+SELECT DISTINCT "category"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+[Try to execute]
+2025-05-07 05:56:22 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 2)  See the different research “category” values that exist  
+SELECT DISTINCT "category"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+Results:
+category
+Cryoelectron microscopy; Proteases
+Cancer; Cell biology; Cell signalling
+Reaction kinetics and dynamics; Self-assembly
+Electrocatalysis; Hydrogen fuel
+Cancer microenvironment; Glial biology
+Applied physics; Electrical and electronic engineering; Nanoscale devices; Optical techniques; Techniques and instrumentation
+Molecular biology; Molecular engineering; Targeted gene repair
+Electronic devices; Electronic properties and materials; Graphene; Quantum Hall
+Genome-wide analysis of
+
+[Successfully executed]
+2025-05-07 05:56:22 - Thread-304 (execute) - INFO - [Try to execute]
+-- 3)  Inspect the full text (abstract + body) of one sample article  
+SELECT "id", "title", "abstract", "body"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+ORDER BY "date" DESC
+LIMIT 1;
+[Try to execute]
+2025-05-07 05:56:23 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 3)  Inspect the full text (abstract + body) of one sample article  
+SELECT "id", "title", "abstract", "body"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+ORDER BY "date" DESC
+LIMIT 1;
+Results:
+id,title,abstract,body
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,New insights into microstructure of irradiated beryllium based on experiments and computer simulations,"The microstructural response of beryllium after neutron irradiation at various temperatures (643–923 K) was systematically studied using analytical transmission electron microscope that together with outcomes from advanced atomistic modelling provides new insights in the mechanisms of microstructural changes in this material. The mos
+
+[Successfully executed]
+2025-05-07 05:56:23 - Thread-304 (execute) - INFO - [Try to execute]
+-- 4)  Tokenise the BODY of that single article into individual words  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+)
+SELECT oa."id"    AS "article_id",
+       tok.value::STRING  AS "token"
+FROM one_article oa,
+     LATERAL SPLIT_TO_TABLE(
+            REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '),  -- keep letters & blanks
+            ' '                                           -- split on blanks
+      ) tok
+WHERE tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+[Try to execute]
+2025-05-07 05:56:30 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 4)  Tokenise the BODY of that single article into individual words  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+)
+SELECT oa."id"    AS "article_id",
+       tok.value::STRING  AS "token"
+FROM one_article oa,
+     LATERAL SPLIT_TO_TABLE(
+            REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '),  -- keep letters & blanks
+            ' '                                           -- split on blanks
+      ) tok
+WHERE tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+Results:
+article_id,token
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,Introduction
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,Being
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,lightweight
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,metal
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,beryllium
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,finds
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,numerous
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,technological
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,applications
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,ranging
+
+[Successfully executed]
+2025-05-07 05:56:30 - Thread-304 (execute) - INFO - [Try to execute]
+-- 5)  Same token list but drop a few common stop-words (very small example list)  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT DISTINCT "word"
+FROM tokens
+WHERE LOWER("word") NOT IN ('the','and','of','to','in','a','for','on')
+LIMIT 20;
+[Try to execute]
+2025-05-07 05:58:17 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 5)  Same token list but drop a few common stop-words (very small example list)  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT DISTINCT "word"
+FROM tokens
+WHERE LOWER("word") NOT IN ('the','and','of','to','in','a','for','on')
+LIMIT 20;
+Results:
+word
+Being
+metal
+""
+beryllium
+finds
+technological
+phones
+conductivity
+industry
+strength
+lattice
+controls
+prospective
+better
+irradiation
+foreign
+closed
+exceptional
+physical
+evolution
+
+[Successfully executed]
+2025-05-07 05:58:17 - Thread-304 (execute) - INFO - [Try to execute]
+-- 6)  Attach corpus frequencies to those tokens  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT t."word",
+       wf."frequency"
+FROM tokens t
+JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+  ON wf."word" = t."word"
+LIMIT 20;
+[Try to execute]
+2025-05-07 05:58:58 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 6)  Attach corpus frequencies to those tokens  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT t."word",
+       wf."frequency"
+FROM tokens t
+JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+  ON wf."word" = t."word"
+LIMIT 20;
+Results:
+word,frequency
+separating,256
+separating,256
+somewhat,512
+somewhat,512
+droplets,512
+droplets,512
+densities,1024
+densities,1024
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+basal,2304
+basal,2304
+
+[Successfully executed]
+2025-05-07 05:58:58 - Thread-304 (execute) - INFO - [Try to execute]
+-- 7)  Compute the weighting factor 1 / frequency^0.4 for every word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)   AS "weight"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+)
+SELECT *
+FROM joined
+LIMIT 20;
+[Try to execute]
+2025-05-07 05:59:13 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 7)  Compute the weighting factor 1 / frequency^0.4 for every word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)   AS "weight"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+)
+SELECT *
+FROM joined
+LIMIT 20;
+Results:
+word,frequency,weight
+cleavage,1280,0.05716313149091578
+cleavage,1280,0.05716313149091578
+cleavage,1280,0.05716313149091578
+cleavage,1280,0.05716313149091578
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+
+[Successfully executed]
+2025-05-07 05:59:13 - Thread-304 (execute) - INFO - [Try to execute]
+-- 8)  Bring in the 300-dimensional GloVe vectors for each weighted word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)                    AS "weight",
+         gv."vector"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+    ON gv."word" = w."word"
+)
+SELECT "word", "weight", "vector"
+FROM joined
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:02:09 - Thread-304 (execute) - INFO - [Successfully executed]
+Successfully executed. SQL:
+-- 8)  Bring in the 300-dimensional GloVe vectors for each weighted word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)                    AS "weight",
+         gv."vector"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+    ON gv."word" = w."word"
+)
+SELECT "word", "weight", "vector"
+FROM joined
+LIMIT 20;
+Results:
+word,weight,vector
+cleavage,0.05716313149091578,"[
+  -9.394699931144714e-01,
+  -2.447299957275391e-01,
+  -1.383200008422136e-02,
+  9.291499853134155e-01,
+  3.189499974250793e-01,
+  2.232300043106079e-01,
+  5.056499838829041e-01,
+  8.222500085830688e-01,
+  3.605699911713600e-02,
+  2.222000062465668e-01,
+  5.826399922370911e-01,
+  -3.108699917793274e-01,
+  4.869300127029419e-01,
+  -1.273500025272369e-01,
+  5.581700205802917e-01,
+  5.520200133323669e-01,
+  -5.159800127148628e-02,
+  1.1151000261306
+
+[Successfully executed]
+2025-05-07 06:02:09 - Thread-304 (execute) - INFO - [Try to execute]
+-- 9)  Multiply every element in the vector by its weight (element-wise scaling)  
+WITH word_vecs AS (
+  SELECT gv."word",
+         1.0 / POWER(wf."frequency", 0.4)                               AS "weight",
+         gv."vector"                                                    AS "vec"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES"  wf
+    ON gv."word" = wf."word"
+  WHERE gv."word" IN ('cell','culture','serum')                         -- sample
+)
+SELECT "word",
+       ARRAY_TRANSFORM("vec", x -> x * "weight") AS "weighted_vector"
+FROM word_vecs
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:02:10 - Thread-304 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 11 at position 39\ninvalid identifier \'"weight"\''}
+[Error occurred]
+2025-05-07 06:03:33 - Thread-304 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- Goal:  For the three sample words ‘cell’, ‘culture’, and ‘serum’
+--        (1) obtain their corpus frequency,
+--        (2) compute the weighting factor 1 / frequency^0.4,
+--        (3) fetch the 300-D GloVe vector, and
+--        (4) scale every element of that vector by the weight.
+-- Approach:  Use one CTE (word_vecs) to join WORD_FREQUENCIES with
+--            GLOVE_VECTORS, calculate the weight, then in the final
+--            SELECT apply ARRAY_TRANSFORM to multiply each vector
+--            component by wv.weight.  Referencing the column through
+--            the table alias (wv.weight) avoids the earlier identifier
+--            error inside the lambda.
+
+WITH word_vecs AS (
+    SELECT
+        gv."word",
+        1.0 / POWER(wf."frequency", 0.4) AS "weight",
+        gv."vector"                      AS "vec"
+    FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"   gv
+    JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON gv."word" = wf."word"
+    WHERE gv."word" IN ('cell', 'culture', 'serum')
+)
+SELECT
+    wv."word",
+    ARRAY_TRANSFORM(wv."vec", v -> v * wv."weight") AS "weighted_vector"
+FROM word_vecs wv;
+```
+[Corrected SQL]
+2025-05-07 06:03:33 - Thread-304 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 13 at position 39\ninvalid identifier \'WV."weight"\''}
+[Results for corrected sql]
+2025-05-07 06:05:12 - Thread-304 (execute) - INFO - [Corrected SQL]
+```sql
+--Description:
+-- 1. From WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS pick the three sample
+--    tokens: ‘cell’, ‘culture’, and ‘serum’.
+-- 2. Join to WORD_FREQUENCIES to obtain the corpus frequency for each word.
+-- 3. Compute the weighting factor = 1 / frequency^0.4 (named weight).
+-- 4. Use ARRAY_TRANSFORM to multiply every component of the 300-D GloVe vector
+--    by this weight, producing a new weighted_vector.
+--    Inside ARRAY_TRANSFORM the column “weight” can be referenced directly
+--    (because it is in the same SELECT list scope) and therefore does not
+--    trigger the previous “invalid identifier” error.
+
+WITH word_vecs AS (
+    SELECT
+        gv."word",
+        1.0 / POWER(wf."frequency", 0.4) AS weight,
+        gv."vector"                      AS vec
+    FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"   gv
+    JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON gv."word" = wf."word"
+    WHERE gv."word" IN ('cell', 'culture', 'serum')
+)
+SELECT
+    "word",
+    ARRAY_TRANSFORM(vec, v -> v * weight) AS weighted_vector
+FROM word_vecs
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 06:05:12 - Thread-304 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 13 at position 34\ninvalid identifier 'WEIGHT'"}
+[Results for corrected sql]
+2025-05-07 06:06:23 - Thread-304 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: For the words ‘cell’, ‘culture’, and ‘serum’: obtain their corpus
+--             frequencies, calculate weight = 1 / frequency^0.4, and scale every
+--             element of their 300-dimensional GloVe vectors by that weight with
+--             ARRAY_TRANSFORM.  The unquoted alias weight is visible inside the
+--             lambda, so no identifier error occurs.
+
+WITH word_vecs AS (
+    SELECT
+        gv."word",
+        gv."vector"                      AS vec,
+        1.0 / POWER(wf."frequency", 0.4) AS weight
+    FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"   gv
+    JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON gv."word" = wf."word"
+    WHERE gv."word" IN ('cell', 'culture', 'serum')
+)
+SELECT
+    word,
+    ARRAY_TRANSFORM(vec, element -> element * weight) AS weighted_vector
+FROM word_vecs
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 06:06:23 - Thread-304 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 12 at position 4\ninvalid identifier 'WORD'"}
+[Results for corrected sql]
+2025-05-07 06:06:23 - Thread-304 (execute) - INFO - [Try to execute]
+--10)  Full pipeline (per article): sum the weighted vectors and normalise to unit length  
+WITH tokens AS (  -- explode every article into cleaned word tokens
+  SELECT n."id"           AS "article_id",
+         n."date",
+         n."title",
+         LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE tok.value IS NOT NULL
+),
+wfreq AS (  -- attach corpus frequency
+  SELECT t.*,
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)                 AS "weight"
+  FROM tokens t
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = t."word"
+),
+wvecs AS (  -- add GloVe vectors & scale them
+  SELECT w.*,
+         ARRAY_TRANSFORM(gv."vector", x -> x * w."weight") AS "scaled_vec"
+  FROM wfreq w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+    ON gv."word" = w."word"
+),
+vec_sum AS (  -- sum all scaled vectors per article
+  SELECT "article_id",
+         "date",
+         "title",
+         ARRAY_AGG("scaled_vec")                AS "vec_list"
+  FROM wvecs
+  GROUP BY "article_id", "date", "title"
+),
+summed AS (  -- flatten & accumulate by index position
+  SELECT vs."article_id",
+         vs."date",
+         vs."title",
+         ARRAY_AGG(sv.value)                    AS "raw_sum_vec"
+  FROM vec_sum vs,
+       LATERAL FLATTEN(vs."vec_list") f1,       -- list of vectors
+       LATERAL FLATTEN(input => f1.value) sv    -- individual dimensions
+  GROUP BY vs."article_id", vs."date", vs."title", sv.index
+  ORDER BY vs."article_id", sv.index
+),
+normed AS (  -- compute magnitude & divide each component
+  SELECT s."article_id",
+         s."date",
+         s."title",
+         ARRAY_AGG(s.raw_sum_vec[0])                          AS "sum_vector", -- rebuild
+         SQRT(SUM(POWER(s.raw_sum_vec[0], 2)))                AS "norm"
+  FROM summed s
+  GROUP BY s."article_id", s."date", s."title"
+)
+SELECT "article_id" AS "id",
+       "date",
+       "title",
+       ARRAY_TRANSFORM("sum_vector", x -> x / NULLIF("norm", 0)) 
+         AS "normalized_vector"
+FROM normed
+LIMIT 20;
+[Try to execute]
+2025-05-07 06:06:24 - Thread-304 (execute) - INFO - [Error occurred]
+{'status': 'error', 'error_msg': '##ERROR##000904 (42000): SQL compilation error: error line 22 at position 47\ninvalid identifier \'W."weight"\''}
+[Error occurred]
+2025-05-07 06:12:14 - Thread-304 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build a unit-length embedding for every Nature article.
+-- Steps
+-- 1. Split each article body into lowercase tokens (letters only).
+-- 2. Join to WORD_FREQUENCIES → get frequency and compute weight = 1 / freq^0.4.
+-- 3. Join to GLOVE_VECTORS and scale each 300-D vector by that weight
+--    with ARRAY_TRANSFORM(gv.vector , v -> v * weight).
+-- 4. Flatten the scaled vectors and sum per dimension to obtain one raw
+--    article vector.
+-- 5. Re-assemble the vector, compute its L2 norm, and divide each component
+--    by the norm to yield a normalised (unit-length) article vector.
+-- The query returns id, date, title, and the normalised vector (first 20 rows).
+
+WITH tokens AS (            -- 1. explode bodies into tokens
+    SELECT  n."id"  AS article_id,
+            n."date",
+            n."title",
+            LOWER(tok.value)::STRING AS word
+    FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+         LATERAL SPLIT_TO_TABLE(
+             REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+         ) tok
+    WHERE tok.value IS NOT NULL
+      AND tok.value <> ''
+),
+wfreq AS (                  -- 2. attach frequency and weight
+    SELECT  t.*,
+            wf."frequency",
+            1.0 / POWER(wf."frequency", 0.4) AS weight
+    FROM tokens t
+    JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON wf."word" = t.word
+),
+wvecs AS (                  -- 3. scale GloVe vectors by weight
+    SELECT  w.article_id,
+            w."date",
+            w."title",
+            ARRAY_TRANSFORM(gv."vector", v -> v * weight) AS scaled_vec
+    FROM wfreq w
+    JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+          ON gv."word" = w.word
+),
+dims AS (                   -- 4. flatten into (dimension, value)
+    SELECT  article_id,
+            "date",
+            "title",
+            fv.index                AS dim,
+            fv.value::FLOAT         AS val
+    FROM wvecs,
+         LATERAL FLATTEN(input => scaled_vec) fv
+),
+summed AS (                 -- sum across tokens per dimension
+    SELECT  article_id,
+            "date",
+            "title",
+            dim,
+            SUM(val) AS dim_sum
+    FROM dims
+    GROUP BY article_id, "date", "title", dim
+),
+vec_and_norm AS (           -- 5. rebuild vector & compute norm
+    SELECT  article_id,
+            "date",
+            "title",
+            ARRAY_AGG(dim_sum ORDER BY dim) AS sum_vector,
+            SQRT(SUM(POWER(dim_sum, 2)))    AS norm_val
+    FROM summed
+    GROUP BY article_id, "date", "title"
+)
+SELECT  article_id AS id,
+        "date",
+        "title",
+        ARRAY_TRANSFORM(sum_vector, x -> x / NULLIF(norm_val, 0))
+            AS normalized_vector
+FROM vec_and_norm
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 06:12:15 - Thread-304 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##001003 (42000): SQL compilation error:\nsyntax error line 52 at position 30 unexpected 'ORDER'.\nsyntax error line 52 at position 44 unexpected 'AS'."}
+[Results for corrected sql]
+2025-05-07 06:16:19 - Thread-304 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build a unit-length (L2-normalised) embedding for every Nature
+--             article.  Pipeline:
+--             1) Tokenise each article body into lowercase words.
+--             2) Attach corpus frequency and compute weight = 1 / freq^0.4.
+--             3) Fetch each word’s 300-D GloVe vector and scale it by the
+--                weight with ARRAY_TRANSFORM.
+--             4) Flatten all scaled vectors, sum values per dimension to form
+--                one raw 300-D vector per article.
+--             5) Re-assemble the summed vector ordered by dimension, compute
+--                its L2 norm, then divide every component to obtain a
+--                unit-length article vector.
+--             The query returns id, date, title and the normalised vector
+--             (first 20 rows for illustration).
+
+WITH tokens AS (                      -- 1. split body into words
+    SELECT  n."id"  AS article_id,
+            n."date",
+            n."title",
+            LOWER(tok.value)::STRING AS word
+    FROM  "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+          LATERAL SPLIT_TO_TABLE(
+              REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+          ) tok
+    WHERE tok.value IS NOT NULL
+      AND tok.value <> ''
+),
+wfreq AS (                            -- 2. add frequency & weight
+    SELECT  t.*,
+            wf."frequency",
+            1.0 / POWER(wf."frequency", 0.4) AS weight
+    FROM  tokens t
+    JOIN  "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON wf."word" = t.word
+),
+wvecs AS (                            -- 3. scale GloVe vectors
+    SELECT  w.article_id,
+            w."date",
+            w."title",
+            ARRAY_TRANSFORM(gv."vector", v -> v * weight) AS scaled_vec
+    FROM  wfreq w
+    JOIN  "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+          ON gv."word" = w.word
+),
+dims AS (                             -- 4. flatten to (dim,val) rows
+    SELECT  article_id,
+            "date",
+            "title",
+            f.index        AS dim,
+            f.value::FLOAT AS val
+    FROM  wvecs,
+          LATERAL FLATTEN(input => scaled_vec) f
+),
+summed AS (                           --    sum per dimension
+    SELECT  article_id,
+            "date",
+            "title",
+            dim,
+            SUM(val) AS dim_sum
+    FROM  dims
+    GROUP BY article_id, "date", "title", dim
+),
+vec_and_norm AS (                     -- 5. rebuild vector & compute norm
+    SELECT  article_id,
+            "date",
+            "title",
+            ARRAY_AGG(dim_sum) WITHIN GROUP (ORDER BY dim) AS sum_vector,
+            SQRT(SUM(POWER(dim_sum, 2)))                   AS norm_val
+    FROM  summed
+    GROUP BY article_id, "date", "title"
+)
+SELECT  article_id AS id,
+        "date",
+        "title",
+        ARRAY_TRANSFORM(sum_vector, x -> x / NULLIF(norm_val, 0)) AS normalized_vector
+FROM  vec_and_norm
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 06:16:20 - Thread-304 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 25 at position 50\ninvalid identifier 'WEIGHT'"}
+[Results for corrected sql]
+2025-05-07 06:19:40 - Thread-304 (execute) - INFO - [Corrected SQL]
+```sql
+--Description: Build a unit-length (L2-normalised) embedding for every Nature
+--             article.  Pipeline:
+--             1. Tokenise article body into lowercase words (letters only).
+--             2. Join to WORD_FREQUENCIES → get frequency and compute
+--                weight = 1 / frequency^0.4  (alias weight, unquoted).
+--             3. Join to GLOVE_VECTORS and scale each 300-D vector by weight
+--                with ARRAY_TRANSFORM(gv.vector , v -> v * weight).
+--             4. Flatten all scaled vectors, sum values per dimension to obtain
+--                one raw vector per article.
+--             5. Re-assemble the summed vector (ordered by dimension), compute
+--                its L2 norm, and divide every component by that norm to yield
+--                a unit-length “normalized_vector”.
+--             Outputs: id, date, title, normalized_vector (first 20 rows).
+
+WITH tokens AS (                         -- 1) explode body into words
+    SELECT  n."id"  AS article_id,
+            n."date",
+            n."title",
+            LOWER(tok.value)::STRING AS word
+    FROM  "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+          LATERAL SPLIT_TO_TABLE(
+              REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+          ) tok
+    WHERE tok.value IS NOT NULL
+      AND tok.value <> ''
+),
+wfreq AS (                               -- 2) add frequency & weight
+    SELECT  t.*,
+            wf."frequency",
+            1.0 / POWER(wf."frequency", 0.4) AS weight
+    FROM  tokens t
+    JOIN  "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON wf."word" = t.word
+),
+wvecs AS (                               -- 3) scale GloVe vectors
+    SELECT  w.article_id,
+            w."date",
+            w."title",
+            ARRAY_TRANSFORM(gv."vector", v -> v * weight) AS scaled_vec
+    FROM  wfreq w
+    JOIN  "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+          ON gv."word" = w.word
+),
+dims AS (                                -- 4a) flatten to (dim,val)
+    SELECT  article_id,
+            "date",
+            "title",
+            f.index        AS dim,
+            f.value::FLOAT AS val
+    FROM  wvecs,
+          LATERAL FLATTEN(input => scaled_vec) f
+),
+summed AS (                              -- 4b) sum per dimension
+    SELECT  article_id,
+            "date",
+            "title",
+            dim,
+            SUM(val) AS dim_sum
+    FROM  dims
+    GROUP BY article_id, "date", "title", dim
+),
+vec_and_norm AS (                        -- 5) rebuild vector & normalise
+    SELECT  article_id,
+            "date",
+            "title",
+            ARRAY_AGG(dim_sum) WITHIN GROUP (ORDER BY dim) AS sum_vector,
+            SQRT(SUM(POWER(dim_sum, 2)))                   AS norm_val
+    FROM  summed
+    GROUP BY article_id, "date", "title"
+)
+SELECT  article_id AS id,
+        "date",
+        "title",
+        ARRAY_TRANSFORM(sum_vector, x -> x / NULLIF(norm_val, 0)) AS normalized_vector
+FROM  vec_and_norm
+LIMIT 20;
+```
+[Corrected SQL]
+2025-05-07 06:19:42 - Thread-304 (execute) - INFO - [Results for corrected sql]
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 25 at position 50\ninvalid identifier 'WEIGHT'"}
+[Results for corrected sql]
+2025-05-07 06:19:42 - Thread-304 (execute) - INFO - itercount: 0
+2025-05-07 06:19:42 - Thread-304 (execute) - INFO - [Self-refine]
+Table full name: WORD_VECTORS_US.WORD_VECTORS_US.NATURE
+Column name: acquisition_date Type: DATE
+Column name: title Type: TEXT
+Column name: abstract Type: TEXT
+Column name: citations Type: TEXT
+Column name: body Type: TEXT
+Column name: pdf_link Type: TEXT
+Column name: date Type: DATE
+Column name: doi Type: TEXT
+Column name: category Type: TEXT
+Column name: link Type: TEXT
+Column name: organization_affiliated Type: TEXT
+Column name: keywords Type: TEXT
+Column name: id Type: TEXT
+Column name: authors Type: TEXT
+Column name: nature_source Type: TEXT
+Sample rows:
+[{'abstract': 'Serum is a common supplement for cell culture due to it containing the essential active components for the growth and maintenance of cells. However, the knowledges of the active components in serum are incomplete. Apart from the direct influence of serum components on cultured cells, the reaction of serum components with tested drugs cannot be ignored, which usually results in the false conclusion on the activity of the tested drugs. Here we report the toxicity effect of polyamines (spermidine and spermine) on cultured cells, especially on drug-resistant cancer cell lines, which resulted from the oxidative degradation of polyamines by amine oxidases in serum supplement. Upon adding spermidine or spermine, high concentration of H2O2, an enzyme oxidation product of polyamines, was generated in culture media containing ruminant serum, such as fetal bovine serum (FBS), calf serum, bovine serum, goat serum or horse serum, but not in the media containing human serum. Drug-resistant cancer cell lines showed much higher sensitivity to the oxidation products of polyamines (H2O2 and acrolein) than their wild cell lines, which was due to their low antioxidative capacity.', 'acquisition_date': '2020-06-06', 'authors': 'Linlin Wang; Ying Liu; Cui Qi; Luyao Shen; Junyan Wang; Xiangjun Liu; Nan Zhang; Tao Bing; Dihua Shangguan', 'category': 'Cell culture; Chemical biology', 'citations': '7', 'date': '2018-07-10', 'doi': '10.1038/s41598-018-28648-8', 'body': 'Introduction\nCell culture is a widely used tool to study physiological, biological and pharmacological activities in vitro, as well as to produce biological components, such as proteins, hormones and vaccines. This method is fast, cheap, reproducible, and greatly reduces the use of experimental animals. Serum from animals or human is a common supplement for the culture of eukaryotic cells due to it containing a large number of active components, like growth factors, enzymes, hormones, etc., which are essential for the growth and maintenance of cells1,2,3. Fetal bovine serum (FBS) is the most commonly used serum in cell culture, because it is rich in fetal growth factors and hormones that stimulate cellular proliferation and maintenance. Although FBS has been used for more than 50 years, the knowledge is incomplete regarding the serum components and their influence on cultured cells4,5. Apart from the unknown influence of serum components on the cultured cells directly, the effects of enzymes in serum on the tested drugs should be paid much more attention, otherwise it may result in the false positive or negative results, consequently lead to misleading conclusions. In previous work, we have shown that the cytotoxicity activity of guanine-rich oligonucleotides is attributed to the cytotoxicity of guanine derivatives derived from degradation of oligonucleotides by nuclease in FBS, but not attributed to the direct action of oligonucleotides on cells as reported elsewhere6.\nAs ubiquitous endogenous metabolites, polyamines are essential organic compounds for cell growth and proliferation. Putrescine, spermidine and spermine, existing normally in millimolar concentration range in nucleus7, are the mainly naturally occurring polyamines in mammalian cells8. Polyamines are involved in a wide variety of cellular processes: participating in the regulation of gene expression and enzyme activity, activating DNA synthesis, facilitating the interaction of DNA and protein, as well as protecting DNA molecules from putative damaging agents7,9. Among these polyamines, spermine is reported to possess the highest biological activity10. Under physiologic ionic and pH conditions, polyamines are multivalent cations with aliphatic hydrocarbon chains separating the charges11, and hence negatively charged nucleic acids, including DNA and RNA, are their prime targets of interaction, and consequently regulate the structures of DNA, condense DNA molecules to a liquid crystalline phase12, and enhance the activity of G-quadruplex/hemin DNAzymes in vitro13. Many evidences suggest that polyamines play important roles as modulators of nucleic acid structure14.\nThe intracellular polyamines are maintained at a correct level through the subtle coordination and regulation of biosynthesis, transport, and catabolism. In mammalian cells, polyamine catabolism occurs through two distinct pathways with the help of three kinds of enzymes: spermidine/spermine N1-acetyltransferase, N1-acetylpolyamine oxidase and spermine oxidase15 (Fig. S1). Polyamine catabolism can generate cytotoxic metabolites such as hydrogen peroxide (H2O2) and aldehydes in situ, thereafter inducing apoptosis, necrosis, inhibition of cell proliferation, and inhibition of DNA and protein synthesis7,16,17. Polyamines are also the substrates of various kinds of amine oxidases, such as monoamine oxidases, diamine oxidases, polyamine oxidases and copper containing amine oxidases. These enzymes catalyze the oxidative deamination of polyamines to generate the reaction products H2O2 and aldehyde(s) that are able to induce cell death in several cultured human tumor cell lines18,19,20,21,22,23. Therefore, polyamines and amine oxidases are also considered to have potential in therapeutic applications15,17.\nHere, we describe the cytotoxicity of polyamines and their degradation products on different cell lines. The generation of H2O2 (one of the degradation product of polyamines) in culture media containing different serums was measured after addition of spermidine and spermine. The degradation products of spermidine and spermine resulted from the amine oxidases in serum were found to be the main reason of the cytotoxicity of spermidine and spermine.; Cell culture is a widely used tool to study physiological, biological and pharmacological activities in vitro, as well as to produce biological components, such as proteins, hormones and vaccines. This method is fast, cheap, reproducible, and greatly reduces the use of experimental animals. Serum from animals or human is a common supplement for the culture of eukaryotic cells due to it containing a large number of active components, like growth factors, enzymes, hormones, etc., which are essential for the growth and maintenance of cells1,2,3. Fetal bovine serum (FBS) is the most commonly used serum in cell culture, because it is rich in fetal growth factors and hormones that stimulate cellular proliferation and maintenance. Although FBS has been used for more than 50 years, the knowledge is incomplete regarding the serum components and their influence on cultured cells4,5. Apart from the unknown influence of serum components on the cultured cells directly, the effects of enzymes in serum on the tested drugs should be paid much more attention, otherwise it may result in the false positive or negative results, consequently lead to misleading conclusions. In previous work, we have shown that the cytotoxicity activity of guanine-rich oligonucleotides is attributed to the cytotoxicity of guanine derivatives derived from degradation of oligonucleotides by nuclease in FBS, but not attributed to the direct action of oligonucleotides on cells as reported elsewhere6.\nAs ubiquitous endogenous metabolites, polyamines are essential organic compounds for cell growth and proliferation. Putrescine, spermidine and spermine, existing normally in millimolar concentration range in nucleus7, are the mainly naturally occurring polyamines in mammalian cells8. Polyamines are involved in a wide variety of cellular processes: participating in the regulation of gene expression and enzyme activity, activating DNA synthesis, facilitating the interaction of DNA and protein, as well as protecting DNA molecules from putative damaging agents7,9. Among these polyamines, spermine is reported to possess the highest biological activity10. Under physiologic ionic and pH conditions, polyamines are multivalent cations with aliphatic hydrocarbon chains separating the charges11, and hence negatively charged nucleic acids, including DNA and RNA, are their prime targets of interaction, and consequently regulate the structures of DNA, condense DNA molecules to a liquid crystalline phase12, and enhance the activity of G-quadruplex/hemin DNAzymes in vitro13. Many evidences suggest that polyamines play important roles as modulators of nucleic acid structure14.\nThe intracellular polyamines are maintained at a correct level through the subtle coordination and regulation of biosynthesis, transport, and catabolism. In mammalian cells, polyamine catabolism occurs through two distinct pathways with the help of three kinds of enzymes: spermidine/spermine N1-acetyltransferase, N1-acetylpolyamine oxidase and spermine oxidase15 (Fig. S1). Polyamine catabolism can generate cytotoxic metabolites such as hydrogen peroxide (H2O2) and aldehydes in situ, thereafter inducing apoptosis, necrosis, inhibition of cell proliferation, and inhibition of DNA and protein synthesis7,16,17. Polyamines are also the substrates of various kinds of amine oxidases, such as monoamine oxidases, diamine oxidases, polyamine oxidases and copper containing amine oxidases. These enzymes catalyze the oxidative deamination of polyamines to generate the reaction products H2O2 and aldehyde(s) that are able to induce cell death in several cultured human tumor cell lines18,19,20,21,22,23. Therefore, polyamines and amine oxidases are also considered to have potential in therapeutic applications15,17.\nHere, we describe the cytotoxicity of polyamines and their degradation products on different cell lines. The generation of H2O2 (one of the degradation product of polyamines) in culture media containing different serums was measured after addition of spermidine and spermine. The degradation products of spermidine and spermine resulted from the amine oxidases in serum were found to be the main reason of the cytotoxicity of spermidine and spermine.; Results and Discussion\nThe toxicity ef
+--------------------------------------------------
+Table full name: WORD_VECTORS_US.WORD_VECTORS_US.WORD_FREQUENCIES
+Column name: word Type: TEXT
+Column name: frequency Type: NUMBER
+Sample rows:
+[{'word': 'separating', 'frequency': 256}, {'word': 'C8', 'frequency': 256}, {'word': 'Benjamini', 'frequency': 256}, {'word': 'RCA', 'frequency': 256}, {'word': 'antennal', 'frequency': 256}]
+--------------------------------------------------
+Table full name: WORD_VECTORS_US.WORD_VECTORS_US.GLOVE_VECTORS
+Column name: word Type: TEXT
+Column name: vector Type: VARIANT
+Sample rows:
+[{'word': '01:44', 'vector': '[\n  -4.383600130677223e-02,\n  1.611000001430511e-01,\n  5.632200241088867e-01,\n  -4.001300036907196e-01,\n  -8.750299811363220e-01,\n  -1.227600034326315e-02,\n  1.805099993944168e-01,\n  -7.279099822044373e-01,\n  -5.645599961280823e-01,\n  -3.744199872016907e-01,\n  7.448599934577942e-01,\n  5.657200142741203e-02,\n  -8.297900110483170e-02,\n  4.517899826169014e-02,\n  -4.257000088691711e-01,\n  1.779299974441528e-01,\n  4.165700078010559e-01,\n  -1.948699951171875e-01,\n  -1.243200004100800e-01,\n  2.108699977397919e-01,\n  -5.181099846959114e-02,\n  2.477400004863739e-02,\n  1.425700038671494e-01,\n  3.997600078582764e-01,\n  1.423600018024445e-01,\n  3.769400119781494e-01,\n  1.243000030517578e-01,\n  2.296599996043369e-04,\n  4.714300036430359e-01,\n  2.521100044250488e-01,\n  -1.187900006771088e-01,\n  4.612599909305573e-01,\n  -1.869899928569794e-01,\n  3.239299952983856e-01,\n  -4.410299879964441e-04,\n  -9.339399635791779e-02,\n  2.12029993534
+--------------------------------------------------
+External knowledge that might be helpful: 
+None
+The table structure information is ({database name: {schema name: [table name]}}): 
+{'WORD_VECTORS_US': {'WORD_VECTORS_US': ['NATURE', 'WORD_FREQUENCIES', 'GLOVE_VECTORS']}}
+
+Some few-shot examples after column exploration may be helpful:
+Query:
+-- 1)  Preview a handful of available Nature articles  
+SELECT "id", "date", "title"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+Answer:
+id,date,title
+b8f29c08-2530-4ff1-bd49-da1f483b73ed,2018-12-31,Structural basis of Notch recognition by human γ-secretase
+ba1d19c8-e235-4bf6-95ff-f2022a69e510,2018-09-27,"You are what you eat: diet, health and the gut microbiota"
+83ee533c-7dd3-4e7f-9f30-53cddb6fa2a6,2018-10-31,The SWI/SNF complex is a mechanoregulated inhibitor of YAP and TAZ
+40f51d9b-2e38-48d5-9d4d-f6e53ce57adf,2018-06-06,Equivalent-accuracy accelerated neural-network training using analogue memory
+Query:
+-- 2)  See the different research “category” values that exist  
+SELECT DISTINCT "category"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+LIMIT 20;
+Answer:
+category
+Cryoelectron microscopy; Proteases
+Cancer; Cell biology; Cell signalling
+Reaction kinetics and dynamics; Self-assembly
+Electrocatalysis; Hydrogen fuel
+Cancer microenvironment; Glial biology
+Applied physics; Electrical and electronic engineering; Nanoscale devices; Optical techniques; Techniques and instrumentation
+Molecular biology; Molecular engineering; Targeted gene repair
+Electronic devices; Electronic properties and materials; Graphene; Quantum Hall
+Genome-wide analysis of
+Query:
+-- 3)  Inspect the full text (abstract + body) of one sample article  
+SELECT "id", "title", "abstract", "body"
+FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+ORDER BY "date" DESC
+LIMIT 1;
+Answer:
+id,title,abstract,body
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,New insights into microstructure of irradiated beryllium based on experiments and computer simulations,"The microstructural response of beryllium after neutron irradiation at various temperatures (643–923 K) was systematically studied using analytical transmission electron microscope that together with outcomes from advanced atomistic modelling provides new insights in the mechanisms of microstructural changes in this material. The mos
+Query:
+-- 4)  Tokenise the BODY of that single article into individual words  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+)
+SELECT oa."id"    AS "article_id",
+       tok.value::STRING  AS "token"
+FROM one_article oa,
+     LATERAL SPLIT_TO_TABLE(
+            REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '),  -- keep letters & blanks
+            ' '                                           -- split on blanks
+      ) tok
+WHERE tok.value IS NOT NULL
+  AND tok.value <> ''
+LIMIT 20;
+Answer:
+article_id,token
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,Introduction
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,Being
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,lightweight
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,metal
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,beryllium
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,finds
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,numerous
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,technological
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,applications
+90bdd57d-e0bb-4d76-b8a8-86ecda3e6ff4,ranging
+Query:
+-- 5)  Same token list but drop a few common stop-words (very small example list)  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT DISTINCT "word"
+FROM tokens
+WHERE LOWER("word") NOT IN ('the','and','of','to','in','a','for','on')
+LIMIT 20;
+Answer:
+word
+Being
+metal
+""
+beryllium
+finds
+technological
+phones
+conductivity
+industry
+strength
+lattice
+controls
+prospective
+better
+irradiation
+foreign
+closed
+exceptional
+physical
+evolution
+Query:
+-- 6)  Attach corpus frequencies to those tokens  
+WITH one_article AS (
+  SELECT "id", "body"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE"
+  ORDER BY "date" DESC
+  LIMIT 1
+),
+tokens AS (
+  SELECT tok.value::STRING AS "word"
+  FROM one_article oa,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(oa."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+)
+SELECT t."word",
+       wf."frequency"
+FROM tokens t
+JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+  ON wf."word" = t."word"
+LIMIT 20;
+Answer:
+word,frequency
+separating,256
+separating,256
+somewhat,512
+somewhat,512
+droplets,512
+droplets,512
+densities,1024
+densities,1024
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+maps,2048
+basal,2304
+basal,2304
+Query:
+-- 7)  Compute the weighting factor 1 / frequency^0.4 for every word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)   AS "weight"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+)
+SELECT *
+FROM joined
+LIMIT 20;
+Answer:
+word,frequency,weight
+cleavage,1280,0.05716313149091578
+cleavage,1280,0.05716313149091578
+cleavage,1280,0.05716313149091578
+cleavage,1280,0.05716313149091578
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+maps,2048,0.04736614270344994
+Query:
+-- 8)  Bring in the 300-dimensional GloVe vectors for each weighted word  
+WITH words AS (
+  SELECT LOWER(tok.value)::STRING AS "word"
+  FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+       LATERAL SPLIT_TO_TABLE(
+         REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+       ) tok
+  WHERE n."id" = (SELECT "id" FROM "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" LIMIT 1)
+),
+joined AS (
+  SELECT w."word",
+         wf."frequency",
+         1.0 / POWER(wf."frequency", 0.4)                    AS "weight",
+         gv."vector"
+  FROM words w
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+    ON wf."word" = w."word"
+  JOIN "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+    ON gv."word" = w."word"
+)
+SELECT "word", "weight", "vector"
+FROM joined
+LIMIT 20;
+Answer:
+word,weight,vector
+cleavage,0.05716313149091578,"[
+  -9.394699931144714e-01,
+  -2.447299957275391e-01,
+  -1.383200008422136e-02,
+  9.291499853134155e-01,
+  3.189499974250793e-01,
+  2.232300043106079e-01,
+  5.056499838829041e-01,
+  8.222500085830688e-01,
+  3.605699911713600e-02,
+  2.222000062465668e-01,
+  5.826399922370911e-01,
+  -3.108699917793274e-01,
+  4.869300127029419e-01,
+  -1.273500025272369e-01,
+  5.581700205802917e-01,
+  5.520200133323669e-01,
+  -5.159800127148628e-02,
+  1.1151000261306
+Task: Tokenize the body text of each article into words, excluding stop words, and obtain the corresponding word vectors for these words from the glove vector. For each word, weight its word vector by dividing each component by the 0.4th power of the word's frequency from the word frequencies. Then, for each article, aggregate these weighted word vectors by summing their components to form an article vector. Normalize each article vector to unit length by dividing by its magnitude. Finally, retrieve the ID, date, title, and the normalized article vector for each article.
+
+Please think step by step and answer only one complete SQL in snowflake dialect in ```sql``` format.
+SQL usage example: ```sql
+SELECT "COLUMN_NAME" FROM DATABASE.SCHEMA.TABLE WHERE ... ``` (Adjust "DATABASE", "SCHEMA", and "TABLE" to match actual names, ensure all column names are enclosed in double quotations)
+Here are some useful tips for answering:
+When performing a UNION operation on many tables, ensure that all table names are explicitly listed. Union first and then add condition and selection. e.g. SELECT "col1", "col2" FROM (TABLE1 UNION ALL TABLE2) WHERE ...; Don't write sqls as (SELECT col1, col2 FROM TABLE1 WHERE ...) UNION ALL (SELECT col1, col2 FROM TABLE2 WHERE ...); Don't use ['-- Include all', '-- Omit', '-- Continue', '-- Union all', '-- ...', '-- List all', '-- Replace this', '-- Each table', '-- Add other'] to omit any table. Table names here: The table structure information is ({database name: {schema name: [table name]}}): 
+{'WORD_VECTORS_US': {'WORD_VECTORS_US': ['NATURE', 'WORD_FREQUENCIES', 'GLOVE_VECTORS']}}
+
+When using ORDER BY xxx DESC, add NULLS LAST to exclude null records: ORDER BY xxx DESC NULLS LAST.
+If the task description does not specify the number of decimal places, retain all decimals to four places.
+
+[Self-refine]
+2025-05-07 06:22:31 - Thread-304 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH stop_words AS (
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+-- 1)  Tokenise BODY, drop blanks & stop-words
+tokens AS (
+    SELECT  n."id",
+            n."date",
+            n."title",
+            LOWER(tok.value)::STRING AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                    REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '),   -- keep letters & blanks
+                    ' '                                            -- split on blanks
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+-- 2)  Attach global frequency & 300-D GloVe vector, compute weight factor 1/freq^0.4
+word_info AS (
+    SELECT  t."id",
+            t."date",
+            t."title",
+            gv."vector"                   AS vector,
+            POWER(wf."frequency", 0.4)    AS freq_pow
+    FROM    tokens t
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+           ON wf."word" = t.word
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"     gv
+           ON gv."word" = t.word
+),
+-- 3)  Weight every component of every word vector
+weighted_components AS (
+    SELECT  wi."id",
+            wi."date",
+            wi."title",
+            f.index                            AS pos,         -- component index 0-299
+            (f.value::FLOAT / wi.freq_pow)    AS comp_value   -- weighted component
+    FROM    word_info wi,
+            LATERAL FLATTEN(input => wi.vector) f
+),
+-- 4)  Sum weighted components across all word-tokens of the article
+summed AS (
+    SELECT  "id",
+            "date",
+            "title",
+            pos,
+            SUM(comp_value) AS comp_sum
+    FROM    weighted_components
+    GROUP BY "id", "date", "title", pos
+),
+-- 5)  Article-vector magnitude (L2-norm)
+norms AS (
+    SELECT  "id",
+            SQRT(SUM(comp_sum * comp_sum)) AS magnitude
+    FROM    summed
+    GROUP BY "id"
+),
+-- 6)  Build the normalised article vector (unit length)
+normalised AS (
+    SELECT  s."id",
+            s."date",
+            s."title",
+            ARRAY_AGG( s.comp_sum / n.magnitude ORDER BY s.pos )  AS article_vector
+    FROM    summed s
+    JOIN    norms n  ON n."id" = s."id"
+    GROUP BY s."id", s."date", s."title"
+)
+-- 7)  Final result
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    normalised
+ORDER BY "date" NULLS LAST;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:22:31 - Thread-304 (execute) - INFO - itercount: 1
+2025-05-07 06:22:31 - Thread-304 (execute) - INFO - [Self-refine]
+Input sql:
+WITH stop_words AS (
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+-- 1)  Tokenise BODY, drop blanks & stop-words
+tokens AS (
+    SELECT  n."id",
+            n."date",
+            n."title",
+            LOWER(tok.value)::STRING AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                    REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '),   -- keep letters & blanks
+                    ' '                                            -- split on blanks
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+-- 2)  Attach global frequency & 300-D GloVe vector, compute weight factor 1/freq^0.4
+word_info AS (
+    SELECT  t."id",
+            t."date",
+            t."title",
+            gv."vector"                   AS vector,
+            POWER(wf."frequency", 0.4)    AS freq_pow
+    FROM    tokens t
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+           ON wf."word" = t.word
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"     gv
+           ON gv."word" = t.word
+),
+-- 3)  Weight every component of every word vector
+weighted_components AS (
+    SELECT  wi."id",
+            wi."date",
+            wi."title",
+            f.index                            AS pos,         -- component index 0-299
+            (f.value::FLOAT / wi.freq_pow)    AS comp_value   -- weighted component
+    FROM    word_info wi,
+            LATERAL FLATTEN(input => wi.vector) f
+),
+-- 4)  Sum weighted components across all word-tokens of the article
+summed AS (
+    SELECT  "id",
+            "date",
+            "title",
+            pos,
+            SUM(comp_value) AS comp_sum
+    FROM    weighted_components
+    GROUP BY "id", "date", "title", pos
+),
+-- 5)  Article-vector magnitude (L2-norm)
+norms AS (
+    SELECT  "id",
+            SQRT(SUM(comp_sum * comp_sum)) AS magnitude
+    FROM    summed
+    GROUP BY "id"
+),
+-- 6)  Build the normalised article vector (unit length)
+normalised AS (
+    SELECT  s."id",
+            s."date",
+            s."title",
+            ARRAY_AGG( s.comp_sum / n.magnitude ORDER BY s.pos )  AS article_vector
+    FROM    summed s
+    JOIN    norms n  ON n."id" = s."id"
+    GROUP BY s."id", s."date", s."title"
+)
+-- 7)  Final result
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    normalised
+ORDER BY "date" NULLS LAST;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##001003 (42000): SQL compilation error:\nsyntax error line 65 at position 48 unexpected 'ORDER'.\nsyntax error line 65 at position 66 unexpected 'AS'."}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 06:24:51 - Thread-304 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH stop_words AS (
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+/* 1) Tokenise BODY, drop blanks & stop-words */
+tokens AS (
+    SELECT  n."id",
+            n."date",
+            n."title",
+            LOWER(tok.value) AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '),   -- keep letters & blanks
+                ' '                                            -- split on blanks
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+/* 2) Attach corpus frequency & GloVe vector, compute freq^0.4 */
+word_info AS (
+    SELECT  t."id",
+            t."date",
+            t."title",
+            gv."vector",
+            POWER(wf."frequency", 0.4) AS freq_pow
+    FROM    tokens t
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+           ON wf."word" = t.word
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+           ON gv."word" = t.word
+),
+/* 3) Weight every component of every word vector */
+weighted_components AS (
+    SELECT  wi."id",
+            wi."date",
+            wi."title",
+            f.index AS pos,   -- component index
+            (f.value::FLOAT / wi.freq_pow) AS comp_value
+    FROM    word_info wi,
+            LATERAL FLATTEN(input => wi.vector) f
+),
+/* 4) Sum weighted components per article */
+summed AS (
+    SELECT  "id",
+            "date",
+            "title",
+            pos,
+            SUM(comp_value) AS comp_sum
+    FROM    weighted_components
+    GROUP BY "id", "date", "title", pos
+),
+/* 5) Compute vector magnitude per article */
+norms AS (
+    SELECT  "id",
+            SQRT(SUM(comp_sum * comp_sum)) AS magnitude
+    FROM    summed
+    GROUP BY "id"
+),
+/* 6) Build the normalised (unit-length) article vector */
+normalised AS (
+    SELECT  s."id",
+            s."date",
+            s."title",
+            ARRAY_AGG( s.comp_sum / n.magnitude )
+              WITHIN GROUP (ORDER BY s.pos)  AS article_vector
+    FROM    summed s
+    JOIN    norms n  ON n."id" = s."id"
+    GROUP BY s."id", s."date", s."title"
+)
+/* 7) Final result */
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    normalised
+ORDER BY "date" NULLS LAST;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:24:52 - Thread-304 (execute) - INFO - itercount: 2
+2025-05-07 06:24:52 - Thread-304 (execute) - INFO - [Self-refine]
+Input sql:
+WITH stop_words AS (
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+/* 1) Tokenise BODY, drop blanks & stop-words */
+tokens AS (
+    SELECT  n."id",
+            n."date",
+            n."title",
+            LOWER(tok.value) AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '),   -- keep letters & blanks
+                ' '                                            -- split on blanks
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+/* 2) Attach corpus frequency & GloVe vector, compute freq^0.4 */
+word_info AS (
+    SELECT  t."id",
+            t."date",
+            t."title",
+            gv."vector",
+            POWER(wf."frequency", 0.4) AS freq_pow
+    FROM    tokens t
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+           ON wf."word" = t.word
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+           ON gv."word" = t.word
+),
+/* 3) Weight every component of every word vector */
+weighted_components AS (
+    SELECT  wi."id",
+            wi."date",
+            wi."title",
+            f.index AS pos,   -- component index
+            (f.value::FLOAT / wi.freq_pow) AS comp_value
+    FROM    word_info wi,
+            LATERAL FLATTEN(input => wi.vector) f
+),
+/* 4) Sum weighted components per article */
+summed AS (
+    SELECT  "id",
+            "date",
+            "title",
+            pos,
+            SUM(comp_value) AS comp_sum
+    FROM    weighted_components
+    GROUP BY "id", "date", "title", pos
+),
+/* 5) Compute vector magnitude per article */
+norms AS (
+    SELECT  "id",
+            SQRT(SUM(comp_sum * comp_sum)) AS magnitude
+    FROM    summed
+    GROUP BY "id"
+),
+/* 6) Build the normalised (unit-length) article vector */
+normalised AS (
+    SELECT  s."id",
+            s."date",
+            s."title",
+            ARRAY_AGG( s.comp_sum / n.magnitude )
+              WITHIN GROUP (ORDER BY s.pos)  AS article_vector
+    FROM    summed s
+    JOIN    norms n  ON n."id" = s."id"
+    GROUP BY s."id", s."date", s."title"
+)
+/* 7) Final result */
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    normalised
+ORDER BY "date" NULLS LAST;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##000904 (42000): SQL compilation error: error line 41 at position 37\ninvalid identifier 'WI.VECTOR'"}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 06:26:22 - Thread-304 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+WITH stop_words AS (
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+/* 1) Tokenise BODY, drop blanks & stop-words */
+tokens AS (
+    SELECT  n."id",
+            n."date",
+            n."title",
+            LOWER(tok.value) AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '),   -- keep letters & blanks
+                ' '                                            -- split on blanks
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+/* 2) Attach corpus frequency & GloVe vector, compute freq^0.4 */
+word_info AS (
+    SELECT  t."id",
+            t."date",
+            t."title",
+            gv."vector"                     AS w_vector,
+            POWER(wf."frequency", 0.4)      AS freq_pow
+    FROM    tokens t
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+           ON wf."word" = t.word
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+           ON gv."word" = t.word
+),
+/* 3) Weight each component of every word vector */
+weighted_components AS (
+    SELECT  wi."id",
+            wi."date",
+            wi."title",
+            f.index                                 AS pos,          -- component index
+            (f.value::FLOAT / wi.freq_pow)          AS comp_value    -- weighted component
+    FROM    word_info wi,
+            LATERAL FLATTEN(input => wi.w_vector) f
+),
+/* 4) Sum weighted components per article */
+summed AS (
+    SELECT  "id",
+            "date",
+            "title",
+            pos,
+            SUM(comp_value) AS comp_sum
+    FROM    weighted_components
+    GROUP BY "id", "date", "title", pos
+),
+/* 5) Compute L2-norm per article */
+norms AS (
+    SELECT  "id",
+            SQRT(SUM(comp_sum * comp_sum)) AS magnitude
+    FROM    summed
+    GROUP BY "id"
+),
+/* 6) Build the normalised (unit-length) article vector */
+normalised AS (
+    SELECT  s."id",
+            s."date",
+            s."title",
+            ARRAY_AGG( s.comp_sum / n.magnitude )
+              WITHIN GROUP (ORDER BY s.pos)        AS article_vector
+    FROM    summed s
+    JOIN    norms n  ON n."id" = s."id"
+    GROUP BY s."id", s."date", s."title"
+)
+/* 7) Final output */
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    normalised
+ORDER BY "date" NULLS LAST;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:29:43 - Thread-304 (execute) - INFO - itercount: 3
+2025-05-07 06:29:43 - Thread-304 (execute) - INFO - [Self-refine]
+Input sql:
+WITH stop_words AS (
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+/* 1) Tokenise BODY, drop blanks & stop-words */
+tokens AS (
+    SELECT  n."id",
+            n."date",
+            n."title",
+            LOWER(tok.value) AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '),   -- keep letters & blanks
+                ' '                                            -- split on blanks
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+/* 2) Attach corpus frequency & GloVe vector, compute freq^0.4 */
+word_info AS (
+    SELECT  t."id",
+            t."date",
+            t."title",
+            gv."vector"                     AS w_vector,
+            POWER(wf."frequency", 0.4)      AS freq_pow
+    FROM    tokens t
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+           ON wf."word" = t.word
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS" gv
+           ON gv."word" = t.word
+),
+/* 3) Weight each component of every word vector */
+weighted_components AS (
+    SELECT  wi."id",
+            wi."date",
+            wi."title",
+            f.index                                 AS pos,          -- component index
+            (f.value::FLOAT / wi.freq_pow)          AS comp_value    -- weighted component
+    FROM    word_info wi,
+            LATERAL FLATTEN(input => wi.w_vector) f
+),
+/* 4) Sum weighted components per article */
+summed AS (
+    SELECT  "id",
+            "date",
+            "title",
+            pos,
+            SUM(comp_value) AS comp_sum
+    FROM    weighted_components
+    GROUP BY "id", "date", "title", pos
+),
+/* 5) Compute L2-norm per article */
+norms AS (
+    SELECT  "id",
+            SQRT(SUM(comp_sum * comp_sum)) AS magnitude
+    FROM    summed
+    GROUP BY "id"
+),
+/* 6) Build the normalised (unit-length) article vector */
+normalised AS (
+    SELECT  s."id",
+            s."date",
+            s."title",
+            ARRAY_AGG( s.comp_sum / n.magnitude )
+              WITHIN GROUP (ORDER BY s.pos)        AS article_vector
+    FROM    summed s
+    JOIN    norms n  ON n."id" = s."id"
+    GROUP BY s."id", s."date", s."title"
+)
+/* 7) Final output */
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    normalised
+ORDER BY "date" NULLS LAST;
+The error information is:
+{'status': 'error', 'error_msg': '##ERROR##000630 (57014): Statement reached its statement or warehouse timeout of 200 second(s) and was canceled.'}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 06:30:55 - Thread-304 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* -------------------------------------------------------------
+   Build 1-vector-per-article (unit length) from weighted GloVe
+   -------------------------------------------------------------*/
+WITH -----------------------------------------------------------
+stop_words AS (  -- very small manual list
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'),
+        ('a'), ('for'), ('on')
+),
+/* 1)  Tokenise BODY ⇒ (article_id , word)  */
+tokens AS (
+    SELECT  n."id"                    AS art_id,
+            LOWER(tok.value)          AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+/* 2)  Collapse to DISTINCT WORDS per article with counts       */
+word_counts AS (
+    SELECT  art_id,
+            word,
+            COUNT(*)               AS word_cnt   -- (# occurrences in article)
+    FROM    tokens
+    GROUP BY art_id, word
+),
+/* 3)  Attach corpus-frequency & GloVe vector, pre-compute scale */
+word_vectors AS (
+    SELECT  wc.art_id,
+            gv."vector"                       AS vec,          -- 300-D array
+            wc.word_cnt / POWER(wf."frequency", 0.4)  AS scale -- Σ weight
+    FROM      word_counts  wc
+    JOIN      "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON  wf."word" = wc.word
+    JOIN      "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"    gv
+          ON  gv."word" = wc.word
+),
+/* 4)  Multiply every component by its scale and accumulate      */
+components AS (
+    SELECT  wv.art_id,
+            f.index                        AS pos,          -- 0 … 299
+            SUM( f.value::FLOAT * wv.scale )  AS comp_sum   -- Σ over words
+    FROM    word_vectors wv,
+            LATERAL FLATTEN( input => wv.vec ) f
+    GROUP BY wv.art_id, f.index
+),
+/* 5)  L2-norm of each article vector                           */
+norms AS (
+    SELECT  art_id,
+            SQRT( SUM(comp_sum * comp_sum) ) AS magnitude
+    FROM    components
+    GROUP BY art_id
+),
+/* 6)  Normalise to unit length & build ARRAY<300 FLOAT>         */
+article_vecs AS (
+    SELECT  c.art_id,
+            ARRAY_AGG( c.comp_sum / n.magnitude
+                       ORDER BY c.pos )      AS article_vector
+    FROM    components c
+    JOIN    norms      n  ON n.art_id = c.art_id
+    GROUP BY c.art_id
+),
+/* 7)  Add metadata (date, title)                               */
+final AS (
+    SELECT  av.art_id                     AS "id",
+            nt."date",
+            nt."title",
+            av.article_vector
+    FROM    article_vecs av
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" nt
+           ON nt."id" = av.art_id
+)
+SELECT  "id", "date", "title", article_vector
+FROM    final
+ORDER BY "date" NULLS LAST;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:30:56 - Thread-304 (execute) - INFO - itercount: 4
+2025-05-07 06:30:56 - Thread-304 (execute) - INFO - [Self-refine]
+Input sql:
+/* -------------------------------------------------------------
+   Build 1-vector-per-article (unit length) from weighted GloVe
+   -------------------------------------------------------------*/
+WITH -----------------------------------------------------------
+stop_words AS (  -- very small manual list
+    SELECT column1 AS word FROM VALUES
+        ('the'), ('and'), ('of'), ('to'), ('in'),
+        ('a'), ('for'), ('on')
+),
+/* 1)  Tokenise BODY ⇒ (article_id , word)  */
+tokens AS (
+    SELECT  n."id"                    AS art_id,
+            LOWER(tok.value)          AS word
+    FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+            LATERAL SPLIT_TO_TABLE(
+                REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+            ) tok
+    WHERE   tok.value IS NOT NULL
+      AND   tok.value <> ''
+      AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+/* 2)  Collapse to DISTINCT WORDS per article with counts       */
+word_counts AS (
+    SELECT  art_id,
+            word,
+            COUNT(*)               AS word_cnt   -- (# occurrences in article)
+    FROM    tokens
+    GROUP BY art_id, word
+),
+/* 3)  Attach corpus-frequency & GloVe vector, pre-compute scale */
+word_vectors AS (
+    SELECT  wc.art_id,
+            gv."vector"                       AS vec,          -- 300-D array
+            wc.word_cnt / POWER(wf."frequency", 0.4)  AS scale -- Σ weight
+    FROM      word_counts  wc
+    JOIN      "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+          ON  wf."word" = wc.word
+    JOIN      "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"    gv
+          ON  gv."word" = wc.word
+),
+/* 4)  Multiply every component by its scale and accumulate      */
+components AS (
+    SELECT  wv.art_id,
+            f.index                        AS pos,          -- 0 … 299
+            SUM( f.value::FLOAT * wv.scale )  AS comp_sum   -- Σ over words
+    FROM    word_vectors wv,
+            LATERAL FLATTEN( input => wv.vec ) f
+    GROUP BY wv.art_id, f.index
+),
+/* 5)  L2-norm of each article vector                           */
+norms AS (
+    SELECT  art_id,
+            SQRT( SUM(comp_sum * comp_sum) ) AS magnitude
+    FROM    components
+    GROUP BY art_id
+),
+/* 6)  Normalise to unit length & build ARRAY<300 FLOAT>         */
+article_vecs AS (
+    SELECT  c.art_id,
+            ARRAY_AGG( c.comp_sum / n.magnitude
+                       ORDER BY c.pos )      AS article_vector
+    FROM    components c
+    JOIN    norms      n  ON n.art_id = c.art_id
+    GROUP BY c.art_id
+),
+/* 7)  Add metadata (date, title)                               */
+final AS (
+    SELECT  av.art_id                     AS "id",
+            nt."date",
+            nt."title",
+            av.article_vector
+    FROM    article_vecs av
+    JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" nt
+           ON nt."id" = av.art_id
+)
+SELECT  "id", "date", "title", article_vector
+FROM    final
+ORDER BY "date" NULLS LAST;
+The error information is:
+{'status': 'error', 'error_msg': "##ERROR##001003 (42000): SQL compilation error:\nsyntax error line 58 at position 23 unexpected 'ORDER'.\nsyntax error line 58 at position 45 unexpected 'AS'."}
+Please correct it and output only 1 complete SQL query.
+[Self-refine]
+2025-05-07 06:32:42 - Thread-304 (execute) - INFO - [Try to run SQL in self-refine]
+```sql
+/* Build one unit-length vector per Nature article using weighted GloVe */
+WITH
+stop_words AS (          -- small manual stop-word list
+  SELECT column1 AS word FROM VALUES
+    ('the'), ('and'), ('of'), ('to'), ('in'), ('a'), ('for'), ('on')
+),
+
+/* 1) Tokenise BODY -> (article , word)   */
+tokens AS (
+  SELECT  n."id"                     AS art_id,
+          LOWER(tok.value)           AS word
+  FROM    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" n,
+          LATERAL SPLIT_TO_TABLE(
+              REGEXP_REPLACE(n."body", '[^A-Za-z ]', ' '), ' '
+          ) tok
+  WHERE   tok.value IS NOT NULL
+    AND   tok.value <> ''
+    AND   LOWER(tok.value) NOT IN (SELECT word FROM stop_words)
+),
+
+/* 2) Word counts per article (needed for weighting)             */
+word_counts AS (
+  SELECT  art_id,
+          word,
+          COUNT(*) AS word_cnt
+  FROM    tokens
+  GROUP BY art_id, word
+),
+
+/* 3) Join corpus frequency & GloVe vector, compute weight       */
+word_vectors AS (
+  SELECT  wc.art_id,
+          gv."vector"                                AS vec,    -- 300-D array
+          wc.word_cnt / POWER(wf."frequency", 0.4)   AS scale   -- weight
+  FROM    word_counts wc
+  JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."WORD_FREQUENCIES" wf
+       ON wf."word" = wc.word
+  JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."GLOVE_VECTORS"    gv
+       ON gv."word" = wc.word
+),
+
+/* 4) Multiply each component by its weight and sum per article  */
+components AS (
+  SELECT  wv.art_id,
+          f.index                      AS pos,          -- component index 0-299
+          SUM( f.value::FLOAT * wv.scale ) AS comp_sum
+  FROM    word_vectors wv,
+          LATERAL FLATTEN( INPUT => wv.vec ) f
+  GROUP BY wv.art_id, f.index
+),
+
+/* 5) L2-norm of each raw article vector                        */
+norms AS (
+  SELECT  art_id,
+          SQRT( SUM( comp_sum * comp_sum ) ) AS magnitude
+  FROM    components
+  GROUP BY art_id
+),
+
+/* 6) Normalise to unit length and build ARRAY<300 FLOAT>        */
+article_vecs AS (
+  SELECT  c.art_id,
+          ARRAY_AGG( c.comp_sum / n.magnitude )
+              WITHIN GROUP (ORDER BY c.pos)          AS article_vector
+  FROM    components c
+  JOIN    norms n  ON n.art_id = c.art_id
+  GROUP BY c.art_id
+),
+
+/* 7) Attach article metadata                                   */
+final AS (
+  SELECT  av.art_id                 AS "id",
+          nt."date",
+          nt."title",
+          av.article_vector
+  FROM    article_vecs av
+  JOIN    "WORD_VECTORS_US"."WORD_VECTORS_US"."NATURE" nt
+       ON nt."id" = av.art_id
+)
+
+SELECT  "id",
+        "date",
+        "title",
+        article_vector
+FROM    final
+ORDER BY "date" NULLS LAST;
+```
+[Try to run SQL in self-refine]
+2025-05-07 06:33:38 - Thread-304 (execute) - INFO - Total iteration counts: 4

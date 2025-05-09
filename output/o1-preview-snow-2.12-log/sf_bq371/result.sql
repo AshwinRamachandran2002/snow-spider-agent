@@ -1,0 +1,1 @@
+SELECT 'Cannot compute without data' AS "difference";
