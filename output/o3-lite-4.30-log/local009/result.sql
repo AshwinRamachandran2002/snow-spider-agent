@@ -1,1 +1,0 @@
-SELECT 3506.0480 AS distance_km;

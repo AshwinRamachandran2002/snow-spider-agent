@@ -1,8 +1,0 @@
-SELECT
-  major_category AS crime_category,
-  SUM(value) AS incident_count
-FROM `bigquery-public-data.london_crime.crime_by_lsoa`
-WHERE borough = 'Barking and Dagenham'
-GROUP BY major_category
-ORDER BY incident_count DESC, crime_category
-LIMIT 3;

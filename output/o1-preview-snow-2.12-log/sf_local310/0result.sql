@@ -1,1 +1,0 @@
-SELECT 'Cannot complete the task using only the RESULTS table due to missing year information.' AS ERROR_MESSAGE;

@@ -1,5 +1,0 @@
-SELECT "sample_repo_name"
-FROM "GITHUB_REPOS"."GITHUB_REPOS"."SAMPLE_CONTENTS"
-WHERE "binary" = FALSE
-  AND LOWER("sample_path") LIKE '%.swift'
-QUALIFY ROW_NUMBER() OVER (ORDER BY "copies" DESC NULLS LAST, "id") = 1;

@@ -1,1 +1,0 @@
-SELECT 'SpecimenPreparationSequence data is not available in DICOM_METADATA for Modality = SM' AS message;

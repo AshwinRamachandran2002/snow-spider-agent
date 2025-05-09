@@ -1,1 +1,0 @@
-SELECT 'error' AS "error", 'answer could not be generated' AS "answer_message";
