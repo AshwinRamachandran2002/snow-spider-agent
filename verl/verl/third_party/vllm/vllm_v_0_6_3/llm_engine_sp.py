@@ -318,7 +318,7 @@ class SQLExecutor():
         seq_id_analyzed_all = []
         # print(f"Number of groups (outputs.outputs): {len(outputs.outputs)}")
         # print_cpu_status()
-        with ThreadPoolExecutor(max_workers=32) as executor:
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
             futures = []
             for index, completion_seq_output in enumerate(outputs.outputs):
                 futures.append(executor.submit(self.process_one_output, index, completion_seq_output, scheduler_outputs))
