@@ -37,8 +37,8 @@
    Binarize the raw data:
    
    ```bash
-   INPUT_PATH="raw/ds_bird_filtered.jsonl"
-   OUTPUT_PATH="processed/ds_bird_filtered.jsonl"
+   INPUT_PATH="raw/ds_bird_trajectory.jsonl"
+   OUTPUT_PATH="processed/ds_bird_trajectory.jsonl"
    TOKENIZER_PATH="../models/DeepSeek-R1-Distill-Qwen-14B"
    bash ./scripts/binarize_data.sh ${INPUT_PATH} ${OUTPUT_PATH} ${TOKENIZER_PATH}
    ```
@@ -46,8 +46,8 @@
    Once the environment is ready and the model paths are configured, run the evaluation suite by executing the following script:
    
    ```bash
-   DATA_PATH="processed/ds_bird_filtered.jsonl.npy"
+   DATA_PATH="processed/ds_bird_trajectory.jsonl.npy"
    PRETRAINED_MODEL="../models/DeepSeek-R1-Distill-Qwen-14B"
-   OUTPUT_DIR="../ag/models"
+   OUTPUT_DIR="../ag/models/DeepSeek-R1-Distill-Qwen-14B-sft"
    sbatch ./scripts/sbatch_multi.sh ${DATA_PATH} ${PRETRAINED_MODEL} ${OUTPUT_DIR}
    ```

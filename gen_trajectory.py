@@ -5,6 +5,7 @@ import argparse
 import json
 import concurrent
 import threading
+import random
 
 class DSChat:
     def __init__(self, model="deepseek-reasoner") -> None:
@@ -37,10 +38,10 @@ class DSChat:
 
 original_prompt = """
 You are a data scientist proficient in Text-to-SQL tasks. 
-Given a task, you should reason step by step to generate at least 3 SQL queries from simple to complex to undersatnd DB schema, execute them step by step, and provide a final answer after reviewing the results. 
-You should use the <exec_sql></exec_sql> tags to execute SQLs and you will get result feedback in <exec_result></exec_result> tags. You should continue to reason based on results.
+Given a task, you should reason step by step to generate at least 5 SQL queries from simple to complex to undersatnd DB schema, execute them step by step, and provide a final answer after reviewing the results. 
+You should use the <exec_sql></exec_sql> tags to execute SQLs and you will get result feedback in <exec_result></exec_result> tags. You should continue to reason based on results. Don't generate <exec_result></exec_result> tags by yourself.
 If there is any syntax error or empty result, you should fix it. For most questions, there's no gold answer with empty results. 
-Write final answer in <|im_start|>SQL\n<|im_end|> tags. The SQL dialect must be SQLite. 
+Write final answer in <answer>\n</answer> tags. The SQL dialect must be SQLite. 
 Basic usage: SELECT \"column_name\" FROM \"table_name\" WHERE ... (Replace \"table_name\" with the actual table name. Enclose table and column names with double quotations.)
 """
 
@@ -102,7 +103,7 @@ If the order_date is stored as a text in 'YYYY-MM-DD' format, this should work. 
 
 Final answer would be the last query, which gives the total sales per category in 2023.
 
-<|im_start|>SQL
+<answer>
 SELECT 
   c."category_name", 
   SUM(o."quantity" * p."price") AS total_sales
@@ -116,7 +117,7 @@ GROUP BY
   c."category_name"
 ORDER BY 
   total_sales DESC;
-<|im_end|>
+</answer>
 """
 
 def is_valid_exec_sequence(text):
@@ -127,11 +128,11 @@ def is_valid_exec_sequence(text):
             return True
         return False
 
-    if not check_once("<|im_start|>SQL", "<|im_end|>", text):
-        return "<|im_start|>SQL and <|im_end|> should appear once. "
+    if not check_once("<answer>", "</answer>", text):
+        return "<answer> and </answer> should appear once. "
 
     if len(re.findall(r'<exec_sql>\nSELECT', text)) != len(re.findall(r'\nSELECT', text)) - 1:
-        return "SELECT should be in <exec_sql></exec_sql> block"
+        return "SELECT should be in <exec_sql></exec_sql> block. "
     
     tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
     tags = tag_pattern.findall(text)
@@ -165,7 +166,7 @@ if __name__ == "__main__":
 
     with open(args.bird_train_pth) as f:
         data = json.load(f)
-
+    random.shuffle(data)
     gen_data = []
     lock = threading.Lock()
 
@@ -181,7 +182,7 @@ if __name__ == "__main__":
         while max_try:
             gen_dict = {
                 "messages": [
-                    {"role": "user", "content": ex["input"]},
+                    {"role": "user", "content": original_prompt + db_info},
                     {"role": "assistant", "content": ""}
                 ],
                 "format": "chatml"
@@ -194,7 +195,7 @@ if __name__ == "__main__":
                     gen_data.append(gen_dict)
 
                     print(f"len(gen_data): {len(gen_data)}, ex_id: ", ex["example_id"])
-                    with open("raw/ds_bird.jsonl", "a", encoding="utf-8") as f:
+                    with open("raw/ds_bird_trajectory.jsonl", "a", encoding="utf-8") as f:
                         f.write(json.dumps(gen_dict, ensure_ascii=False) + "\n")
                 break
             
@@ -202,4 +203,4 @@ if __name__ == "__main__":
             max_try -= 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process_example, ex) for ex in data[400:600]]
+        futures = [executor.submit(process_example, ex) for ex in data[:1000]]

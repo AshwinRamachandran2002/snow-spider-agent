@@ -13,7 +13,7 @@ IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 # Set special tokens globally to avoid adding them multiple times.
 def setup_tokenizer(tokenizer):
     special_tokens = [
-        "<|im_start|>", "<|im_end|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"
+        "<|im_start|>", "<|im_end|>", "<answer>", "</answer>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"
     ]
     tokenizer.add_special_tokens({
         "additional_special_tokens": special_tokens

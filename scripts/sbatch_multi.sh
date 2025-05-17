@@ -39,7 +39,7 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 DEEPSPEED_CONFIG="./configs/default_offload_opt_param.json"
-BATCH_SIZE=64
+BATCH_SIZE=256
 MICRO_BATCH_SIZE=1
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 

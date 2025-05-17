@@ -228,7 +228,7 @@ def train():
         padding_side = "right",
         trust_remote_code = True
     )
-    special_tokens = ["<|im_end|>", "<|im_start|>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"]
+    special_tokens = ["<|im_end|>", "<|im_start|>", "<answer>", "</answer>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"]
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     for token in special_tokens:
         token_id = tokenizer.convert_tokens_to_ids(token)
