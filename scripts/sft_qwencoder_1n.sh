@@ -1,6 +1,6 @@
-DATA_PATH="processed/ds_bird_trajectory.jsonl.npy"
-PRETRAINED_MODEL="../models/Qwen3-1.7B"
-OUTPUT_DIR="../exec-fb/models"
+DATA_PATH="processed/ds_bird_trajectory_r1.npy"
+PRETRAINED_MODEL="../models/DeepSeek-R1-Distill-Qwen-1.5B"
+OUTPUT_DIR="../exec-fb/models/DeepSeek-R1-Distill-Qwen-1.5B-sft"
 
 GPUS_PER_NODE=$(python -c "import torch; print(torch.cuda.device_count());")
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -22,7 +22,7 @@ GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
 LR=5e-5
 MIN_LR=5e-6
-WARMUP_STEPS=100
+WARMUP_STEPS=0
 WEIGHT_DECAY=0.0
 MAX_LENGTH=8192
 

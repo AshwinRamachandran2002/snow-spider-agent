@@ -15,7 +15,7 @@ import numpy as np
 from utils import utils
 from utils import training_datasets
 from peft import get_peft_model, PeftConfig
-from binarize_data import SPEC_TOKENS
+from binarize_data_r1 import SPEC_TOKENS
 IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 logging.basicConfig(level=logging.DEBUG)  
 @dataclass
