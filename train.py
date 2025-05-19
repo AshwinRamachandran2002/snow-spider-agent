@@ -15,6 +15,7 @@ import numpy as np
 from utils import utils
 from utils import training_datasets
 from peft import get_peft_model, PeftConfig
+from binarize_data import SPEC_TOKENS
 IGNORE_INDEX = -100 #default ignore_index = 100 in transformers
 logging.basicConfig(level=logging.DEBUG)  
 @dataclass
@@ -180,7 +181,7 @@ def find_latest_checkpoint(output_dir):
 
 
 class CustomTrainer(Trainer):
-    def log(self, logs: Dict[str, float]) -> None:
+    def log(self, logs: Dict[str, float], iterator_start_time=None) -> None:
         """
         Log `logs` on the various objects watching training.
 
@@ -219,16 +220,13 @@ def train():
         model.print_trainable_parameters()
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        pad_token = '<|endoftext|>',
-        eos_token = '<|im_end|>',
-        bos_token = '<|im_start|>',
         cache_dir = None,
         model_max_length = training_args.model_max_length,
         truncation = True,
         padding_side = "right",
         trust_remote_code = True
     )
-    special_tokens = ["<|im_end|>", "<|im_start|>", "<answer>", "</answer>", "<think>", "</think>", "<exec_sql>", "</exec_sql>", "<exec_result>", "</exec_result>"]
+    special_tokens = SPEC_TOKENS
     tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     for token in special_tokens:
         token_id = tokenizer.convert_tokens_to_ids(token)
