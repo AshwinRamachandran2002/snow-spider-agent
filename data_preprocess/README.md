@@ -1,16 +1,17 @@
 ### Download BIRD Data
 ```bash
+cd BIRD
 wget https://bird-bench.oss-cn-beijing.aliyuncs.com/train.zip
-python -m zipfile -e train.zip .
+unzip train.zip
 cd train
-python -m zipfile -e train_databases.zip .
+unzip train_databases.zip
 
 cd ..
 wget https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip
-python -m zipfile -e dev.zip .
+unzip dev.zip
 mv dev_20240627 dev
 cd dev
-python -m zipfile -e dev_databases.zip .
+unzip dev_databases.zip
 ```
 
 ### Data Preprocessing

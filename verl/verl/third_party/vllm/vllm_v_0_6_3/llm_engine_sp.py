@@ -180,7 +180,7 @@ class SQLExecutor():
                 # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
                 if completion[index] == self.ans_start_id:
                     sql_string = self.tokenizer.decode(completion[index+1:-1])
-                    # print(f"sql_string: {sql_string}, {self.initial_prompts}")
+                    
                     kwargs = self.initial_prompts[str(request_id)]
                     example_id = kwargs["example_id"]
                     start = time.time()
@@ -188,8 +188,11 @@ class SQLExecutor():
                     log_ = self.tokenizer.decode(completion).strip()
                     log_gen = log_
                     log_gen = log_[:log_.find("<exec_sql>")]
-                    file_name = f"{example_id}_{calculate_md5(sql_string)}"
 
+                    response_str = log_[log_.find("<exec_sql>"):log_.find("</answer>")]
+                    file_name = f"{example_id}_{calculate_md5(response_str)}"
+
+                    
                     # env = SqlTask(sql_string, kwargs["sqlite_path"])
                     # env.launch_env()
                     # if "##SQLERROR##" not in env.answer:

@@ -17,12 +17,27 @@ from rllm.data.dataset_types import TrainDataset, TestDataset
 
 
 prompt = """
-You are a data scientist proficient in Text-to-SQL tasks. 
-Given a task, you should reason step by step to generate at least 5 SQL queries from simple to complex to undersatnd DB schema, execute them step by step, and provide a final answer after reviewing the results. 
-You should use the <exec_sql></exec_sql> tags to execute SQLs and you will get result feedback in <exec_result></exec_result> tags. You should continue to reason based on results. Don't generate <exec_result></exec_result> tags by yourself.
-If there is any syntax error or empty result, you should fix it. For most questions, there's no gold answer with empty results. 
-Write final answer in <answer>\n</answer> tags. The SQL dialect must be SQLite. 
-Basic usage: SELECT \"column_name\" FROM \"table_name\" WHERE ... (Replace \"table_name\" with the actual table name. Enclose table and column names with double quotations.)
+You are a data scientist proficient in Text-to-SQL tasks.
+
+Given a task, you should reason step by step using execution feedback to arrive at the final answer.
+
+Step 1: Identify all relevant schemas (which may include more than just the gold schema) and enclose them within <schema_linking></schema_linking> tags. The schema should be represented in JSON format:
+<schema_linking>
+{Table name: [column name1, column name2]}.
+</schema_linking>
+
+Step 2: Write SQL queries to examine the values of each column in the JSON to assess their validity. Use <exec_sql></exec_sql> tags to execute SQL queries. The results will be returned in <exec_result></exec_result> tags. You should reason based on results.
+
+Step 3: After reviewing all relevant schemas and values from the database, decide on the final schema to use by removing useless parts in the previous JSON. 
+Then, generate the final SQL query inside <exec_sql></exec_sql> tags and verify its correctness based on the feedback provided in <exec_result></exec_result> tags.
+
+Step 4: Write the final SQL in <answer></answer> tags.
+
+Note: 
+
+Do not generate <exec_result></exec_result> tags yourself. If any syntax error or empty result occurs, revise your query accordingly before proceeding. All 'SELECT' should be in <exec_sql></exec_sql> block. <schema_linking> and </schema_linking> should appear twice: in Step 1 and Step 3.
+
+The SQL dialect must be SQLite. Use the format SELECT "column_name" FROM "table_name" WHERE ..., replacing "table_name" and "column_name" with actual names. Always enclose table and column names in double quotation marks.
 """
 
 def make_map_fn(split: str):
@@ -74,9 +89,9 @@ if __name__ == '__main__':
     makedirs(local_dir, exist_ok=True)
 
     # Initialize datasets
-    train_datasets = [TrainDataset.Code.BIRD_TRAIN]
+    train_datasets = [TrainDataset.Code.BIRD]
     train_dataset = load_dataset(train_datasets[0])
-    test_datasets = [TestDataset.Code.BIRD_DEV]
+    test_datasets = [TestDataset.Code.BIRD]
     
     test_datasets_data = [load_dataset(d) for d in test_datasets]
 

@@ -39,7 +39,10 @@ class RewardSQLFn(RewardFn):
         #     return 0
         if text.count("</think>") != 1:
             return False
-        
+
+        if text.count("<schema_linking>") != text.count("</schema_linking>") or text.count("<schema_linking>") < 1:
+            return False
+
         if not check_once("<answer>", "</answer>", text):
             return False
 
@@ -87,18 +90,19 @@ class RewardSQLFn(RewardFn):
         example_id = input.metadata["example_id"]
         model_response = input.model_response
         
-        response_str = model_response
+        response_str = model_response[model_response.rfind("<think>"):]
         if response_str.count("</answer>") != 1:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
-        # response_str = response_str[:response_str.find("</answer>")+len("</answer>")]
-        response_str = response_str[response_str.find("<answer>")+len("<answer>"):response_str.find("</answer>")]
+        filename = calculate_md5(response_str[response_str.find("<exec_sql>"):response_str.find("</answer>")])
+        # response_str = response_str[response_str.find("<answer>")+len("<answer>"):response_str.find("</answer>")]
         log_folder = os.getenv("EXEC_FOLDER")
-        log_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".log")
-        csv_path = os.path.join(log_folder, example_id + '_' + calculate_md5(response_str) + ".csv")
+        log_path = os.path.join(log_folder, example_id + '_' + filename + ".log")
+        csv_path = os.path.join(log_folder, example_id + '_' + filename + ".csv")
         # print(f"log_path: {log_path}")
         
         if not os.path.exists(log_path):
-            # print(f"{log_path} doesn't exist, response_str: {response_str}")
+            with open(os.path.join("log", example_id + '_' + filename + ".log"), "w") as f:
+                f.write(input.model_response) 
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         if not os.path.exists(csv_path):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
@@ -111,7 +115,9 @@ class RewardSQLFn(RewardFn):
                     return RewardOutput(reward=self.config.correct_reward, is_correct=True)
                 return RewardOutput(reward=self.config.half_correct_reward, is_correct=True)
         # Format
-        return RewardOutput(reward=self.config.format_reward, is_correct=True)
+        if self.is_valid_exec_sequence(response_str):
+            return RewardOutput(reward=self.config.format_reward, is_correct=False)
+        return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
 
 
 
@@ -162,7 +168,7 @@ if __name__ == "__main__":
             model_response=llm_solution,
             metadata=ground_truth
         ))
-    return reward_response.is_correct
+    return reward_response.reward
 
 
 if __name__ == "__main__":
