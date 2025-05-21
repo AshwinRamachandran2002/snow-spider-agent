@@ -1,6 +1,6 @@
-DATA_PATH="processed/ds_bird_trajectory_r1.npy"
-PRETRAINED_MODEL="../models/DeepSeek-R1-Distill-Qwen-1.5B"
-OUTPUT_DIR="../exec-fb/models/DeepSeek-R1-Distill-Qwen-1.5B-sft"
+DATA_PATH=$1
+PRETRAINED_MODEL=$2
+OUTPUT_DIR=$3
 
 GPUS_PER_NODE=$(python -c "import torch; print(torch.cuda.device_count());")
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -16,7 +16,7 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT
 "
 DEEPSPEED_CONFIG="./configs/default_offload_opt_param.json"
-BATCH_SIZE=16
+BATCH_SIZE=8
 MICRO_BATCH_SIZE=1
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
@@ -37,7 +37,7 @@ torchrun --nproc_per_node=8 train.py \
     --data_path $DATA_PATH \
     --model_max_length ${MAX_LENGTH} \
     --output_dir ${OUTPUT_DIR} \
-    --num_train_epochs 3 \
+    --num_train_epochs 6 \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --per_device_eval_batch_size 4 \
