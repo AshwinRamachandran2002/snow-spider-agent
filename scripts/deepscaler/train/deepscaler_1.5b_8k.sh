@@ -30,7 +30,7 @@ fi
 
 export MODEL_PATH=$MODEL_PATH
 
-TMP_DIR=/tmp/ray/
+TMP_DIR=/mbz/bruce/ray
 rm -rf $TMP_DIR
 mkdir -p $TMP_DIR
 export TMPDIR=$TMP_DIR

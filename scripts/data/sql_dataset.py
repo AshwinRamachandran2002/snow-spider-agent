@@ -52,7 +52,8 @@ def make_map_fn(split: str):
     def process_fn(example: Dict[str, Any], idx: int, instruction: str = None) -> Optional[Dict[str, Any]]:
         
         user_prompt = prompt
-        user_prompt += "\nTask: " + example["question"]
+        db_info = "DB Info: " + example["input"] + "\n" + "Question: " + example["question"] + "\n"
+        user_prompt += db_info
 
         data = {
             "data_source": "",
@@ -114,7 +115,7 @@ if __name__ == '__main__':
 
         dataset_name = test_dataset.value.lower()
         test_df = pd.DataFrame(test_data)
-        test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}.parquet'))
+        test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}_dev.parquet'))
         print(f"{dataset_name} test data size:", len(test_data))
 
     # Save training dataset

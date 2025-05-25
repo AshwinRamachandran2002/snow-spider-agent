@@ -9,6 +9,8 @@ import os
 import multiprocessing
 from typing import Optional, Union, List, Set, Any
 import sqlglot
+import threading
+from func_timeout import func_timeout, FunctionTimedOut
 
 def hard_cut(str_e, length=0):
     if length:
@@ -210,67 +212,88 @@ class SqlEnv:
             else:
                 return hard_cut(csv_content, max_len)
             
-    def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
-        # print_cpu_status(self.conns.keys())
-        if sqlite_path not in self.conns:
-            self.start_db(sqlite_path, exe_id, example_id)
-        if example_id+exe_id not in self.conns:
-            self.new_con(example_id, exe_id, sqlite_path)
-        def target(q):
-            try:
-                result = self.exec_sql(sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
-                q.put(str(result))
-            except Exception as e:
-                traceback.print_exc()
-                print("Exception in process", str(e))
-                q.put(str(e))
-            # finally:
-            #     self.conns[example_id+exe_id].close()
-            #     print(f"Close conn {example_id+exe_id}, current num: {len(self.conns)}")
-        q = Queue()
-        p = Process(target=target, args=(q,))
-        p.start()
-
-        p.join(timeout)
-        if p.is_alive():
-            try:
-                p.terminate()
-                p.join(timeout=2)
-                if p.is_alive():
-                    print("Terminate failed, forcing kill.")
-                    p.kill()
-                    p.join()
-            except Exception as e:
-                print(f"Error stopping process: {e}")
-            print(f"##ERROR## {sql_query} Timed out, p.exitcode: {p.exitcode}\n")
-            return f"##ERROR## {sql_query} Timed out\n"
-        else:
-            if not q.empty():
-                result = q.get()
-                return result
-            else:
-                return "##ERROR## Process p dead"
-
     # def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
-    #     print_cpu_status()
-
-    #     # Setup connection
+    #     # print_cpu_status(self.conns.keys())
     #     if sqlite_path not in self.conns:
     #         self.start_db(sqlite_path, exe_id, example_id)
-
-    #     args = (sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
-
-    #     with Pool(processes=8) as pool:
-    #         async_result = pool.apply_async(_sql_worker_wrapper, (args,))
+    #     if example_id+exe_id not in self.conns:
+    #         self.new_con(example_id, exe_id, sqlite_path)
+    #     def target(q):
     #         try:
-    #             result = async_result.get(timeout=timeout)
-    #             return result
-    #         except TimeoutError:
-    #             print(f"##ERROR## {sql_query} Timed out (via pool)\n")
-    #             return f"##ERROR## {sql_query} Timed out\n"
+    #             result = self.exec_sql(sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
+    #             q.put(str(result))
+    #         except Exception as e:
+    #             traceback.print_exc()
+    #             print("Exception in process", str(e))
+    #             q.put(str(e))
+    #         # finally:
+    #         #     self.conns[example_id+exe_id].close()
+    #         #     print(f"Close conn {example_id+exe_id}, current num: {len(self.conns)}")
+    #     q = Queue()
+    #     p = Process(target=target, args=(q,))
+    #     p.start()
 
-    def __del__(self):
-        self.close_db()
+    #     p.join(timeout)
+    #     if p.is_alive():
+    #         try:
+    #             p.terminate()
+    #             p.join(timeout=2)
+    #             if p.is_alive():
+    #                 print("Terminate failed, forcing kill.")
+    #                 p.kill()
+    #                 p.join()
+    #         except Exception as e:
+    #             print(f"Error stopping process: {e}")
+    #         print(f"##ERROR## {sql_query} Timed out, p.exitcode: {p.exitcode}\n")
+    #         return f"##ERROR## {sql_query} Timed out\n"
+    #     else:
+    #         if not q.empty():
+    #             result = q.get()
+    #             return result
+    #         else:
+    #             return "##ERROR## Process p dead"
+
+    def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000,
+                                LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
+        # Ensure the database and connection are initialized
+        if sqlite_path not in self.conns:
+            self.start_db(sqlite_path, exe_id, example_id)
+        if example_id + exe_id not in self.conns:
+            self.new_con(example_id, exe_id, sqlite_path)
+
+        conn = self.conns[example_id + exe_id]
+
+        # SQL execution logic
+        def run_sql():
+            return self.exec_sql(sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
+
+        # Interrupt thread in case func_timeout fails to stop a stuck SQLite query
+        def delayed_interrupt():
+            threading.Event().wait(timeout + 1)  # Add slight buffer
+            try:
+                conn.interrupt()
+                # print(f"[INFO] Called conn.interrupt() after timeout for: {sql_query}")
+            except Exception as e:
+                print(f"[WARN] Failed to call conn.interrupt(): {e}")
+
+        try:
+            # Start the interrupt fallback thread
+            interrupt_thread = threading.Thread(target=delayed_interrupt, daemon=True)
+            interrupt_thread.start()
+
+            # Attempt to execute SQL with timeout
+            result = func_timeout(timeout, run_sql)
+            return str(result)
+        except FunctionTimedOut:
+            print(f"##ERROR## {sql_query} Timed out after {timeout} seconds")
+            return f"##ERROR## Timed out"
+        except Exception as e:
+            traceback.print_exc()
+            print(f"##ERROR## SQL execution failed: {e}")
+            return f"##ERROR## {str(e)}"
+
+    # def __del__(self):
+    #     self.close_db()
 
 import psutil
 import datetime

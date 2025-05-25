@@ -186,8 +186,7 @@ class SQLExecutor():
                     start = time.time()
 
                     log_ = self.tokenizer.decode(completion).strip()
-                    log_gen = log_
-                    log_gen = log_[:log_.find("<exec_sql>")]
+                    rollout_id = calculate_md5(log_)
 
                     response_str = log_[log_.find("<exec_sql>"):log_.find("</answer>")]
                     file_name = f"{example_id}_{calculate_md5(response_str)}"
@@ -198,7 +197,7 @@ class SQLExecutor():
                     # if "##SQLERROR##" not in env.answer:
                     #     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), "w") as f:
                     #         f.write(env.answer)
-                    exec_result = self.exec_func_sql(sql_string, calculate_md5(log_gen), save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
+                    exec_result = self.exec_func_sql(sql_string, rollout_id, save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
                     
                     # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
                     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:

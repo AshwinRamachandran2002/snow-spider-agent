@@ -25,15 +25,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MODEL_PATH" ]; then
-    MODEL_PATH="models/DeepSeek-R1-Distill-Qwen-1.5B-sft"
+    MODEL_PATH="models/DeepSeek-R1-Distill-Qwen-7B-sft"
 fi
 
 export MODEL_PATH=$MODEL_PATH
 
-TMP_DIR=/tmp/ray/
+TMP_DIR=/mbz/bruce/ray
 rm -rf $TMP_DIR
 mkdir -p $TMP_DIR
 export TMPDIR=$TMP_DIR
+ray stop
 
 python3 -u -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -41,8 +42,8 @@ python3 -u -m verl.trainer.main_ppo \
     data.val_files=data_preprocess/data/processed/bird_dev.parquet \
     data.train_batch_size=128 \
     data.val_batch_size=512 \
-    data.max_prompt_length=8192 \
-    data.max_response_length=8192 \
+    data.max_prompt_length=6000 \
+    data.max_response_length=4096 \
     actor_rollout_ref.model.path=$MODEL_PATH  \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
