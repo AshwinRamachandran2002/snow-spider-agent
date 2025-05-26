@@ -56,70 +56,14 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
-class TagController:
-    def __init__(self, tokenizer):
-        # Tokens to ban completely
-        self.banned_tokens = self._encode_tokens(tokenizer, [
-            "<exec_result>", "</exec_result>"
-        ])
+class BanTokens:
+    def __init__(self, banned_ids):
+        self.banned_ids = banned_ids
 
-        # Tag pairs to control
-        self.tag_pairs = [
-            ("<answer>", "</answer>"),
-            ("<think>", "</think>"),
-            ("<exec_sql>", "</exec_sql>"),
-            ("<schema_linking>", "</schema_linking>")
-        ]
-        self.tag_open_tokens = {start: tokenizer.encode(start, add_special_tokens=False)[0]
-                                for start, _ in self.tag_pairs}
-        self.tag_close_tokens = {end: tokenizer.encode(end, add_special_tokens=False)[0]
-                                 for _, end in self.tag_pairs}
-        self.tokenizer = tokenizer
-        self.active_tag = None  # Only one open tag allowed at a time
-        self.opened_tags = set()  # To track which have ever opened
-
-    def __call__(self, token_ids: list[int], logits: list[float]) -> list[float]:
-        # Always block banned tokens
-        for tid in self.banned_tokens:
+    def __call__(self, token_ids, logits):
+        for tid in self.banned_ids:
             logits[tid] = -1e9
-
-        # Get last token to track tag transitions
-        last_token = token_ids[-1] if token_ids else None
-
-        # Update active tag state
-        decoded = self.tokenizer.decode([last_token]) if last_token is not None else ""
-        if decoded in self.tag_open_tokens:
-            self.active_tag = decoded
-            self.opened_tags.add(decoded)
-        elif decoded in self.tag_close_tokens:
-            self.active_tag = None  # closed tag
-
-        # Disallow any tag nesting
-        if self.active_tag:
-            # Block all other tag openings
-            for tag in self.tag_open_tokens:
-                tid = self.tag_open_tokens[tag]
-                if tag != self.active_tag:
-                    logits[tid] = -1e9
-
-        # Forbid closing tags unless opened
-        for tag, close_tag in self.tag_pairs:
-            close_tid = self.tag_close_tokens[close_tag]
-            if tag not in self.opened_tags:
-                logits[close_tid] = -1e9
-
         return logits
-
-    def _encode_tokens(self, tokenizer, strings: list[str]) -> list[int]:
-        token_ids = []
-        for s in strings:
-            ids = tokenizer.encode(s, add_special_tokens=False)
-            if len(ids) == 1:
-                token_ids.append(ids[0])
-            else:
-                print(f"⚠️ Token '{s}' is split into multiple tokens: {ids}, skipping.")
-        return token_ids
-
 
 class vLLMRollout(BaseRollout):
 
@@ -283,7 +227,13 @@ class vLLMRollout(BaseRollout):
             for i in range(batch_size)
         ]
 
-        tag_controller = TagController(self.tokenizer)
+
+        banned_token_ids = []
+        for tok in ["<exec_result>", "</exec_result>"]:
+            ids = self.tokenizer.encode(tok, add_special_tokens=False)
+            assert len(ids) == 1
+            banned_token_ids.append(ids[0])
+        ban_exec_result = BanTokens(banned_token_ids)
 
         kwargs['n'] = 1
         # Generating sequences
@@ -295,7 +245,7 @@ class vLLMRollout(BaseRollout):
                     **kwargs
             ):
                 sp = self.sampling_params.clone()
-                sp.logits_processors = [tag_controller]
+                sp.logits_processors = [ban_exec_result]
                 batch_sampling_params.append(sp)
                 # Inside the context, perform the operations to generate the sequence
                 # batch_sampling_params.append(self.sampling_params.clone())
