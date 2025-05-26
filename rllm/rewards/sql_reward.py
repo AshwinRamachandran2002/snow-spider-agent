@@ -68,7 +68,7 @@ class RewardSQLFn(RewardFn):
         if not tags:
             return False
 
-        if len(tags) % 2 != 0 or len(tags) < 2:
+        if len(tags) % 2 != 0 or len(tags) < 6:
             return False
 
         for i, tag in enumerate(tags):
