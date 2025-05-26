@@ -68,7 +68,7 @@ class RewardSQLFn(RewardFn):
         if not tags:
             return False
 
-        if len(tags) % 2 != 0 or len(tags) < 6:
+        if len(tags) % 2 != 0 or len(tags) < 2:
             return False
 
         for i, tag in enumerate(tags):
@@ -101,8 +101,8 @@ class RewardSQLFn(RewardFn):
         # print(f"log_path: {log_path}")
         
         if not os.path.exists(log_path):
-            with open(os.path.join("log", example_id + '_' + filename + ".log"), "w") as f:
-                f.write(input.model_response) 
+            # with open(os.path.join("log", example_id + '_' + filename + ".log"), "w") as f:
+            #     f.write(input.model_response) 
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         if not os.path.exists(csv_path):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
@@ -113,7 +113,7 @@ class RewardSQLFn(RewardFn):
                 print(f"Correct: {example_id}")
                 if self.is_valid_exec_sequence(response_str):
                     return RewardOutput(reward=self.config.correct_reward, is_correct=True)
-                return RewardOutput(reward=self.config.half_correct_reward, is_correct=True)
+                # return RewardOutput(reward=self.config.half_correct_reward, is_correct=True)
         # Format
         if self.is_valid_exec_sequence(response_str):
             return RewardOutput(reward=self.config.format_reward, is_correct=False)

@@ -14,7 +14,7 @@ from func_timeout import func_timeout, FunctionTimedOut
 
 def hard_cut(str_e, length=0):
     if length:
-        if len(str_e) > length and not str_e.startswith("Too long, hard cut"):
+        if len(str_e) > length and not str_e.startswith("Too long"):
             str_e = f"Too long, show first {length} chars:\n" + str_e[:int(length)]+"\n"
     return str_e
 
@@ -172,7 +172,7 @@ class SqlEnv:
                 row_str = str(row)
                 rows.append(row)
                 current_len += len(row_str)
-                if current_len + len(row_str) > max_len:
+                if current_len > max_len:
                     break
             return rows
         
@@ -262,6 +262,7 @@ class SqlEnv:
             self.new_con(example_id, exe_id, sqlite_path)
 
         conn = self.conns[example_id + exe_id]
+        should_interrupt = threading.Event()
 
         # SQL execution logic
         def run_sql():
@@ -269,12 +270,12 @@ class SqlEnv:
 
         # Interrupt thread in case func_timeout fails to stop a stuck SQLite query
         def delayed_interrupt():
-            threading.Event().wait(timeout + 1)  # Add slight buffer
-            try:
-                conn.interrupt()
-                # print(f"[INFO] Called conn.interrupt() after timeout for: {sql_query}")
-            except Exception as e:
-                print(f"[WARN] Failed to call conn.interrupt(): {e}")
+            if not should_interrupt.wait(timeout):
+                try:
+                    conn.interrupt()
+                    # print(f"[INFO] Called conn.interrupt() after timeout for: {sql_query}")
+                except Exception as e:
+                    print(f"[WARN] Failed to call conn.interrupt(): {e}")
 
         try:
             # Start the interrupt fallback thread

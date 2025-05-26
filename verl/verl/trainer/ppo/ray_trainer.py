@@ -661,7 +661,7 @@ class RayPPOTrainer(object):
 
                         metrics['batch/wrong_ans_and_wrong_format'] = wrong_ans_and_wrong_format
                         metrics['batch/wrong_ans_and_right_format'] = wrong_ans_and_right_format
-                        metrics['batch/right_ans_and_wrong_format'] = right_ans_and_wrong_format
+                        # metrics['batch/right_ans_and_wrong_format'] = right_ans_and_wrong_format
                         metrics['batch/right_ans_and_right_format'] = right_ans_and_right_format
 
                         num_gen = 0
