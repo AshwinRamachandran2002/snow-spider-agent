@@ -25,8 +25,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MODEL_PATH" ]; then
-    # MODEL_PATH="models/DeepSeek-R1-Distill-Qwen-1.5B-sft"
-    MODEL_PATH="/mbz/bruce/exec-fb/checkpoints/execution/test/actor/global_step_100"
+    MODEL_PATH="models/DeepSeek-R1-Distill-Qwen-1.5B-sft"
+    # MODEL_PATH="/mbz/bruce/exec-fb/checkpoints/execution/test/actor/global_step_100"
 fi
 
 export MODEL_PATH=$MODEL_PATH
@@ -73,7 +73,7 @@ python3 -u -m verl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.project_name='execution' \
-    trainer.experiment_name='1.5B-step100' \
+    trainer.experiment_name='1.5B' \
     +trainer.val_before_train=False \
     trainer.n_gpus_per_node=8 \
     trainer.nnodes=1 \

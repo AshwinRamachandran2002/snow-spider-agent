@@ -56,6 +56,14 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
+class BanTokens:
+    def __init__(self, banned_ids):
+        self.banned_ids = banned_ids
+
+    def __call__(self, token_ids, logits):
+        for tid in self.banned_ids:
+            logits[tid] = -1e9
+        return logits
 
 class vLLMRollout(BaseRollout):
 
@@ -220,6 +228,13 @@ class vLLMRollout(BaseRollout):
         ]
 
 
+        banned_token_ids = []
+        for tok in ["<exec_result>", "</exec_result>"]:
+            ids = self.tokenizer.encode(tok, add_special_tokens=False)
+            assert len(ids) == 1
+            banned_token_ids.append(ids[0])
+        ban_exec_result = BanTokens(banned_token_ids)
+
         kwargs['n'] = 1
         # Generating sequences
         batch_sampling_params = []
@@ -229,8 +244,11 @@ class vLLMRollout(BaseRollout):
                     sqlite_path=sqlite_path_list[_idx],
                     **kwargs
             ):
+                sp = self.sampling_params.clone()
+                sp.logits_processors = [ban_exec_result]
+                batch_sampling_params.append(sp)
                 # Inside the context, perform the operations to generate the sequence
-                batch_sampling_params.append(self.sampling_params.clone())
+                # batch_sampling_params.append(self.sampling_params.clone())
 
         if do_sample:
             idx_list = [deepcopy(item) for item in idx_list for _ in range(self.config.n)]
