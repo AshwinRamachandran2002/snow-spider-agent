@@ -68,7 +68,7 @@ class RewardSQLFn(RewardFn):
         if not tags:
             return False
 
-        if len(tags) % 2 != 0 or len(tags) < 6:
+        if len(tags) % 2 != 0 or len(tags) < 2:
             return False
 
         for i, tag in enumerate(tags):
@@ -76,10 +76,10 @@ class RewardSQLFn(RewardFn):
                 return False
             if i % 2 == 1 and not tag.startswith('<exec_result>'):
                 return False
-            # if i % 2 == 1 and i > 2 and tag.startswith('<exec_result>'):
-            #     if "No data found for the specified query." in tags[i-2] or "Incorrect SQL Syntax" in tags[i-2]:
-            #         if "No data found for the specified query." in tags[i] or "Incorrect SQL Syntax" in tags[i]:
-            #             return False
+            if i % 2 == 1 and i > 2 and tag.startswith('<exec_result>'):
+                if "No data found for the specified query." in tags[i-2] or "Incorrect SQL Syntax" in tags[i-2]:
+                    if "No data found for the specified query." in tags[i] or "Incorrect SQL Syntax" in tags[i]:
+                        return False
 
         return True
 
