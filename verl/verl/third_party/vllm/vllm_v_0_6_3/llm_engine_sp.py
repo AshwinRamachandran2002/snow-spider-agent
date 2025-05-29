@@ -100,31 +100,31 @@ class SQLExecutor():
         # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]]
         # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
         self.tokenizer = tokenizer_group.tokenizer
-        exec_sql_start = self.tokenizer.encode("<exec_sql>")
-        exec_sql_end = self.tokenizer.encode("</exec_sql>")
-        ans_start = self.tokenizer.encode("<answer>")
-        ans_end = self.tokenizer.encode("</answer>")
+        exec_sql_start = self.tokenizer.encode("<exec_sql>", add_special_tokens=False)
+        exec_sql_end = self.tokenizer.encode("</exec_sql>", add_special_tokens=False)
+        ans_start = self.tokenizer.encode("<answer>", add_special_tokens=False)
+        ans_end = self.tokenizer.encode("</answer>", add_special_tokens=False)
 
-        if len(exec_sql_start) == 2:
-            self.start_token_id = exec_sql_start[1]
+        if len(exec_sql_start) == 1:
+            self.start_token_id = exec_sql_start[0]
         else:
             self.start_token_id = -1
             warnings.warn(f"<exec_sql>: {exec_sql_start}", UserWarning)
         
-        if len(exec_sql_end) == 2:
-            self.monitor_token_id = exec_sql_end[1]
+        if len(exec_sql_end) == 1:
+            self.monitor_token_id = exec_sql_end[0]
         else:
             self.monitor_token_id = -1
             warnings.warn(f"</exec_sql>: {exec_sql_end}", UserWarning)        
             
-        if len(ans_start) == 2:
-            self.ans_start_id = ans_start[1]
+        if len(ans_start) == 1:
+            self.ans_start_id = ans_start[0]
         else:
             self.ans_start_id = -1
             warnings.warn(f"<answer>: {ans_start}", UserWarning)
 
-        if len(ans_end) == 2:
-            self.ans_end_id = ans_end[1]
+        if len(ans_end) == 1:
+            self.ans_end_id = ans_end[0]
         else:
             self.ans_end_id = -1
             warnings.warn(f"</answer>: {ans_end}", UserWarning)
@@ -175,7 +175,7 @@ class SQLExecutor():
                         f.write(f"time for api is {time.time()-start}")
                 if kwargs['api'] == "snowflake":
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
-                return self.tokenizer.encode(exec_result)
+                return self.tokenizer.encode(exec_result, add_special_tokens=False)
             elif completion[-1] == self.ans_end_id:
                 # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
                 if completion[index] == self.ans_start_id:

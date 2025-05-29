@@ -229,7 +229,7 @@ class vLLMRollout(BaseRollout):
 
 
         banned_token_ids = []
-        for tok in ["<exec_result>", "</exec_result>"]:
+        for tok in ["<exec_result>", "</exec_result>", "```"]:
             ids = self.tokenizer.encode(tok, add_special_tokens=False)
             assert len(ids) == 1
             banned_token_ids.append(ids[0])

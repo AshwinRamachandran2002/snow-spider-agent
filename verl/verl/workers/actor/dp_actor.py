@@ -305,28 +305,18 @@ class DataParallelPPOActor(BasePPOActor):
                     ignore_now = False
                     for batch in range(len(responses)):
                         for index in range(len(responses[batch])):
-                            assert len(tokenizer.encode("<exec_result>")) == 2, tokenizer.encode("<exec_result>")
-                            if responses[batch][index] == tokenizer.encode("<exec_result>")[1]:
-                                if index - 3 >= 0 and responses[batch][index-3] == tokenizer.encode("</exec_sql>")[1]:
-                                    response_mask[batch][index-2] = 0
-                                    response_mask[batch][index-1] = 0 # mask \n before <exec_res>
-                                    response_mask[batch][index] = 0
-                                    ignore_now = True
-                                    continue
-                                elif index - 2 >= 0 and responses[batch][index-2] == tokenizer.encode("</exec_sql>")[1]:
-                                    response_mask[batch][index-1] = 0 # mask \n before <exec_res>
-                                    response_mask[batch][index] = 0
-                                    ignore_now = True
-                                    continue                                    
+                            if responses[batch][index] == tokenizer.encode("<exec_result>", add_special_tokens=False)[0]:
+                                assert responses[batch][index-2] == tokenizer.encode("</exec_sql>", add_special_tokens=False)[0], tokenizer.decode(responses)
+                                response_mask[batch][index-1] = 0 # mask \n before <exec_res>
+                                response_mask[batch][index] = 0
+                                ignore_now = True
+                                continue                                    
                             
-                            assert len(tokenizer.encode("</exec_result>")) == 2, tokenizer.encode("</exec_result>")
-                            if responses[batch][index] == tokenizer.encode("</exec_result>")[1]:
+                            if responses[batch][index] == tokenizer.encode("</exec_result>", add_special_tokens=False)[0]:
                                 response_mask[batch][index] = 0
                                 ignore_now = False
                                 
-                            if ignore_now or responses[batch][index] == tokenizer.pad_token_id \
-                                or responses[batch][index] == tokenizer.eos_token_id \
-                                or responses[batch][index] == tokenizer.bos_token_id: # mask pad, eos, bos
+                            if ignore_now or responses[batch][index] == tokenizer.eos_token_id: # mask pad, eos, bos
                                 response_mask[batch][index] = 0
 
 
