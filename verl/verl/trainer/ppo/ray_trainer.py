@@ -642,7 +642,7 @@ class RayPPOTrainer(object):
                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
                             
                             # Check if all rewards are 0 or all are 1 for this uid
-                            if (uid_rewards == 0).all():
+                            if (uid_rewards != 1).all():
                                 valid_mask[uid_mask] = False
                                 solve_none += 1
                             elif (uid_rewards == 1).all():
