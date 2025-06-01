@@ -24,7 +24,7 @@ LR=5e-5
 MIN_LR=5e-6
 WARMUP_STEPS=0
 WEIGHT_DECAY=0.0
-MAX_LENGTH=8192
+MAX_LENGTH=4096
 
 echo $OUTPUT_DIR
 echo "Pretrained Model" ${PRETRAINED_MODEL}
@@ -37,7 +37,7 @@ torchrun --nproc_per_node=8 train.py \
     --data_path $DATA_PATH \
     --model_max_length ${MAX_LENGTH} \
     --output_dir ${OUTPUT_DIR} \
-    --num_train_epochs 6 \
+    --num_train_epochs 4 \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --per_device_eval_batch_size 4 \

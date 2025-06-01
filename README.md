@@ -13,6 +13,11 @@
    ```bash
    pip install -r requirements.txt
    ```
+
+   pip install transformers==4.51.0
+   pip install deepspeed==0.16.9
+   accelerate-1.7.0
+
 3. **Binarize Data**
    Provide the raw data as follows:
    the raw JSONLINE file contains a JSON object (each line). Each sample should follow the following format:

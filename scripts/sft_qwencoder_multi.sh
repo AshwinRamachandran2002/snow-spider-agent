@@ -1,14 +1,4 @@
 #!/bin/bash
-# run_multi.sh — Multi-node training script
-# Usage:
-#   bash run_multi.sh <DATA_PATH> <PRETRAINED_MODEL> <OUTPUT_DIR> <NODE_RANK>
-#
-# Example on Node 0:
-#   bash run_multi.sh /mnt/data my_model /mnt/output 0
-# On Node 1:
-#   bash run_multi.sh /mnt/data my_model /mnt/output 1
-# On Node 2:
-#   bash run_multi.sh /mnt/data my_model /mnt/output 2
 
 set -e
 
@@ -29,8 +19,8 @@ NODE_RANK=$4
 # 2. Cluster configuration
 #######################
 # List of private IPs for all nodes (first one is master)
-# HOSTS=(10.111.0.5 10.111.0.6 10.111.0.7)
 HOSTS=(10.111.0.5 10.111.0.6)
+# HOSTS=(10.111.0.5 10.111.0.6)
 MASTER_ADDR=${HOSTS[0]}
 MASTER_PORT=6105
 
@@ -51,7 +41,7 @@ WORLD_SIZE=$(($GPUS_PER_NODE * $NNODES))
 # 4. Training hyperparameters
 #######################
 DEEPSPEED_CONFIG="./configs/default_offload_opt_param.json"
-BATCH_SIZE=8
+BATCH_SIZE=16
 MICRO_BATCH_SIZE=1
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
@@ -63,9 +53,16 @@ MAX_LENGTH=8192
 #######################
 # 5. NCCL & debug environment variables
 #######################
-export NCCL_DEBUG=INFO
 export NCCL_SOCKET_IFNAME=eth0         # Replace with your actual network interface name if needed
 export NCCL_IB_DISABLE=0
+export NCCL_DEBUG_SUBSYS=ALL
+export NCCL_IB_DISABLE=1                   # 禁用 InfiniBand，强制走 TCP/IP
+export NCCL_P2P_DISABLE=0
+export NCCL_NET_GDR_LEVEL=PHB
+export NCCL_SOCKET_IFNAME=eth0             # 确保 eth0 是主通信接口，按 `ip a` 确定
+export NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo_${RANK}.xml
+export GLOO_SOCKET_IFNAME=eth0             # 避免 fallback 的 GLOO 后端出问题
+
 
 #######################
 # 6. Print configuration summary
@@ -97,12 +94,12 @@ torchrun \
     --data_path ${DATA_PATH} \
     --model_max_length ${MAX_LENGTH} \
     --output_dir ${OUTPUT_DIR} \
-    --num_train_epochs 6 \
+    --num_train_epochs 1 \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --per_device_eval_batch_size 4 \
     --save_strategy "steps" \
-    --save_steps 1000 \
+    --save_steps 100 \
     --save_total_limit 100 \
     --learning_rate ${LR} \
     --weight_decay ${WEIGHT_DECAY} \
