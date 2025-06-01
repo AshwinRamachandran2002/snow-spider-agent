@@ -36,5 +36,5 @@ if __name__ == "__main__":
             token_count.append(tokenizer(data["db_desc"], return_tensors="pt").input_ids.shape[1])
     print(len(json_list))
     print(f"Max tokens: {max(token_count)}, mean: {sum(token_count)/len(token_count)}, > 8k: {sum([i > 8192 for i in token_count])}")
-    with open(f"data/{args.dataset_mode}/bird_{args.dataset_mode}_data.json", "w") as f:
+    with open(f"data/{args.dataset_mode}/bird.json", "w") as f:
         json.dump(json_list, f)

@@ -152,7 +152,7 @@ if __name__ == "__main__":
                     "empty_result": empty_result,
                 }
             }
-            if split == "dev" or (not empty_result and exec_time < 5 and "##SQLERROR##" not in str(out)):
+            if split == "dev" or (not empty_result and exec_time < 20 and "##SQLERROR##" not in str(out)):
                 df = pd.DataFrame(out)
                 df.to_csv(f"BIRD/gold_results/local_BIRD_{split}_{idx:04d}.csv", index=False)
                 folder_name = f"BIRD/examples_{split}/local_BIRD_{split}_{idx:04d}"

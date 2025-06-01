@@ -61,7 +61,7 @@ class SqlEnv:
             cur.close()
             conn.close()
 
-    def exec_sql(self, sql_command: str, timeout: int = 6) -> Union[str, List]:
+    def exec_sql(self, sql_command: str, timeout: int = 20) -> Union[str, List]:
         # we select all training data, whose golden sql can be done in 5s, we give 1 more second for the timeout
         # get timeout from env
 

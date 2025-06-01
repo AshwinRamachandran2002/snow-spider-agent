@@ -69,4 +69,21 @@ if __name__ == "__main__":
             )
 
     print(dataset)
+    with open(f"data/{args.dataset_mode}/{args.dataset_mode}_bird.json") as f:
+        omni_data = json.load(f)
+
+    def add_db_desc(example, omni):
+        question = example['question']
+        omni_input = omni['input_seq']
+        assert question[:20] in omni_input
+        assert omni_input.count("Database Schema:\n") == 1 and omni_input.count("\nThis schema describes the database's structure") == 1
+        db_desc = omni_input[
+            omni_input.find("Database Schema:\n")+len("Database Schema:\n") :
+            omni_input.find("\nThis schema describes the database's structure")
+        ]
+        example['db_desc'] = db_desc
+        return example
+
+    dataset = dataset.map(lambda ex, idx: add_db_desc(ex, omni_data[idx]), with_indices=True)
+    print(dataset[0])
     dataset.to_parquet(os.path.join(args.local_dir, f"{args.save_prefix}_{args.dataset_mode}.parquet"))
