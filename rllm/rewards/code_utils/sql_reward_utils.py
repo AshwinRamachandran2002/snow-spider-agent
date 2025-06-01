@@ -163,7 +163,7 @@ class SqlEnv:
             cursor.execute(sql_query)
         except Exception as e:
             cursor.close()
-            return "##ERROR## Incorrect SQL Syntax: " + str(e)
+            return "##ERROR## Incorrect SQL Syntax: " + str(e) + "\n"
         
         def get_rows(cursor):
             rows = []
@@ -179,13 +179,13 @@ class SqlEnv:
         try:
             rows = get_rows(cursor)
             if cursor.description is None:
-                err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
+                err = f"##ERROR## Not a valid SELECT SQL: {sql_query}\n"
                 print(err)
                 return err
             columns = [desc[0] for desc in cursor.description]
         except Exception as e:
             print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
-            return "##ERROR## " + str(e)
+            return "##ERROR## " + str(e) + "\n"
         finally:
             try:
                 cursor.close()
@@ -208,7 +208,7 @@ class SqlEnv:
                     return 0
                 except Exception as e:
                     print("##ERROR## ", str(e))
-                    return str(e)
+                    return str(e) + "\n"
             else:
                 return hard_cut(csv_content, max_len)
             
@@ -287,11 +287,11 @@ class SqlEnv:
             return str(result)
         except FunctionTimedOut:
             print(f"##ERROR## {sql_query} Timed out after {timeout} seconds")
-            return f"##ERROR## Timed out"
+            return f"##ERROR## Timed out\n"
         except Exception as e:
             traceback.print_exc()
             print(f"##ERROR## SQL execution failed: {e}")
-            return f"##ERROR## {str(e)}"
+            return f"##ERROR## {str(e)}\n"
 
     # def __del__(self):
     #     self.close_db()

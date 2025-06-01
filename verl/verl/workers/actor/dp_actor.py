@@ -57,8 +57,10 @@ def log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response
         num_top = 5
         if masked_kld.numel() >= num_top:
             lowest_kld_idx = torch.topk(masked_kld, k=num_top, largest=False).indices
+            highest_kld_idx = torch.topk(masked_kld, k=num_top, largest=True).indices
         else:
             lowest_kld_idx = torch.arange(masked_kld.numel())
+            highest_kld_idx = torch.arange(masked_kld.numel())
 
         log += (f"🔍 Top {num_top} most negative kld tokens:\n")
         for i, idx in enumerate(lowest_kld_idx):
@@ -82,7 +84,30 @@ def log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response
                 f"log_prob={lp:.4f}, ref_log_prob={rlp:.4f}, kld={diff:.4f}\n"
                 f"     Context: ...{context_str}...\n"
             )
-    
+
+        log += (f"🔍 Top {num_top} most positive kld tokens:\n")
+        for i, idx in enumerate(highest_kld_idx):
+            token_id = masked_input_ids[idx].item()
+            token_str = tokenizer.decode([token_id])
+            lp = masked_log_prob[idx].item()
+            rlp = masked_ref_log_prob[idx].item()
+            diff = masked_kld[idx].item()
+
+            context_str = ''
+            if idx - 1 >= 0:
+                token_id_before = masked_input_ids[idx-1].item()
+                context_str += tokenizer.decode([token_id_before])
+            context_str += f"|{token_str}|"
+            if idx + 1 < len(masked_input_ids):
+                token_id_before = masked_input_ids[idx+1].item()
+                context_str += tokenizer.decode([token_id_before])
+
+            log += (
+                f"#{i+1}: Token='{token_str}' (id={token_id}), "
+                f"log_prob={lp:.4f}, ref_log_prob={rlp:.4f}, kld={diff:.4f}\n"
+                f"     Context: ...{context_str}...\n"
+            )
+
         import hashlib
         def calculate_md5(input_string):
             md5_obj = hashlib.md5()
