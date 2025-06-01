@@ -24,24 +24,31 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
-from copy import deepcopy
-import numpy as np
-from typing import List
+
+import logging
+import os
 from contextlib import contextmanager
-from omegaconf import DictConfig
+from copy import deepcopy
+from typing import List
+
 import torch
 import torch.distributed
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
-import traceback
 from torch import nn
+from vllm import SamplingParams
 
 from verl import DataProto
-from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
-from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
-from vllm import SamplingParams
-import time
+from verl.utils.debug import GPUMemoryLogger
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
+from verl.workers.rollout.base import BaseRollout
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+from vllm.lora.request import LoRARequest
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -56,18 +63,9 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
-class BanTokens:
-    def __init__(self, banned_ids):
-        self.banned_ids = banned_ids
-
-    def __call__(self, token_ids, logits):
-        for tid in self.banned_ids:
-            logits[tid] = -1e9
-        return logits
 
 class vLLMRollout(BaseRollout):
-
-    def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, reward_fn, val_reward_fn, **kwargs):
+    def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -78,62 +76,82 @@ class vLLMRollout(BaseRollout):
             **kwargs: train_tp, for Megatron Backend to initialize hybrid engine (zero redundancy) process group
         """
         super().__init__()
-        self.actor_module = actor_module
         self.config = config
-        self.tokenizer = tokenizer
-        self.model_hf_config = model_hf_config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
-        assert not (not config.enforce_eager and config.free_cache_engine), \
-            "disable CUDA graph (enforce_eager = False) if free cache engine"
+        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
-        tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), \
-            "tensor parallel size should be less than or equal to the world size"
-        self.tensor_parallel_size = tensor_parallel_size
-        
-        max_num_batched_tokens = self.config.get('max_num_batched_tokens', 32768)
-        
-        if kwargs.get('train_tp', None) is not None:
+        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        max_num_batched_tokens = int(self.config.get("max_num_batched_tokens", 8192))
+
+        if kwargs.get("train_tp") is not None:
             # deployed with megatron
             import os
-            os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
-            os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
-            train_tp = kwargs.get('train_tp', None)
-            num_tp_per_train_tp = train_tp // tensor_parallel_size
-            if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size,
-                                                  num_tp_per_train_tp=num_tp_per_train_tp)
 
-        assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
-            "model context length should be greater than total sequence length"
-        self.inference_engine = LLM(actor_module,
-                                    tokenizer=tokenizer,
-                                    sql_executor_config=config.sql_executor,
-                                    model_hf_config=model_hf_config,
-                                    tensor_parallel_size=tensor_parallel_size,
-                                    dtype=config.dtype,
-                                    enforce_eager=config.enforce_eager,
-                                    gpu_memory_utilization=config.gpu_memory_utilization,
-                                    skip_tokenizer_init=False,
-                                    max_model_len=config.prompt_length + config.response_length,
-                                    max_num_batched_tokens=max_num_batched_tokens,
-                                    enable_chunked_prefill=config.enable_chunked_prefill,
-                                    load_format=config.load_format)
-        self.tensor_parallel_rank = vllm_ps.get_tensor_model_parallel_rank()
-        print(f"Rank {torch.distributed.get_rank()}, TP rank {self.tensor_parallel_rank} initialized vLLM rollout")
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            train_tp = kwargs.get("train_tp")
+            num_tp_per_train_tp = train_tp // tensor_parallel_size
+            if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        if not rope_scaling_config:
+            assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+
+        max_model_len = self.config.max_model_len if self.config.max_model_len else config.prompt_length + config.response_length
+        max_model_len = int(max_model_len)
+
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError(
+                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill"
+            )
+
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        # For each vLLM engine parameter,
+        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
+        #    (which can vary across different vLLM versions);
+        # - Otherwise it's the desired value we want to explicitly set.
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        lora_kwargs = kwargs.pop('lora_kwargs', {})
+        self.lora_kwargs = lora_kwargs
+        self.inference_engine = LLM(
+            actor_module,
+            tokenizer=tokenizer,
+            model_hf_config=model_hf_config,
+            tensor_parallel_size=tensor_parallel_size,
+            dtype=config.dtype,
+            enforce_eager=config.enforce_eager,
+            gpu_memory_utilization=config.gpu_memory_utilization,
+            skip_tokenizer_init=False,
+            max_model_len=max_model_len,
+            load_format=config.load_format,
+            disable_log_stats=config.disable_log_stats,
+            max_num_batched_tokens=max_num_batched_tokens,
+            enable_chunked_prefill=config.enable_chunked_prefill,
+            **lora_kwargs,
+            **engine_kwargs,
+        )
+
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.offload_model_weights()
 
         kwargs = dict(
             n=1,
-            logprobs=1,  # can be set to 0 and let actor to recompute
+            logprobs=0,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
         )
 
         # we may detokenize the result all together later
-        if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-            kwargs['detokenize'] = False
+        if vllm_version in (
+            "0.5.4",
+            "0.6.3",
+        ):
+            kwargs["detokenize"] = False
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
@@ -161,181 +179,110 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto,  **kwargs) -> DataProto:
-        """Generate sequences using vLLM engine with retry logic for failures.
-
-        Args:
-            prompts (DataProto): Input prompts containing batch data with input_ids, attention_mask,
-                position_ids and meta_info.
-            max_retries (int, optional): Maximum number of retries on failure. Defaults to 1e9.
-            **kwargs: Additional sampling parameters to override defaults.
-
-        Returns:
-            DataProto: Generated sequences containing:
-                - prompts: Original input token ids
-                - responses: Generated response token ids
-                - input_ids: Concatenated prompt and response tokens
-                - attention_mask: Attention mask for full sequence
-                - position_ids: Position ids for full sequence
-
-        Raises:
-            RuntimeError: If generation fails after max_retries attempts.
-        """
-        # Rebuild vLLM cache engine if configured
+    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        # rebuild vllm cache engine
         if self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
-        # Extract input tensors from prompt batch
-        idx = prompts.batch['input_ids']
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
-        eos_token_id = prompts.meta_info['eos_token_id']
-        reward_model = prompts.non_tensor_batch['reward_model']
+
+        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
+        # left-padded attention_mask
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+
+        # used to construct attention_mask
+        eos_token_id = prompts.meta_info["eos_token_id"]
+
         batch_size = idx.size(0)
 
-        # Pre-process input token ids
-        idx_list = [
-            _pre_process_inputs(self.pad_token_id, idx[i])
-            for i in range(batch_size)
-        ]
+        idx_list = []
+        # parse idx from torch.Tensor to List[List[str]]
+        for i in range(batch_size):
+            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
-        print(f"Rank {torch.distributed.get_rank()}, TP rank {self.tensor_parallel_rank} `generate_sequence`: BS={len(idx_list)}")
-
-        # Configure sampling parameters
-        do_sample = prompts.meta_info.get('do_sample', True)
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
             kwargs = {
-                'best_of': 1,
-                'top_p': 0.95,
-                'top_k': -1,
-                'min_p': 0.0,
-                'temperature': 0,
-                'n': 1
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
             }
-        is_validation = False
-        if prompts.meta_info.get('val_temperature', None):
-            kwargs['temperature'] = prompts.meta_info['val_temperature']
-            is_validation = True
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                "top_k": self.config.val_kwargs.top_k,
+                "top_p": self.config.val_kwargs.top_p,
+                "temperature": self.config.val_kwargs.temperature,
+                "n": 1,  # if validate, already repeat in ray_trainer
+            }
 
-        # add
-        example_id_list = [
-            reward_model[i]["ground_truth"]['example_id']
-            for i in range(batch_size)
-        ]
-        sqlite_path_list = [
-            reward_model[i]["ground_truth"]['sqlite_path']
-            for i in range(batch_size)
-        ]
-
-
-        banned_token_ids = []
-        for tok in ["<exec_result>", "</exec_result>", "```"]:
-            ids = self.tokenizer.encode(tok, add_special_tokens=False)
-            assert len(ids) == 1
-            banned_token_ids.append(ids[0])
-        ban_exec_result = BanTokens(banned_token_ids)
-
-        kwargs['n'] = 1
-        # Generating sequences
-        batch_sampling_params = []
-        for _idx in range(batch_size):
-            with self.update_sampling_params(
-                    example_id=example_id_list[_idx],
-                    sqlite_path=sqlite_path_list[_idx],
-                    **kwargs
-            ):
-                sp = self.sampling_params.clone()
-                sp.logits_processors = [ban_exec_result]
-                batch_sampling_params.append(sp)
-                # Inside the context, perform the operations to generate the sequence
-                # batch_sampling_params.append(self.sampling_params.clone())
-
-        if do_sample:
-            idx_list = [deepcopy(item) for item in idx_list for _ in range(self.config.n)]
-            batch_sampling_params = [deepcopy(p) for p in batch_sampling_params for _ in range(self.config.n)]
-        assert len(idx_list) == len(batch_sampling_params), \
-                f"Mismatch: idx_list={len(idx_list)}, sampling_params={len(batch_sampling_params)}"
-
-        self.inference_engine.llm_engine.sql_executor_context.start_time = time.time()
-        # Generate sequences
+        lora_requests = None
+        if self.lora_kwargs:
+            # self.inference_engine.llm_engine.list_loras
+            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
+            if len(lora_int_ids) > 0:
+                lora_int_id=lora_int_ids[0]
+                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
+        # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             output = self.inference_engine.generate(
-                prompts=None,
-                sampling_params=batch_sampling_params,
+                prompts=None,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
                 prompt_token_ids=idx_list,
-                use_tqdm=False)
+                lora_request=lora_requests,
+                use_tqdm=False,
+            )
 
-        self.inference_engine.llm_engine.sql_executor_context.remove_all_ids()
+            # TODO(sgm): disable logprob when recompute_log_prob is enable
+            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
+            response = output[0].to(idx.device)
+            log_probs = output[1].to(idx.device)
 
-        # Process outputs
-        response = output[0].to(idx.device)
-        log_probs = output[1].to(idx.device)
+            if response.shape[1] < self.config.response_length:
+                response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
+                log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
 
-        # Pad sequences if needed
-        if response.shape[1] < self.config.response_length:
-            response = pad_sequence_to_length(
-                response, self.config.response_length, self.pad_token_id)
-            log_probs = pad_sequence_to_length(
-                log_probs, self.config.response_length, self.pad_token_id)
+            # utilize current sampling params
+            if self.sampling_params.n > 1 and do_sample:
+                idx = idx.repeat_interleave(self.sampling_params.n, dim=0)
+                attention_mask = attention_mask.repeat_interleave(self.sampling_params.n, dim=0)
+                position_ids = position_ids.repeat_interleave(self.sampling_params.n, dim=0)
+                batch_size = batch_size * self.sampling_params.n
+            seq = torch.cat([idx, response], dim=-1)
 
-        # Handle multiple samples per prompt
-        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
-        # print(f"idx.shape before: {idx.shape}")
-        if self.config.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(
-                self.config.n, dim=0)
-            position_ids = position_ids.repeat_interleave(
-                self.config.n, dim=0)
-            batch_size = batch_size * self.config.n
-                # Create interleaved non_tensor_batch
-            non_tensor_batch = {}
-            for key, val in prompts.non_tensor_batch.items():
-                # Repeat each element n times (interleaved)
-                repeated_val = np.repeat(val, self.config.n)
-                non_tensor_batch[key] = repeated_val
-
-        # Concatenate prompt and response
-        # print(f"idx.shape: {idx.shape}, response.shape: {response.shape}, self.config.n: {self.config.n}")
-        seq = torch.cat([idx, response], dim=-1)
-
-        # Create position IDs and attention mask for full sequence
         response_length = response.size(1)
-        delta_position_id = torch.arange(
-            1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(
-            batch_size, 1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
 
+        # TODO(sgm): fix position_ids on right_pad
+        # prompt: left pad + response: right pad
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids],
-                                dim=-1)
-        response_attention_mask = get_eos_mask(
-            response_id=response,
-            eos_token=eos_token_id,
-            dtype=attention_mask.dtype)
-        attention_mask = torch.cat(
-            (attention_mask, response_attention_mask), dim=-1)
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
-        # Construct output batch
+        # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
             {
-                'prompts': idx,
-                'responses': response,
-                'input_ids': seq,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,  # here input_ids become the whole sentences
+                'rollout_log_probs': log_probs, # we will recompute old log prob with actor
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
             },
-            batch_size=batch_size)
+            batch_size=batch_size,
+        )
 
-        # Free cache if configured
+        # free vllm cache engine
         if self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
 
-        batch = DataProto(batch=batch,
-                            non_tensor_batch=non_tensor_batch,
-                            meta_info=prompts.meta_info)
-        if self.reward_fn is not None and not is_validation:
-            reward_tensor = self.reward_fn(batch)
-            batch.batch['token_level_scores'] = reward_tensor
-
-        return batch
+        return DataProto(batch=batch)

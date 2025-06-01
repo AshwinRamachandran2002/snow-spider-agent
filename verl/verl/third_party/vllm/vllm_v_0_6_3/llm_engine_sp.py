@@ -12,29 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/engine/llm_engine.py
-import os
+
 from functools import partial
-from typing import Callable, Dict, Optional, Type, Union, List
-import time
-import torch
+from typing import Callable, Dict, Iterable, Optional, Type, Union
+
 import torch.nn as nn
 from vllm.config import (
     CacheConfig,
     DecodingConfig,
     DeviceConfig,
     EngineConfig,
-    LoadConfig,
     LoRAConfig,
-    ModelConfig,
     ObservabilityConfig,
     ParallelConfig,
     PromptAdapterConfig,
     SchedulerConfig,
     SpeculativeConfig,
 )
-from omegaconf import DictConfig
 from vllm.core.scheduler import Scheduler
-from vllm.engine.arg_utils import EngineArgs
 from vllm.engine.llm_engine import LLMEngine, SchedulerContext, SchedulerOutputState, _load_generation_config_dict
 from vllm.engine.metrics_types import StatLoggerBase
 from vllm.engine.output_processor.interfaces import SequenceGroupOutputProcessor
@@ -43,314 +38,21 @@ from vllm.executor.executor_base import ExecutorBase
 from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
-from vllm.sequence import Sequence, ExecuteModelRequest
+from vllm.sequence import Sequence
 from vllm.tracing import init_tracer
 from vllm.transformers_utils.detokenizer import Detokenizer
 from vllm.transformers_utils.tokenizer import AnyTokenizer
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils import Counter, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
-from vllm.outputs import (EmbeddingRequestOutput, RequestOutput)
 
 from .arg_utils import EngineArgs
 from .config import LoadConfig, ModelConfig
 from .tokenizer import TokenizerGroup
-from rllm.rewards.code_utils.sql_reward_evaluate import evaluate_spider2sql, evaluate_bird
-from rllm.rewards.code_utils.sql_reward_utils import get_api_name, SqlEnv, calculate_md5
-import uuid
-import datetime
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-import warnings
-import psutil
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
-def print_cpu_status(keys=[]):
-    l = []
-    l.append("\n" + "=" * 40 + " CPU Usage " + "=" * 40)
-    
-    # Show total and per-core CPU usage
-    l.append(f"Total usage: {psutil.cpu_percent(interval=1)}%")
-    l.append("Per-core usage:")
-    for i, perc in enumerate(psutil.cpu_percent(percpu=True, interval=1)):
-        l.append(f" - Core {i}: {perc}%")
 
-    l.append("\n" + "=" * 40 + " Memory Usage " + "=" * 40)
-    
-    # Display memory usage stats
-    mem = psutil.virtual_memory()
-    l.append(f"Total memory: {mem.total / (1024**3):.2f} GB")
-    l.append(f"Used: {mem.used / (1024**3):.2f} GB ({mem.percent}%)")
-    l.append(f"Available: {mem.available / (1024**3):.2f} GB")
-
-    l.append("=" * 92)
-    l.append(f"len(keys): {len(keys)}\n{keys}")
-    with open(f"log/cpu_state_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log", "w") as f:
-        f.write("\n".join(l))
-
-class SQLExecutor():
-
-    def __init__(self, tokenizer_group, sql_executor_config):
-        self.parent_seq_ids_completions = {}
-        self.monitor_parent_seq_ids = {}
-        self.initial_prompts = {}
-        self.calls_per_parent_seq_id = {}
-        self.time_per_parent_seq_id = {}
-
-        # For v1:
-        # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]]
-        # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
-        self.tokenizer = tokenizer_group.tokenizer
-        exec_sql_start = self.tokenizer.encode("<exec_sql>", add_special_tokens=False)
-        exec_sql_end = self.tokenizer.encode("</exec_sql>", add_special_tokens=False)
-        ans_start = self.tokenizer.encode("<answer>", add_special_tokens=False)
-        ans_end = self.tokenizer.encode("</answer>", add_special_tokens=False)
-
-        if len(exec_sql_start) == 1:
-            self.start_token_id = exec_sql_start[0]
-        else:
-            self.start_token_id = -1
-            warnings.warn(f"<exec_sql>: {exec_sql_start}", UserWarning)
-        
-        if len(exec_sql_end) == 1:
-            self.monitor_token_id = exec_sql_end[0]
-        else:
-            self.monitor_token_id = -1
-            warnings.warn(f"</exec_sql>: {exec_sql_end}", UserWarning)        
-            
-        if len(ans_start) == 1:
-            self.ans_start_id = ans_start[0]
-        else:
-            self.ans_start_id = -1
-            warnings.warn(f"<answer>: {ans_start}", UserWarning)
-
-        if len(ans_end) == 1:
-            self.ans_end_id = ans_end[0]
-        else:
-            self.ans_end_id = -1
-            warnings.warn(f"</answer>: {ans_end}", UserWarning)
-
-        self.sql_env = SqlEnv()
-        self.ground_truths = "data_preprocess/BIRD/gold_results"
-        self.exec_func_sql = self.sql_env.execute_sql_with_timeout
-        self.beginning = True
-        self.sqlite_source_path = sql_executor_config.sqlite_source_path
-
-        self.max_calls = sql_executor_config.max_calls
-        self.max_time = sql_executor_config.max_time
-        self.timeout_for_exploration = sql_executor_config.timeout_for_exploration
-        self.timeout_for_final_answer = sql_executor_config.timeout_for_final_answer
-
-        self.start_time = 0
-        
-        print(f"SQLExecutor initialized with sqlite_source_path {self.sqlite_source_path} and max_calls {self.max_calls} and max_time {self.max_time}")
-
-        self.logging = False
-        self.log_path = f"log/sql_executor_{str(uuid.uuid4())}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
-
-    def fetch_execution_result(self, completion, request_id):
-        for index in range(len(completion)-1, 0, -1):
-            if completion[-1] == self.monitor_token_id and completion[index] == self.start_token_id:
-                sql_string = self.tokenizer.decode(completion[index+1:-1])
- 
-                kwargs = self.initial_prompts[str(request_id)]
-                start = time.time()
-
-                log_ = self.tokenizer.decode(completion).strip()
-                log_gen = log_[:log_.find("<exec_sql>")]
-
-                # env = SqlTask(sql_string, kwargs["sqlite_path"])
-                # env.launch_env()
-                # exec_result = env.answer
-                exec_result = self.exec_func_sql(sql_string, calculate_md5(log_gen), timeout=self.timeout_for_exploration, max_len=500, LIMIT=100, **kwargs)
-                if "Timed out" in exec_result:
-                    print(f"Timed out time: {time.time() - start}")
-                    return [self.tokenizer.eos_token_id]
-                
-                exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>"
-                if self.logging:
-                    with open(self.log_path, "a") as f:
-                        f.write(f"executed below SQL with kwargs {kwargs}\n")
-                        f.write(f"{sql_string}\n")
-                        f.write(f"result is {exec_result}\n")
-                        f.write(f"time for api is {time.time()-start}")
-                if kwargs['api'] == "snowflake":
-                    print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
-                return self.tokenizer.encode(exec_result, add_special_tokens=False)
-            elif completion[-1] == self.ans_end_id:
-                # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
-                if completion[index] == self.ans_start_id:
-                    sql_string = self.tokenizer.decode(completion[index+1:-1])
-                    
-                    kwargs = self.initial_prompts[str(request_id)]
-                    example_id = kwargs["example_id"]
-                    start = time.time()
-
-                    log_ = self.tokenizer.decode(completion).strip()
-                    rollout_id = calculate_md5(log_)
-
-                    response_str = log_[log_.find("<exec_sql>"):log_.find("</answer>")]
-                    file_name = f"{example_id}_{calculate_md5(response_str)}"
-
-                    
-                    # env = SqlTask(sql_string, kwargs["sqlite_path"])
-                    # env.launch_env()
-                    # if "##SQLERROR##" not in env.answer:
-                    #     with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), "w") as f:
-                    #         f.write(env.answer)
-                    exec_result = self.exec_func_sql(sql_string, rollout_id, save_path=os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), timeout=self.timeout_for_final_answer, **kwargs)
-                    
-                    # print(f"response_str: {log}, MD5: {calculate_md5(log)}")
-                    with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".log"), "w") as f:
-                        f.write(log_)
-                    with open(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".txt"), "w") as f:
-                        if not os.path.exists(os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv")):
-                            f.write('0')
-                        else:
-                            f.write(str(evaluate_bird(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
-                    return [self.tokenizer.eos_token_id]
-        print(f"Fatal err: Not matched: {completion}")
-        return [self.tokenizer.eos_token_id]
-
-    def remove(self, request_id):
-        if request_id in self.parent_seq_ids_completions:
-            del self.parent_seq_ids_completions[request_id]
-
-        if request_id in self.monitor_parent_seq_ids:
-            del self.monitor_parent_seq_ids[request_id]
-        
-        if request_id in self.calls_per_parent_seq_id:
-            del self.calls_per_parent_seq_id[request_id]
-        
-        if request_id in self.initial_prompts:
-            del self.initial_prompts[str(request_id)]
-
-    def remove_all_ids(self):
-        self.parent_seq_ids_completions = {}
-        self.monitor_parent_seq_ids = {}
-        self.calls_per_parent_seq_id = {}
-        self.initial_prompts = {}
-        # print(f"Start releasing DB")
-        self.sql_env.close_db()
-        # print(f"End releasing  DB")
-        # self.sql_env.executor = ThreadPoolExecutor(max_workers=1)
-
-    def process_one_output(self, index, completion_seq_output, scheduler_outputs):
-        seq_id_analyzed = []
-        # print(f"Group {index} has {len(completion_seq_output.samples)} samples")
-        seq_group_id = scheduler_outputs.scheduled_seq_groups[index].seq_group.request_id
-
-        if self.logging:
-            with open(self.log_path, "a") as f:
-                f.write(f"processing group {seq_group_id}\n")
-
-        for seq_output in completion_seq_output.samples:
-            seq_id = seq_output.parent_seq_id
-            seq_id_analyzed.append(seq_id)
-
-            if self.logging:
-                with open(self.log_path, "a") as f:
-                    f.write(f"processing seq_id {seq_id}\n")
-
-            if seq_id not in self.initial_prompts:
-                seq_group = scheduler_outputs.scheduled_seq_groups[index].seq_group
-                sqlite_path = seq_group.sampling_params.sqlite_path
-                example_id = seq_group.sampling_params.example_id
-                self.initial_prompts[str(seq_id)] = {
-                    "example_id": example_id,
-                    "api": get_api_name(example_id),
-                    "sqlite_path": os.path.join(self.sqlite_source_path, sqlite_path) if sqlite_path else '',
-                }
-
-            if seq_id in self.monitor_parent_seq_ids:
-                monitor_info = self.monitor_parent_seq_ids[seq_id]
-                actual_output_token = seq_output.output_token
-                replacement_token = monitor_info["exec_result"][monitor_info["curr_pointer"]]
-                monitor_info["curr_pointer"] += 1
-
-                seq_output.output_token = replacement_token
-                seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
-                if replacement_token != actual_output_token:
-                    del seq_output.logprobs[actual_output_token]
-
-                if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
-                    del self.monitor_parent_seq_ids[seq_id]
-
-            output_token = seq_output.output_token
-
-            if seq_id not in self.parent_seq_ids_completions:
-                self.parent_seq_ids_completions[seq_id] = []
-            self.parent_seq_ids_completions[seq_id].append(output_token)
-
-            completions = self.parent_seq_ids_completions[seq_id]
-
-            if completions[-1] == self.monitor_token_id:
-                if seq_id not in self.calls_per_parent_seq_id:
-                    self.calls_per_parent_seq_id[seq_id] = 0
-                if seq_id not in self.time_per_parent_seq_id:
-                    self.time_per_parent_seq_id[seq_id] = []
-
-                self.calls_per_parent_seq_id[seq_id] += 1
-                self.time_per_parent_seq_id[seq_id] += [time.time()]
-
-                used_time = self.time_per_parent_seq_id[seq_id][-1] - self.start_time
-                if used_time > self.max_time or self.calls_per_parent_seq_id[seq_id] > self.max_calls:
-                    self.monitor_parent_seq_ids[seq_id] = {
-                        "exec_result": [self.tokenizer.eos_token_id],
-                        "curr_pointer": 0
-                    }
-                else:
-                    exec_res = self.fetch_execution_result(completions, seq_id)
-                    self.monitor_parent_seq_ids[seq_id] = {
-                        "exec_result": exec_res,
-                        "curr_pointer": 0
-                    }
-            elif completions[-1] == self.ans_end_id:
-                self.fetch_execution_result(completions, seq_id)
-
-        return seq_id_analyzed
-
-    def process(self, outputs, scheduler_outputs):
-        if self.beginning:
-            self.beginning = False
-            return outputs
-
-        assert len(outputs) == 1
-        outputs = outputs[0]
-
-        seq_id_analyzed_all = []
-        # print(f"Number of groups (outputs.outputs): {len(outputs.outputs)}")
-        # print_cpu_status()
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-            futures = []
-            for index, completion_seq_output in enumerate(outputs.outputs):
-                futures.append(executor.submit(self.process_one_output, index, completion_seq_output, scheduler_outputs))
-
-            for future in as_completed(futures):
-                seq_id_analyzed_all.extend(future.result())
-        # for index, completion_seq_output in enumerate(outputs.outputs):
-        #     seq_id_analyzed_all += self.process_one_output(index, completion_seq_output, scheduler_outputs)
-
-        to_be_removed = []
-        for index in self.monitor_parent_seq_ids:
-            if index not in seq_id_analyzed_all:
-                to_be_removed.append(index)
-
-        for index in self.calls_per_parent_seq_id:
-            if index not in seq_id_analyzed_all:
-                to_be_removed.append(index)
-
-        for index in self.parent_seq_ids_completions:
-            if index not in seq_id_analyzed_all:
-                to_be_removed.append(index)
-
-        for index in self.initial_prompts:
-            if index not in seq_id_analyzed_all:
-                to_be_removed.append(index)
-
-        for index in to_be_removed:
-            self.remove(index)
-
-        return [outputs]
 
 class LLMEngine(LLMEngine):
     """An LLM engine that receives requests and generates texts.
@@ -391,7 +93,6 @@ class LLMEngine(LLMEngine):
         # NOTE(sgm): first two arguments are added for verl
         model: Union[nn.Module, Dict],  # model itself or its parameter dict
         tokenizer: nn.Module,
-        sql_executor_config: DictConfig,
         # NOTE(sgm): vllm original arguments
         model_config: ModelConfig,
         cache_config: CacheConfig,
@@ -409,7 +110,7 @@ class LLMEngine(LLMEngine):
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
         input_registry: InputRegistry = INPUT_REGISTRY,
-        use_cached_outputs: bool = False
+        use_cached_outputs: bool = False,
     ) -> None:
         logger.info(
             "Initializing an LLM engine (v%s) with config: "
@@ -493,7 +194,7 @@ class LLMEngine(LLMEngine):
         # Ensure that the function doesn't contain a reference to self,
         # to avoid engine GC issues
         def get_tokenizer_for_seq(sequence: Sequence) -> AnyTokenizer:
-            assert tokenizer_group, "tokenizer_group cannot be None, " "make sure skip_tokenizer_init is False"
+            assert tokenizer_group, "tokenizer_group cannot be None, make sure skip_tokenizer_init is False"
             return tokenizer_group.get_lora_tokenizer(sequence.lora_request)
 
         self.seq_counter = Counter()
@@ -551,22 +252,14 @@ class LLMEngine(LLMEngine):
             # different process.
             self.tokenizer.ping()
 
-        self.cached_scheduler_outputs = [
-            SchedulerOutputState() for _ in range(self.parallel_config.pipeline_parallel_size)
-        ]
+        self.cached_scheduler_outputs = [SchedulerOutputState() for _ in range(self.parallel_config.pipeline_parallel_size)]
 
-        self.scheduler_contexts = [
-            SchedulerContext(multi_step_stream_outputs=self.scheduler_config.multi_step_stream_outputs)
-            for _ in range(self.parallel_config.pipeline_parallel_size)
-        ]
+        self.scheduler_contexts = [SchedulerContext(multi_step_stream_outputs=self.scheduler_config.multi_step_stream_outputs) for _ in range(self.parallel_config.pipeline_parallel_size)]
 
         if model_config.use_async_output_proc:
             process_model_outputs = weak_bind(self._process_model_outputs)
 
-            self.async_callbacks = [
-                partial(process_model_outputs, ctx=self.scheduler_contexts[v_id])
-                for v_id in range(self.parallel_config.pipeline_parallel_size)
-            ]
+            self.async_callbacks = [partial(process_model_outputs, ctx=self.scheduler_contexts[v_id]) for v_id in range(self.parallel_config.pipeline_parallel_size)]
         else:
             self.async_callbacks = []
 
@@ -584,7 +277,8 @@ class LLMEngine(LLMEngine):
                 lora_config,
                 parallel_config.pipeline_parallel_size,
                 self.async_callbacks[v_id] if model_config.use_async_output_proc else None,
-            ) for v_id in range(parallel_config.pipeline_parallel_size)
+            )
+            for v_id in range(parallel_config.pipeline_parallel_size)
         ]
 
         # Metric Logging.
@@ -599,14 +293,12 @@ class LLMEngine(LLMEngine):
                 from vllm.engine.metrics import LoggingStatLogger, PrometheusStatLogger
 
                 self.stat_loggers = {
-                    "logging":
-                        LoggingStatLogger(local_interval=_LOCAL_LOGGING_INTERVAL_SEC),
-                    "prometheus":
-                        PrometheusStatLogger(
-                            local_interval=_LOCAL_LOGGING_INTERVAL_SEC,
-                            labels=dict(model_name=model_config.served_model_name),
-                            max_model_len=self.model_config.max_model_len,
-                        ),
+                    "logging": LoggingStatLogger(local_interval=_LOCAL_LOGGING_INTERVAL_SEC),
+                    "prometheus": PrometheusStatLogger(
+                        local_interval=_LOCAL_LOGGING_INTERVAL_SEC,
+                        labels=dict(model_name=model_config.served_model_name),
+                        max_model_len=self.model_config.max_model_len,
+                    ),
                 }
                 self.stat_loggers["prometheus"].info("cache_config", self.cache_config)
 
@@ -628,13 +320,9 @@ class LLMEngine(LLMEngine):
             ),
         )
 
-        self.sql_executor_context = SQLExecutor(self.tokenizer, sql_executor_config)
-
     # TODO(sgm): add for verl but we may not tokenizer in Rollout
     def _init_tokenizer(self, tokenizer, **tokenizer_init_kwargs):
-        init_kwargs = dict(enable_lora=bool(self.lora_config),
-                           max_num_seqs=self.scheduler_config.max_num_seqs,
-                           max_input_length=None)
+        init_kwargs = dict(enable_lora=bool(self.lora_config), max_num_seqs=self.scheduler_config.max_num_seqs, max_input_length=None)
         init_kwargs.update(tokenizer_init_kwargs)
         return TokenizerGroup(tokenizer, **init_kwargs)
 
@@ -650,10 +338,8 @@ class LLMEngine(LLMEngine):
     # The GPUExecutor remove the Ray dependency
     @classmethod
     def _get_executor_cls(cls, engine_config: EngineConfig) -> Type[ExecutorBase]:
-        distributed_executor_backend = engine_config.parallel_config.distributed_executor_backend
         # Initialize the cluster and specify the executor class.]
-        assert (engine_config.device_config.device_type == "cuda"
-               ), "Currently, the vllm in verl only support running on GPU"
+        assert engine_config.device_config.device_type == "cuda", "Currently, the vllm in verl only support running on GPU"
 
         # print('Waiting for debugger'); import os,debugpy; debugpy.listen(('localhost', 5678 + int(os.getenv('RANK', '0')))); debugpy.wait_for_client()
         if engine_config.parallel_config.world_size == 1:
@@ -670,18 +356,16 @@ class LLMEngine(LLMEngine):
         cls,
         model,
         tokenizer,
-        sql_executor_config: DictConfig,
         engine_args: EngineArgs,
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
-        stat_loggers: Optional[Dict[str, StatLoggerBase]] = None
+        stat_loggers: Optional[Dict[str, StatLoggerBase]] = None,
     ) -> "LLMEngine":
         """Creates an LLM engine from the engine arguments."""
         # Create the engine configs.
         engine_config = engine_args.create_engine_config()
         executor_class = cls._get_executor_cls(engine_config)
         # Initialize the cluster and specify the executor class.
-        assert (engine_config.device_config.device_type == "cuda"
-               ), "Currently, the vllm in verl only support running on GPU"
+        assert engine_config.device_config.device_type == "cuda", "Currently, the vllm in verl only support running on GPU"
 
         from .spmd_gpu_executor import SPMDGPUExecutor
 
@@ -691,182 +375,16 @@ class LLMEngine(LLMEngine):
         engine = cls(
             model,
             tokenizer,
-            sql_executor_config,
             **engine_config.to_dict(),
             executor_class=executor_class,
             log_stats=not engine_args.disable_log_stats,
             usage_context=usage_context,
-            stat_loggers=stat_loggers
+            stat_loggers=stat_loggers,
         )
         return engine
 
-    def sync_model_weights(self, actor_weights: Dict[str, torch.Tensor], load_format: str) -> None:
+    def sync_model_weights(self, actor_weights: Iterable, load_format: str) -> None:
         self.model_executor.sync_model_weights(actor_weights=actor_weights, load_format=load_format)
 
     def offload_model_weights(self) -> None:
         self.model_executor.offload_model_weights()
-
-    def step(self) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
-        if self.parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Pipeline parallelism is only supported through AsyncLLMEngine "
-                "as performance will be severely degraded otherwise.")
-
-        # For llm_engine, there is no pipeline parallel support, so the engine
-        # used is always 0.
-        virtual_engine = 0
-
-        # These are cached outputs from previous iterations. None if on first
-        # iteration
-        cached_outputs = self.cached_scheduler_outputs[virtual_engine]
-        seq_group_metadata_list = cached_outputs.seq_group_metadata_list
-        scheduler_outputs = cached_outputs.scheduler_outputs
-        allow_async_output_proc = cached_outputs.allow_async_output_proc
-
-        ctx = self.scheduler_contexts[virtual_engine]
-
-        # Clear outputs for each new scheduler iteration
-        ctx.request_outputs.clear()
-
-        # Skip the scheduler if there are any remaining steps in the seq groups.
-        # This ensures that the scheduler is only called again when the current
-        # batch has completed.
-        if not self._has_remaining_steps(seq_group_metadata_list):
-            # Schedule iteration
-            (seq_group_metadata_list, scheduler_outputs,
-             allow_async_output_proc
-             ) = self.scheduler[virtual_engine].schedule()
-
-            ctx.seq_group_metadata_list = seq_group_metadata_list
-            ctx.scheduler_outputs = scheduler_outputs
-
-            # Maybe switch from async mode to sync mode
-            if not allow_async_output_proc and len(ctx.output_queue) > 0:
-                self._process_model_outputs(ctx=ctx)
-
-            if (self.scheduler_config.is_multi_step
-                    and scheduler_outputs.num_lookahead_slots > 0):
-                # cache the scheduler outputs for the next iteration if we have
-                # lookahead slots
-                self._cache_scheduler_outputs_for_multi_step(
-                    virtual_engine, seq_group_metadata_list, scheduler_outputs,
-                    allow_async_output_proc)
-
-        assert seq_group_metadata_list is not None
-        assert scheduler_outputs is not None
-
-        if not scheduler_outputs.is_empty():
-            
-            finished_requests_ids = self.scheduler[
-                virtual_engine].get_and_reset_finished_requests_ids()
-
-            # Check if we have a cached last_output from the previous iteration.
-            # For supporting PP this is probably the best way to pass the
-            # sampled_token_ids, as a separate broadcast over all the PP stages
-            # will cause one virtual engine's microbatch to block the pipeline.
-            last_sampled_token_ids = \
-                self._get_last_sampled_token_ids(virtual_engine)
-
-            execute_model_req = ExecuteModelRequest(
-                seq_group_metadata_list=seq_group_metadata_list,
-                blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
-                blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
-                blocks_to_copy=scheduler_outputs.blocks_to_copy,
-                num_lookahead_slots=scheduler_outputs.num_lookahead_slots,
-                running_queue_size=scheduler_outputs.running_queue_size,
-                finished_requests_ids=finished_requests_ids,
-                # We use ExecuteModelRequest to pass the last sampled_token_ids
-                # to each of the non-last PP stages for in-place prepare_input.
-                last_sampled_token_ids=last_sampled_token_ids)
-
-            if allow_async_output_proc:
-                execute_model_req.async_callback = self.async_callbacks[
-                    virtual_engine]
-
-            outputs = self.model_executor.execute_model(
-                execute_model_req=execute_model_req)
-
-            # We need to do this here so that last step's sampled_token_ids can
-            # be passed to the next iteration for PP.
-            if self.scheduler_config.is_multi_step:
-                self._update_cached_scheduler_output(virtual_engine, outputs)
-        else:
-            
-            # Nothing scheduled => If there is pending async postprocessor,
-            # then finish it here.
-            if len(ctx.output_queue) > 0:
-                self._process_model_outputs(ctx=ctx)
-            # No outputs in this case
-            outputs = []
-
-        # Finish the current step for all the sequence groups.
-        if self.scheduler_config.is_multi_step:
-            for seq_group in seq_group_metadata_list:
-                seq_group.finish_step()
-
-        if not self._has_remaining_steps(seq_group_metadata_list):
-            
-            # clear the cache if we have finished all the steps.
-            if self.scheduler_config.is_multi_step:
-                self.cached_scheduler_outputs[0] = SchedulerOutputState()
-
-            # is_first_step_output is True only when the num_steps of all
-            # the sequences are 1. When the num_steps > 1,
-            # multi_step_model_runner does the first-step output append.
-            is_first_step_output: bool = False if not seq_group_metadata_list \
-                else seq_group_metadata_list[0].state.num_steps == 1
-
-            # Add results to the output_queue
-            if self.sql_executor_context.logging:
-                with open(self.sql_executor_context.log_path, "a") as f:
-                    f.write(f"llm engine otuput before process {outputs}\n")
-                    f.write(f"scheduler outputs {scheduler_outputs}\n")
-            outputs = self.sql_executor_context.process(outputs, scheduler_outputs)
-            if self.sql_executor_context.logging:
-                with open(self.sql_executor_context.log_path, "a") as f:
-                    f.write(f"llm engine otuput after process {outputs}\n")
-            ctx.append_output(outputs=outputs,
-                              seq_group_metadata_list=seq_group_metadata_list,
-                              scheduler_outputs=scheduler_outputs,
-                              is_async=allow_async_output_proc,
-                              is_last_step=True,
-                              is_first_step_output=is_first_step_output)
-
-            if outputs and allow_async_output_proc:
-                assert len(outputs) == 1, (
-                    "Async postprocessor expects only a single output set")
-
-                self._advance_to_next_step(
-                    outputs[0], seq_group_metadata_list,
-                    scheduler_outputs.scheduled_seq_groups)
-
-            # Check if need to run the usual non-async path
-            if not allow_async_output_proc:
-                
-                self._process_model_outputs(ctx=ctx)
-
-                # Log stats.
-                self.do_log_stats(scheduler_outputs, outputs)
-
-                # Tracing
-                self.do_tracing(scheduler_outputs)
-        else:
-            # Multi-step case
-            return ctx.request_outputs
-
-        if not self.has_unfinished_requests():
-            # Drain async postprocessor (if exists)
-            if len(ctx.output_queue) > 0:
-                self._process_model_outputs(ctx=ctx)
-            assert len(ctx.output_queue) == 0
-
-            # Stop the execute model loop in parallel workers until there are
-            # more requests to process. This avoids waiting indefinitely in
-            # torch.distributed ops which may otherwise timeout, and unblocks
-            # the RPC thread in the workers so that they can process any other
-            # queued control plane messages, such as add/remove lora adapters.
-            logger.debug("Stopping remote worker execution loop.")
-            self.model_executor.stop_remote_worker_execution_loop()
-
-
-        return ctx.request_outputs
