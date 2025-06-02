@@ -109,8 +109,8 @@ if [ "$NODE_RANK" -eq 0 ]; then
         actor_rollout_ref.actor.ppo_epochs=1 \
         actor_rollout_ref.actor.use_dynamic_bsz=True \
         actor_rollout_ref.actor.ppo_max_token_len_per_gpu=32768 \
-        actor_rollout_ref.actor.use_kl_loss=False \
-        actor_rollout_ref.actor.kl_loss_coef=0 \
+        actor_rollout_ref.actor.use_kl_loss=True \
+        actor_rollout_ref.actor.kl_loss_coef=0.001 \
         actor_rollout_ref.actor.kl_loss_type=low_var_kl \
         actor_rollout_ref.actor.ulysses_sequence_parallel_size=1 \
         actor_rollout_ref.model.enable_gradient_checkpointing=True \
@@ -128,7 +128,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         actor_rollout_ref.rollout.sql_executor.max_calls=20 \
         actor_rollout_ref.rollout.sql_executor.timeout_for_exploration=10 \
         actor_rollout_ref.rollout.sql_executor.timeout_for_final_answer=10 \
-        actor_rollout_ref.rollout.enforce_eager=False \
+        actor_rollout_ref.rollout.enforce_eager=True \
         actor_rollout_ref.rollout.free_cache_engine=False \
         actor_rollout_ref.ref.fsdp_config.param_offload=True \
         algorithm.kl_ctrl.kl_coef=0.001 \

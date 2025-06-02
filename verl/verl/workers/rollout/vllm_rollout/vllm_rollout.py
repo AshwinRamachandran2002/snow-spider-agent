@@ -194,6 +194,8 @@ class vLLMRollout(BaseRollout):
             and self.config.free_cache_engine
         ):
             self.inference_engine.init_cache_engine()
+        else:
+            self.inference_engine.wake_up()
         # Extract input tensors from prompt batch
         idx = prompts.batch['input_ids']
         attention_mask = prompts.batch['attention_mask']
@@ -360,6 +362,8 @@ class vLLMRollout(BaseRollout):
             and self.config.free_cache_engine
         ):
             self.inference_engine.free_cache_engine()
+        else:
+            self.inference_engine.sleep(level=1)
 
         batch = DataProto(batch=batch,
                             non_tensor_batch=non_tensor_batch,
