@@ -41,7 +41,7 @@ WORLD_SIZE=$(($GPUS_PER_NODE * $NNODES))
 # 4. Training hyperparameters
 #######################
 DEEPSPEED_CONFIG="./configs/default_offload_opt_param.json"
-BATCH_SIZE=16
+BATCH_SIZE=32
 MICRO_BATCH_SIZE=1
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
@@ -94,7 +94,7 @@ torchrun \
     --data_path ${DATA_PATH} \
     --model_max_length ${MAX_LENGTH} \
     --output_dir ${OUTPUT_DIR} \
-    --num_train_epochs 1 \
+    --num_train_epochs 3 \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --per_device_eval_batch_size 4 \
