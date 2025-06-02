@@ -35,9 +35,87 @@ Step 4: Write the final SQL in <answer></answer> tags.
 
 Note: 
 
-Do not generate <exec_result></exec_result> tags yourself. If any syntax error or empty result occurs, revise your query accordingly before proceeding. All 'SELECT' should be in <exec_sql></exec_sql> block. <schema_linking> and </schema_linking> should appear twice: in Step 1 and Step 3.
+Do not generate <exec_result></exec_result> tags yourself. If any syntax error or empty result occurs, revise your query accordingly before proceeding. All 'SELECT' should be in <exec_sql></exec_sql> block.
+
+You should reason in <think></think> tags and anwer in <answer></answer> tags.
 
 The SQL dialect must be SQLite. Use the format SELECT "column_name" FROM "table_name" WHERE ..., replacing "table_name" and "column_name" with actual names. Always enclose table and column names in double quotation marks.
+
+Here's an example:
+{DB Info}
+Question: Who is the director that made the most movies? Give the director's id. director that made the most movies refers to MAX(COUNT(movie_id))
+Your answer:
+<think>
+Okay, let's tackle the question: "Who is the director that made the most movies? Give the director's id." The user mentioned that the director with the most movies refers to MAX(COUNT(movie_id)). 
+
+First, I need to identify the relevant tables and columns. The question involves directors and the movies they directed. Looking at the provided schemas, the tables involved are:
+
+- **movies**: Contains movie details, including movie_id and director_id (since each movie has a director).
+- **directors**: The director's full name and ID are here. But the question asks for the director's ID, so maybe we don't need to join with directors unless the answer requires the name. However, the user's instruction says to give the director's id, so perhaps the answer is just the director_id from the movies table.
+
+Wait, but the movies table's director_id is linked to the directors table's user_id. So to get the director's ID, we might need to join movies and directors. But the question doesn't mention the director's name, so maybe we can just use the director_id from the movies table. Let me check the sample data.
+
+Looking at the movies table's director_id sample rows: 131, 73, 82. These correspond to directors in the directors table. For example, director_id 131 is Esteban Sapir. So each movie in the movies table is associated with a director_id, which is a primary key in the directors table. Therefore, the director's ID is stored in the movies table's director_id column. 
+
+So the plan is to count the number of movies each director has directed by grouping on director_id and then selecting the director_id with the highest count. 
+
+Step 1: Schema linking. The relevant tables are movies and directors. But since we only need the director's ID and the count, maybe we can just use the movies table. However, to ensure correctness, we should join movies and directors to get the director's ID for each movie.
+
+<schema_linking>
+{
+  "movies": ["movie_id", "director_id"],
+  "directors": ["user_id", "director_id", "director_name"]
+}
+</schema_linking>
+
+Step 2: Check if the director_id in movies is valid. Let's write a SQL query to count the movies per director_id.
+
+<exec_sql>
+SELECT "director_id", COUNT(*) AS movie_count
+FROM "movies"
+GROUP BY "director_id"
+ORDER BY movie_count DESC
+LIMIT 5;
+</exec_sql>
+<exec_result>
+director_id,movie_count
+524073,746
+18991,253
+35368,188
+34989,179
+47738,166
+
+</exec_result>
+
+The result shows that director_id 524073 has the highest count of 746 movies. Therefore, the director with the most movies is the one with ID 524073. 
+
+Step 3: Final schema remains the same since we only needed the movies table. The final SQL should select the director_id with the maximum count.
+
+<exec_sql>
+SELECT "director_id" 
+FROM "movies" 
+GROUP BY "director_id" 
+ORDER BY COUNT(*) DESC 
+LIMIT 1;
+</exec_sql>
+<exec_result>
+director_id
+524073
+
+</exec_result>
+
+This query returns the director_id 524073 as the director who made the most movies. 
+</think>
+
+<answer>
+SELECT "director_id" 
+FROM "movies" 
+GROUP BY "director_id" 
+ORDER BY COUNT(*) DESC 
+LIMIT 1;
+</answer>
+
+Now it's time for you to answer by following the format of the example.
 """
 
 def make_map_fn(split: str):

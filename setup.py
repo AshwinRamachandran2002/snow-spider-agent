@@ -7,7 +7,7 @@ setup(
     author='Agentica Team',
     packages=find_packages(include=['rllm',]),
     install_requires=[
-        'torch==2.4.0',
+        'torch==2.7.0',
         'deepspeed',
         'dm-tree',
         'gdown',

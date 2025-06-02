@@ -36,11 +36,11 @@ import traceback
 from torch import nn
 
 from verl import DataProto
-from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
+from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
-from vllm import SamplingParams
+from verl.third_party.vllm import SamplingParams
 import time
 # TODO
 # 1. support pp in vllm
@@ -67,7 +67,7 @@ class BanTokens:
 
 class vLLMRollout(BaseRollout):
 
-    def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, reward_fn, val_reward_fn, **kwargs):
+    def __init__(self, actor_module: str, config: DictConfig, tokenizer, model_hf_config, reward_fn, val_reward_fn, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -107,10 +107,12 @@ class vLLMRollout(BaseRollout):
 
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
+        # print(model_hf_config)
         self.inference_engine = LLM(actor_module,
-                                    tokenizer=tokenizer,
+                                    enable_sleep_mode=True,
+                                    tokenizer=actor_module,
                                     sql_executor_config=config.sql_executor,
-                                    model_hf_config=model_hf_config,
+                                    # model_hf_config=model_hf_config,
                                     tensor_parallel_size=tensor_parallel_size,
                                     dtype=config.dtype,
                                     enforce_eager=config.enforce_eager,
@@ -123,7 +125,7 @@ class vLLMRollout(BaseRollout):
         self.tensor_parallel_rank = vllm_ps.get_tensor_model_parallel_rank()
         print(f"Rank {torch.distributed.get_rank()}, TP rank {self.tensor_parallel_rank} initialized vLLM rollout")
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.offload_model_weights()
+        self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,
@@ -182,8 +184,15 @@ class vLLMRollout(BaseRollout):
         Raises:
             RuntimeError: If generation fails after max_retries attempts.
         """
-        # Rebuild vLLM cache engine if configured
-        if self.config.free_cache_engine:
+        # rebuild vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
             self.inference_engine.init_cache_engine()
         # Extract input tensors from prompt batch
         idx = prompts.batch['input_ids']
@@ -259,17 +268,31 @@ class vLLMRollout(BaseRollout):
         self.inference_engine.llm_engine.sql_executor_context.start_time = time.time()
         # Generate sequences
         with self.update_sampling_params(**kwargs):
-            output = self.inference_engine.generate(
+            outputs = self.inference_engine.generate(
                 prompts=None,
                 sampling_params=batch_sampling_params,
                 prompt_token_ids=idx_list,
                 use_tqdm=False)
 
-        self.inference_engine.llm_engine.sql_executor_context.remove_all_ids()
+            self.inference_engine.llm_engine.sql_executor_context.remove_all_ids()
 
         # Process outputs
-        response = output[0].to(idx.device)
-        log_probs = output[1].to(idx.device)
+        # response = output[0].to(idx.device)
+        # log_probs = output[1].to(idx.device)
+            response = []
+            rollout_log_probs = []
+            for output in outputs:
+                for sample_id in range(len(output.outputs)):
+                    response_ids = output.outputs[sample_id].token_ids
+                    response.append(response_ids)
+                    curr_log_prob = []
+                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        curr_log_prob.append(logprob[response_ids[i]].logprob)
+                    rollout_log_probs.append(curr_log_prob)
+
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            log_probs = rollout_log_probs.to(torch.float32)
 
         # Pad sequences if needed
         if response.shape[1] < self.config.response_length:
@@ -327,8 +350,15 @@ class vLLMRollout(BaseRollout):
             },
             batch_size=batch_size)
 
-        # Free cache if configured
-        if self.config.free_cache_engine:
+        # free vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
             self.inference_engine.free_cache_engine()
 
         batch = DataProto(batch=batch,

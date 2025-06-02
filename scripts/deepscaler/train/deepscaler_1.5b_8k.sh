@@ -25,7 +25,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$MODEL_PATH" ]; then
-    MODEL_PATH="models/DeepSeek-R1-Distill-Qwen-1.5B-sft"
+    MODEL_PATH="/mbz/bruce/exec-fb/models/Qwen3-1.7B"
     # MODEL_PATH="/mbz/bruce/exec-fb/checkpoints/execution/test/actor/global_step_100"
 fi
 

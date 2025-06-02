@@ -45,6 +45,12 @@ elif package_version == '0.6.3':
     from .vllm_v_0_6_3.llm import LLM
     from .vllm_v_0_6_3.llm import LLMEngine
     from .vllm_v_0_6_3 import parallel_state
+elif package_version == '0.9.0.1':
+    vllm_version = '0.9.0.1'
+    from .vllm_v_0_9_0_1.llm import LLM
+    from .vllm_v_0_9_0_1.llm import LLMEngine
+    from .vllm_v_0_9_0_1.sampling_params import SamplingParams
+    from vllm.distributed import parallel_state   
 else:
     raise ValueError(
         f'vllm version {package_version} not supported. Currently supported versions are 0.3.1, 0.4.2, 0.5.4 and 0.6.3.'
