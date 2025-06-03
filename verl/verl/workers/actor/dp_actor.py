@@ -298,6 +298,17 @@ class DataParallelPPOActor(BasePPOActor):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         dataloader = batch.split(self.config.ppo_mini_batch_size)
         tokenizer = AutoTokenizer.from_pretrained(os.getenv("MODEL_PATH"))
+        exec_result_start = tokenizer.encode("<exec_result>", add_special_tokens=False)[0]
+        exec_result_end = tokenizer.encode("</exec_result>", add_special_tokens=False)[0]
+        answer_start = tokenizer.encode("<answer>", add_special_tokens=False)[0]
+        answer_end = tokenizer.encode("</answer>", add_special_tokens=False)[0]
+        exec_sql_start = tokenizer.encode("<exec_sql>", add_special_tokens=False)[0]
+        exec_sql_end = tokenizer.encode("</exec_sql>", add_special_tokens=False)[0]
+        think_start = tokenizer.encode("<think>", add_special_tokens=False)[0]
+        think_end = tokenizer.encode("</think>", add_special_tokens=False)[0]
+        schema_linking_start = tokenizer.encode("<schema_linking>", add_special_tokens=False)[0]
+        schema_linking_end = tokenizer.encode("</schema_linking>", add_special_tokens=False)[0]
+
         metrics = {}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(dataloader):
@@ -319,6 +330,7 @@ class DataParallelPPOActor(BasePPOActor):
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
                     response_mask = attention_mask[:, -response_length:]
+                    response_mask_kl = attention_mask[:, -response_length:]
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 
@@ -330,20 +342,34 @@ class DataParallelPPOActor(BasePPOActor):
                     ignore_now = False
                     for batch in range(len(responses)):
                         for index in range(len(responses[batch])):
-                            if responses[batch][index] == tokenizer.encode("<exec_result>", add_special_tokens=False)[0]:
-                                assert responses[batch][index-2] == tokenizer.encode("</exec_sql>", add_special_tokens=False)[0], tokenizer.decode(responses)
+                            if index >= 2 and responses[batch][index] == exec_result_start:
+                                assert responses[batch][index-2] == exec_sql_end, tokenizer.decode([responses[batch][index-2]])
                                 response_mask[batch][index-1] = 0 # mask \n before <exec_res>
                                 response_mask[batch][index] = 0
                                 ignore_now = True
                                 continue                                    
                             
-                            if responses[batch][index] == tokenizer.encode("</exec_result>", add_special_tokens=False)[0]:
+                            if responses[batch][index] == exec_result_end:
                                 response_mask[batch][index] = 0
                                 ignore_now = False
                                 
                             if ignore_now or responses[batch][index] == tokenizer.eos_token_id: # mask pad, eos, bos
                                 response_mask[batch][index] = 0
 
+                            if responses[batch][index] in [
+                                    tokenizer.eos_token_id, 
+                                    exec_result_start,
+                                    exec_result_end,
+                                    answer_start,
+                                    answer_end,
+                                    exec_sql_start,
+                                    exec_sql_end,
+                                    think_start,
+                                    think_end,
+                                    schema_linking_start,
+                                    schema_linking_end,
+                            ]:
+                                response_mask_kl[batch][index] = 0
 
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                                 log_prob=log_prob,
@@ -361,7 +387,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
-                        log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length)
+                        # log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length)
                         # compute kl loss
                         kld = core_algos.kl_penalty(logprob=log_prob,
                                                     ref_logprob=ref_log_prob,

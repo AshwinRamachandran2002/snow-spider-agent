@@ -13,6 +13,7 @@ from rllm.system_prompts import ORM_PROMPT
 from rllm.utils import calculate_md5, call_oai_rm_llm
 import os 
 import re
+from datetime import datetime
 ORM_USER_TEMPLATE = """
 Problem: {problem}
 Answer 1: {answer_1}
@@ -92,11 +93,19 @@ class RewardSQLFn(RewardFn):
         # print(f"input.metadata: {input.metadata}")
         example_id = input.metadata["example_id"]
         model_response = input.model_response
-        
+
         response_str = model_response[model_response.rfind("<think>"):]
+        filename = calculate_md5(response_str[response_str.find("<exec_sql>"):response_str.find("</answer>")])
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_dir = os.path.join("log_all", timestamp)
+        os.makedirs(log_dir, exist_ok=True)
+        with open(os.path.join(log_dir, example_id + '_' + filename + ".log"), "w") as f:
+            f.write(input.model_response) 
+
         if response_str.count("</answer>") != 1:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
-        filename = calculate_md5(response_str[response_str.find("<exec_sql>"):response_str.find("</answer>")])
+        
         # response_str = response_str[response_str.find("<answer>")+len("<answer>"):response_str.find("</answer>")]
         log_folder = os.getenv("EXEC_FOLDER")
         log_path = os.path.join(log_folder, example_id + '_' + filename + ".log")
@@ -104,8 +113,6 @@ class RewardSQLFn(RewardFn):
         # print(f"log_path: {log_path}")
         
         if not os.path.exists(log_path):
-            # with open(os.path.join("log", example_id + '_' + filename + ".log"), "w") as f:
-            #     f.write(input.model_response) 
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
         if not os.path.exists(csv_path):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)

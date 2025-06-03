@@ -29,6 +29,12 @@ Step 1: Identify all relevant schemas (which may include more than just the gold
 Step 2: Write SQL queries to examine the values of each column in the JSON to assess their validity. Use <exec_sql></exec_sql> tags to execute SQL queries. The results will be returned in <exec_result></exec_result> tags. You should reason based on results.
 
 Step 3: After reviewing all relevant schemas and values from the database, decide on the final schema to use by removing useless parts in the previous JSON. 
+
+If the schema changes, update it as:
+<schema_linking>
+{Table name: [column name1, column name2]}.
+</schema_linking>
+
 Then, generate the final SQL query inside <exec_sql></exec_sql> tags and verify its correctness based on the feedback provided in <exec_result></exec_result> tags.
 
 Step 4: Write the final SQL in <answer></answer> tags.
@@ -39,7 +45,7 @@ Do not generate <exec_result></exec_result> tags yourself. If any syntax error o
 
 You should reason in <think></think> tags and anwer in <answer></answer> tags.
 
-The SQL dialect must be SQLite. Use the format SELECT "column_name" FROM "table_name" WHERE ..., replacing "table_name" and "column_name" with actual names. Always enclose table and column names in double quotation marks.
+The SQL dialect must be SQLite. Use the format SELECT `column_name` FROM `table_name` WHERE ..., replacing `table_name` and `column_name` with actual names. Always enclose table and column names in backquotes.
 
 Here's an example:
 {DB Info}
@@ -71,9 +77,9 @@ Step 1: Schema linking. The relevant tables are movies and directors. But since 
 Step 2: Check if the director_id in movies is valid. Let's write a SQL query to count the movies per director_id.
 
 <exec_sql>
-SELECT "director_id", COUNT(*) AS movie_count
-FROM "movies"
-GROUP BY "director_id"
+SELECT `director_id`, COUNT(*) AS movie_count
+FROM `movies`
+GROUP BY `director_id`
 ORDER BY movie_count DESC
 LIMIT 5;
 </exec_sql>
@@ -89,12 +95,20 @@ director_id,movie_count
 
 The result shows that director_id 524073 has the highest count of 746 movies. Therefore, the director with the most movies is the one with ID 524073. 
 
-Step 3: Final schema remains the same since we only needed the movies table. The final SQL should select the director_id with the maximum count.
+Step 3: Final schema changed since we only needed the movies table. 
+
+<schema_linking>
+{
+  "movies": ["movie_id", "director_id"]
+}
+</schema_linking>
+
+The final SQL should select the director_id with the maximum count.
 
 <exec_sql>
-SELECT "director_id" 
-FROM "movies" 
-GROUP BY "director_id" 
+SELECT `director_id` 
+FROM `movies` 
+GROUP BY `director_id` 
 ORDER BY COUNT(*) DESC 
 LIMIT 1;
 </exec_sql>
@@ -108,9 +122,9 @@ This query returns the director_id 524073 as the director who made the most movi
 </think>
 
 <answer>
-SELECT "director_id" 
-FROM "movies" 
-GROUP BY "director_id" 
+SELECT `director_id` 
+FROM `movies` 
+GROUP BY `director_id` 
 ORDER BY COUNT(*) DESC 
 LIMIT 1;
 </answer>
