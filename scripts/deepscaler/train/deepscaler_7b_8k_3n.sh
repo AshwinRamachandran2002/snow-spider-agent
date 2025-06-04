@@ -19,8 +19,8 @@ NNODES=${#HOSTS[@]}
 #############################
 NODE_RANK=$1
 shift
-MODEL_PATH="checkpoints/execution/8B/actor/global_step_50"
-# MODEL_PATH="models/Qwen3-8B-sft"
+# MODEL_PATH="/mbz/bruce/exec-fb/models/Qwen3-8B-sft/checkpoint-40"
+MODEL_PATH="models/Qwen3-8B-sft"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -124,7 +124,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
         actor_rollout_ref.rollout.n=16 \
         actor_rollout_ref.rollout.n_val=1 \
-        actor_rollout_ref.rollout.sql_executor.max_time=600 \
+        actor_rollout_ref.rollout.sql_executor.max_time=400 \
         actor_rollout_ref.rollout.sql_executor.max_calls=20 \
         actor_rollout_ref.rollout.sql_executor.timeout_for_exploration=10 \
         actor_rollout_ref.rollout.sql_executor.timeout_for_final_answer=10 \
@@ -135,7 +135,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         trainer.critic_warmup=0 \
         trainer.logger=['console','wandb'] \
         trainer.project_name='execution' \
-        trainer.experiment_name='8B_1epoch' \
+        trainer.experiment_name='8B' \
         +trainer.val_before_train=False \
         trainer.n_gpus_per_node=$GPUS_PER_NODE \
         trainer.nnodes=$NNODES \

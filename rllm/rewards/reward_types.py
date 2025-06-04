@@ -30,6 +30,8 @@ class RewardConfig:
     half_correct_reward: float = 0.9
     format_reward: float = 0.1
 
+    sl_bonus: float = 0.1 
+
 class RewardType(Enum):
     """
     Enum class representing the different types of rewards that can be assigned.

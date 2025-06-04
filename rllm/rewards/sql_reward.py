@@ -35,15 +35,12 @@ class RewardSQLFn(RewardFn):
             if start_count == 1 and end_count == 1:
                 return True
             return False
-    
+
         # if not check_once("<think>", "</think>", text):
         #     return 0
         if text.count("</think>") != 1:
             return False
-
-        if text.count("<schema_linking>") != text.count("</schema_linking>") or text.count("<schema_linking>") < 1:
-            return False
-
+        
         if not check_once("<answer>", "</answer>", text):
             return False
 
@@ -62,11 +59,16 @@ class RewardSQLFn(RewardFn):
             'exec_result_close': len(re.findall(r'</exec_result>', text)),
             'SELECT': len(re.findall(r'<exec_sql>\nSELECT', text)),
             ';\n': len(re.findall(r';\n</exec_sql>', text)),
+            'schema_linking_open': len(re.findall(r'<schema_linking>', text)),
+            'schema_linking_close': len(re.findall(r'</schema_linking>', text)),
         }
 
         if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
                 all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
                 all_tag_counts["SELECT"] == all_tag_counts[";\n"]):
+            return False
+
+        if not (all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close']) or all_tag_counts['schema_linking_open'] < 1:
             return False
 
         if not tags:
@@ -87,6 +89,16 @@ class RewardSQLFn(RewardFn):
 
         return True
 
+    def check_sl_bonus(self, text):
+        all_tag_counts = {
+            'schema_linking_open': len(re.findall(r'<schema_linking>', text)),
+            'schema_linking_close': len(re.findall(r'</schema_linking>', text)),
+        }
+
+        if all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close'] and all_tag_counts['schema_linking_open'] >= 2:
+            return True
+        return False
+
     def __call__(self, input: RewardInput) -> RewardOutput:
         assert input.problem_type == RewardType.CODE, \
             "Invalid problem type: expected 'CODE', but got '{}'".format(input.problem_type)
@@ -96,12 +108,6 @@ class RewardSQLFn(RewardFn):
 
         response_str = model_response[model_response.rfind("<think>"):]
         filename = calculate_md5(response_str[response_str.find("<exec_sql>"):response_str.find("</answer>")])
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_dir = os.path.join("log_all", timestamp)
-        os.makedirs(log_dir, exist_ok=True)
-        with open(os.path.join(log_dir, example_id + '_' + filename + ".log"), "w") as f:
-            f.write(input.model_response) 
 
         if response_str.count("</answer>") != 1:
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
@@ -117,16 +123,27 @@ class RewardSQLFn(RewardFn):
         if not os.path.exists(csv_path):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
 
+        sl_bonus = 0
+        if self.check_sl_bonus(response_str):
+            sl_bonus = self.config.sl_bonus
         with open(log_path.replace(".log", ".txt")) as f:
             is_correct = int(f.read())
             if is_correct: 
                 print(f"Correct: {example_id}")
+
                 if self.is_valid_exec_sequence(response_str):
-                    return RewardOutput(reward=self.config.correct_reward, is_correct=True)
+                    # log trajectory
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    log_dir = os.path.join("log_all", timestamp)
+                    os.makedirs(log_dir, exist_ok=True)
+                    with open(os.path.join(log_dir, example_id + '_' + filename + ".log"), "w") as f:
+                        f.write(input.model_response) 
+                    
+                    return RewardOutput(reward=self.config.correct_reward+sl_bonus, is_correct=True)
                 # return RewardOutput(reward=self.config.half_correct_reward, is_correct=True)
         # Format
         if self.is_valid_exec_sequence(response_str):
-            return RewardOutput(reward=self.config.format_reward, is_correct=False)
+            return RewardOutput(reward=self.config.format_reward+sl_bonus, is_correct=False)
         return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
 
 

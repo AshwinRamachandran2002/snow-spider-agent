@@ -18,79 +18,20 @@ def hard_cut(str_e, length=0):
             str_e = f"Too long, show first {length} chars:\n" + str_e[:int(length)]+"\n"
     return str_e
 
-# def exec_sql_(con, sql_query, exe_id, save_path=None, api="snowflake", max_len=30000, LIMIT=None, sqlite_path=None, example_id=None):
-#     cursor = con.cursor()
-#     # Don't add LIMIT
-#     try:
-#         cursor.execute(sql_query)
-#     except Exception as e:
-#         cursor.close()
-#         return "##ERROR## Incorrect SQL Syntax: " + str(e)
-    
-#     def get_rows(cursor):
-#         rows = []
-#         current_len = 0
-#         for row in cursor:
-#             row_str = str(row)
-#             rows.append(row)
-#             current_len += len(row_str)
-#             if current_len + len(row_str) > max_len:
-#                 break
-#         return rows
-    
-#     try:
-#         rows = get_rows(cursor)
-#         if cursor.description is None:
-#             err = f"##ERROR## Not a valid SELECT SQL: {sql_query}"
-#             print(err)
-#             return err
-#         columns = [desc[0] for desc in cursor.description]
-#     except Exception as e:
-#         print(f"##ERROR## sqlite_path: {sqlite_path}, len(self.conns): {len(self.conns)}, {str(e)}.")
-#         return "##ERROR## " + str(e)
-#     finally:
-#         try:
-#             cursor.close()
-#         except Exception as e:
-#             print("##ERROR## Failed to close cursor:", e)
+def warn_if_literal_column_from_result(exec_result_text: str):
+    lines = exec_result_text.strip().splitlines()
 
-#     if not rows:
-#         return "No data found for the specified query.\n"
-#     else:
-#         output = io.StringIO()
-#         writer = csv.writer(output)
-#         writer.writerow(columns)
-#         writer.writerows(rows)
-#         csv_content = output.getvalue()
-#         output.close()
-#         if save_path:
-#             try:
-#                 with open(save_path, 'w', newline='') as f:
-#                     f.write(csv_content)
-#                 return 0
-#             except Exception as e:
-#                 print("##ERROR## ", str(e))
-#                 return str(e)
-#         else:
-#             return hard_cut(csv_content, max_len)
+    # Clean each line: remove leading/trailing quotes and whitespace
+    cleaned = [line.strip().strip('"') for line in lines if line.strip()]
+    
+    if not cleaned:
+        return
 
-# def _sql_worker_wrapper(args):
-#     sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id = args
-#     try:
-#         con = sqlite3.connect(
-#             f"file:{sqlite_path}?mode=memory&cache=shared",
-#             uri=True, 
-#             check_same_thread=False
-#         )
-#         result = exec_sql_(con, sql_query, exe_id, save_path, api, max_len, LIMIT, sqlite_path, example_id)
-#         return str(result)
-#     except Exception as e:
-#         import traceback
-#         traceback.print_exc()
-#         print("Exception in worker", str(e))
-#         return f"##ERROR## {str(e)}"
-#     finally:
-#         con.close()
+    # If all values are the same, it's suspicious
+    if all(val.lower() == cleaned[0].lower() for val in cleaned):
+        candidate_col = cleaned[0]
+        exec_result_text += f"\nWarning: All results are '{candidate_col}', which suggests you may have used a non-existent column name as a string literal.\n"
+    return exec_result_text
 
 class SqlEnv:
     def __init__(self):
@@ -199,7 +140,7 @@ class SqlEnv:
             writer = csv.writer(output)
             writer.writerow(columns)
             writer.writerows(rows)
-            csv_content = output.getvalue()
+            csv_content = warn_if_literal_column_from_result(output.getvalue())
             output.close()
             if save_path:
                 try:

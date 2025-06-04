@@ -387,7 +387,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
-                        # log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length)
+                        log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length)
                         # compute kl loss
                         kld = core_algos.kl_penalty(logprob=log_prob,
                                                     ref_logprob=ref_log_prob,

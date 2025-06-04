@@ -642,17 +642,17 @@ class RayPPOTrainer(object):
                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
                             
                             # Check if all rewards are 0 or all are 1 for this uid
-                            if (uid_rewards != 1).all():
+                            if (uid_rewards < 1).all():
                                 valid_mask[uid_mask] = False
                                 solve_none += 1
-                            elif (uid_rewards == 1).all():
+                            elif (uid_rewards >= 1).all():
                                 valid_mask[uid_mask] = False
                                 solve_all += 1
 
                             wrong_ans_and_wrong_format += torch.sum(uid_rewards == 0)
-                            wrong_ans_and_right_format += torch.sum(uid_rewards == 0.1)
-                            right_ans_and_wrong_format += torch.sum(uid_rewards == 0.9)
-                            right_ans_and_right_format += torch.sum(uid_rewards == 1)
+                            wrong_ans_and_right_format += torch.sum((uid_rewards > 0) & (uid_rewards < 1))
+                            # right_ans_and_wrong_format += torch.sum(uid_rewards == 0.9)
+                            right_ans_and_right_format += torch.sum(uid_rewards >= 1)
                         
                         # Log to metrics
                         metrics['batch/solve_none'] = solve_none
