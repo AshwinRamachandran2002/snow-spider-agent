@@ -100,6 +100,15 @@ class DataCollatorForSupervisedDataset(object):
             input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+
+        # Debug
+        supervised_count = (labels != IGNORE_INDEX).sum().item()
+        print(f"[collate_fn] Batch supervised tokens: {supervised_count}")
+        if supervised_count == 0:
+            print("[WARNING] All labels are IGNORE_INDEX! Possible data or masking issue.")
+            print("Labels", labels)
+            print("Input ids", input_ids)
+
         return dict(
             input_ids=input_ids,
             labels=labels,

@@ -1,110 +1,92 @@
-prompt = """
-You are a data scientist proficient in Text-to-SQL tasks.
+import re
+def is_valid_exec_sequence(text):
+    def check_once(start, end, text):
+        start_count = text.count(start)
+        end_count = text.count(end)
+        if start_count == 1 and end_count == 1:
+            return True
+        return False
 
-Given a task, you should reason step by step using execution feedback to arrive at the final answer.
+    # if not check_once("<think>", "</think>", text):
+    #     return 0
+    if text.count("</think>") != 1:
+        return False
+    
+    if not check_once("<answer>", "</answer>", text):
+        return False
 
-Step 1: Identify all relevant schemas (which may include more than just the gold schema) and enclose them within <schema_linking></schema_linking> tags. The schema should be represented in JSON format:
-<schema_linking>
-{Table name: [column name1, column name2]}.
-</schema_linking>
+    text = text[:text.find("</think>")]
+    
+    if len(re.findall(r'<exec_sql>\nSELECT', text)) != len(re.findall(r'\nSELECT', text)):
+        return False
 
-Step 2: Write SQL queries to examine the values of each column in the JSON to assess their validity. Use <exec_sql></exec_sql> tags to execute SQL queries. The results will be returned in <exec_result></exec_result> tags. You should reason based on results.
+    tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
+    tags = tag_pattern.findall(text)
 
-Step 3: After reviewing all relevant schemas and values from the database, decide on the final schema to use by removing useless parts in the previous JSON. 
-Then, generate the final SQL query inside <exec_sql></exec_sql> tags and verify its correctness based on the feedback provided in <exec_result></exec_result> tags.
+    all_tag_counts = {
+        'exec_sql_open': len(re.findall(r'<exec_sql>', text)),
+        'exec_sql_close': len(re.findall(r'</exec_sql>', text)),
+        'exec_result_open': len(re.findall(r'<exec_result>', text)),
+        'exec_result_close': len(re.findall(r'</exec_result>', text)),
+        'SELECT': len(re.findall(r'<exec_sql>\nSELECT', text)),
+        ';\n': len(re.findall(r';\n</exec_sql>', text)),
+        'schema_linking_open': len(re.findall(r'<schema_linking>', text)),
+        'schema_linking_close': len(re.findall(r'</schema_linking>', text)),
+    }
 
-Step 4: Write the final SQL in <answer></answer> tags.
+    if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
+            all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
+            all_tag_counts["SELECT"] == all_tag_counts[";\n"]):
+        return False
 
-Note: 
+    if not (all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close']) or all_tag_counts['schema_linking_open'] < 1:
+        return False
 
-Do not generate <exec_result></exec_result> tags yourself. If any syntax error or empty result occurs, revise your query accordingly before proceeding. All 'SELECT' should be in <exec_sql></exec_sql> block.
+    if not tags:
+        return False
 
-You should reason in <think></think> tags and anwer in <answer></answer> tags.
+    if len(tags) % 2 != 0 or len(tags) < 2:
+        return False
 
-The SQL dialect must be SQLite. Use the format SELECT "column_name" FROM "table_name" WHERE ..., replacing "table_name" and "column_name" with actual names. Always enclose table and column names in double quotation marks.
+    for i, tag in enumerate(tags):
+        if i % 2 == 0 and not tag.startswith('<exec_sql>'):
+            return False
+        if i % 2 == 1 and not tag.startswith('<exec_result>'):
+            return False
+        # if i % 2 == 1 and i > 2 and tag.startswith('<exec_result>'):
+        #     if "No data found for the specified query." in tags[i-2] or "##ERROR##" in tags[i-2]:
+        #         if "No data found for the specified query." in tags[i] or "##ERROR##" in tags[i]:
+        #             return False
 
-Here's an example:
-{DB Info}
-Question: Who is the director that made the most movies? Give the director's id. director that made the most movies refers to MAX(COUNT(movie_id))
-Your answer:
-<think>
-Okay, let's tackle the question: "Who is the director that made the most movies? Give the director's id." The user mentioned that the director with the most movies refers to MAX(COUNT(movie_id)). 
+    return True
 
-First, I need to identify the relevant tables and columns. The question involves directors and the movies they directed. Looking at the provided schemas, the tables involved are:
+def replace_quotes_in_exec_sql_blocks(text):
+    def replacer(match):
+        content = match.group(1)
+        replaced_content = content.replace('"', '`')
+        return f"<exec_sql>{replaced_content}</exec_sql>"
 
-- **movies**: Contains movie details, including movie_id and director_id (since each movie has a director).
-- **directors**: The director's full name and ID are here. But the question asks for the director's ID, so maybe we don't need to join with directors unless the answer requires the name. However, the user's instruction says to give the director's id, so perhaps the answer is just the director_id from the movies table.
+    pattern = r"<exec_sql>(.*?)</exec_sql>"
+    return re.sub(pattern, replacer, text, flags=re.DOTALL)
 
-Wait, but the movies table's director_id is linked to the directors table's user_id. So to get the director's ID, we might need to join movies and directors. But the question doesn't mention the director's name, so maybe we can just use the director_id from the movies table. Let me check the sample data.
+def replace_quotes_in_answer_blocks(text):
+    def replacer(match):
+        content = match.group(1)
+        replaced_content = content.replace('"', '`')
+        return f"<answer>{replaced_content}</answer>"
 
-Looking at the movies table's director_id sample rows: 131, 73, 82. These correspond to directors in the directors table. For example, director_id 131 is Esteban Sapir. So each movie in the movies table is associated with a director_id, which is a primary key in the directors table. Therefore, the director's ID is stored in the movies table's director_id column. 
-
-So the plan is to count the number of movies each director has directed by grouping on director_id and then selecting the director_id with the highest count. 
-
-Step 1: Schema linking. The relevant tables are movies and directors. But since we only need the director's ID and the count, maybe we can just use the movies table. However, to ensure correctness, we should join movies and directors to get the director's ID for each movie.
-
-<schema_linking>
-{
-  "movies": ["movie_id", "director_id"],
-  "directors": ["user_id", "director_id", "director_name"]
-}
-</schema_linking>
-
-Step 2: Check if the director_id in movies is valid. Let's write a SQL query to count the movies per director_id.
-
-<exec_sql>
-SELECT "director_id", COUNT(*) AS movie_count
-FROM "movies"
-GROUP BY "director_id"
-ORDER BY movie_count DESC
-LIMIT 5;
-</exec_sql>
-<exec_result>
-director_id,movie_count
-524073,746
-18991,253
-35368,188
-34989,179
-47738,166
-
-</exec_result>
-
-The result shows that director_id 524073 has the highest count of 746 movies. Therefore, the director with the most movies is the one with ID 524073. 
-
-Step 3: Final schema remains the same since we only needed the movies table. The final SQL should select the director_id with the maximum count.
-
-<exec_sql>
-SELECT "director_id" 
-FROM "movies" 
-GROUP BY "director_id" 
-ORDER BY COUNT(*) DESC 
-LIMIT 1;
-</exec_sql>
-<exec_result>
-director_id
-524073
-
-</exec_result>
-
-This query returns the director_id 524073 as the director who made the most movies. 
-</think>
-
-<answer>
-SELECT "director_id" 
-FROM "movies" 
-GROUP BY "director_id" 
-ORDER BY COUNT(*) DESC 
-LIMIT 1;
-</answer>
-
-Now it's time for you to answer by following the format of the example.
-"""
+    pattern = r"<answer>(.*?)</answer>"
+    return re.sub(pattern, replacer, text, flags=re.DOTALL)
 
 import os
 import json
 from tqdm import tqdm
-with open("/mbz/bruce/exec-fb/data_preprocess/data/train/bird.json") as f:
-    bird_data = json.load(f)
+import pandas as pd
+# with open("/mbz/bruce/exec-fb/data_preprocess/data/train/bird.json") as f:
+#     bird_data = json.load(f)
+file_path = '/mbz/bruce/exec-fb/data_preprocess/data/processed/train.parquet'
+bird_data = pd.read_parquet(file_path)
+
 log_dir = "/mbz/bruce/logs"
 gen_data = []
 id_rec = []
@@ -117,27 +99,32 @@ for step in os.listdir(log_dir):
         if example.endswith(".txt") and example_id not in id_rec:
             with open(example_dir) as f:
                 data = f.read().strip()
-            if data == "1":
-                with open(example_dir.replace(".txt", ".log")) as f:
-                    l = f.read()
-                    
-                for i in bird_data:
-                    if i["example_id"] == f"local_BIRD_train_{example_id}":
-                        db_info = i["input"]
-                        question = i["question"]
-                gen_dict = {
-                    "messages": [
-                        {"role": "user", "content": prompt + "DB Info: " + db_info + "\n" + "Question: " + question + "\n"},
-                        {"role": "assistant", "content": "<think>\n"+l}
-                    ],
-                    "format": "chatml"
-                }
+            with open(example_dir.replace(".txt", ".log")) as f:
+                l = f.read()
+            if data == "1" and is_valid_exec_sequence(l):
+                # l = replace_quotes_in_exec_sql_blocks(l)
+                # l = replace_quotes_in_answer_blocks(l)
+                user_prompt = None
+                for index, row in bird_data.iterrows():
+                    if row["reward_model"]["ground_truth"]["example_id"] == f"local_BIRD_train_{example_id}":
+                        sys_prompt = row["prompt"][0]["content"]
+                        user_prompt = row["prompt"][1]["content"]
+                if user_prompt:
+                    gen_dict = {
+                        "messages": [
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": user_prompt},
+                            {"role": "assistant", "content": "<think>\n"+l}
+                        ],
+                        "format": "chatml"
+                    }
+                else:
+                    print(example_dir)
+                    continue
                 
                 gen_data.append(gen_dict)
                 id_rec.append(example_id)
-            else:
-                assert data == "0", example_dir
-print(gen_data[0])
+print(gen_data[0]["messages"][-1]["content"])
 print("Length", len(gen_data))
 
 with open("raw/bird_trajectory_log.jsonl", "w") as f:

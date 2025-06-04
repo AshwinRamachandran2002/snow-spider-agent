@@ -41,7 +41,7 @@ WORLD_SIZE=$(($GPUS_PER_NODE * $NNODES))
 # 4. Training hyperparameters
 #######################
 DEEPSPEED_CONFIG="./configs/default_offload_opt_param.json"
-BATCH_SIZE=32
+BATCH_SIZE=16
 MICRO_BATCH_SIZE=1
 GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 
@@ -62,7 +62,7 @@ export NCCL_NET_GDR_LEVEL=PHB
 export NCCL_SOCKET_IFNAME=eth0             # 确保 eth0 是主通信接口，按 `ip a` 确定
 export NCCL_TOPO_DUMP_FILE=/tmp/nccl_topo_${RANK}.xml
 export GLOO_SOCKET_IFNAME=eth0             # 避免 fallback 的 GLOO 后端出问题
-
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 #######################
 # 6. Print configuration summary
@@ -94,12 +94,12 @@ torchrun \
     --data_path ${DATA_PATH} \
     --model_max_length ${MAX_LENGTH} \
     --output_dir ${OUTPUT_DIR} \
-    --num_train_epochs 3 \
+    --num_train_epochs 6 \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --per_device_eval_batch_size 4 \
     --save_strategy "steps" \
-    --save_steps 100 \
+    --save_steps 1000 \
     --save_total_limit 100 \
     --learning_rate ${LR} \
     --weight_decay ${WEIGHT_DECAY} \
@@ -111,4 +111,5 @@ torchrun \
     --report_to "tensorboard" \
     --bf16 True \
     --tf32 True \
-    --truncate_source False
+    --truncate_source False \
+    --resume_from_checkpoint /mbz/bruce/exec-fb/models/Qwen3-8B-sft/checkpoint-273
