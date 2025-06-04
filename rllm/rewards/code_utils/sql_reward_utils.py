@@ -18,20 +18,28 @@ def hard_cut(str_e, length=0):
             str_e = f"Too long, show first {length} chars:\n" + str_e[:int(length)]+"\n"
     return str_e
 
-def warn_if_literal_column_from_result(exec_result_text: str):
-    lines = exec_result_text.strip().splitlines()
+def warn_if_literal_column_from_result(csv_text: str):
+    reader = csv.reader(io.StringIO(csv_text))
+    rows = list(reader)
 
-    # Clean each line: remove leading/trailing quotes and whitespace
-    cleaned = [line.strip().strip('"') for line in lines if line.strip()]
-    
-    if not cleaned:
-        return
+    if not rows or len(rows) < 2:
+        return csv_text
 
-    # If all values are the same, it's suspicious
-    if all(val.lower() == cleaned[0].lower() for val in cleaned):
-        candidate_col = cleaned[0]
-        exec_result_text += f"\nWarning: All results are '{candidate_col}', which suggests you may have used a non-existent column name as a string literal.\n"
-    return exec_result_text
+    header = [h.strip('"') for h in rows[0]]  # strip triple quotes if present
+    data_rows = rows[1:]
+
+    num_cols = len(header)
+
+    for col_idx in range(num_cols):
+        col_name = header[col_idx]
+        col_values = [row[col_idx].strip('"') for row in data_rows if len(row) > col_idx]
+
+        if all(val == col_name for val in col_values):
+            csv_text += (
+                f"##Warning##: Column \"\"\"{col_name}\"\"\" contains only '{col_name}'. "
+                f"You may have used a missing column name as a string literal.\n"
+            )
+    return csv_text
 
 class SqlEnv:
     def __init__(self):
@@ -144,8 +152,9 @@ class SqlEnv:
             output.close()
             if save_path:
                 try:
-                    with open(save_path, 'w', newline='') as f:
-                        f.write(csv_content)
+                    if "##Warning##" not in csv_content:
+                        with open(save_path, 'w', newline='') as f:
+                            f.write(csv_content)
                     return 0
                 except Exception as e:
                     print("##ERROR## ", str(e))
