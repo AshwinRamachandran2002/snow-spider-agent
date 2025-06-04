@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 from transformers import AutoTokenizer
 from functools import partial
-
+import hashlib
 from datasets import load_dataset
 
 from sql_utils import (
@@ -19,6 +19,7 @@ from sql_utils import (
     load_bird_dataset_util, 
     load_spider_dataset_util
 )
+from sql_reward_utils import SqlEnv
 import shutil
 import pandas as pd
 
@@ -72,7 +73,10 @@ Question: {data["question"]} {instruct_info}
     # Question: Please list the codes of the schools with a total enrollment of over 500. Total enrollment can be represented by `Enrollment (K-12)` + `Enrollment (Ages 5-17)`<｜Assistant｜><think>
 
     return num_tokens, messages
-
+def calculate_md5(input_string):
+    md5_obj = hashlib.md5()
+    md5_obj.update(input_string.encode('utf-8'))
+    return md5_obj.hexdigest()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -103,22 +107,25 @@ if __name__ == "__main__":
     dataset = load_dataset(
             "parquet", data_files=args.parquet_data_path, split="train" # fix split = 'train'
     )
-
+    sql_env = SqlEnv()
     def make_map_fn(split):
-
+        timeout = 10
+        if split == "dev":
+            timeout = 60
         def process_fn(example, idx):
             num_tokens, messages = get_messages(example, tokenizer)
 
-            time_start = time.time()
-            for i in range(1):
-                db_folder = Path(args.database_path)
-                db_path = get_db_path(db_folder, example["db_id"])
-                # print(db_path)
-                env = SqlTask(example["ground_truth"], db_path)
-                env.launch_env()
-            time_end = time.time()
+            # time_start = time.time()
+            # for i in range(1):
+            db_folder = Path(args.database_path)
+            db_path = get_db_path(db_folder, example["db_id"])
+            # print(db_path)
+            # env = SqlTask(example["ground_truth"], db_path)
+            # env.launch_env()
+            out = sql_env.execute_sql_with_timeout(example["ground_truth"], calculate_md5(example["ground_truth"]), sqlite_path=db_path, example_id=str(idx), timeout=timeout)
+            # time_end = time.time()
             # check if output is None
-            out = env.answer
+            # out = env.answer
             empty_result = False
             empty_flag = True
             # try:
@@ -126,11 +133,11 @@ if __name__ == "__main__":
             # except:
             #     pass
             # if len(out) > 1 or not empty_flag:
-            if out:
-                exec_time = time_end - time_start
-            else:
-                empty_result = True
-                exec_time = 1000000
+            # if out:
+            #     exec_time = time_end - time_start
+            # else:
+            #     empty_result = True
+            #     exec_time = 1000000
             data = {
                 "data_source": args.dataset_type,
                 "prompt": {
@@ -148,13 +155,13 @@ if __name__ == "__main__":
                     'answer': str(out),
                     "db_id": example["db_id"],
                     "num_tokens": num_tokens,
-                    "exec_time": exec_time,
+                    # "exec_time": exec_time,
                     "empty_result": empty_result,
                 }
             }
-            if split == "dev" or (not empty_result and exec_time < 20 and "##SQLERROR##" not in str(out)):
-                df = pd.DataFrame(out)
-                df.to_csv(f"BIRD/gold_results/local_BIRD_{split}_{idx:04d}.csv", index=False)
+            if split == "dev" or (not empty_result and "##SQLERROR##" not in str(out) and "No data found for the specified query.\n" not in str(out)):
+                with open(f"BIRD/gold_results/local_BIRD_{split}_{idx:04d}.csv", "w") as f:
+                    f.write(str(out))
                 folder_name = f"BIRD/examples_{split}/local_BIRD_{split}_{idx:04d}"
             else:
                 print(f"{idx}: {out}")
@@ -162,5 +169,5 @@ if __name__ == "__main__":
 
         return process_fn
     
-    dataset = dataset.map(function=make_map_fn(args.dataset_mode), with_indices=True, num_proc=int(os.cpu_count() * 0.8))
+    dataset = dataset.map(function=make_map_fn(args.dataset_mode), with_indices=True, num_proc=int(os.cpu_count()))
     dataset.to_parquet(os.path.join(args.local_dir, f"{args.save_prefix}_{args.dataset_mode}.parquet"))
