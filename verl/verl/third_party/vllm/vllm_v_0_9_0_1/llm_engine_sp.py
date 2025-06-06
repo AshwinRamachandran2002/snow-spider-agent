@@ -276,7 +276,7 @@ class SQLExecutor():
                         else:
                             f.write(str(evaluate_bird(self.ground_truths, os.path.join(os.getenv("EXEC_FOLDER"), file_name+".csv"), example_id)))
                     return [self.tokenizer.eos_token_id]
-        print(f"Fatal err: Not matched: {completion}")
+        # print(f"Fatal err: Not matched: {completion}")
         return [self.tokenizer.eos_token_id]
 
     def remove(self, request_id):

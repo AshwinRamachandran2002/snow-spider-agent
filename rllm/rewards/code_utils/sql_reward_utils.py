@@ -38,7 +38,7 @@ def warn_if_literal_column_from_result(csv_text: str):
         if all(val == col_name for val in col_values):
             csv_text += (
                 f"##Warning##: Column \"\"\"{col_name}\"\"\" contains only '{col_name}'. "
-                f"You may have used a missing column name as a string literal.\n"
+                f"You may have used a missing column name as a string literal."
             )
     return csv_text
 
@@ -73,11 +73,11 @@ def schema_check(schema_json, sqlite_path):
     if err_rec:
         response += f"##Warning## These tables or \"table\".\"column\" do not exist: {err_rec_str}."
         if candiates:
-            response += f"Consider these candidates: {cand_str}."
+            response += f"\nConsider these candidates: {cand_str}."
     else:
-        response += "Schema check passed. All column exists."
+        response += "Schema check passed. All columns exist."
 
-    return response+"\n"
+    return response
 
 class SqlEnv:
     def __init__(self):

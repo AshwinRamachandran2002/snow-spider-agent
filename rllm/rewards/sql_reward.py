@@ -49,9 +49,6 @@ class RewardSQLFn(RewardFn):
         if len(re.findall(r'<exec_sql>\nSELECT', text)) != len(re.findall(r'\nSELECT', text)):
             return False
 
-        tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
-        tags = tag_pattern.findall(text)
-
         all_tag_counts = {
             'exec_sql_open': len(re.findall(r'<exec_sql>', text)),
             'exec_sql_close': len(re.findall(r'</exec_sql>', text)),
@@ -64,28 +61,12 @@ class RewardSQLFn(RewardFn):
         }
 
         if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
-                all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
-                all_tag_counts["SELECT"] == all_tag_counts[";\n"]):
+                # all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
+                all_tag_counts["SELECT"] == all_tag_counts[";\n"]) or all_tag_counts['exec_sql_open'] < 1:
             return False
 
         if not (all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close']) or all_tag_counts['schema_linking_open'] < 1:
             return False
-
-        if not tags:
-            return False
-
-        if len(tags) % 2 != 0 or len(tags) < 2:
-            return False
-
-        for i, tag in enumerate(tags):
-            if i % 2 == 0 and not tag.startswith('<exec_sql>'):
-                return False
-            if i % 2 == 1 and not tag.startswith('<exec_result>'):
-                return False
-            # if i % 2 == 1 and i > 2 and tag.startswith('<exec_result>'):
-            #     if "No data found for the specified query." in tags[i-2] or "##ERROR##" in tags[i-2]:
-            #         if "No data found for the specified query." in tags[i] or "##ERROR##" in tags[i]:
-            #             return False
 
         return True
 
@@ -129,7 +110,7 @@ class RewardSQLFn(RewardFn):
         with open(log_path.replace(".log", ".txt")) as f:
             is_correct = int(f.read())
             if is_correct: 
-                print(f"Correct: {example_id}")
+                # print(f"Correct: {example_id}")
 
                 if self.is_valid_exec_sequence(response_str):
                     # log trajectory

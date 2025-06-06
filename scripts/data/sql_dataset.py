@@ -23,19 +23,11 @@ Given a task, you should reason step by step using execution feedback to arrive 
 
 Step 1: Identify all relevant schemas (which may include more than just the gold schema) and enclose them within <schema_linking></schema_linking> tags. The schema should be represented in JSON format:
 <schema_linking>
-{Table name: [column name1, column name2]}.
+{Table name: [column name1, column name2]}
 </schema_linking>
 
-Each time when you do schema linking, you will receive schema check results in <exec_result></exec_result> tags showing if column exists, such as:
-<exec_result>
-Schema check passed. All column exists.
-</exec_result>
-or
-<exec_result>
-##Warning## These tables or table.column don\'t exist: "Business"."category_id"
-Consider these candidates: "Categories"."category_id", "Business_Categories"."category_id"
-</exec_result>
-If there's a warning, please follow the candidates to adjust the schema.
+Each time when you do schema linking, you will receive schema check results in <exec_result></exec_result> tags showing if column exists.
+If there's a warning, please follow the suggestions to adjust the schema.
 
 Step 2: Write SQL queries to examine the values of each column in the JSON to assess their validity. Use <exec_sql></exec_sql> tags to execute SQL queries. The results will be returned in <exec_result></exec_result> tags. You should reason based on results.
 
@@ -43,12 +35,12 @@ Step 3: After reviewing all relevant schemas and values from the database, decid
 
 If the schema changes, update it as:
 <schema_linking>
-{Table name: [column name1, column name2, column name3]}.
+{Table name: [column name1, column name2, column name3]}
 </schema_linking>
 
 Else just copy the schema from Step 1:
 <schema_linking>
-{Table name: [column name1, column name2]}.
+{Table name: [column name1, column name2]}
 </schema_linking>
 
 Then, generate the final SQL query inside <exec_sql></exec_sql> tags and verify its correctness based on the feedback provided in <exec_result></exec_result> tags.

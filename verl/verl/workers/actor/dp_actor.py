@@ -308,6 +308,7 @@ class DataParallelPPOActor(BasePPOActor):
         think_end = tokenizer.encode("</think>", add_special_tokens=False)[0]
         schema_linking_start = tokenizer.encode("<schema_linking>", add_special_tokens=False)[0]
         schema_linking_end = tokenizer.encode("</schema_linking>", add_special_tokens=False)[0]
+        nl_token = tokenizer.encode("\n", add_special_tokens=False)[0]
         # schema check: start: [27, 17349, 7200, 397], end: [522, 17349, 7200, 397] or [522, 17349, 7200, 1339]
 
         metrics = {}
@@ -345,7 +346,7 @@ class DataParallelPPOActor(BasePPOActor):
                     for batch in range(len(responses)):
                         for index in range(len(responses[batch])):
                             if index >= 2 and responses[batch][index] == exec_result_start:
-                                assert responses[batch][index-2] == exec_sql_end, tokenizer.decode([responses[batch][index-2]])
+                                # assert responses[batch][index-2] == exec_sql_end, tokenizer.decode([responses[batch][index-2]])
                                 response_mask[batch][index-1] = 0 # mask \n before <exec_res>
                                 response_mask[batch][index] = 0
                                 response_mask_kl[batch][index-1] = 0
@@ -374,6 +375,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     think_end,
                                     schema_linking_start,
                                     schema_linking_end,
+                                    nl_token
                             ]:
                                 response_mask_kl[batch][index] = 0
 
