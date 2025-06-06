@@ -20,9 +20,6 @@ def is_valid_exec_sequence(text):
     if len(re.findall(r'<exec_sql>\nSELECT', text)) != len(re.findall(r'\nSELECT', text)):
         return False
 
-    tag_pattern = re.compile(r'<exec_sql>.*?</exec_sql>|<exec_result>.*?</exec_result>', re.DOTALL)
-    tags = tag_pattern.findall(text)
-
     all_tag_counts = {
         'exec_sql_open': len(re.findall(r'<exec_sql>', text)),
         'exec_sql_close': len(re.findall(r'</exec_sql>', text)),
@@ -35,28 +32,12 @@ def is_valid_exec_sequence(text):
     }
 
     if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
-            all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
-            all_tag_counts["SELECT"] == all_tag_counts[";\n"]):
+            # all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
+            all_tag_counts["SELECT"] == all_tag_counts[";\n"]) or all_tag_counts['exec_sql_open'] < 1:
         return False
 
     if not (all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close']) or all_tag_counts['schema_linking_open'] < 1:
         return False
-
-    if not tags:
-        return False
-
-    if len(tags) % 2 != 0 or len(tags) < 2:
-        return False
-
-    for i, tag in enumerate(tags):
-        if i % 2 == 0 and not tag.startswith('<exec_sql>'):
-            return False
-        if i % 2 == 1 and not tag.startswith('<exec_result>'):
-            return False
-        # if i % 2 == 1 and i > 2 and tag.startswith('<exec_result>'):
-        #     if "No data found for the specified query." in tags[i-2] or "##ERROR##" in tags[i-2]:
-        #         if "No data found for the specified query." in tags[i] or "##ERROR##" in tags[i]:
-        #             return False
 
     return True
 
@@ -87,7 +68,7 @@ import pandas as pd
 file_path = '/mbz/bruce/exec-fb/data_preprocess/data/processed/train.parquet'
 bird_data = pd.read_parquet(file_path)
 
-log_dir = "/mbz/bruce/logs"
+log_dir = "/mbz/bruce/exec-fb/log_all"
 gen_data = []
 id_rec = []
 
@@ -96,12 +77,12 @@ for step in os.listdir(log_dir):
     for example in tqdm(os.listdir(step_pth)):
         example_dir = os.path.join(step_pth, example)
         example_id = example[len("local_BIRD_train_"):len("local_BIRD_train_")+4]
-        if example.endswith(".txt") and example_id not in id_rec:
+        if example.endswith(".log") and example_id not in id_rec:
             with open(example_dir) as f:
-                data = f.read().strip()
-            with open(example_dir.replace(".txt", ".log")) as f:
                 l = f.read()
-            if data == "1" and is_valid_exec_sequence(l):
+            assert l.count("<|im_start|>assistant\n<think>\n") == 1
+            l = l[l.find("<|im_start|>assistant\n<think>\n")+len("<|im_start|>assistant\n<think>\n"):]
+            if is_valid_exec_sequence(l):
                 # l = replace_quotes_in_exec_sql_blocks(l)
                 # l = replace_quotes_in_answer_blocks(l)
                 user_prompt = None
@@ -123,7 +104,7 @@ for step in os.listdir(log_dir):
                     continue
                 
                 gen_data.append(gen_dict)
-                id_rec.append(example_id)
+                # id_rec.append(example_id)
 print(gen_data[0]["messages"][-1]["content"])
 print("Length", len(gen_data))
 

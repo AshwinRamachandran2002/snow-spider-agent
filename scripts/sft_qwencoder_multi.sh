@@ -48,7 +48,7 @@ GRAD_ACCU=$(($BATCH_SIZE / $WORLD_SIZE / $MICRO_BATCH_SIZE))
 LR=5e-5
 WEIGHT_DECAY=0.0
 WARMUP_STEPS=0
-MAX_LENGTH=8192
+MAX_LENGTH=6000
 
 #######################
 # 5. NCCL & debug environment variables
@@ -94,7 +94,7 @@ torchrun \
     --data_path ${DATA_PATH} \
     --model_max_length ${MAX_LENGTH} \
     --output_dir ${OUTPUT_DIR} \
-    --num_train_epochs 6 \
+    --num_train_epochs 3 \
     --per_device_train_batch_size ${MICRO_BATCH_SIZE} \
     --gradient_accumulation_steps ${GRAD_ACCU} \
     --per_device_eval_batch_size 4 \
@@ -112,4 +112,4 @@ torchrun \
     --bf16 True \
     --tf32 True \
     --truncate_source False \
-    --resume_from_checkpoint /mbz/bruce/exec-fb/models/Qwen3-8B-sft/checkpoint-273
+    # --resume_from_checkpoint /mbz/bruce/exec-fb/models/Qwen3-8B-sft/checkpoint-273
