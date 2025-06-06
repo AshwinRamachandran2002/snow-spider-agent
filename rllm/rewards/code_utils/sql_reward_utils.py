@@ -68,14 +68,16 @@ def schema_check(schema_json, sqlite_path):
                             candiates.append(f'"{tb}"."{col}"')
 
     response = ""
+    err_rec_str = ", ".join(err_rec)
+    cand_str = ", ".join(candiates)
     if err_rec:
-        response += f"##Warning## These tables or table.column don't exist: {", ".join(err_rec)}"
+        response += f"##Warning## These tables or \"table\".\"column\" do not exist: {err_rec_str}."
         if candiates:
-            response += f"Consider these candidates: {", ".join(candiates)}"
+            response += f"Consider these candidates: {cand_str}."
     else:
         response += "Schema check passed. All column exists."
 
-    return response
+    return response+"\n"
 
 class SqlEnv:
     def __init__(self):

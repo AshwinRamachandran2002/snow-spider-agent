@@ -348,26 +348,19 @@ class DataParallelPPOActor(BasePPOActor):
                                 assert responses[batch][index-2] == exec_sql_end, tokenizer.decode([responses[batch][index-2]])
                                 response_mask[batch][index-1] = 0 # mask \n before <exec_res>
                                 response_mask[batch][index] = 0
+                                response_mask_kl[batch][index-1] = 0
+                                response_mask_kl[batch][index] = 0
                                 ignore_now = True
                                 continue                                    
                             
-                            if responses[batch][index:index+4] == [27, 17349, 7200, 397]:
-                                response_mask[batch][index] = 0
-                                response_mask_kl[batch][index:index+4] = [0, 0, 0, 0]
-                                ignore_sl = True
-                                continue 
-
                             if responses[batch][index] == exec_result_end:
                                 response_mask[batch][index] = 0
-                                ignore_now = False
-
-                            if index >=3 and index + 1 <= len(responses[batch]) and responses[batch][index-3:index+1] in [[522, 17349, 7200, 397], [522, 17349, 7200, 1339]]:
-                                response_mask[batch][index] = 0
-                                response_mask_kl[batch][index-3:index+1] = [0, 0, 0, 0]
-                                ignore_sl = False                            
+                                response_mask_kl[batch][index] = 0
+                                ignore_now = False                        
                                 
                             if ignore_now or responses[batch][index] == tokenizer.eos_token_id or ignore_sl: # mask pad, eos, bos
                                 response_mask[batch][index] = 0
+                                response_mask_kl[batch][index] = 0
 
                             if responses[batch][index] in [
                                     tokenizer.eos_token_id, 
@@ -400,12 +393,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
-                        log_kl_loss(log_prob, ref_log_prob, response_mask, tokenizer, data, response_length)
+                        log_kl_loss(log_prob, ref_log_prob, response_mask_kl, tokenizer, data, response_length)
                         # compute kl loss
                         kld = core_algos.kl_penalty(logprob=log_prob,
                                                     ref_logprob=ref_log_prob,
                                                     kl_penalty=self.config.kl_loss_type)
-                        kl_loss = masked_mean(kld, response_mask)
+                        kl_loss = masked_mean(kld, response_mask_kl)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics['actor/kl_loss'] = kl_loss.detach().item()

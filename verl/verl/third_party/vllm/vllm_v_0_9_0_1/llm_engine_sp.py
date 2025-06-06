@@ -239,7 +239,7 @@ class SQLExecutor():
                     schema_json = json.loads(schema_str)
                     kwargs = self.initial_prompts[str(request_id)]
                     sqlite_path = kwargs["sqlite_path"]
-                    response = "\n<schema_check>\n" + schema_check(schema_json, sqlite_path) + "\n</schema_check>\n"
+                    response = "\n<exec_result>\n" + schema_check(schema_json, sqlite_path) + "\n</exec_result>\n"
                     return self.tokenizer.encode(response, add_special_tokens=False)
                 except Exception as e:
                     print(schema_str, e)
