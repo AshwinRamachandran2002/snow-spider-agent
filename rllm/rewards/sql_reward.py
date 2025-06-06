@@ -105,8 +105,8 @@ class RewardSQLFn(RewardFn):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
 
         sl_bonus = 0
-        if self.check_sl_bonus(response_str):
-            sl_bonus = self.config.sl_bonus
+        # if self.check_sl_bonus(response_str):
+        #     sl_bonus = self.config.sl_bonus
         with open(log_path.replace(".log", ".txt")) as f:
             is_correct = int(f.read())
             if is_correct: 

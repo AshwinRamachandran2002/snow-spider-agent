@@ -242,7 +242,7 @@ class SQLExecutor():
                     response = "\n<exec_result>\n" + schema_check(schema_json, sqlite_path) + "\n</exec_result>\n"
                     return self.tokenizer.encode(response, add_special_tokens=False)
                 except Exception as e:
-                    print(schema_str, e)
+                    # print(schema_str, e)
                     break
             elif completion[-1] == self.ans_end_id:
                 # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
