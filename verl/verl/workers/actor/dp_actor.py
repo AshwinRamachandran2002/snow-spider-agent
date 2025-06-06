@@ -341,6 +341,7 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
                     ignore_now = False
+                    ignore_sl = False
                     for batch in range(len(responses)):
                         for index in range(len(responses[batch])):
                             if index >= 2 and responses[batch][index] == exec_result_start:
@@ -350,11 +351,22 @@ class DataParallelPPOActor(BasePPOActor):
                                 ignore_now = True
                                 continue                                    
                             
+                            if responses[batch][index:index+4] == [27, 17349, 7200, 397]:
+                                response_mask[batch][index] = 0
+                                response_mask_kl[batch][index:index+4] = [0, 0, 0, 0]
+                                ignore_sl = True
+                                continue 
+
                             if responses[batch][index] == exec_result_end:
                                 response_mask[batch][index] = 0
                                 ignore_now = False
+
+                            if index >=3 and index + 1 <= len(responses[batch]) and responses[batch][index-3:index+1] in [[522, 17349, 7200, 397], [522, 17349, 7200, 1339]]:
+                                response_mask[batch][index] = 0
+                                response_mask_kl[batch][index-3:index+1] = [0, 0, 0, 0]
+                                ignore_sl = False                            
                                 
-                            if ignore_now or responses[batch][index] == tokenizer.eos_token_id: # mask pad, eos, bos
+                            if ignore_now or responses[batch][index] == tokenizer.eos_token_id or ignore_sl: # mask pad, eos, bos
                                 response_mask[batch][index] = 0
 
                             if responses[batch][index] in [

@@ -26,6 +26,17 @@ Step 1: Identify all relevant schemas (which may include more than just the gold
 {Table name: [column name1, column name2]}.
 </schema_linking>
 
+Each time when you do schema linking, you will receive schema check results in <schema_check></schema_check> tags showing if column exists, such as:
+<schema_check>
+Schema check passed. All column exists.
+</schema_check>
+or
+<schema_check>
+##Warning## These tables or table.column don\'t exist: "Business"."category_id"
+Consider these candidates: "Categories"."category_id", "Business_Categories"."category_id"
+</schema_check>
+If there's a warning, please follow the candidates to adjust the schema.
+
 Step 2: Write SQL queries to examine the values of each column in the JSON to assess their validity. Use <exec_sql></exec_sql> tags to execute SQL queries. The results will be returned in <exec_result></exec_result> tags. You should reason based on results.
 
 Step 3: After reviewing all relevant schemas and values from the database, decide on the final schema to use by removing useless parts in the previous JSON. 
@@ -78,6 +89,9 @@ Step 1: Schema linking. The relevant tables are movies and directors. But since 
   "directors": ["user_id", "director_id", "director_name"]
 }
 </schema_linking>
+<schema_check>
+Schema check passed. All column exists.
+</schema_check>
 
 Step 2: Check if the director_id in movies is valid. Let's write a SQL query to count the movies per director_id.
 
@@ -107,6 +121,9 @@ Step 3: Final schema changed since we only needed the movies table.
   "movies": ["movie_id", "director_id"]
 }
 </schema_linking>
+<schema_check>
+Schema check passed. All column exists.
+</schema_check>
 
 The final SQL should select the director_id with the maximum count.
 

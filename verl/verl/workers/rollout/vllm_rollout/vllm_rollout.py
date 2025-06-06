@@ -61,8 +61,12 @@ class BanTokens:
         self.banned_ids = banned_ids
 
     def __call__(self, token_ids, logits):
+        vocab_size = logits.shape[0]
         for tid in self.banned_ids:
-            logits[tid] = -1e9
+            if 0 <= tid < vocab_size:
+                logits[tid] = -1e9
+            else:
+                print(f"[WARN] Banned token ID {tid} is out of bounds for logits shape {logits.shape}")
         return logits
 
 class vLLMRollout(BaseRollout):

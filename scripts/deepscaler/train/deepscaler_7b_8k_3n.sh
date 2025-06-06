@@ -19,7 +19,7 @@ NNODES=${#HOSTS[@]}
 #############################
 NODE_RANK=$1
 shift
-MODEL_PATH="/mbz/bruce/exec-fb/checkpoints/execution/8B/actor/global_step_40"
+MODEL_PATH="/mbz/bruce/exec-fb/checkpoints/execution/8B/actor/global_step_30"
 # MODEL_PATH="models/Qwen3-8B-sft"
 
 while [[ $# -gt 0 ]]; do
@@ -135,7 +135,7 @@ if [ "$NODE_RANK" -eq 0 ]; then
         trainer.critic_warmup=0 \
         trainer.logger=['console','wandb'] \
         trainer.project_name='execution' \
-        trainer.experiment_name='8B' \
+        trainer.experiment_name='8B_step70' \
         +trainer.val_before_train=False \
         trainer.n_gpus_per_node=$GPUS_PER_NODE \
         trainer.nnodes=$NNODES \

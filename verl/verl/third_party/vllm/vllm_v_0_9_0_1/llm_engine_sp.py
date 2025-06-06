@@ -211,13 +211,14 @@ class SQLExecutor():
                 kwargs = self.initial_prompts[str(request_id)]
                 start = time.time()
 
-                log_ = self.tokenizer.decode(completion).strip()
-                log_gen = log_[:log_.find("<exec_sql>")]
+                # log_ = self.tokenizer.decode(completion).strip()
+                # log_gen = log_[:log_.find("<exec_sql>")]
 
                 # env = SqlTask(sql_string, kwargs["sqlite_path"])
                 # env.launch_env()
                 # exec_result = env.answer
-                exec_result = self.exec_func_sql(sql_string, calculate_md5(log_gen), timeout=self.timeout_for_exploration, max_len=500, LIMIT=100, **kwargs)
+                exe_id = calculate_md5(self.tokenizer.decode(completion)+str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')))
+                exec_result = self.exec_func_sql(sql_string, exe_id, timeout=self.timeout_for_exploration, max_len=500, LIMIT=100, **kwargs)
                 if "Timed out" in exec_result:
                     print(f"Timed out time: {time.time() - start}")
                     return [self.tokenizer.eos_token_id]
@@ -389,12 +390,12 @@ class SQLExecutor():
                         "exec_result": exec_res,
                         "curr_pointer": 0
                     }
-            # elif completions[-1] == self.sl_end_id:
-            #     schema_check = self.fetch_execution_result(completions, seq_id)
-            #     self.monitor_parent_seq_ids_sl[seq_id] = {
-            #         "schema_check": schema_check,
-            #         "curr_pointer": 0
-            #     }
+            elif completions[-1] == self.sl_end_id:
+                schema_check = self.fetch_execution_result(completions, seq_id)
+                self.monitor_parent_seq_ids_sl[seq_id] = {
+                    "schema_check": schema_check,
+                    "curr_pointer": 0
+                }
             elif completions[-1] == self.ans_end_id:
                 self.fetch_execution_result(completions, seq_id)
 
