@@ -186,11 +186,11 @@ class SqlEnv:
             writer = csv.writer(output)
             writer.writerow(columns)
             writer.writerows(rows)
-            csv_content = warn_if_literal_column_from_result(output.getvalue())
+            csv_content = output.getvalue()
             output.close()
             if save_path:
                 try:
-                    if "##Warning##" not in csv_content:
+                    if "##Warning##" not in warn_if_literal_column_from_result(csv_content):
                         with open(save_path, 'w', newline='') as f:
                             f.write(csv_content)
                     return 0
@@ -198,7 +198,7 @@ class SqlEnv:
                     print("##ERROR## ", str(e))
                     return str(e) + "\n"
             else:
-                return hard_cut(csv_content, max_len)
+                return warn_if_literal_column_from_result(hard_cut(csv_content, max_len))
             
     # def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
     #     # print_cpu_status(self.conns.keys())
