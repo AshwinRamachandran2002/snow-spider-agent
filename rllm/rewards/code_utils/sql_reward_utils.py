@@ -11,6 +11,7 @@ from typing import Optional, Union, List, Set, Any
 import sqlglot
 import threading
 from func_timeout import func_timeout, FunctionTimedOut
+import json
 
 def hard_cut(str_e, length=0):
     if length:
@@ -40,6 +41,41 @@ def warn_if_literal_column_from_result(csv_text: str):
                 f"You may have used a missing column name as a string literal.\n"
             )
     return csv_text
+
+def schema_check(schema_json, sqlite_path):
+    db_id = sqlite_path.split("/")[-2]
+    table_pths = os.path.join("/".join(sqlite_path.split("/")[:-3]), "schema")
+
+    err_rec = []
+    candiates = []
+    for db in os.listdir(table_pths):
+        db_pth = os.path.join(table_pths, db)
+        if db.split(".")[0] == db_id:
+            with open(db_pth) as f:
+                schema_ori = json.load(f)
+            for sl_tb in schema_json:
+                if sl_tb in schema_ori:
+                    for sl_col in schema_json[sl_tb]:
+                        if sl_col not in schema_ori[sl_tb]:
+                            err_rec.append(f'"{sl_tb}"."{sl_col}"')
+                else:
+                    err_rec.append(sl_tb)
+
+            for tb in schema_ori:
+                for col in schema_ori[tb]:
+                    for err in err_rec:
+                        if "." in err and col == err.split(".")[-1].strip("\""):
+                            candiates.append(f'"{tb}"."{col}"')
+
+    response = ""
+    if err_rec:
+        response += f"##Warning## These tables or table.column don't exist: {", ".join(err_rec)}"
+        if candiates:
+            response += f"Consider these candidates: {", ".join(candiates)}"
+    else:
+        response += "Schema check passed. All column exists."
+
+    return response
 
 class SqlEnv:
     def __init__(self):

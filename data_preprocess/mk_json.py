@@ -20,7 +20,7 @@ if __name__ == "__main__":
     json_list = []
     token_count = []
     for data in dataset:
-        if mode == "dev" or ("##SQLERROR##" not in data["extra_info"]["answer"] and "No data found for the specified query.\n" not in data["extra_info"]["answer"]):
+        if mode == "dev" or ("##ERROR##" not in data["extra_info"]["answer"] and "No data found for the specified query.\n" not in data["extra_info"]["answer"]):
             example = {}
             example["data_source"] = "BIRD"
             

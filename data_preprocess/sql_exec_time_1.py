@@ -159,7 +159,7 @@ if __name__ == "__main__":
                     "empty_result": empty_result,
                 }
             }
-            if split == "dev" or (not empty_result and "##SQLERROR##" not in str(out) and "No data found for the specified query.\n" not in str(out)):
+            if split == "dev" or (not empty_result and "##ERROR##" not in str(out) and "No data found for the specified query.\n" not in str(out)):
                 with open(f"BIRD/gold_results/local_BIRD_{split}_{idx:04d}.csv", "w") as f:
                     f.write(str(out))
                 folder_name = f"BIRD/examples_{split}/local_BIRD_{split}_{idx:04d}"

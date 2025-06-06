@@ -308,6 +308,7 @@ class DataParallelPPOActor(BasePPOActor):
         think_end = tokenizer.encode("</think>", add_special_tokens=False)[0]
         schema_linking_start = tokenizer.encode("<schema_linking>", add_special_tokens=False)[0]
         schema_linking_end = tokenizer.encode("</schema_linking>", add_special_tokens=False)[0]
+        # schema check: start: [27, 17349, 7200, 397], end: [522, 17349, 7200, 397] or [522, 17349, 7200, 1339]
 
         metrics = {}
         for _ in range(self.config.ppo_epochs):

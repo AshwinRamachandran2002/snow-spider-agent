@@ -61,6 +61,7 @@ from vllm.utils import (Counter, Device, deprecate_kwargs,
                         resolve_obj_by_qualname, weak_bind)
 from vllm.version import __version__ as VLLM_VERSION
 from vllm.worker.model_runner_base import InputProcessingError
+import json
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -121,7 +122,7 @@ class SchedulerContext:
 
 
 from rllm.rewards.code_utils.sql_reward_evaluate import evaluate_bird
-from rllm.rewards.code_utils.sql_reward_utils import get_api_name, SqlEnv, calculate_md5
+from rllm.rewards.code_utils.sql_reward_utils import get_api_name, SqlEnv, calculate_md5, schema_check
 import uuid
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -132,29 +133,32 @@ class SQLExecutor():
     def __init__(self, tokenizer_group, sql_executor_config):
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
+        self.monitor_parent_seq_ids_sl = {}
         self.initial_prompts = {}
         self.calls_per_parent_seq_id = {}
         self.time_per_parent_seq_id = {}
 
         # For v1:
-        # self.monitor_token_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]]
-        # self.start_token_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
+        # self.end_sql_ids = [[522, 11748, 18063, 397], [522, 11748, 18063, 1339], [522, 11748, 18063, 10370]]
+        # self.start_sql_ids = [[27, 11748, 18063, 397], [366, 11748, 18063, 397]]
         self.tokenizer = tokenizer_group.tokenizer
         exec_sql_start = self.tokenizer.encode("<exec_sql>", add_special_tokens=False)
         exec_sql_end = self.tokenizer.encode("</exec_sql>", add_special_tokens=False)
         ans_start = self.tokenizer.encode("<answer>", add_special_tokens=False)
         ans_end = self.tokenizer.encode("</answer>", add_special_tokens=False)
+        sl_start = self.tokenizer.encode("<schema_linking>", add_special_tokens=False)
+        sl_end = self.tokenizer.encode("</schema_linking>", add_special_tokens=False)
 
         if len(exec_sql_start) == 1:
-            self.start_token_id = exec_sql_start[0]
+            self.start_sql_id = exec_sql_start[0]
         else:
-            self.start_token_id = -1
+            self.start_sql_id = -1
             warnings.warn(f"<exec_sql>: {exec_sql_start}", UserWarning)
         
         if len(exec_sql_end) == 1:
-            self.monitor_token_id = exec_sql_end[0]
+            self.end_sql_id = exec_sql_end[0]
         else:
-            self.monitor_token_id = -1
+            self.end_sql_id = -1
             warnings.warn(f"</exec_sql>: {exec_sql_end}", UserWarning)        
             
         if len(ans_start) == 1:
@@ -168,6 +172,18 @@ class SQLExecutor():
         else:
             self.ans_end_id = -1
             warnings.warn(f"</answer>: {ans_end}", UserWarning)
+        
+        if len(sl_start) == 1:
+            self.sl_start_id = sl_start[0]
+        else:
+            self.sl_start_id = -1
+            warnings.warn(f"<schema_linking>: {sl_start}", UserWarning)
+
+        if len(sl_end) == 1:
+            self.sl_end_id = sl_end[0]
+        else:
+            self.sl_end_id = -1
+            warnings.warn(f"</schema_linking>: {sl_end}", UserWarning)
 
         self.sql_env = SqlEnv()
         self.ground_truths = "data_preprocess/BIRD/gold_results"
@@ -189,7 +205,7 @@ class SQLExecutor():
 
     def fetch_execution_result(self, completion, request_id):
         for index in range(len(completion)-1, 0, -1):
-            if completion[-1] == self.monitor_token_id and completion[index] == self.start_token_id:
+            if completion[-1] == self.end_sql_id and completion[index] == self.start_sql_id:
                 sql_string = self.tokenizer.decode(completion[index+1:-1])
  
                 kwargs = self.initial_prompts[str(request_id)]
@@ -216,6 +232,17 @@ class SQLExecutor():
                 if kwargs['api'] == "snowflake":
                     print(f"executed below SQL with kwargs {kwargs}\n, {sql_string} time for api is {time.time()-start}\n")
                 return self.tokenizer.encode(exec_result, add_special_tokens=False)
+            elif completion[-1] == self.sl_end_id and completion[index] == self.sl_start_id:
+                schema_str = self.tokenizer.decode(completion[index+1:-1]).strip()
+                try:
+                    schema_json = json.loads(schema_str)
+                    kwargs = self.initial_prompts[str(request_id)]
+                    sqlite_path = kwargs["sqlite_path"]
+                    response = "\n<schema_check>\n" + schema_check(schema_json, sqlite_path) + "\n</schema_check>\n"
+                    return self.tokenizer.encode(response, add_special_tokens=False)
+                except Exception as e:
+                    print(schema_str, e)
+                    break
             elif completion[-1] == self.ans_end_id:
                 # print(f"completion: {completion}, self.tokenizer.decode(completion): {self.tokenizer.decode(completion)}")
                 if completion[index] == self.ans_start_id:
@@ -257,6 +284,9 @@ class SQLExecutor():
 
         if request_id in self.monitor_parent_seq_ids:
             del self.monitor_parent_seq_ids[request_id]
+
+        if request_id in self.monitor_parent_seq_ids_sl:
+            del self.monitor_parent_seq_ids_sl[request_id]
         
         if request_id in self.calls_per_parent_seq_id:
             del self.calls_per_parent_seq_id[request_id]
@@ -267,6 +297,7 @@ class SQLExecutor():
     def remove_all_ids(self):
         self.parent_seq_ids_completions = {}
         self.monitor_parent_seq_ids = {}
+        self.monitor_parent_seq_ids_sl = {}
         self.calls_per_parent_seq_id = {}
         self.initial_prompts = {}
         # print(f"Start releasing DB")
@@ -315,6 +346,20 @@ class SQLExecutor():
                 if monitor_info["curr_pointer"] >= len(monitor_info["exec_result"]):
                     del self.monitor_parent_seq_ids[seq_id]
 
+            if seq_id in self.monitor_parent_seq_ids_sl:
+                monitor_info = self.monitor_parent_seq_ids_sl[seq_id]
+                actual_output_token = seq_output.output_token
+                replacement_token = monitor_info["schema_check"][monitor_info["curr_pointer"]]
+                monitor_info["curr_pointer"] += 1
+
+                seq_output.output_token = replacement_token
+                seq_output.logprobs[replacement_token] = seq_output.logprobs[actual_output_token]
+                if replacement_token != actual_output_token:
+                    del seq_output.logprobs[actual_output_token]
+
+                if monitor_info["curr_pointer"] >= len(monitor_info["schema_check"]):
+                    del self.monitor_parent_seq_ids_sl[seq_id]
+
             output_token = seq_output.output_token
 
             if seq_id not in self.parent_seq_ids_completions:
@@ -323,7 +368,7 @@ class SQLExecutor():
 
             completions = self.parent_seq_ids_completions[seq_id]
 
-            if completions[-1] == self.monitor_token_id:
+            if completions[-1] == self.end_sql_id:
                 if seq_id not in self.calls_per_parent_seq_id:
                     self.calls_per_parent_seq_id[seq_id] = 0
                 if seq_id not in self.time_per_parent_seq_id:
@@ -344,6 +389,12 @@ class SQLExecutor():
                         "exec_result": exec_res,
                         "curr_pointer": 0
                     }
+            # elif completions[-1] == self.sl_end_id:
+            #     schema_check = self.fetch_execution_result(completions, seq_id)
+            #     self.monitor_parent_seq_ids_sl[seq_id] = {
+            #         "schema_check": schema_check,
+            #         "curr_pointer": 0
+            #     }
             elif completions[-1] == self.ans_end_id:
                 self.fetch_execution_result(completions, seq_id)
 

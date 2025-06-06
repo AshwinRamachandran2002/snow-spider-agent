@@ -19,8 +19,8 @@ NNODES=${#HOSTS[@]}
 #############################
 NODE_RANK=$1
 shift
-# MODEL_PATH="/mbz/bruce/exec-fb/models/Qwen3-8B-sft/checkpoint-40"
-MODEL_PATH="models/Qwen3-8B-sft"
+MODEL_PATH="/mbz/bruce/exec-fb/checkpoints/execution/8B/actor/global_step_40"
+# MODEL_PATH="models/Qwen3-8B-sft"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
