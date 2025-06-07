@@ -33,9 +33,8 @@ def warn_if_literal_column_from_result(csv_text: str):
     err_info = ""
     for col_idx in range(num_cols):
         col_name = header[col_idx]
-        col_values = [row[col_idx].strip('"') for row in data_rows if len(row) > col_idx]
-
-        if all(col_name == f'"""{val}"""' for val in col_values):
+        col_values = [row[col_idx] for row in data_rows if len(row) > col_idx]
+        if all(col_name == f'"{val}"' for val in col_values):
             err_info += (
                 f"##ERROR## Incorrect SQL Syntax: no such column: {col_name}.\n"
             )
@@ -189,17 +188,17 @@ class SqlEnv:
             writer.writerows(rows)
             csv_content = output.getvalue()
             output.close()
+            content_check = warn_if_literal_column_from_result(csv_content)
             if save_path:
-                try:
-                    if "##Warning##" not in warn_if_literal_column_from_result(csv_content):
-                        with open(save_path, 'w', newline='') as f:
-                            f.write(csv_content)
+                if "##ERROR##" not in content_check:
+                    with open(save_path, 'w', newline='') as f:
+                        f.write(csv_content)
                     return 0
-                except Exception as e:
-                    print("##ERROR## ", str(e))
-                    return str(e) + "\n"
+                return content_check
             else:
-                return warn_if_literal_column_from_result(hard_cut(csv_content, max_len))
+                if "##ERROR##" not in content_check:
+                    return hard_cut(content_check, max_len)
+                return content_check
             
     # def execute_sql_with_timeout(self, sql_query, exe_id, save_path=None, api="sqlite", max_len=30000, LIMIT=None, sqlite_path=None, timeout=3, example_id=None):
     #     # print_cpu_status(self.conns.keys())
