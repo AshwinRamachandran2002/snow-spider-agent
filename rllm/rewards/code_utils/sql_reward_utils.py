@@ -26,20 +26,21 @@ def warn_if_literal_column_from_result(csv_text: str):
     if not rows or len(rows) < 2:
         return csv_text
 
-    header = [h.strip('"') for h in rows[0]]  # strip triple quotes if present
+    header = rows[0]
     data_rows = rows[1:]
 
     num_cols = len(header)
-
+    err_info = ""
     for col_idx in range(num_cols):
         col_name = header[col_idx]
         col_values = [row[col_idx].strip('"') for row in data_rows if len(row) > col_idx]
 
-        if all(val == col_name for val in col_values):
-            csv_text += (
-                f"##Warning##: Column \"\"\"{col_name}\"\"\" contains only '{col_name}'. "
-                f"You may have used a missing column name as a string literal."
+        if all(col_name == f'"""{val}"""' for val in col_values):
+            err_info += (
+                f"##ERROR## Incorrect SQL Syntax: no such column: {col_name}.\n"
             )
+    if err_info:
+        csv_text = err_info
     return csv_text
 
 def schema_check(schema_json, sqlite_path):

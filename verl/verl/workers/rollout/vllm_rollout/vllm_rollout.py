@@ -58,15 +58,40 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
 
 class BanTokens:
     def __init__(self, banned_ids):
-        self.banned_ids = banned_ids
+        """
+        Args:
+            banned_ids (list[int]): Token IDs to be banned (masked in logits).
+        """
+        self.banned_ids = list(set(banned_ids))
 
     def __call__(self, token_ids, logits):
-        vocab_size = logits.shape[0]
-        for tid in self.banned_ids:
-            if 0 <= tid < vocab_size:
-                logits[tid] = -1e9
+        """
+        Args:
+            token_ids (torch.Tensor): Current token IDs (not used here but kept for compatibility).
+            logits (torch.Tensor): Logits tensor of shape [vocab_size] or [batch_size, vocab_size].
+        Returns:
+            torch.Tensor: Modified logits with banned token positions set to -inf.
+        """
+        vocab_size = logits.shape[-1]
+        device = logits.device
+
+        valid_banned_ids = [tid for tid in self.banned_ids if 0 <= tid < vocab_size]
+        if len(valid_banned_ids) < len(self.banned_ids):
+            invalid_ids = [tid for tid in self.banned_ids if tid < 0 or tid >= vocab_size]
+            print(f"[WARN] Skipping invalid token IDs (out of bounds): {invalid_ids}")
+
+        banned_tensor = torch.tensor(valid_banned_ids, device=device, dtype=torch.long)
+
+        logits = logits.clone()
+
+        with torch.no_grad():
+            if logits.dim() == 1:
+                logits[banned_tensor] = float('-inf')
+            elif logits.dim() == 2:
+                logits[:, banned_tensor] = float('-inf')
             else:
-                print(f"[WARN] Banned token ID {tid} is out of bounds for logits shape {logits.shape}")
+                raise ValueError(f"Unsupported logits shape: {logits.shape}")
+
         return logits
 
 class vLLMRollout(BaseRollout):
