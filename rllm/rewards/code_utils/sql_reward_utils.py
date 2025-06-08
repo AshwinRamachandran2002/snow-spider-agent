@@ -96,7 +96,7 @@ class SqlEnv:
                     memory_conn = sqlite3.connect(
                         f"file:{sqlite_path}?mode=memory&cache=shared",
                         uri=True, 
-                        check_same_thread=False
+                        # check_same_thread=False
                     )
                     memory_conn.execute("PRAGMA shared_cache = ON;")
                     mid = time.time()

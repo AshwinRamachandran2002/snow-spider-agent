@@ -6,6 +6,7 @@ import pandas as pd
 import argparse
 from io import StringIO
 import csv
+from collections import Counter
 
 def load_jsonl_to_dict(jsonl_file):
     data_dict = {}
@@ -130,7 +131,7 @@ def evaluate_bird(gold_result_dir, exec_result_path, example_id):
             gold_csv = f.read()
         with open(os.path.join(exec_result_path)) as f:
             exec_result = f.read()
-        if set(get_tuple(exec_result)) == set(get_tuple(gold_csv)):
+        if Counter(get_tuple(exec_result)) == Counter(get_tuple(gold_csv)):
             return 1
         return 0
     except Exception as e:
