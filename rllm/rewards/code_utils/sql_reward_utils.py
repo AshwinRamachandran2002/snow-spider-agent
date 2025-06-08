@@ -133,7 +133,8 @@ class SqlEnv:
                     # print(f"Connection {key} closed.")
                     del self.conns[key]
             except Exception as e:
-                print(f"##ERROR## When closing DB for {key}: {e}")
+                # print(f"##ERROR## When closing DB for {key}: {e}")
+                pass
 
     def new_con(self, example_id, exe_id, sqlite_path):
         self.conns[example_id+exe_id] = sqlite3.connect(
