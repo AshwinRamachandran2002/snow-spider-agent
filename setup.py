@@ -8,7 +8,7 @@ setup(
     packages=find_packages(include=['rllm',]),
     install_requires=[
         'torch==2.7.0',
-        'deepspeed',
+        'deepspeed==0.16.7',
         'dm-tree',
         'gdown',
         'google-cloud-aiplatform',
@@ -20,7 +20,7 @@ setup(
         'sortedcontainers',
         'tabulate',
         'torchmetrics',
-        'flash-attn',
+        'flash-attn==2.7.4.post1',
         'gym',
         'selenium',
         'PyMuPDF',

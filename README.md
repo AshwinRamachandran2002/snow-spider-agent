@@ -1,6 +1,6 @@
 ### Installation
 ```bash
-# Recommend Python 3.10.
+# Recommend Python 3.10, cuda 12.4.
 pip install -r requirements.txt
 pip install -e ./verl
 pip install -e .

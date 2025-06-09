@@ -1,14 +1,19 @@
 set -x
 
-export VLLM_ATTENTION_BACKEND=XFORMERS
+export VLLM_USE_V1="0"
+export WANDB_API_KEY=REDACTED_WANDB_API_KEY
+export PATH_TO_SQLITE_PATH="data_preprocess"
+
+EXEC_FOLDER="exec_eval"
+export EXEC_FOLDER=$EXEC_FOLDER
 
 # Default values
 MODEL_PATH="$HOME/DeepScaleR-1.5B-Preview"
 # Possible values: aime, amc, math, minerva, olympiad_bench
-DATATYPES=("aime")
+DATATYPES=("bird")
 OUTPUT_DIR="$HOME"  # Add default output directory
 N_PASSES=1  # Add default number of passes
-MAX_LENGTH=32768  # Default max response length
+MAX_LENGTH=8192  # Default max response length
 TP_SIZE=1  # Default tensor parallel size
 
 # Parse named arguments
@@ -64,7 +69,7 @@ for DATA_TYPE in "${DATATYPES[@]}"; do
     python3 -m verl.trainer.main_generation \
         trainer.nnodes=1 \
         trainer.n_gpus_per_node=8 \
-        data.path=$HOME/rllm/data/${DATA_TYPE}.parquet \
+        data.path=data_preprocess/data/processed/bird_dev.parquet \
         data.output_path=${OUTPUT_DIR}/${DATA_TYPE}.parquet \
         data.n_samples=${N_PASSES} \
         data.batch_size=2048 \
