@@ -219,8 +219,8 @@ class SQLExecutor():
                 # exec_result = env.answer
                 exe_id = calculate_md5(self.tokenizer.decode(completion)+str(datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')))
                 exec_result = self.exec_func_sql(sql_string, exe_id, timeout=self.timeout_for_exploration, max_len=500, LIMIT=100, **kwargs)
-                if "Timed out" in exec_result:
-                    print(f"Timed out time: {time.time() - start}")
+                if "Timed out" in exec_result or "##ERROR## Incorrect SQL Syntax: interrupted" in exec_result:
+                    print(exec_result)
                     return [self.tokenizer.eos_token_id]
                 
                 exec_result = "\n<exec_result>\n" + exec_result + "\n</exec_result>"
@@ -380,6 +380,7 @@ class SQLExecutor():
 
                 used_time = self.time_per_parent_seq_id[seq_id][-1] - self.start_time
                 if used_time > self.max_time or self.calls_per_parent_seq_id[seq_id] > self.max_calls:
+                    print(f"used_time: {used_time}, calls: {self.calls_per_parent_seq_id[seq_id]}")
                     self.monitor_parent_seq_ids[seq_id] = {
                         "exec_result": [self.tokenizer.eos_token_id],
                         "curr_pointer": 0
