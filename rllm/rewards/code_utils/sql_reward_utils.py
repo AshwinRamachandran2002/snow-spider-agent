@@ -9,9 +9,11 @@ import os
 import multiprocessing
 from typing import Optional, Union, List, Set, Any
 import sqlglot
+from sqlglot.expressions import Column, Table
 import threading
 from func_timeout import func_timeout, FunctionTimedOut
 import json
+import re
 
 def hard_cut(str_e, length=0):
     if length:
@@ -66,6 +68,12 @@ def schema_check(schema_json, sqlite_path):
                     for err in err_rec:
                         if "." in err and col == err.split(".")[-1].strip("\""):
                             candiates.append(f'"{tb}"."{col}"')
+                            if tb in schema_json:
+                                schema_json[tb].append(col)
+                            else:
+                                schema_json[tb] = col
+                        else:
+                            schema_json.pop(err, None)
 
     response = ""
     err_rec_str = ", ".join(err_rec)
@@ -74,10 +82,103 @@ def schema_check(schema_json, sqlite_path):
         response += f"##Warning## These tables or \"table\".\"column\" do not exist: {err_rec_str}."
         if candiates:
             response += f"\nConsider these candidates: {cand_str}."
+            # response += f"Improved schema: \n<schema_linking>\n{schema_json}\n<\schema_linking>\n"
     else:
         response += "Schema check passed. All columns exist."
 
     return response
+
+def get_valid_fields(sqlite_path):
+    db_id = sqlite_path.split("/")[-2]
+    table_pths = os.path.join("/".join(sqlite_path.split("/")[:-3]), "schema")
+
+    fields = []
+    for db in os.listdir(table_pths):
+        db_pth = os.path.join(table_pths, db)
+        if db.split(".")[0] == db_id:
+            with open(db_pth) as f:
+                schema_ori = json.load(f)
+    for k, v in schema_ori.items():
+        fields += [f"{k}.{i}" for i in v]
+    return fields
+
+def preprocess_sql(sql: str) -> str:
+    """
+    Preprocess SQLite SQL string by:
+    - Converting [Column] → "Column"
+    - Converting `Column` → "Column"
+    This makes the SQL parseable by sqlglot (ANSI-style).
+    """
+    sql = re.sub(r'\[(.*?)\]', r'"\1"', sql)
+    sql = sql.replace("`", '"')
+    return sql
+
+def extract_fields_from_sql(sql: str, valid_fields: set[str]) -> List[str]:
+    """
+    Extract and normalize table.column references from SQL.
+    Resolves aliases (e.g., T1 → frpm) and maps fields to real schema fields.
+    """
+    try:
+        sql = preprocess_sql(sql)
+        parsed = sqlglot.parse_one(sql)
+        fields = set()
+
+        alias_map = {}
+        for table_expr in parsed.find_all(Table):
+            alias = table_expr.alias_or_name
+            real_name = table_expr.name
+            if alias:  # alias may equal name
+                alias_map[alias] = real_name
+
+        for col in parsed.find_all(Column):
+            table_alias = col.table
+            column_name = col.name
+
+            if table_alias:
+                true_table = alias_map.get(table_alias, table_alias)
+                full = f"{true_table}.{column_name}"
+                if full in valid_fields:
+                    fields.add(full)
+            else:
+                candidates = [fc for fc in valid_fields if fc.endswith(f".{column_name}")]
+                if len(candidates) >= 1:
+                    for c in candidates:
+                        fields.add(c)
+                else:
+                    print(f"[WARN] Unknown column: {column_name}")
+
+        return list(fields)
+
+    except Exception as e:
+        print(f"[WARN] Failed to parse SQL: {e}")
+        print(sql)
+        return []
+
+def compute_precision_recall(final_fields: list[str], gold_fields: list[str]) -> dict:
+    """
+    Computes precision and recall between predicted fields and gold fields.
+    Args:
+        final_fields: list of predicted table.column field names.
+        gold_fields: list of gold standard field names.
+    Returns:
+        dict with precision, recall, and f1.
+    """
+    pred_set = set(final_fields)
+    gold_set = set(gold_fields)
+    correct = pred_set & gold_set
+
+    precision = len(correct) / len(pred_set) if pred_set else 0.0
+    recall = len(correct) / len(gold_set) if gold_set else 0.0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    return {
+        "precision": round(precision, 3),
+        "recall": round(recall, 3),
+        "f1": round(f1, 3),
+        "matched": sorted(correct),
+        "extra": sorted(pred_set - gold_set),
+        "missing": sorted(gold_set - pred_set)
+    }
 
 class SqlEnv:
     def __init__(self):
@@ -151,7 +252,14 @@ class SqlEnv:
             cursor.execute(sql_query)
         except Exception as e:
             cursor.close()
-            return "##ERROR## Incorrect SQL Syntax: " + str(e) + "\n"
+            try:
+                sqlglot.parse_one(sql_query, read="sqlite")
+                return "##ERROR## Incorrect SQL Syntax: " + str(e) + "\n"
+            except sqlglot.ParseError as pe:
+                sqlglot_msg = f"sqlglot detected parse error:\n{str(pe)}\n"
+            except sqlglot.TokenError as te:
+                sqlglot_msg = f"sqlglot detected tokenization error:\n{str(te)}\n"
+            return "##ERROR## Incorrect SQL Syntax: " + str(e) + "\n" + sqlglot_msg
         
         def get_rows(cursor):
             rows = []

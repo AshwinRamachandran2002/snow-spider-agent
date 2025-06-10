@@ -17,43 +17,44 @@ from rllm.data.dataset_types import TrainDataset, TestDataset
 
 
 prompt = """
-You are a data scientist proficient in Text-to-SQL tasks.
+You are a data scientist specializing in Text-to-SQL tasks.
 
-Given a task, you should reason step by step using execution feedback to arrive at the final answer.
+Given a task, you must reason step-by-step using execution feedback to derive the final answer.
 
-Step 1: Identify all relevant schemas (which may include more than just the gold schema) and enclose them within <schema_linking></schema_linking> tags. The schema should be represented in JSON format:
+Step 1: Schema Linking  
+Identify all relevant tables and their columns (including, but not limited to, the gold schema).  
+Enclose the schema in <schema_linking></schema_linking> tags, formatted as JSON:
 <schema_linking>
-{Table name: [column name1, column name2]}
+{
+  "TableName": ["column_name1", "column_name2"]
+}
 </schema_linking>
 
-Each time when you do schema linking, you will receive schema check results in <exec_result></exec_result> tags showing if column exists.
-If there's a warning, please follow the suggestions to adjust the schema.
+After submitting a schema, you will receive schema check results within <exec_result></exec_result> tags.  
+If any warnings appear (e.g., column not found), revise your schema accordingly based on the suggestions.
 
-Step 2: Write SQL queries to examine the values of each column in the JSON to assess their validity. Use <exec_sql></exec_sql> tags to execute SQL queries. The results will be returned in <exec_result></exec_result> tags. You should reason based on results.
+Step 2: Column Value Checking  
+For each column listed in the schema, write SQL queries to examine its values and assess their validity.  
+Wrap these SQL queries in <exec_sql></exec_sql> tags.  
+Query results will be returned inside <exec_result></exec_result> tags, and you should reason based on the output.
 
-Step 3: After reviewing all relevant schemas and values from the database, decide on the final schema to use by removing useless parts in the previous JSON. 
+Step 3: Schema Adjustment and Final Query Preparation  
+After examining the relevant schema and column values:
+- Adjust the schema JSON if needed.
+- Generate the final SQL query, wrapped in <exec_sql></exec_sql> tags.
+- Confirm its correctness using the feedback returned in <exec_result></exec_result> tags.
 
-If the schema changes, update it as:
-<schema_linking>
-{Table name: [column name1, column name2, column name3]}
-</schema_linking>
+Step 4: Final Answer  
+Write the final SQL query within <answer></answer> tags.
 
-Else just copy the schema from Step 1:
-<schema_linking>
-{Table name: [column name1, column name2]}
-</schema_linking>
-
-Then, generate the final SQL query inside <exec_sql></exec_sql> tags and verify its correctness based on the feedback provided in <exec_result></exec_result> tags.
-
-Step 4: Write the final SQL in <answer></answer> tags.
-
-Note: 
-
-Do not generate <exec_result></exec_result> tags yourself. If any syntax error or empty result occurs, revise your query accordingly before proceeding. All 'SELECT' should be in <exec_sql></exec_sql> block.
-
-You should reason in <think></think> tags and anwer in <answer></answer> tags.
-
-The SQL dialect must be SQLite. Use the format SELECT "column_name" FROM "table_name" WHERE ..., replacing "table_name" and "column_name" with actual names. Always enclose table and column names in double quotaions.
+Additional Notes:
+- If a syntax error or empty result occurs, revise your SQL query accordingly before moving forward.
+- All SELECT statements must be wrapped inside <exec_sql></exec_sql> tags.
+- Use <think></think> tags to write your reasoning and <answer></answer> for the final answer.
+- All SQL must conform to the SQLite dialect.
+  - Always use double quotes around table and column names.
+  - Use the format:
+    SELECT "column_name" FROM "table_name" WHERE ...
 
 Here's an example:
 {DB Info}
@@ -190,7 +191,7 @@ def make_map_fn(split: str):
             "ability": "math",
             "reward_model": {
                 "style": "rule",
-                "ground_truth": {"sqlite_path": example["sqlite_path"], "example_id": example["example_id"]}
+                "ground_truth": {"sqlite_path": example["sqlite_path"], "example_id": example["example_id"], "gold_sql": example["answer"]}
             },
             "extra_info": {
                 'split': split,

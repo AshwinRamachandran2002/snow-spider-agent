@@ -7,13 +7,14 @@ from typing import List, Dict, Union
 
 from rllm.globals import THOUGHT_DELIMITER_START, THOUGHT_DELIMITER_END, OAI_RM_MODEL
 from rllm.rewards import RewardConfig, RewardFn, RewardInput, RewardOutput, RewardType
-from rllm.rewards.math_utils.utils import extract_answer, grade_answer_sympy, grade_answer_mathd
+from rllm.rewards.code_utils.sql_reward_utils import extract_fields_from_sql, compute_precision_recall, get_valid_fields
 
 from rllm.system_prompts import ORM_PROMPT
 from rllm.utils import calculate_md5, call_oai_rm_llm
 import os 
 import re
 from datetime import datetime
+import json
 ORM_USER_TEMPLATE = """
 Problem: {problem}
 Answer 1: {answer_1}
@@ -62,7 +63,7 @@ class RewardSQLFn(RewardFn):
 
         if not (all_tag_counts['exec_sql_open'] == all_tag_counts['exec_sql_close'] ==
                 # all_tag_counts['exec_result_open'] == all_tag_counts['exec_result_close'] == 
-                all_tag_counts["SELECT"] == all_tag_counts[";\n"]) or all_tag_counts['exec_sql_open'] < 1:
+                all_tag_counts["SELECT"] == all_tag_counts[";\n"]):
             return False
 
         if not (all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close']) or all_tag_counts['schema_linking_open'] < 1:
@@ -70,14 +71,29 @@ class RewardSQLFn(RewardFn):
 
         return True
 
-    def check_sl_bonus(self, text):
+    def check_sl_bonus(self, text, gold_sql, valid_fields):
         all_tag_counts = {
             'schema_linking_open': len(re.findall(r'<schema_linking>', text)),
             'schema_linking_close': len(re.findall(r'</schema_linking>', text)),
         }
 
-        if all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close'] and all_tag_counts['schema_linking_open'] >= 2:
-            return True
+        def extract_last_schema_linking(text):
+            pattern = r"<schema_linking>(.*?)</schema_linking>"
+            matches = re.findall(pattern, text, flags=re.DOTALL)
+            return matches[-1] if matches else None
+
+        if all_tag_counts['schema_linking_open'] == all_tag_counts['schema_linking_close']:
+            content = extract_last_schema_linking(text)
+            gold_fields = extract_fields_from_sql(gold_sql, valid_fields)
+            fields = []
+            try:
+                content_json = json.loads(content)
+                for k, v in content_json.items():
+                    fields += [f"{k}.{i}" for i in v]
+                if compute_precision_recall(fields, gold_fields)["recall"] == 1:
+                    return True
+            except:
+                pass
         return False
 
     def __call__(self, input: RewardInput) -> RewardOutput:
@@ -85,6 +101,8 @@ class RewardSQLFn(RewardFn):
             "Invalid problem type: expected 'CODE', but got '{}'".format(input.problem_type)
         # print(f"input.metadata: {input.metadata}")
         example_id = input.metadata["example_id"]
+        gold_sql = input.metadata["gold_sql"]
+        valid_fields = get_valid_fields(os.path.join(os.getenv("PATH_TO_SQLITE_PATH"), input.metadata["sqlite_path"]))
         model_response = input.model_response
 
         response_str = model_response[model_response.rfind("<think>"):]
@@ -104,9 +122,9 @@ class RewardSQLFn(RewardFn):
         if not os.path.exists(csv_path):
             return RewardOutput(reward=self.config.format_error_reward, is_correct=False)
 
-        sl_bonus = 0
-        # if self.check_sl_bonus(response_str):
-        #     sl_bonus = self.config.sl_bonus
+        sl_bonus = -0.1
+        if self.check_sl_bonus(response_str, gold_sql, valid_fields):
+            sl_bonus = 0
         with open(log_path.replace(".log", ".txt")) as f:
             is_correct = int(f.read())
             if is_correct: 

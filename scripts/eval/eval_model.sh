@@ -6,12 +6,16 @@ export PATH_TO_SQLITE_PATH="data_preprocess"
 
 EXEC_FOLDER="exec_eval"
 export EXEC_FOLDER=$EXEC_FOLDER
+rm -rf $EXEC_FOLDER
+mkdir -p $EXEC_FOLDER
+
+export TMPDIR=/mbz/bruce/exec-fb/ray_8
 
 # Default values
-MODEL_PATH="$HOME/DeepScaleR-1.5B-Preview"
+MODEL_PATH=/mbz/bruce/exec-fb/checkpoints/execution/8B_sl_step120/actor/global_step_40
 # Possible values: aime, amc, math, minerva, olympiad_bench
 DATATYPES=("bird")
-OUTPUT_DIR="$HOME"  # Add default output directory
+OUTPUT_DIR="outputs"  # Add default output directory
 N_PASSES=1  # Add default number of passes
 MAX_LENGTH=8192  # Default max response length
 TP_SIZE=1  # Default tensor parallel size
@@ -79,5 +83,12 @@ for DATA_TYPE in "${DATATYPES[@]}"; do
         rollout.top_k=-1 \
         rollout.top_p=0.95 \
         rollout.gpu_memory_utilization=0.8 \
-        rollout.tensor_model_parallel_size=${TP_SIZE}
+        rollout.tensor_model_parallel_size=${TP_SIZE} \
+        rollout.sql_executor.max_time=400 \
+        rollout.sql_executor.max_calls=40 \
+        rollout.sql_executor.timeout_for_exploration=10 \
+        rollout.sql_executor.timeout_for_final_answer=10 \
+        # trainer.logger=['console','wandb'] \
+        # trainer.project_name='execution' \
+        # trainer.experiment_name='8B_sl_step120_eval' 
 done

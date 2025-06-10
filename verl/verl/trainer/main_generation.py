@@ -99,15 +99,18 @@ def main(config):
         dp_size = wg.world_size
         num_batch = (total_samples // config_batch_size) + 1
         output_lst = []  # We'll reshape at the end
+        reward_model_data = dataset[config.data.reward_model_key]
 
         for batch_idx in range(num_batch):
             print(f'[{batch_idx+1}/{num_batch}] Start to process.')
             batch_chat_lst = chat_lst[batch_idx * config_batch_size:(batch_idx + 1) * config_batch_size]
-            
+            batch_reward_model = reward_model_data[batch_idx * config_batch_size:(batch_idx + 1) * config_batch_size]
             # Repeat the batch n_samples times
             repeated_chat_lst = []
-            for chat in batch_chat_lst:
+            repeated_reward_model = []
+            for chat, r in zip(batch_chat_lst, batch_reward_model):
                 repeated_chat_lst.extend([chat] * config.data.n_samples)
+                repeated_reward_model.extend([r] * config.data.n_samples)
             
             inputs = tokenizer.apply_chat_template(repeated_chat_lst,
                                                  add_generation_prompt=True,
@@ -125,6 +128,9 @@ def main(config):
             batch_dict = {'input_ids': input_ids, 'attention_mask': attention_mask, 'position_ids': position_ids}
 
             data = DataProto.from_dict(batch_dict)
+            data.non_tensor_batch = {
+                'reward_model': repeated_reward_model
+            }
             real_batch_size = data.batch['input_ids'].shape[0]
             
             if real_batch_size % dp_size != 0:
@@ -174,7 +180,6 @@ def main(config):
     prompts = dataset[config.data.prompt_key]
     responses = dataset['responses']  # Using the generated responses
     data_sources = dataset[config.data.data_source_key]
-    reward_model_data = dataset[config.data.reward_model_key]
 
     passes = 0
     total = len(dataset)
